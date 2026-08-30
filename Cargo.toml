@@ -16,3 +16,9 @@ memmap2 = "0.9"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+
+[features]
+# Off by default so the crate builds and tests without a CUDA toolkit.
+# CLAUDE.md scopes the project to NVIDIA + sm_120; this gate is about keeping
+# `cargo test` usable, not about portability.
+cuda = []

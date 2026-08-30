@@ -10,6 +10,8 @@
 //! contraction dimension**, so `{n_in, n_out}` maps `n_in -> n_out`, and rows of
 //! length `n_in` are contiguous.
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod naive;
 pub mod par;
 pub mod pool;

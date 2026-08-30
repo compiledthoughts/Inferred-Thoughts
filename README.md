@@ -60,6 +60,21 @@ cargo build --release
 export B=~/.cargo-target/inferredthoughts/release/inferred
 ```
 
+`.cargo/config.toml` sets `-C target-cpu=native`. Without it rustc emits
+SSE2-only code, which costs about 2x on attention — see the file for the
+measurements.
+
+CUDA is behind an off-by-default feature so the crate builds and tests without
+a toolkit:
+
+```bash
+cargo test --features cuda        # needs CUDA 12.8+ and an sm_120 device
+```
+
+`build.rs` finds `nvcc` via `CUDA_PATH`, `CUDA_HOME`, or `/usr/local/cuda`,
+compiles `kernels/kernels.cu` to sm_120 PTX, and links the driver API
+(`libcuda.so`) — no `libcudart`, no wrapper crate.
+
 ## Run
 
 ```bash

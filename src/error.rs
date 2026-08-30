@@ -177,4 +177,10 @@ pub enum Error {
 
     #[error("cannot apply a chat template to this model: {detail}")]
     UnsupportedChatTemplate { detail: String },
+
+    #[error("cuda: {what} failed: {detail}")]
+    Cuda {
+        what: &'static str,
+        detail: String,
+    },
 }
