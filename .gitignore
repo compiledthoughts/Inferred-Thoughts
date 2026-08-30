@@ -1,0 +1,17 @@
+# Rust build output. Builds normally go to CARGO_TARGET_DIR outside the repo
+# (ext4 rather than DrvFs), but catch a local one too.
+/target/
+
+# Trace dumps and comparison scratch from `inferred trace --dump`
+*.bin
+*.log
+ours.txt
+ref.txt
+
+# Local tool settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,8 @@
+# Developed in WSL. Keep LF in the repo regardless of the host's autocrlf.
+* text=auto eol=lf
+
+# Test fixtures are binary: raw quantized bytes plus f32 reference values.
+# Line-ending translation would corrupt them.
+*.itfx binary
+*.gguf binary
+*.bin binary

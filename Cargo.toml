@@ -1,0 +1,17 @@
+[package]
+name = "inferred-thoughts"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "inferred_thoughts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inferred"
+path = "src/main.rs"
+
+[dependencies]
+memmap2 = "0.9"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
