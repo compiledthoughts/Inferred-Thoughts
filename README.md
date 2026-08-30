@@ -202,7 +202,10 @@ python scripts/check_q8_matmul.py                       # isolate the Q8_0 matmu
 
 ## Known limits
 
-- `qwen3` only; no MoE, no GatedDeltaNet
+- `qwen3` only; no MoE, no GatedDeltaNet. Quant support covers what the three
+  target models use: F32, F16, BF16, Q8_0, Q5_K, Q6_K, IQ4_XS
+- CUDA is a toolchain spike, not a backend: device, memory, PTX and one
+  bit-exact kernel work, but there is no `Ops` impl so the model runs on CPU
 - Greedy sampling only
 - Scalar f32 kernels: no SIMD, no GPU, both deliberate. Threading exists
   (`-t N`) but only the LM head is large enough to pay for it — 1.18x. See
