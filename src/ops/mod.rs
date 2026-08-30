@@ -1,15 +1,17 @@
 //! Tensor primitives, behind a backend seam.
 //!
-//! Three implementations are planned: `naive` (scalar f32 Rust, the oracle we
-//! own), `ggml` (CPU SIMD via FFI, for the dense path), and `cuda` (ours, for
-//! the MoE expert path). Only `naive` exists today. Model code is written
-//! against the [`Ops`] trait so adding a backend never touches it.
+//! Implementations: `naive` (scalar f32 Rust, the oracle we own), `par` (the
+//! same kernels spread across threads), and, planned, `ggml` (CPU SIMD via
+//! FFI, for the dense path) and `cuda` (ours, for the MoE expert path). Model
+//! code is written against the [`Ops`] trait so adding a backend never touches
+//! it.
 //!
 //! Shapes follow ggml's convention: a weight is `{ne0, ne1}` where **ne0 is the
 //! contraction dimension**, so `{n_in, n_out}` maps `n_in -> n_out`, and rows of
 //! length `n_in` are contiguous.
 
 pub mod naive;
+pub mod par;
 
 use crate::gguf::GgmlType;
 

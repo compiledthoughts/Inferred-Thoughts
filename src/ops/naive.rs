@@ -7,6 +7,12 @@
 //!
 //! So: no SIMD, no threads, no `unsafe`, and no cleverness. Correctness and
 //! legibility only. Per `CLAUDE.md`, never optimize this module.
+//!
+//! Its dot products are `pub(crate)` so [`super::par`] can call the *same*
+//! kernels across threads rather than growing a second copy that could drift.
+//! The parallel backend changes only which thread runs a row, never how a row
+//! is computed, which is what lets its differential test demand bit equality
+//! instead of a tolerance.
 
 use super::{Ops, Weights};
 use crate::gguf::GgmlType;
@@ -15,7 +21,7 @@ use crate::quant::half::{f16_to_f32, f32_to_f16};
 pub struct Naive;
 
 /// Elements per Q8_0 block (`QK8_0` in ggml-common.h).
-const QK8_0: usize = 32;
+pub(crate) const QK8_0: usize = 32;
 
 impl Ops for Naive {
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
@@ -158,13 +164,13 @@ fn rms_scale(x: &[f32], eps: f32) -> f32 {
 /// Mirrors `quantize_row_q8_0_ref` in `ggml/src/ggml-quants.c`:
 /// `d = amax/127`, `q = roundf(x/d)`, with `d` stored as f16 and read back —
 /// so `scales` holds the f16-rounded value, not the exact one.
-struct QuantizedRow {
+pub(crate) struct QuantizedRow {
     scales: Vec<f32>,
     quants: Vec<i8>,
 }
 
 impl QuantizedRow {
-    fn from_f32(x: &[f32]) -> Self {
+    pub(crate) fn from_f32(x: &[f32]) -> Self {
         let n_blocks = x.len() / QK8_0;
         let mut scales = Vec::with_capacity(n_blocks);
         let mut quants = Vec::with_capacity(x.len());
@@ -191,7 +197,7 @@ impl QuantizedRow {
 
 /// `ggml_vec_dot_q8_0_q8_0`: per block, an integer sum of products scaled by
 /// the product of the two f16 scales, accumulated in f32.
-fn dot_q8_0_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
+pub(crate) fn dot_q8_0_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
     let mut sumf = 0.0f32;
     for (i, block) in row.chunks_exact(2 + QK8_0).enumerate() {
         let dw = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
@@ -210,7 +216,7 @@ fn dot_q8_0_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
 ///
 /// Used for the unquantized types, where ggml also works directly in f32.
 /// Dequantizes a block at a time rather than materializing the row.
-fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
+pub(crate) fn dot_row(ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
     match ty {
         GgmlType::F32 => row
             .chunks_exact(4)

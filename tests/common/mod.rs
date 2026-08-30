@@ -1,0 +1,59 @@
+//! Shared helpers for tests that need a real model on disk.
+//!
+//! These tests cannot be self-contained the way the dequantization fixtures
+//! are: the forward pass needs the whole model. So they locate one, and skip
+//! loudly when it is absent rather than quietly passing.
+
+use std::path::{Path, PathBuf};
+
+/// The 0.6B, the smallest model the project targets. Honours
+/// `INFERRED_MODEL_DIR`, matching the tokenizer suite's convention.
+pub fn find_model() -> Option<PathBuf> {
+    let name = "Qwen3-0.6B-Q8_0.gguf";
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::var("INFERRED_MODEL_DIR") {
+        roots.push(PathBuf::from(dir));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        roots.push(Path::new(&home).join("models"));
+    }
+    roots.into_iter().map(|r| r.join(name)).find(|p| p.exists())
+}
+
+/// Bind the model path or return, announcing the skip on stdout — `--nocapture`
+/// is part of the documented invocation, so a silent no-op is not possible.
+macro_rules! model_or_skip {
+    ($path:ident) => {
+        let Some($path) = crate::common::find_model() else {
+            println!("SKIPPED: no Qwen3-0.6B-Q8_0.gguf found; set INFERRED_MODEL_DIR");
+            return;
+        };
+    };
+}
+
+pub(crate) use model_or_skip;
+
+/// Compare raw bits, not a tolerance.
+///
+/// `CLAUDE.md` forbids adjusting a tolerance until a test passes, and in both
+/// places this is used there is nothing to adjust: the two paths under
+/// comparison run the same operations in the same order, so anything other than
+/// equality is a bug.
+pub fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: different logit counts");
+    let mismatches: Vec<usize> = (0..a.len())
+        .filter(|&i| a[i].to_bits() != b[i].to_bits())
+        .collect();
+    if !mismatches.is_empty() {
+        let i = mismatches[0];
+        panic!(
+            "{what}: {} of {} logits differ; first at {i}: {:?} ({:#x}) vs {:?} ({:#x})",
+            mismatches.len(),
+            a.len(),
+            a[i],
+            a[i].to_bits(),
+            b[i],
+            b[i].to_bits(),
+        );
+    }
+}

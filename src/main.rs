@@ -27,10 +27,8 @@ enum Command {
         max_array: usize,
     },
 
-    /// Generate text greedily.
-    ///
-    /// Stage 4 has no KV cache, so every token re-runs the whole sequence.
-    /// Correct but quadratic -- Stage 5 fixes that.
+    /// Generate text greedily, prefilling the prompt and decoding against a
+    /// KV cache.
     Generate {
         #[arg(short, long)]
         model: String,
@@ -42,6 +40,25 @@ enum Command {
         /// Keep going past the end-of-sequence token.
         #[arg(long)]
         ignore_eos: bool,
+        /// KV cache size in positions. The cache is allocated up front, so
+        /// this trades memory for the longest usable context.
+        #[arg(short = 'c', long, default_value_t = 4096)]
+        ctx: usize,
+        /// Print the profile summary: phase timings, byte traffic, and the
+        /// top-2 logit margins.
+        #[arg(long)]
+        profile: bool,
+        /// Also time each layer's attention and FFN halves.
+        #[arg(long)]
+        profile_detail: bool,
+        /// Write the profile as JSON, for diffing two runs against each other.
+        #[arg(long)]
+        profile_json: Option<String>,
+        /// Compute threads. 1 selects the scalar `naive` oracle directly;
+        /// anything more selects `par`, which must produce identical bits.
+        /// 0 means physical cores.
+        #[arg(short = 't', long, default_value_t = 0)]
+        threads: usize,
     },
 
     /// Run one forward pass and print a checksum of every intermediate tensor,
@@ -71,7 +88,22 @@ fn main() -> ExitCode {
             prompt,
             max_tokens,
             ignore_eos,
-        } => generate(&model, &prompt, max_tokens, ignore_eos),
+            ctx,
+            profile,
+            profile_detail,
+            profile_json,
+            threads,
+        } => generate(
+            &model,
+            &prompt,
+            max_tokens,
+            ignore_eos,
+            ctx,
+            profile || profile_detail,
+            profile_detail,
+            profile_json.as_deref(),
+            threads,
+        ),
         Command::Trace { model, prompt, dump } => trace(&model, &prompt, dump.as_deref()),
     };
 
@@ -106,61 +138,125 @@ fn inspect(path: &str, json: bool, max_array: usize) -> inferred_thoughts::Resul
 ///
 /// This exists so the engine is usable end to end before the KV cache lands.
 /// Cost is quadratic in sequence length by construction; Stage 5 replaces it.
+#[allow(clippy::too_many_arguments)]
 fn generate(
     model: &str,
     prompt: &str,
     max_tokens: usize,
     ignore_eos: bool,
+    n_ctx: usize,
+    report: bool,
+    detail: bool,
+    json: Option<&str>,
+    threads: usize,
 ) -> inferred_thoughts::Result<()> {
-    use inferred_thoughts::{Naive, Qwen3, Tokenizer};
-    use std::io::Write;
+    use inferred_thoughts::{Naive, Par, Qwen3, Tokenizer};
 
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
     let m = Qwen3::load(&f)?;
+    let tokens = tk.encode(prompt, true, true);
 
-    let mut tokens = tk.encode(prompt, true, true);
+    let n_threads = if threads == 0 {
+        Par::default_threads()
+    } else {
+        threads
+    };
+
     eprintln!(
-        "model {} | {} layers | {} prompt tokens",
+        "model {} | {} layers | {} prompt tokens | ctx {} | {}",
         f.path.file_name().unwrap_or_default().to_string_lossy(),
         m.cfg.n_layer,
-        tokens.len()
+        tokens.len(),
+        n_ctx,
+        if n_threads <= 1 {
+            "naive (1 thread)".to_string()
+        } else {
+            format!("par ({n_threads} threads)")
+        },
     );
 
-    print!("{prompt}");
+    // One thread means the oracle itself, not a pool of one -- there is no
+    // reason to pay dispatch for a single worker, and it makes `-t 1` the
+    // reference run that `par` must reproduce bit for bit.
+    if n_threads <= 1 {
+        run_generation(m, Naive, &tk, &tokens, max_tokens, ignore_eos, n_ctx, report, detail, json)
+    } else {
+        Par::init(n_threads);
+        run_generation(m, Par, &tk, &tokens, max_tokens, ignore_eos, n_ctx, report, detail, json)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_generation<O: inferred_thoughts::Ops>(
+    model: inferred_thoughts::Qwen3<'_>,
+    ops: O,
+    tk: &inferred_thoughts::Tokenizer,
+    tokens: &[u32],
+    max_tokens: usize,
+    ignore_eos: bool,
+    n_ctx: usize,
+    report: bool,
+    detail: bool,
+    json: Option<&str>,
+) -> inferred_thoughts::Result<()> {
+    use inferred_thoughts::Engine;
+    use std::io::Write;
+
+    let mut engine = Engine::new(model, ops, n_ctx, detail);
+    eprintln!(
+        "kv cache {:.0} MiB resident",
+        engine.kv_capacity_bytes() as f64 / 1048576.0
+    );
+
+    let prompt_text = tk.decode(tokens, false)?;
+    print!("{prompt_text}");
     let _ = std::io::stdout().flush();
 
+    // Decode incrementally so multi-token characters still render: decode the
+    // whole sequence each time and print only what is new.
+    let mut shown = tokens.to_vec();
+    let mut before = prompt_text;
+    let eos = if ignore_eos { None } else { tk.eos_token_id };
+
     let started = std::time::Instant::now();
-    let mut produced = 0usize;
-
-    for _ in 0..max_tokens {
-        let logits = m.forward(&Naive, &tokens, &mut |_, _, _| {})?;
-        let next = Qwen3::argmax(&logits);
-
-        if !ignore_eos && Some(next) == tk.eos_token_id {
-            eprintln!("\n[eos]");
-            break;
+    let produced = engine.generate(tokens, max_tokens, eos, |id| {
+        shown.push(id);
+        if let Ok(after) = tk.decode(&shown, false) {
+            if let Some(new_text) = after.strip_prefix(&before) {
+                print!("{new_text}");
+                let _ = std::io::stdout().flush();
+            }
+            before = after;
         }
-
-        // Decode incrementally so multi-token characters still render: decode
-        // the whole sequence and print only what is new.
-        let before = tk.decode(&tokens, false)?;
-        tokens.push(next);
-        let after = tk.decode(&tokens, false)?;
-        if let Some(new_text) = after.strip_prefix(&before) {
-            print!("{new_text}");
-            let _ = std::io::stdout().flush();
-        }
-        produced += 1;
-    }
-
+    })?;
     let secs = started.elapsed().as_secs_f64();
     println!();
+
+    if produced.len() < max_tokens && eos.is_some() {
+        eprintln!("[eos]");
+    }
     eprintln!(
-        "\n{produced} tokens in {secs:.1}s ({:.2} tok/s, {:.0} ms/token)",
-        produced as f64 / secs,
-        secs * 1000.0 / produced.max(1) as f64
+        "\n{} tokens in {secs:.1}s ({:.2} tok/s, {:.0} ms/token)",
+        produced.len(),
+        produced.len() as f64 / secs.max(1e-9),
+        secs * 1000.0 / produced.len().max(1) as f64
     );
+
+    if report {
+        let mut err = std::io::stderr();
+        let _ = writeln!(err);
+        let _ = engine.prof.report(&mut err);
+    }
+    if let Some(path) = json {
+        std::fs::write(path, engine.prof.to_json()).map_err(|source| {
+            inferred_thoughts::Error::Io {
+                path: path.to_string(),
+                source,
+            }
+        })?;
+        eprintln!("profile written to {path}");
+    }
     Ok(())
 }
 
@@ -215,7 +311,12 @@ fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Re
         }
     };
 
-    let logits = m.forward(&Naive, &tokens, &mut emit)?;
+    // A single pass at position 0, so the cache only needs room for the prompt
+    // and the profiler is inert -- `trace` measures numerics, not time.
+    let mut cache = inferred_thoughts::KvCache::new(m.cfg.n_layer, m.cfg.kv_dim(), tokens.len());
+    let mut prof = inferred_thoughts::Profile::new(false);
+    let mut ctx = inferred_thoughts::Ctx::new(&mut emit, &mut prof);
+    let logits = m.forward(&Naive, &tokens, 0, &mut cache, &mut ctx)?;
 
     let top = Qwen3::argmax(&logits);
     eprintln!(

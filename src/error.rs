@@ -169,4 +169,9 @@ pub enum Error {
         what: &'static str,
         detail: String,
     },
+
+    #[error(
+        "position {pos} exceeds the KV cache context of {n_ctx}; raise --ctx"
+    )]
+    ContextOverflow { pos: usize, n_ctx: usize },
 }

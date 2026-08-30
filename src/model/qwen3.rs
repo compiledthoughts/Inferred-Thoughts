@@ -20,11 +20,12 @@
 //! The LM head is tied when the file has no `output.weight`, which is how
 //! llama.cpp's loader behaves and is the case for Qwen3-0.6B.
 
+use crate::cache::KvCache;
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
 use crate::ops::{Ops, Weights};
+use crate::profile::{Ctx, Part};
 use crate::quant::dequantize_into;
-use crate::quant::half::{f16_to_f32, f32_to_f16};
 
 use super::{matrix, tensor, vector};
 
@@ -187,16 +188,59 @@ impl<'a> Qwen3<'a> {
         dequantize_into(self.tok_embd.row(id as usize), self.tok_embd.ty, out)
     }
 
-    /// Run the whole prompt and return logits for the final position.
+    /// Bytes of quantized weight one full forward pass reads.
     ///
-    /// Stage 4 has no KV cache: the full sequence is recomputed every call, as
-    /// `PROMPTS.md` specifies. `trace` receives every named intermediate so the
-    /// acceptance test can diff layer by layer against `llama-eval-callback`.
+    /// Derived from the tensor types and shapes rather than counted during
+    /// execution, per rule 3 in [`crate::profile`]: every matmul reads its
+    /// whole weight exactly once per pass, so a runtime counter would only
+    /// recompute a constant — while contending across threads to do it.
+    ///
+    /// The embedding lookup is excluded: it touches one row, not the tensor.
+    /// When the LM head is tied it *is* `token_embd`, and a pass still reads it
+    /// once, so counting it once is right either way.
+    pub fn weight_bytes_per_pass(&self) -> u64 {
+        let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
+        let per_layer: u64 = self
+            .layers
+            .iter()
+            .map(|l| {
+                w(&l.wq)
+                    + w(&l.wk)
+                    + w(&l.wv)
+                    + w(&l.wo)
+                    + w(&l.ffn_gate)
+                    + w(&l.ffn_up)
+                    + w(&l.ffn_down)
+            })
+            .sum();
+        per_layer + w(&self.output)
+    }
+
+    /// Run `tokens` starting at absolute position `start_pos`, append their K
+    /// and V to `cache`, and return logits for the final position.
+    ///
+    /// **One function serves both phases.** Prefill is the whole prompt at
+    /// `start_pos = 0` against a fresh cache; decode is a single token at
+    /// `start_pos = cache.len()`. Keeping them one code path is what makes the
+    /// acceptance test exact: incremental decode must produce *bit-identical*
+    /// logits to a full recompute, because it is the same arithmetic in the
+    /// same order over the same f16-rounded K and V. Any position or slot
+    /// indexing error breaks that equality immediately and unambiguously,
+    /// which a token-for-token comparison against `llama-cli` cannot do — the
+    /// ~1% logit drift documented in `CLAUDE.md` would flip an argmax
+    /// somewhere in 250 greedy decisions regardless of whether the cache is
+    /// correct.
+    ///
+    /// `ctx` carries the Stage 4 tensor tracer and the profiler. Tracer calls
+    /// still hand out whole batch-local tensors, so the `llama-eval-callback`
+    /// comparison keeps working unchanged.
     pub fn forward<O: Ops>(
         &self,
         ops: &O,
         tokens: &[u32],
-        trace: &mut dyn FnMut(&str, usize, &[f32]),
+        start_pos: usize,
+        cache: &mut KvCache,
+        ctx: &mut Ctx<'_>,
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
         let n = tokens.len();
@@ -206,17 +250,37 @@ impl<'a> Qwen3<'a> {
                 detail: "no tokens supplied".to_string(),
             });
         }
+        if cache.kv_dim() != c.kv_dim() {
+            return Err(Error::InconsistentArchitecture {
+                what: "kv cache",
+                detail: format!(
+                    "cache holds {} lanes per position, model needs {}",
+                    cache.kv_dim(),
+                    c.kv_dim()
+                ),
+            });
+        }
+        // Checked up front so the cache is never left half-written.
+        if start_pos + n > cache.n_ctx() {
+            return Err(Error::ContextOverflow {
+                pos: start_pos + n - 1,
+                n_ctx: cache.n_ctx(),
+            });
+        }
 
-        // Residual stream, one row of n_embd per token.
+        let step = ctx.prof.begin_step();
+
+        // Residual stream, one row of n_embd per token in this batch.
         let mut x = vec![0.0f32; n * c.n_embd];
         for (t, &id) in tokens.iter().enumerate() {
             self.embed(id, &mut x[t * c.n_embd..(t + 1) * c.n_embd])?;
         }
-        trace("inp_embd", 0, &x);
+        ctx.trace("inp_embd", 0, &x);
 
-        // Full-sequence buffers. Sized for every token rather than reused per
-        // token so that each `trace` call hands out a whole tensor, matching
-        // what `llama-eval-callback` prints at the same point.
+        // Batch-local buffers: one slot per token being processed now, which in
+        // decode is exactly one. Sized for the whole batch rather than reused
+        // per token so each trace call hands out a whole tensor, matching what
+        // `llama-eval-callback` prints at the same point.
         let (nd, qd, kd, nf) = (c.n_embd, c.q_dim(), c.kv_dim(), c.n_ff);
         let mut normed = vec![0.0f32; n * nd];
         let mut q = vec![0.0f32; n * qd];
@@ -227,9 +291,13 @@ impl<'a> Qwen3<'a> {
         let mut gate = vec![0.0f32; n * nf];
         let mut up = vec![0.0f32; n * nf];
         let mut ffn_out = vec![0.0f32; n * nd];
-        let mut scores = vec![0.0f32; n];
+        // Attention reaches back over every cached position, not just this
+        // batch, so scores are indexed by absolute position.
+        let mut scores = vec![0.0f32; start_pos + n];
 
         for (il, layer) in self.layers.iter().enumerate() {
+            let t_attn = ctx.prof.layer_begin();
+
             for t in 0..n {
                 ops.rms_norm(
                     &x[t * nd..(t + 1) * nd],
@@ -238,7 +306,7 @@ impl<'a> Qwen3<'a> {
                     &mut normed[t * nd..(t + 1) * nd],
                 );
             }
-            trace("attn_norm", il, &normed);
+            ctx.trace("attn_norm", il, &normed);
 
             for t in 0..n {
                 let inp = &normed[t * nd..(t + 1) * nd];
@@ -246,58 +314,94 @@ impl<'a> Qwen3<'a> {
                 ops.matmul(&layer.wk, inp, &mut k[t * kd..(t + 1) * kd]);
                 ops.matmul(&layer.wv, inp, &mut v[t * kd..(t + 1) * kd]);
             }
-            trace("Vcur", il, &v);
+            ctx.trace("Vcur", il, &v);
 
             // QK-norm strictly before RoPE, per head over head_dim.
             for t in 0..n {
-                ops.rms_norm_heads(&mut q[t * qd..(t + 1) * qd], &layer.q_norm, c.head_dim, c.rms_eps);
+                ops.rms_norm_heads(
+                    &mut q[t * qd..(t + 1) * qd],
+                    &layer.q_norm,
+                    c.head_dim,
+                    c.rms_eps,
+                );
             }
-            trace("Qcur_normed", il, &q);
+            ctx.trace("Qcur_normed", il, &q);
             for t in 0..n {
-                ops.rms_norm_heads(&mut k[t * kd..(t + 1) * kd], &layer.k_norm, c.head_dim, c.rms_eps);
+                ops.rms_norm_heads(
+                    &mut k[t * kd..(t + 1) * kd],
+                    &layer.k_norm,
+                    c.head_dim,
+                    c.rms_eps,
+                );
             }
-            trace("Kcur_normed", il, &k);
+            ctx.trace("Kcur_normed", il, &k);
 
+            // RoPE at the ABSOLUTE position. Using the batch index `t` here is
+            // the classic KV cache bug: it is invisible during prefill, where
+            // the two are equal, and wrong for every token decoded after.
             for t in 0..n {
-                ops.rope_neox(&mut q[t * qd..(t + 1) * qd], t, c.head_dim, c.n_head, c.rope_theta);
+                ops.rope_neox(
+                    &mut q[t * qd..(t + 1) * qd],
+                    start_pos + t,
+                    c.head_dim,
+                    c.n_head,
+                    c.rope_theta,
+                );
             }
-            trace("Qcur", il, &q);
+            ctx.trace("Qcur", il, &q);
             for t in 0..n {
-                ops.rope_neox(&mut k[t * kd..(t + 1) * kd], t, c.head_dim, c.n_head_kv, c.rope_theta);
+                ops.rope_neox(
+                    &mut k[t * kd..(t + 1) * kd],
+                    start_pos + t,
+                    c.head_dim,
+                    c.n_head_kv,
+                    c.rope_theta,
+                );
             }
-            trace("Kcur", il, &k);
+            ctx.trace("Kcur", il, &k);
 
-            // llama.cpp writes K and V into an f16 KV cache and reads them back
-            // for attention, so its scores are computed on f16-rounded values.
-            // That is a semantic difference worth ~3e-3 of tensor magnitude,
-            // not rounding noise -- and an f16 cache is what we want regardless,
-            // since it halves the VRAM the cache takes from the expert pool.
-            // Stage 5 will do this at the cache boundary instead.
-            for val in k.iter_mut().chain(v.iter_mut()) {
-                *val = f16_to_f32(f32_to_f16(*val));
+            // Publish the whole batch before attending: within a prefill, token
+            // t attends to tokens start_pos..=start_pos+t, which includes rows
+            // written by this same call. The cache rounds to f16 on the way in
+            // — that is where llama.cpp's f16 KV semantics now live, replacing
+            // the explicit round-trip Stage 4 did here.
+            for t in 0..n {
+                cache.store(
+                    il,
+                    start_pos + t,
+                    &k[t * kd..(t + 1) * kd],
+                    &v[t * kd..(t + 1) * kd],
+                )?;
             }
 
             let scale = 1.0 / (c.head_dim as f32).sqrt();
             let group = c.gqa_group();
 
             for t in 0..n {
+                let pos = start_pos + t;
                 for h in 0..c.n_head {
-                    let h_kv = h / group;
+                    // GQA: query head h reads kv head h / group.
+                    let head_off = (h / group) * c.head_dim;
                     let qh = &q[t * qd + h * c.head_dim..][..c.head_dim];
 
-                    // Causal mask: positions 0..=t only.
-                    for (s, score) in scores[..=t].iter_mut().enumerate() {
-                        let kh = &k[s * kd + h_kv * c.head_dim..][..c.head_dim];
-                        *score = qh.iter().zip(kh).map(|(a, b)| a * b).sum::<f32>() * scale;
+                    // Causal mask: absolute positions 0..=pos only.
+                    for (s, score) in scores[..=pos].iter_mut().enumerate() {
+                        let kh = cache.k_head(il, s, head_off, c.head_dim);
+                        *score = qh
+                            .iter()
+                            .zip(kh)
+                            .map(|(a, &b)| a * KvCache::read(b))
+                            .sum::<f32>()
+                            * scale;
                     }
-                    ops.softmax(&mut scores[..=t]);
+                    ops.softmax(&mut scores[..=pos]);
 
                     let out = &mut attn[t * qd + h * c.head_dim..][..c.head_dim];
                     out.fill(0.0);
-                    for (s, &w) in scores[..=t].iter().enumerate() {
-                        let vh = &v[s * kd + h_kv * c.head_dim..][..c.head_dim];
+                    for (s, &weight) in scores[..=pos].iter().enumerate() {
+                        let vh = cache.v_head(il, s, head_off, c.head_dim);
                         for (o, &vi) in out.iter_mut().zip(vh) {
-                            *o += w * vi;
+                            *o += weight * KvCache::read(vi);
                         }
                     }
                 }
@@ -306,17 +410,24 @@ impl<'a> Qwen3<'a> {
             // The reference names the concatenated head output "kqv_out",
             // before the output projection -- its dims are {q_dim, n_tokens}.
             // For token 0 this equals V[0], since it can only attend to itself.
-            trace("kqv_out", il, &attn);
+            ctx.trace("kqv_out", il, &attn);
 
             for t in 0..n {
-                ops.matmul(&layer.wo, &attn[t * qd..(t + 1) * qd], &mut kqv[t * nd..(t + 1) * nd]);
+                ops.matmul(
+                    &layer.wo,
+                    &attn[t * qd..(t + 1) * qd],
+                    &mut kqv[t * nd..(t + 1) * nd],
+                );
             }
 
             for t in 0..n {
                 let (row, add) = (&mut x[t * nd..(t + 1) * nd], &kqv[t * nd..(t + 1) * nd]);
                 ops.add_assign(row, add);
             }
-            trace("ffn_inp", il, &x);
+            ctx.trace("ffn_inp", il, &x);
+            ctx.prof.layer_end(t_attn, step, il, Part::Attn);
+
+            let t_ffn = ctx.prof.layer_begin();
 
             for t in 0..n {
                 ops.rms_norm(
@@ -326,44 +437,64 @@ impl<'a> Qwen3<'a> {
                     &mut normed[t * nd..(t + 1) * nd],
                 );
             }
-            trace("ffn_norm", il, &normed);
+            ctx.trace("ffn_norm", il, &normed);
 
             for t in 0..n {
                 let inp = &normed[t * nd..(t + 1) * nd];
                 ops.matmul(&layer.ffn_gate, inp, &mut gate[t * nf..(t + 1) * nf]);
                 ops.matmul(&layer.ffn_up, inp, &mut up[t * nf..(t + 1) * nf]);
             }
-            trace("ffn_gate", il, &gate);
-            trace("ffn_up", il, &up);
+            ctx.trace("ffn_gate", il, &gate);
+            ctx.trace("ffn_up", il, &up);
 
             for t in 0..n {
                 let (g, u) = (&mut gate[t * nf..(t + 1) * nf], &up[t * nf..(t + 1) * nf]);
                 ops.silu_mul(g, u);
             }
-            trace("ffn_swiglu", il, &gate);
+            ctx.trace("ffn_swiglu", il, &gate);
 
             for t in 0..n {
-                ops.matmul(&layer.ffn_down, &gate[t * nf..(t + 1) * nf], &mut ffn_out[t * nd..(t + 1) * nd]);
+                ops.matmul(
+                    &layer.ffn_down,
+                    &gate[t * nf..(t + 1) * nf],
+                    &mut ffn_out[t * nd..(t + 1) * nd],
+                );
             }
-            trace("ffn_out", il, &ffn_out);
+            ctx.trace("ffn_out", il, &ffn_out);
 
             for t in 0..n {
                 let (row, add) = (&mut x[t * nd..(t + 1) * nd], &ffn_out[t * nd..(t + 1) * nd]);
                 ops.add_assign(row, add);
             }
-            trace("l_out", il, &x);
+            ctx.trace("l_out", il, &x);
+            ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
         }
+
+        // Every layer wrote its rows, so the positions are now real.
+        cache.commit(start_pos + n);
+
+        // KV traffic, derived rather than counted (rule 3 in `crate::profile`).
+        // These are *distinct* bytes: a GQA group of query heads shares one kv
+        // head, so counting per query head would report re-reads of the same
+        // cache lines as bus traffic. The read term grows with position, which
+        // is what makes attention's quadratic term visible next to the FFN's
+        // flat one.
+        let per_pos = cache.bytes_per_position();
+        ctx.prof.kv_write_bytes += n as u64 * per_pos;
+        ctx.prof.kv_read_bytes += (start_pos..start_pos + n)
+            .map(|p| (p as u64 + 1) * per_pos)
+            .sum::<u64>();
 
         // Only the final position's logits are needed.
         let last = &x[(n - 1) * nd..];
         let mut final_norm = vec![0.0f32; nd];
         ops.rms_norm(last, &self.output_norm, c.rms_eps, &mut final_norm);
-        trace("result_norm", 0, &final_norm);
+        ctx.trace("result_norm", 0, &final_norm);
         let normed = final_norm;
 
         let mut logits = vec![0.0f32; c.n_vocab];
         ops.matmul(&self.output, &normed, &mut logits);
-        trace("result_output", 0, &logits);
+        ctx.trace("result_output", 0, &logits);
 
         Ok(logits)
     }

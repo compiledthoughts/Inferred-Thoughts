@@ -4,8 +4,10 @@ A from-scratch Rust inference engine for GGUF models. Built toward serving an
 MoE model whose weights do not fit in VRAM — see `HANDOFF.md` for why, and
 `CLAUDE.md` for how.
 
-**Status:** Stages 1–4 complete. Loads a GGUF, tokenizes exactly like
-llama.cpp, and generates coherent text. 71 tests. CPU only, no KV cache yet.
+**Status:** Stages 1–5 complete. Loads a GGUF, tokenizes exactly like
+llama.cpp, and generates coherent text at ~27 tok/s on Qwen3-0.6B. KV cache,
+prefill/decode split, and a profiler. 91 tests, plus 8 more that need a model
+on disk. CPU only.
 
 ## Build
 
@@ -82,6 +84,9 @@ python scripts/check_q8_matmul.py                       # isolate the Q8_0 matmu
 ## Known limits
 
 - `qwen3` only; no MoE, no GatedDeltaNet
-- No KV cache — cost is quadratic in sequence length (~430 ms/token on the 0.6B)
 - Greedy sampling only
-- Single-threaded scalar f32: no SIMD, no threads, no GPU, all deliberate
+- Scalar f32 kernels: no SIMD, no GPU, both deliberate. Threading exists
+  (`-t N`) but only the LM head is large enough to pay for it — 1.18x. See
+  `PARALLEL_THRESHOLD` in `src/ops/par.rs` for the measurements.
+- Attention scoring is the bottleneck past a few hundred tokens: 64% of decode
+  time at 384 tokens, and ~10x less efficient per byte than the matmul path
