@@ -30,11 +30,20 @@
 use rayon::prelude::*;
 
 use super::naive::{self, Naive};
-use super::{Ops, Weights};
+use super::{Attn, Ops, Weights};
 use crate::gguf::GgmlType;
 
 /// Rows handed to one task.
 const ROWS_PER_TASK: usize = 512;
+
+/// Below this many cached positions, attention is too small to thread.
+///
+/// One key/value head at `n_pos` positions is roughly `2 * n_pos * head_dim`
+/// conversions plus `group * n_pos * head_dim` multiply-adds. At 64 positions
+/// and `head_dim` 128 that is already tens of microseconds per head, well clear
+/// of dispatch; below it the prompt is short enough that decode is dominated by
+/// the weight matmuls anyway.
+const ATTN_POS_THRESHOLD: usize = 64;
 
 /// Below this many rows, run serially: the tasks cost more than they save.
 ///
@@ -161,6 +170,40 @@ impl Ops for Par {
 
     fn softmax(&self, x: &mut [f32]) {
         Naive.softmax(x)
+    }
+
+    /// Threaded over key/value heads.
+    ///
+    /// **This is the case matmul threading could not be**, and the contrast is
+    /// the whole reason the op exists at the token level. A matmul here is a
+    /// fixed few microseconds, so per-task overhead swamped it (see
+    /// [`PARALLEL_THRESHOLD`]). Attention work *grows with context* — at 384
+    /// positions one key/value head is `group * 384 * head_dim` multiply-adds
+    /// plus 2 * 384 * head_dim conversions — and there is one dispatch per
+    /// layer rather than seven.
+    ///
+    /// Output chunking is what makes it safe: query heads served by one
+    /// key/value head are contiguous, so `out` splits into disjoint
+    /// `group * head_dim` slices, one per task, with no sharing at all.
+    ///
+    /// Bit-identical to [`Naive`]: same kernel, and threads change only which
+    /// core runs a head, never the order within one.
+    fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), a.n_head * a.head_dim);
+        let per_kv = a.group() * a.head_dim;
+
+        // Below this there is not enough work to cover a dispatch -- the same
+        // lesson PARALLEL_THRESHOLD records, applied to the other axis.
+        if a.n_pos < ATTN_POS_THRESHOLD || a.n_head_kv < 2 {
+            return Naive.attend(a, out);
+        }
+
+        out.par_chunks_mut(per_kv)
+            .enumerate()
+            .for_each_init(
+                || naive::Scratch::for_attn(a),
+                |sc, (h_kv, chunk)| naive::attend_kv_head(a, h_kv, chunk, sc),
+            );
     }
 
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {

@@ -75,12 +75,13 @@ fn par_generates_the_same_text_as_naive() {
 
     let m = Qwen3::load(&f).expect("load model");
     let mut e = Engine::new(m, Naive, n_ctx, false);
-    let serial = e.generate(&tokens, 32, None, |_| {}).expect("generate");
+    let (serial, serial_why) = e.generate(&tokens, 32, None, |_| {}).expect("generate");
 
     let m = Qwen3::load(&f).expect("load model");
     let mut e = Engine::new(m, Par, n_ctx, false);
-    let parallel = e.generate(&tokens, 32, None, |_| {}).expect("generate");
+    let (parallel, parallel_why) = e.generate(&tokens, 32, None, |_| {}).expect("generate");
 
+    assert_eq!(serial_why, parallel_why, "backends stopped for different reasons");
     assert_eq!(
         serial,
         parallel,

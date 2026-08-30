@@ -15,6 +15,32 @@ use crate::model::Qwen3;
 use crate::ops::Ops;
 use crate::profile::{Ctx, Profile};
 
+/// Why generation stopped.
+///
+/// The engine knows this exactly; before this existed the CLI inferred `[eos]`
+/// from `produced.len() < max_tokens`, which reports a filled context as an
+/// end-of-sequence stop. Two very different situations — one is the model
+/// finishing, the other is us running out of room — so they get distinct names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The model emitted its end-of-sequence token.
+    Eos,
+    /// Hit the caller's `max_new` budget.
+    MaxTokens,
+    /// The KV cache has no room for another position.
+    ContextFull,
+}
+
+impl StopReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            StopReason::Eos => "eos",
+            StopReason::MaxTokens => "token limit",
+            StopReason::ContextFull => "context full",
+        }
+    }
+}
+
 pub struct Engine<'a, O: Ops> {
     pub model: Qwen3<'a>,
     pub ops: O,
@@ -93,7 +119,7 @@ impl<'a, O: Ops> Engine<'a, O> {
         max_new: usize,
         eos: Option<u32>,
         mut on_token: impl FnMut(u32),
-    ) -> Result<Vec<u32>> {
+    ) -> Result<(Vec<u32>, StopReason)> {
         self.prof.reserve(self.model.cfg.n_layer, max_new);
 
         let (mut logits, dt) = self.run(prompt)?;
@@ -101,15 +127,22 @@ impl<'a, O: Ops> Engine<'a, O> {
         let mut elapsed = dt;
 
         let mut produced = Vec::with_capacity(max_new);
+        let mut why = StopReason::MaxTokens;
         for _ in 0..max_new {
             let pos = self.cache.len();
             let next = self.prof.record_token(pos, &logits, elapsed);
             if Some(next) == eos {
+                why = StopReason::Eos;
                 break;
             }
             produced.push(next);
             on_token(next);
-            if produced.len() == max_new || pos + 1 >= self.cache.n_ctx() {
+            if produced.len() == max_new {
+                why = StopReason::MaxTokens;
+                break;
+            }
+            if pos + 1 >= self.cache.n_ctx() {
+                why = StopReason::ContextFull;
                 break;
             }
             let (l, dt) = self.run(&[next])?;
@@ -117,6 +150,6 @@ impl<'a, O: Ops> Engine<'a, O> {
             logits = l;
             elapsed = dt;
         }
-        Ok(produced)
+        Ok((produced, why))
     }
 }

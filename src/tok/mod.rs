@@ -10,6 +10,7 @@
 //! `qwen2` and `qwen35` both set `clean_spaces = false`, `ignore_merges =
 //! false`, `add_space_prefix = false` and `byte_encode = true`.
 
+pub mod chat;
 mod bpe;
 mod split;
 mod unicode;
@@ -171,6 +172,18 @@ impl Tokenizer {
                 id,
                 vocab_size: self.tokens.len(),
             })
+    }
+
+    /// Id of a special token by its literal spelling, e.g. `<|im_start|>`.
+    ///
+    /// The reverse of [`Tokenizer::token_text`] restricted to special tokens,
+    /// so callers can ask the *model* whether it knows a marker instead of
+    /// assuming an id. See [`chat::ChatMl::detect`].
+    pub fn special_id(&self, text: &str) -> Option<u32> {
+        self.specials
+            .iter()
+            .find(|(spelling, _)| spelling.as_slice() == text.as_bytes())
+            .map(|(_, id)| *id)
     }
 
     pub fn is_special(&self, id: u32) -> bool {

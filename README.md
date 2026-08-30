@@ -5,9 +5,36 @@ MoE model whose weights do not fit in VRAM — see `HANDOFF.md` for why, and
 `CLAUDE.md` for how.
 
 **Status:** Stages 1–5 complete. Loads a GGUF, tokenizes exactly like
-llama.cpp, and generates coherent text at ~27 tok/s on Qwen3-0.6B. KV cache,
-prefill/decode split, and a profiler. 91 tests, plus 8 more that need a model
-on disk. CPU only.
+llama.cpp, and generates coherent text on Qwen3-0.6B. KV cache, prefill/decode
+split, threaded attention, and a profiler. 94 tests, plus 11 more that need a
+model on disk. CPU only.
+
+## Progress
+
+All figures are Qwen3-0.6B Q8_0 on the machine in `CLAUDE.md` — Ryzen 7 9700X,
+8 cores, dual-channel DDR5. Decode is measured at short context unless noted.
+
+| | decode | backend | added | state | key finding |
+|---|---|---|---|---|---|
+| **v0**<br>`065fc41` | ~2 tok/s<br>*quadratic in context* | `naive` — scalar f32, 1 thread | GGUF parser, dequant, tokenizer, `qwen3` forward pass | 71 tests; verified layer by layer against `llama-eval-callback` | RMSNorm must accumulate in f64, as ggml does — f32 shifts the scale enough to flip Q8_0 quants downstream. And ~1e-3 per tensor is the **floor** for independent Q8_0 implementations, not a defect |
+| **v1**<br>`36ebcd8` | **27 tok/s**<br>*linear in context* | `naive` + `par` (rayon, LM head only) | KV cache (f16), engine with prefill/decode split, profiler, threading | 91 tests + 8 model-backed; decode proven **bit-identical** to full recompute; `par` ≡ `naive` bit for bit | Attention scoring is **18.3x** behind llama.cpp while dense matmuls are only **2.45x** behind. Threading at matmul granularity is a *net loss* — cost is per task, not per region |
+| **v2** | **19.9 tok/s @ d384**<br>*24.0 @ d64* | + `Ops::attend`, threaded over kv heads | block-wise f16 conversion, `--chat`, `--show-special`, honest stop reasons | 94 tests + 11 model-backed; forward pass **byte-identical** to v1 | Attention growth cut **3.4x** (29.5 → 8.6 ms over 320 positions) with **zero** numeric change — f16→f32 is lossless, so hoisting it out of the dot product cannot move a bit |
+
+For scale, llama.cpp on the same CPU, same model, same 16-token prompt:
+**568 t/s prefill, 65 t/s decode**. The shape of our gap to it matters more than
+its size:
+
+| depth | v1 | v2 | llama.cpp | v2 gap |
+|---|---|---|---|---|
+| d64 | 23.9 | 24.0 | 67.7 | 2.8x |
+| d128 | 21.1 | 22.2 | 64.4 | 2.9x |
+| d256 | 16.9 | 21.3 | 63.0 | 3.0x |
+| d384 | 14.0 | 19.9 | 60.8 | **3.0x** |
+
+v1's gap *widened* with context, 2.8x → 4.4x. v2's is flat at ~3x, so what
+remains is the dense-kernel gap rather than a defect of ours. llama.cpp is the
+oracle, not the thing to beat here — the real target is 40 tok/s on
+Qwen3.6-35B-A3B, which is where the offload policy actually matters.
 
 ## Build
 
@@ -23,18 +50,33 @@ export B=~/.cargo-target/inferredthoughts/release/inferred
 ## Run
 
 ```bash
+export MODEL=~/models/Qwen3-0.6B-Q8_0.gguf
+
 # generate text (greedy)
-$B generate -m ~/models/Qwen3-0.6B-Q8_0.gguf -p "The capital of France is" -n 20
+$B generate -m $MODEL -p "The capital of France is" -n 20
 
-# inspect a model: metadata, tensor table, per-type summary
-$B inspect ~/models/Qwen3-0.6B-Q8_0.gguf
+# -t threads (0 = physical cores, 1 = the scalar oracle), -c KV context
+$B generate -m $MODEL -p "..." -n 200 -t 4 -c 8192
 
-# machine-readable, for diffing
-$B inspect ~/models/Qwen3-0.6B-Q8_0.gguf --json
+# inspect a model: metadata, tensor table, per-type summary. --json to diff.
+$B inspect $MODEL
 ```
 
 Only the `qwen3` architecture loads today. `Qwen3.5-9B` (`qwen35`) is rejected
 with a named error — it needs GatedDeltaNet.
+
+**There is no chat template yet.** A raw prompt runs in completion mode, so an
+instruct model never enters the assistant turn, never emits `<|im_end|>`, and
+degenerates into repetition. Write the markers yourself — `parse_special` is on,
+so they tokenize as special tokens:
+
+```bash
+P=$(printf '<|im_start|>user\nList the capitals of 10 countries<|im_end|>\n<|im_start|>assistant\n'; echo X); P=${P%X}
+$B generate -m $MODEL -p "$P" -n 500
+```
+
+The `; echo X` guard matters: plain `$(...)` strips the trailing newline, which
+gives a 15-token prompt instead of 16 and a completely different answer.
 
 ## Test
 
@@ -44,6 +86,55 @@ cargo test
 
 Model-backed tests skip if the model is missing, but the suite fails if *every*
 one skips. Override the search path with `INFERRED_MODEL_DIR`.
+
+The Stage 5 acceptance tests load a real model, which is too slow for a debug
+build, so they are `#[ignore]`d:
+
+```bash
+cargo test --release -- --ignored --test-threads=1
+```
+
+They assert that decode-with-cache produces **bit-identical** logits to full
+recompute, and that `par` reproduces `naive` bit for bit.
+
+## Profiler
+
+Two tiers. Tier 1 is always collected — phase timings and a top-2 logit scan
+cost orders of magnitude less than a token — so `--profile` only controls
+whether it prints.
+
+```bash
+$B generate -m $MODEL -p "$P" -n 500 --profile
+$B generate -m $MODEL -p "$P" -n 500 --profile-detail        # + per-layer
+$B generate -m $MODEL -p "$P" -n 500 --profile-json p.json   # every record
+```
+
+```
+prefill      16 tok      639.8 ms      25.0 tok/s
+decode      413 tok    23321.3 ms     17.71 tok/s     56.5 ms/tok
+
+weights  0.590 GiB per forward pass
+         11.7 GB/s effective during decode
+kv       46.9 MiB written, 10088.2 MiB read back
+
+margin   min 0.0015  median 0.1860  (22 of 414 tokens inside the 1% drift band)
+```
+
+- **prefill vs decode**, not input vs output. They are compute-bound and
+  memory-bound respectively, and most optimizations help only one.
+- **bytes**, because the thesis is about bytes and time alone measures the
+  symptom. Derived from tensor shapes rather than counted, so nothing contends
+  on the hot path.
+- **margin** — the top-1/top-2 logit gap. Tokens inside the ~1% drift band could
+  differ from `llama-cli` without anything being wrong. A risk measure, not a
+  defect count.
+
+`--profile-detail` adds per-layer attention/FFN timing, which is what separates
+attention's growth with context from the FFN's flat cost. `--profile-json`
+writes one record per token and per layer half, for diffing two runs.
+
+Overhead is verified rather than asserted: 26.3 vs 26.6 tok/s with detail on,
+i.e. inside noise.
 
 ## Verifying against llama.cpp
 
@@ -88,5 +179,8 @@ python scripts/check_q8_matmul.py                       # isolate the Q8_0 matmu
 - Scalar f32 kernels: no SIMD, no GPU, both deliberate. Threading exists
   (`-t N`) but only the LM head is large enough to pay for it — 1.18x. See
   `PARALLEL_THRESHOLD` in `src/ops/par.rs` for the measurements.
-- Attention scoring is the bottleneck past a few hundred tokens: 64% of decode
-  time at 384 tokens, and ~10x less efficient per byte than the matmul path
+- Scalar attention: after v2 the growth term is **5.2x** behind llama.cpp,
+  down from 18.3x. Closing the rest needs SIMD, which would cost bit-exact
+  differential testing — see `CLAUDE.md`.
+- Dense matmuls are **~2.8x** behind hand-tuned AVX-512; that gap is what the
+  planned `ggml` backend addresses

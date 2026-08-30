@@ -23,7 +23,7 @@
 use crate::cache::KvCache;
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
-use crate::ops::{Ops, Weights};
+use crate::ops::{Attn, Ops, Weights};
 use crate::profile::{Ctx, Part};
 use crate::quant::dequantize_into;
 
@@ -291,9 +291,6 @@ impl<'a> Qwen3<'a> {
         let mut gate = vec![0.0f32; n * nf];
         let mut up = vec![0.0f32; n * nf];
         let mut ffn_out = vec![0.0f32; n * nd];
-        // Attention reaches back over every cached position, not just this
-        // batch, so scores are indexed by absolute position.
-        let mut scores = vec![0.0f32; start_pos + n];
 
         for (il, layer) in self.layers.iter().enumerate() {
             let t_attn = ctx.prof.layer_begin();
@@ -375,36 +372,25 @@ impl<'a> Qwen3<'a> {
             }
 
             let scale = 1.0 / (c.head_dim as f32).sqrt();
-            let group = c.gqa_group();
 
+            // Attention now goes through the ops seam rather than a loop here,
+            // so a backend can thread over heads. Model code stays unaware of
+            // which backend it is talking to, per CLAUDE.md.
             for t in 0..n {
                 let pos = start_pos + t;
-                for h in 0..c.n_head {
-                    // GQA: query head h reads kv head h / group.
-                    let head_off = (h / group) * c.head_dim;
-                    let qh = &q[t * qd + h * c.head_dim..][..c.head_dim];
-
-                    // Causal mask: absolute positions 0..=pos only.
-                    for (s, score) in scores[..=pos].iter_mut().enumerate() {
-                        let kh = cache.k_head(il, s, head_off, c.head_dim);
-                        *score = qh
-                            .iter()
-                            .zip(kh)
-                            .map(|(a, &b)| a * KvCache::read(b))
-                            .sum::<f32>()
-                            * scale;
-                    }
-                    ops.softmax(&mut scores[..=pos]);
-
-                    let out = &mut attn[t * qd + h * c.head_dim..][..c.head_dim];
-                    out.fill(0.0);
-                    for (s, &weight) in scores[..=pos].iter().enumerate() {
-                        let vh = cache.v_head(il, s, head_off, c.head_dim);
-                        for (o, &vi) in out.iter_mut().zip(vh) {
-                            *o += weight * KvCache::read(vi);
-                        }
-                    }
-                }
+                let a = Attn {
+                    q: &q[t * qd..(t + 1) * qd],
+                    k: cache.k_layer(il),
+                    v: cache.v_layer(il),
+                    kv_dim: kd,
+                    // Inclusive of this token, which is what masks the future.
+                    n_pos: pos + 1,
+                    head_dim: c.head_dim,
+                    n_head: c.n_head,
+                    n_head_kv: c.n_head_kv,
+                    scale,
+                };
+                ops.attend(&a, &mut attn[t * qd..(t + 1) * qd]);
             }
 
             // The reference names the concatenated head output "kqv_out",

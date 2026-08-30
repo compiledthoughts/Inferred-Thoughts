@@ -35,10 +35,14 @@ pub(crate) use model_or_skip;
 
 /// Compare raw bits, not a tolerance.
 ///
+/// `#[allow(dead_code)]`: every integration test binary compiles this module
+/// separately, so a helper only some of them use looks unused in the others.
+///
 /// `CLAUDE.md` forbids adjusting a tolerance until a test passes, and in both
 /// places this is used there is nothing to adjust: the two paths under
 /// comparison run the same operations in the same order, so anything other than
 /// equality is a bug.
+#[allow(dead_code)]
 pub fn assert_bit_identical(a: &[f32], b: &[f32], what: &str) {
     assert_eq!(a.len(), b.len(), "{what}: different logit counts");
     let mismatches: Vec<usize> = (0..a.len())

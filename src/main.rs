@@ -59,6 +59,14 @@ enum Command {
         /// 0 means physical cores.
         #[arg(short = 't', long, default_value_t = 0)]
         threads: usize,
+        /// Wrap the prompt as a chat turn, so an instruct model answers instead
+        /// of continuing the text. Requires a ChatML model; fails loudly if the
+        /// file's own template is a shape we do not implement.
+        #[arg(long)]
+        chat: bool,
+        /// Render special tokens such as <think> instead of dropping them.
+        #[arg(long)]
+        show_special: bool,
     },
 
     /// Run one forward pass and print a checksum of every intermediate tensor,
@@ -93,16 +101,22 @@ fn main() -> ExitCode {
             profile_detail,
             profile_json,
             threads,
+            chat,
+            show_special,
         } => generate(
             &model,
             &prompt,
-            max_tokens,
-            ignore_eos,
-            ctx,
-            profile || profile_detail,
-            profile_detail,
-            profile_json.as_deref(),
-            threads,
+            GenOpts {
+                max_tokens,
+                ignore_eos,
+                n_ctx: ctx,
+                report: profile || profile_detail,
+                detail: profile_detail,
+                json: profile_json,
+                threads,
+                chat,
+                show_special,
+            },
         ),
         Command::Trace { model, prompt, dump } => trace(&model, &prompt, dump.as_deref()),
     };
@@ -138,37 +152,51 @@ fn inspect(path: &str, json: bool, max_array: usize) -> inferred_thoughts::Resul
 ///
 /// This exists so the engine is usable end to end before the KV cache lands.
 /// Cost is quadratic in sequence length by construction; Stage 5 replaces it.
-#[allow(clippy::too_many_arguments)]
-fn generate(
-    model: &str,
-    prompt: &str,
+/// Everything `generate` takes beyond the model and prompt. A struct rather
+/// than nine positional arguments, which is how the wrong flag ends up in the
+/// wrong slot.
+struct GenOpts {
     max_tokens: usize,
     ignore_eos: bool,
     n_ctx: usize,
     report: bool,
     detail: bool,
-    json: Option<&str>,
+    json: Option<String>,
     threads: usize,
-) -> inferred_thoughts::Result<()> {
+    chat: bool,
+    show_special: bool,
+}
+
+fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<()> {
+    use inferred_thoughts::tok::chat::ChatMl;
     use inferred_thoughts::{Naive, Par, Qwen3, Tokenizer};
 
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
     let m = Qwen3::load(&f)?;
-    let tokens = tk.encode(prompt, true, true);
 
-    let n_threads = if threads == 0 {
+    // Wrapping happens before tokenization so the markers go through
+    // `parse_special` and encode as single tokens, not as literal text.
+    let text = if o.chat {
+        ChatMl::detect(&tk, &f.metadata)?.wrap(prompt)
+    } else {
+        prompt.to_string()
+    };
+    let tokens = tk.encode(&text, true, true);
+
+    let n_threads = if o.threads == 0 {
         Par::default_threads()
     } else {
-        threads
+        o.threads
     };
 
     eprintln!(
-        "model {} | {} layers | {} prompt tokens | ctx {} | {}",
+        "model {} | {} layers | {} prompt tokens{} | ctx {} | {}",
         f.path.file_name().unwrap_or_default().to_string_lossy(),
         m.cfg.n_layer,
         tokens.len(),
-        n_ctx,
+        if o.chat { " (chat)" } else { "" },
+        o.n_ctx,
         if n_threads <= 1 {
             "naive (1 thread)".to_string()
         } else {
@@ -180,49 +208,43 @@ fn generate(
     // reason to pay dispatch for a single worker, and it makes `-t 1` the
     // reference run that `par` must reproduce bit for bit.
     if n_threads <= 1 {
-        run_generation(m, Naive, &tk, &tokens, max_tokens, ignore_eos, n_ctx, report, detail, json)
+        run_generation(m, Naive, &tk, &tokens, &text, &o)
     } else {
         Par::init(n_threads);
-        run_generation(m, Par, &tk, &tokens, max_tokens, ignore_eos, n_ctx, report, detail, json)
+        run_generation(m, Par, &tk, &tokens, &text, &o)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_generation<O: inferred_thoughts::Ops>(
     model: inferred_thoughts::Qwen3<'_>,
     ops: O,
     tk: &inferred_thoughts::Tokenizer,
     tokens: &[u32],
-    max_tokens: usize,
-    ignore_eos: bool,
-    n_ctx: usize,
-    report: bool,
-    detail: bool,
-    json: Option<&str>,
+    prompt_text: &str,
+    o: &GenOpts,
 ) -> inferred_thoughts::Result<()> {
     use inferred_thoughts::Engine;
     use std::io::Write;
 
-    let mut engine = Engine::new(model, ops, n_ctx, detail);
+    let mut engine = Engine::new(model, ops, o.n_ctx, o.detail);
     eprintln!(
         "kv cache {:.0} MiB resident",
         engine.kv_capacity_bytes() as f64 / 1048576.0
     );
 
-    let prompt_text = tk.decode(tokens, false)?;
     print!("{prompt_text}");
     let _ = std::io::stdout().flush();
 
     // Decode incrementally so multi-token characters still render: decode the
     // whole sequence each time and print only what is new.
     let mut shown = tokens.to_vec();
-    let mut before = prompt_text;
-    let eos = if ignore_eos { None } else { tk.eos_token_id };
+    let mut before = tk.decode(&shown, o.show_special)?;
+    let eos = if o.ignore_eos { None } else { tk.eos_token_id };
 
     let started = std::time::Instant::now();
-    let produced = engine.generate(tokens, max_tokens, eos, |id| {
+    let (produced, why) = engine.generate(tokens, o.max_tokens, eos, |id| {
         shown.push(id);
-        if let Ok(after) = tk.decode(&shown, false) {
+        if let Ok(after) = tk.decode(&shown, o.show_special) {
             if let Some(new_text) = after.strip_prefix(&before) {
                 print!("{new_text}");
                 let _ = std::io::stdout().flush();
@@ -233,9 +255,8 @@ fn run_generation<O: inferred_thoughts::Ops>(
     let secs = started.elapsed().as_secs_f64();
     println!();
 
-    if produced.len() < max_tokens && eos.is_some() {
-        eprintln!("[eos]");
-    }
+    // Reported, not inferred: the engine knows which of the three it was.
+    eprintln!("[stopped: {}]", why.label());
     eprintln!(
         "\n{} tokens in {secs:.1}s ({:.2} tok/s, {:.0} ms/token)",
         produced.len(),
@@ -243,12 +264,12 @@ fn run_generation<O: inferred_thoughts::Ops>(
         secs * 1000.0 / produced.len().max(1) as f64
     );
 
-    if report {
+    if o.report {
         let mut err = std::io::stderr();
         let _ = writeln!(err);
         let _ = engine.prof.report(&mut err);
     }
-    if let Some(path) = json {
+    if let Some(path) = o.json.as_deref() {
         std::fs::write(path, engine.prof.to_json()).map_err(|source| {
             inferred_thoughts::Error::Io {
                 path: path.to_string(),

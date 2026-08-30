@@ -28,6 +28,7 @@
 //!
 //! The cheap invariants that do run by default live in `src/cache/mod.rs`.
 
+use inferred_thoughts::engine::StopReason;
 use inferred_thoughts::{Engine, GgufFile, KvCache, Naive, Qwen3, Tokenizer};
 
 mod common;
@@ -141,9 +142,14 @@ fn generation_stops_at_the_context_limit() {
 
     let m = Qwen3::load(&f).expect("load model");
     let mut e = Engine::new(m, Naive, n_ctx, false);
-    let produced = e
+    let (produced, why) = e
         .generate(&tokens, 50, None, |_| {})
         .expect("generate must stop, not overflow");
+    assert_eq!(
+        why,
+        StopReason::ContextFull,
+        "a filled cache must not be reported as an eos stop"
+    );
     assert!(produced.len() <= 3, "produced {} tokens", produced.len());
     assert!(e.pos() <= n_ctx);
 }
@@ -176,7 +182,7 @@ fn profiling_does_not_change_the_output() {
     let run = |detail: bool| {
         let m = Qwen3::load(&f).expect("load model");
         let mut e = Engine::new(m, Naive, n_ctx, detail);
-        let out = e.generate(&tokens, 6, None, |_| {}).expect("generate");
+        let (out, _) = e.generate(&tokens, 6, None, |_| {}).expect("generate");
         (out, e.prof.layers.len())
     };
 

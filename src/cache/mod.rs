@@ -117,6 +117,23 @@ impl KvCache {
         self.len = len;
     }
 
+    /// A whole layer's key slab, `n_ctx * kv_dim` f16 bits, position-major.
+    ///
+    /// Handed to [`crate::ops::Ops::attend`] so the backend can walk positions
+    /// itself and thread over heads. The ops layer sees raw bits and a stride,
+    /// never this type.
+    #[inline]
+    pub fn k_layer(&self, il: usize) -> &[u16] {
+        let at = self.offset(il, 0);
+        &self.k[at..at + self.n_ctx * self.kv_dim]
+    }
+
+    #[inline]
+    pub fn v_layer(&self, il: usize) -> &[u16] {
+        let at = self.offset(il, 0);
+        &self.v[at..at + self.n_ctx * self.kv_dim]
+    }
+
     /// One head's slice of K at a position, still as f16 bits.
     ///
     /// Callers convert per element inside the dot product rather than

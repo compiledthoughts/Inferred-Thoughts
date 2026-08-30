@@ -174,4 +174,7 @@ pub enum Error {
         "position {pos} exceeds the KV cache context of {n_ctx}; raise --ctx"
     )]
     ContextOverflow { pos: usize, n_ctx: usize },
+
+    #[error("cannot apply a chat template to this model: {detail}")]
+    UnsupportedChatTemplate { detail: String },
 }

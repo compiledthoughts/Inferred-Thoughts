@@ -14,7 +14,7 @@
 //! is computed, which is what lets its differential test demand bit equality
 //! instead of a tolerance.
 
-use super::{Ops, Weights};
+use super::{Attn, Ops, Weights};
 use crate::gguf::GgmlType;
 use crate::quant::half::{f16_to_f32, f32_to_f16};
 
@@ -103,18 +103,16 @@ impl Ops for Naive {
     }
 
     fn softmax(&self, x: &mut [f32]) {
-        if x.is_empty() {
-            return;
-        }
-        // Subtract the max before exponentiating, or a large logit overflows.
-        let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut sum = 0.0f32;
-        for v in x.iter_mut() {
-            *v = (*v - max).exp();
-            sum += *v;
-        }
-        for v in x.iter_mut() {
-            *v /= sum;
+        softmax_in_place(x)
+    }
+
+    fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), a.n_head * a.head_dim);
+        let per_kv = a.group() * a.head_dim;
+        // One scratch for the whole call, not one per head.
+        let mut sc = Scratch::for_attn(a);
+        for (h_kv, chunk) in out.chunks_mut(per_kv).enumerate() {
+            attend_kv_head(a, h_kv, chunk, &mut sc);
         }
     }
 
@@ -130,6 +128,105 @@ impl Ops for Naive {
         debug_assert_eq!(a.len(), b.len());
         for i in 0..a.len() {
             a[i] += b[i];
+        }
+    }
+}
+
+/// Numerically stable softmax. Shared so [`attend_kv_head`] runs the same code
+/// the trait method does, rather than a second copy that could drift.
+pub(crate) fn softmax_in_place(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    // Subtract the max before exponentiating, or a large logit overflows.
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    for v in x.iter_mut() {
+        *v /= sum;
+    }
+}
+
+/// Reusable buffers for one key/value head's attention.
+///
+/// Sized once and reused across positions. `par` keeps one per worker thread,
+/// so a threaded run allocates per thread rather than per head.
+pub(crate) struct Scratch {
+    /// One score row per query head in the group: `group * n_pos`.
+    scores: Vec<f32>,
+    /// One position's key or value head, converted to f32: `head_dim`.
+    conv: Vec<f32>,
+}
+
+impl Scratch {
+    pub(crate) fn for_attn(a: &Attn<'_>) -> Self {
+        Self {
+            scores: vec![0.0; a.group() * a.n_pos],
+            conv: vec![0.0; a.head_dim],
+        }
+    }
+
+    /// Grow to fit; context only ever increases within a run.
+    fn fit(&mut self, a: &Attn<'_>) {
+        self.scores.resize(a.group() * a.n_pos, 0.0);
+        self.conv.resize(a.head_dim, 0.0);
+    }
+}
+
+/// Attention for the `group` query heads served by key/value head `h_kv`.
+///
+/// **Structured around the f16 conversion, which was the bottleneck.** The old
+/// inline loop converted K and V one element at a time inside the dot product,
+/// once per *query* head — so with GQA it converted the same key data `group`
+/// times, ~44 million branchy scalar conversions per token at 384 positions.
+/// Here each position is converted once into [`Scratch::conv`] and reused
+/// across the group, over a contiguous run the compiler can vectorize.
+///
+/// **This does not change a single output bit.** f16 -> f32 is exact — every
+/// f16 value is representable in f32, with no rounding — so hoisting the
+/// conversion cannot alter a value. The dot product still accumulates serially
+/// in index order, and the weighted sum still walks positions outermost, which
+/// is what keeps `par` bit-identical to this. Breaking the accumulator
+/// dependency chain *would* change the order, and is deliberately not done
+/// here.
+pub(crate) fn attend_kv_head(a: &Attn<'_>, h_kv: usize, out: &mut [f32], sc: &mut Scratch) {
+    sc.fit(a);
+    let (hd, group, n_pos) = (a.head_dim, a.group(), a.n_pos);
+    let off = h_kv * hd;
+    debug_assert_eq!(out.len(), group * hd);
+
+    // Pass 1: scores. Convert each position's key once, score it against every
+    // query head in the group.
+    for s in 0..n_pos {
+        let key = &a.k[s * a.kv_dim + off..][..hd];
+        for (dst, &bits) in sc.conv.iter_mut().zip(key) {
+            *dst = f16_to_f32(bits);
+        }
+        for g in 0..group {
+            let q = &a.q[(h_kv * group + g) * hd..][..hd];
+            let dot: f32 = q.iter().zip(&sc.conv).map(|(x, y)| x * y).sum();
+            sc.scores[g * n_pos + s] = dot * a.scale;
+        }
+    }
+    for g in 0..group {
+        softmax_in_place(&mut sc.scores[g * n_pos..(g + 1) * n_pos]);
+    }
+
+    // Pass 2: weighted sum of values, same conversion trick.
+    out.fill(0.0);
+    for s in 0..n_pos {
+        let val = &a.v[s * a.kv_dim + off..][..hd];
+        for (dst, &bits) in sc.conv.iter_mut().zip(val) {
+            *dst = f16_to_f32(bits);
+        }
+        for g in 0..group {
+            let w = sc.scores[g * n_pos + s];
+            for (o, &vi) in out[g * hd..(g + 1) * hd].iter_mut().zip(&sc.conv) {
+                *o += w * vi;
+            }
         }
     }
 }

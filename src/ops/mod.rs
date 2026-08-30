@@ -38,6 +38,37 @@ impl<'a> Weights<'a> {
     }
 }
 
+/// One token's attention inputs.
+///
+/// A struct rather than ten positional arguments, which is how a `head_dim` and
+/// an `n_head` end up swapped.
+pub struct Attn<'a> {
+    /// This token's queries, post-RoPE: `n_head * head_dim`.
+    pub q: &'a [f32],
+    /// The layer's whole key slab as f16 bits, position-major with stride
+    /// `kv_dim`. Only `0..n_pos` is read.
+    pub k: &'a [u16],
+    /// The layer's value slab, same layout.
+    pub v: &'a [u16],
+    /// Distance in elements between consecutive positions.
+    pub kv_dim: usize,
+    /// Positions to attend over: `0..n_pos`, inclusive of this token, which is
+    /// what applies the causal mask.
+    pub n_pos: usize,
+    pub head_dim: usize,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    /// `1/sqrt(head_dim)`.
+    pub scale: f32,
+}
+
+impl Attn<'_> {
+    /// Query heads served by one key/value head.
+    pub fn group(&self) -> usize {
+        self.n_head / self.n_head_kv
+    }
+}
+
 /// Every primitive the qwen3 forward pass needs.
 ///
 /// Methods write into caller-provided buffers so a backend never allocates on
@@ -64,8 +95,25 @@ pub trait Ops {
     /// offset by n_rot/2" group.
     fn rope_neox(&self, x: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta_base: f32);
 
-    /// Numerically stable softmax, in place.
+    /// Numerically stable softmax, in place. Used by [`Ops::attend`]'s
+    /// implementations, and by the MoE router when Stage 7 lands.
     fn softmax(&self, x: &mut [f32]);
+
+    /// Scaled dot-product attention for one token against the cached history,
+    /// all heads at once.
+    ///
+    /// **This is a whole-token op, not a per-head one, and that is the point.**
+    /// Attention scoring is the only part of decode whose work grows with
+    /// context, so it is the only part with enough work per call to pay for a
+    /// parallel dispatch — `PARALLEL_THRESHOLD` in [`super::par`] records why
+    /// the individual matmuls do not. Handing the backend every head at once
+    /// lets it spread them across threads; handing it one head at a time would
+    /// put the loop back in model code, where a backend cannot reach it.
+    ///
+    /// K and V arrive as **raw f16 bits**, deliberately: the seam must not
+    /// depend on `KvCache`, or the ops layer would be coupled to the very type
+    /// the project exists to iterate on.
+    fn attend(&self, a: &Attn<'_>, out: &mut [f32]);
 
     /// `gate = silu(gate) * up`, in place — the SwiGLU nonlinearity.
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]);
