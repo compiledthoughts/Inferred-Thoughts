@@ -6,39 +6,58 @@
 //! rounding to disagree about, including for subnormals.
 
 /// Convert an IEEE-754 binary16 bit pattern to f32.
+///
+/// **Branch-free on purpose.** Attention converts K and V a block at a time
+/// (see `ops::naive::attend_kv_head`), tens of millions of elements per token,
+/// and a `match` on the exponent plus a normalization loop stops LLVM
+/// vectorizing that block. Masks instead of branches let it emit
+/// `vcvtph2ps`-shaped code over a contiguous run.
+///
+/// The shape is the standard one: shift the exponent and mantissa into f32
+/// position, rebias, then correct the two special ranges. Subnormals are
+/// renormalized by a float subtraction against a magic constant rather than a
+/// shift loop — `2^-14 * (1 + m/2^10) - 2^-14` is exactly `m * 2^-24`, which is
+/// the value a half subnormal denotes.
+///
+/// Both corrections are computed unconditionally and selected with masks. The
+/// discarded one is harmless: the subtraction cannot trap, and its result is
+/// masked away for inputs that do not need it.
+///
+/// This is exact, as [`f16_to_f32`]'s caller relies on: every f16 value is
+/// representable in f32, so there is no rounding, and `exhaustive_agreement`
+/// below proves it against the readable implementation over all 65,536 inputs.
 pub fn f16_to_f32(h: u16) -> f32 {
-    let sign = ((h >> 15) & 1) as u32;
-    let exp = ((h >> 10) & 0x1f) as u32;
-    let mant = (h & 0x03ff) as u32;
+    /// Exponent rebias, 15 -> 127.
+    const EXP_ADJUST: u32 = (127 - 15) << 23;
+    /// A second rebias, applied only to infinities and NaNs.
+    const INF_NAN_ADJUST: u32 = (128 - 16) << 23;
+    /// `2^-14`, the smallest normal half. Subtracting it renormalizes.
+    const MAGIC: u32 = 113 << 23;
+    /// The half exponent field, shifted into f32 position.
+    const SHIFTED_EXP: u32 = 0x7c00 << 13;
 
-    let bits = match exp {
-        // Zero or subnormal.
-        0 => {
-            if mant == 0 {
-                sign << 31
-            } else {
-                // A half subnormal is mant * 2^-24. Shift until bit 10 is set,
-                // so the value reads as 1.f x 2^(-14-k); then exp32 = 113 - k.
-                let mut m = mant;
-                let mut k = 0u32;
-                while m & 0x0400 == 0 {
-                    m <<= 1;
-                    k += 1;
-                }
-                (sign << 31) | ((113 - k) << 23) | ((m & 0x03ff) << 13)
-            }
-        }
-        // Infinity or NaN: exponent saturates, mantissa is carried across so a
-        // signalling/quiet distinction survives.
-        0x1f => (sign << 31) | (0xff << 23) | (mant << 13),
-        // Normal: rebias the exponent from 15 to 127.
-        _ => (sign << 31) | ((exp + 112) << 23) | (mant << 13),
-    };
+    let h = h as u32;
+    let sign = (h & 0x8000) << 16;
+    let shifted = (h & 0x7fff) << 13;
+    let exp = shifted & SHIFTED_EXP;
+    let normal = shifted + EXP_ADJUST;
 
-    f32::from_bits(bits)
+    // All ones or all zeros, with no branch.
+    let is_inf_nan = 0u32.wrapping_sub((exp == SHIFTED_EXP) as u32);
+    let is_subnormal = 0u32.wrapping_sub((exp == 0) as u32);
+
+    let inf_nan = normal.wrapping_add(INF_NAN_ADJUST);
+    let subnormal =
+        (f32::from_bits(normal.wrapping_add(1 << 23)) - f32::from_bits(MAGIC)).to_bits();
+
+    // The two masks are mutually exclusive, so this is a three-way select.
+    let bits = (normal & !(is_inf_nan | is_subnormal))
+        | (inf_nan & is_inf_nan)
+        | (subnormal & is_subnormal);
+
+    f32::from_bits(bits | sign)
 }
 
-/// Convert a bfloat16 bit pattern to f32. bf16 is the top 16 bits of an f32.
 pub fn bf16_to_f32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
@@ -97,6 +116,72 @@ pub fn f32_to_f16(f: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readable implementation this replaced, kept as the reference the
+    /// branch-free one is proved against. Transcribed from the original: a
+    /// `match` on the exponent, with a shift loop to renormalize subnormals.
+    fn reference(h: u16) -> f32 {
+        let sign = ((h >> 15) & 1) as u32;
+        let exp = ((h >> 10) & 0x1f) as u32;
+        let mant = (h & 0x03ff) as u32;
+
+        let bits = match exp {
+            0 => {
+                if mant == 0 {
+                    sign << 31
+                } else {
+                    let mut m = mant;
+                    let mut k = 0u32;
+                    while m & 0x0400 == 0 {
+                        m <<= 1;
+                        k += 1;
+                    }
+                    (sign << 31) | ((113 - k) << 23) | ((m & 0x03ff) << 13)
+                }
+            }
+            0x1f => (sign << 31) | (0xff << 23) | (mant << 13),
+            _ => (sign << 31) | ((exp + 112) << 23) | (mant << 13),
+        };
+        f32::from_bits(bits)
+    }
+
+    /// **The whole input domain is 65,536 values, so this is a proof rather
+    /// than a sample.** Bits are compared, not values, so NaN payloads and the
+    /// sign of zero are held to account too — `==` would call every NaN
+    /// unequal and both zeros equal, and neither is what we want here.
+    #[test]
+    fn exhaustive_agreement_with_the_readable_implementation() {
+        for h in 0..=u16::MAX {
+            let (fast, slow) = (f16_to_f32(h), reference(h));
+            assert_eq!(
+                fast.to_bits(),
+                slow.to_bits(),
+                "h = {h:#06x}: {fast:?} ({:#010x}) vs {slow:?} ({:#010x})",
+                fast.to_bits(),
+                slow.to_bits()
+            );
+        }
+    }
+
+    /// Every class in one place, so a failure names which range broke.
+    #[test]
+    fn covers_every_exponent_class() {
+        let mut classes = [0usize; 4];
+        for h in 0..=u16::MAX {
+            let exp = (h >> 10) & 0x1f;
+            let mant = h & 0x3ff;
+            classes[match (exp, mant) {
+                (0, 0) => 0,      // zeros
+                (0, _) => 1,      // subnormals
+                (0x1f, _) => 2,   // inf and NaN
+                _ => 3,           // normals
+            }] += 1;
+        }
+        assert_eq!(classes[0], 2, "two zeros");
+        assert_eq!(classes[1], 2 * 1023, "subnormals");
+        assert_eq!(classes[2], 2 * 1024, "inf and NaN");
+        assert_eq!(classes[3], 2 * 30 * 1024, "normals");
+    }
 
     #[test]
     fn exact_values() {

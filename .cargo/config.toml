@@ -1,0 +1,23 @@
+# Build for the machine we target, not for baseline x86-64.
+#
+# Without this, rustc emits SSE2-only code: no AVX, no AVX-512, no F16C, on a
+# Zen 5 with a full-width 512-bit datapath. `CLAUDE.md` scopes this project to
+# exactly one CPU, so compiling for anything less is leaving performance on the
+# floor for portability we explicitly do not want.
+#
+# Measured on Qwen3-0.6B, decode, spin backend at 8 threads:
+#
+#   attention, per cached position   0.01313 -> 0.00641 ms   (2.05x)
+#   dense matmuls, per token           16.29 ->   16.39 ms   (no change)
+#
+# The split is the point, and it is the same story `HANDOFF.md` section 6
+# tells: the dense path is limited by DDR5 rather than by arithmetic, so wider
+# instructions buy nothing there. Attention reads a fraction of the bytes and
+# is compute-bound, so it doubles.
+#
+# **This does not change any result.** The forward-pass dump stays byte-
+# identical, because Rust does not contract `a * b + c` into an FMA without
+# being asked, so no accumulation is re-rounded. The differential tests still
+# demand bit equality against the `naive` oracle and still pass.
+[build]
+rustflags = ["-C", "target-cpu=native"]
