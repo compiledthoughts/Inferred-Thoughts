@@ -67,6 +67,12 @@ enum Command {
         /// Render special tokens such as <think> instead of dropping them.
         #[arg(long)]
         show_special: bool,
+        /// Threaded backend: `spin` (persistent spinning pool) or `par`
+        /// (rayon). Both must produce identical bits to `naive`; `spin` exists
+        /// because a rayon parallel region costs ~430 us on this machine
+        /// against 0.4 us for a spin barrier.
+        #[arg(long, default_value = "spin")]
+        backend: String,
     },
 
     /// Run one forward pass and print a checksum of every intermediate tensor,
@@ -103,6 +109,7 @@ fn main() -> ExitCode {
             threads,
             chat,
             show_special,
+            backend,
         } => generate(
             &model,
             &prompt,
@@ -116,6 +123,7 @@ fn main() -> ExitCode {
                 threads,
                 chat,
                 show_special,
+                backend,
             },
         ),
         Command::Trace { model, prompt, dump } => trace(&model, &prompt, dump.as_deref()),
@@ -165,11 +173,12 @@ struct GenOpts {
     threads: usize,
     chat: bool,
     show_special: bool,
+    backend: String,
 }
 
 fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<()> {
     use inferred_thoughts::tok::chat::ChatMl;
-    use inferred_thoughts::{Naive, Par, Qwen3, Tokenizer};
+    use inferred_thoughts::{Naive, Par, Qwen3, Spin, Tokenizer};
 
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
@@ -190,28 +199,36 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         o.threads
     };
 
+    let label = if n_threads <= 1 {
+        "naive (1 thread)".to_string()
+    } else {
+        format!("{} ({n_threads} threads)", o.backend)
+    };
     eprintln!(
-        "model {} | {} layers | {} prompt tokens{} | ctx {} | {}",
+        "model {} | {} layers | {} prompt tokens{} | ctx {} | {label}",
         f.path.file_name().unwrap_or_default().to_string_lossy(),
         m.cfg.n_layer,
         tokens.len(),
         if o.chat { " (chat)" } else { "" },
         o.n_ctx,
-        if n_threads <= 1 {
-            "naive (1 thread)".to_string()
-        } else {
-            format!("par ({n_threads} threads)")
-        },
     );
 
     // One thread means the oracle itself, not a pool of one -- there is no
-    // reason to pay dispatch for a single worker, and it makes `-t 1` the
-    // reference run that `par` must reproduce bit for bit.
+    // reason to pay a barrier for a single worker, and it makes `-t 1` the
+    // reference run the threaded backends must reproduce bit for bit.
     if n_threads <= 1 {
-        run_generation(m, Naive, &tk, &tokens, &text, &o)
-    } else {
-        Par::init(n_threads);
-        run_generation(m, Par, &tk, &tokens, &text, &o)
+        return run_generation(m, Naive, &tk, &tokens, &text, &o);
+    }
+    match o.backend.as_str() {
+        "spin" => run_generation(m, Spin::new(n_threads), &tk, &tokens, &text, &o),
+        "par" => {
+            Par::init(n_threads);
+            run_generation(m, Par, &tk, &tokens, &text, &o)
+        }
+        other => Err(inferred_thoughts::Error::InconsistentArchitecture {
+            what: "--backend",
+            detail: format!("{other:?} is not a backend; expected \"spin\" or \"par\""),
+        }),
     }
 }
 

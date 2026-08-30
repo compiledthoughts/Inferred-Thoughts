@@ -12,6 +12,8 @@
 
 pub mod naive;
 pub mod par;
+pub mod pool;
+pub mod spin;
 
 use crate::gguf::GgmlType;
 

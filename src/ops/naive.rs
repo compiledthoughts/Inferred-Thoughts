@@ -14,6 +14,11 @@
 //! is computed, which is what lets its differential test demand bit equality
 //! instead of a tolerance.
 
+// The "never optimize the oracle" rule in CLAUDE.md, enforced by the compiler
+// rather than by convention. Threading, SIMD and CUDA all live beside this
+// module, never inside it.
+#![forbid(unsafe_code)]
+
 use super::{Attn, Ops, Weights};
 use crate::gguf::GgmlType;
 use crate::quant::half::{f16_to_f32, f32_to_f16};

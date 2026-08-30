@@ -18,6 +18,6 @@ pub use engine::Engine;
 pub use error::{Error, Result};
 pub use gguf::GgufFile;
 pub use model::Qwen3;
-pub use ops::{Ops, naive::Naive, par::Par};
+pub use ops::{Ops, naive::Naive, par::Par, spin::Spin};
 pub use profile::{Ctx, Profile};
 pub use tok::Tokenizer;
