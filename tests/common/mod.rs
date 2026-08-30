@@ -8,8 +8,15 @@ use std::path::{Path, PathBuf};
 
 /// The 0.6B, the smallest model the project targets. Honours
 /// `INFERRED_MODEL_DIR`, matching the tokenizer suite's convention.
+#[allow(dead_code)]
 pub fn find_model() -> Option<PathBuf> {
-    let name = "Qwen3-0.6B-Q8_0.gguf";
+    find_model_named("Qwen3-0.6B-Q8_0.gguf")
+}
+
+/// Any of the target models, by file name. `CLAUDE.md` records where each
+/// lives; `INFERRED_MODEL_DIR` overrides.
+#[allow(dead_code)]
+pub fn find_model_named(name: &str) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = std::env::var("INFERRED_MODEL_DIR") {
         roots.push(PathBuf::from(dir));
@@ -17,11 +24,13 @@ pub fn find_model() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("HOME") {
         roots.push(Path::new(&home).join("models"));
     }
+    roots.push(PathBuf::from("/mnt/d/aiprojects/models"));
     roots.into_iter().map(|r| r.join(name)).find(|p| p.exists())
 }
 
 /// Bind the model path or return, announcing the skip on stdout — `--nocapture`
 /// is part of the documented invocation, so a silent no-op is not possible.
+#[allow(unused_macros)]
 macro_rules! model_or_skip {
     ($path:ident) => {
         let Some($path) = crate::common::find_model() else {
@@ -31,6 +40,7 @@ macro_rules! model_or_skip {
     };
 }
 
+#[allow(unused_imports)]
 pub(crate) use model_or_skip;
 
 /// Compare raw bits, not a tolerance.

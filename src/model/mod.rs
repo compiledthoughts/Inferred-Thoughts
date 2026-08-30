@@ -1,6 +1,7 @@
 //! Model architectures, written against the [`crate::ops::Ops`] seam.
 
 pub mod qwen3;
+pub mod qwen35;
 
 pub use qwen3::Qwen3;
 
