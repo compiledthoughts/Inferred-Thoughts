@@ -13,9 +13,9 @@ oracle. KV cache, prefill/decode split, threaded attention, a spin-waiting
 thread pool, a chat template, and a profiler. 116 tests by default, 120 with
 `--features cuda`, plus 19 that need a model or a device.
 
-The CUDA backend is **correct and slow on purpose** — 14.2 tok/s against the
-CPU's 62.6 and llama.cpp's 337.5 on the same card. See "The CUDA backend"
-below for what that measured.
+The CUDA backend runs the whole model on the GPU at **42.4 tok/s**, against the
+CPU's 62.6 and llama.cpp's 337.5 on the same card — every logit still identical
+to the scalar oracle. See "The CUDA backend" below.
 
 ## Progress
 
@@ -29,7 +29,8 @@ All figures are Qwen3-0.6B Q8_0 on the machine in `CLAUDE.md` — Ryzen 7 9700X,
 | **v2** | **19.9 tok/s @ d384**<br>*24.0 @ d64* | + `Ops::attend`, threaded over kv heads | block-wise f16 conversion, `--chat`, `--show-special`, honest stop reasons | 94 tests + 11 model-backed; forward pass **byte-identical** to v1 | Attention growth cut **3.4x** (29.5 → 8.6 ms over 320 positions) with **zero** numeric change — f16→f32 is lossless, so hoisting it out of the dot product cannot move a bit |
 | **v3** | **46.9 tok/s @ d384**<br>*58.4 @ d64* | + `spin` — persistent spin-waiting pool, every matmul threaded | `src/ops/pool.rs`, the crate's only `unsafe`; `naive` is now `#![forbid(unsafe_code)]` | 106 tests + 13 model-backed; bit-identical to `naive` at 2/3/5/8 threads | **A rayon parallel region costs ~430 µs here; a spin barrier costs 0.40 µs — 1088x.** Threading was never the problem, dispatch was. Decode bandwidth 12 → **37 GB/s** |
 | **v4** | **53.0 tok/s @ d384**<br>*59.5 @ d64* | same, built for the actual CPU | branch-free `f16_to_f32`; `-C target-cpu=native` | 108 tests + 13 model-backed; forward pass still **byte-identical** to v1 | We had been compiling **SSE2-only on a Zen 5**. Enabling AVX-512 doubled attention (2.05x) and did **nothing** for the dense matmuls — the cleanest confirmation yet that one is compute-bound and the other DDR5-bound |
-| **v0.1** | **14.2 tok/s**<br>*on the GPU* | + `cuda` — all eight ops as kernels | weights resident in VRAM, KV mirrored on device, `--backend cuda` | 120 tests + 19 device/model-backed; five kernels **bit-identical** to `naive` through the whole model | **The seam costs 25.4 ms of a 70.4 ms token.** A round trip through `Ops` is 56.4 us and a decode step makes ~450 of them, so 36% of the token is spent before any arithmetic. Same shape as v3's rayon finding, one layer down |
+| **v0.1** | **12.5 tok/s**<br>*on the GPU* | + `cuda` — all eight ops as kernels | weights resident in VRAM, KV mirrored on device, `--backend cuda` | 120 tests + 19 device/model-backed; five kernels **bit-identical** to `naive` through the whole model | **Slower than our own CPU.** A round trip through `Ops` costs ~66 us and a decode step makes ~478 of them, so a third of the token goes before any arithmetic. Same shape as v3's rayon finding, one layer down |
+| **v0.2** | **42.4 tok/s**<br>*on the GPU* | same, activations stay on the card | `host_wrote` / `host_needs` / `begin_pass` on the seam (no-ops on CPU); warp-per-row matmul; device-side Q8_0 quantize; `--profile-device` | same counts; still bit-identical, and `naive`/`spin` unchanged | **1329 bus crossings per token became 67**, for 3.4x. And the expected trade never came due: Q8_0's block structure hands you a split that is parallel where the arithmetic is order-free and serial where it is not, so the fast matmul is *still* bit-exact |
 | **since v4**<br>`402d262`<br>`29b6f02`<br>`e34ec08` | unchanged | same | Q5_K, Q6_K, IQ4_XS; a CUDA driver-API spike — sm_120 PTX from `build.rs` and one bit-exact kernel; the `qwen35` config decoded and shape-checked | 116 tests + 15 model-backed; the three new quants **bit-exact** against `gguf.quants` on 65,536 real weights each, taken from the 35B itself | Reading the 35B rather than trusting notes about it: **40 blocks not 41, embedding 2048 not 4096**, and it needs **three** k-quant formats — `Q6_K` appeared on no prior list. Structural unit tests hold independently of the fixtures, so a regenerated fixture cannot bless a layout error |
 
 For scale, llama.cpp on the same CPU, same model, same 16-token prompt:
@@ -64,41 +65,84 @@ measurement, and also why it is not yet trustworthy.
 
 ```bash
 cargo build --release --features cuda
-$B generate -m $MODEL -p "..." -n 64 --backend cuda
+$B generate -m $MODEL -p "..." -n 64 --backend cuda --profile --profile-device
 ```
 
 The whole forward pass runs on the GPU: all eight `Ops` methods as kernels,
 weights uploaded once and kept in VRAM, the KV cache mirrored on device and
-appended to rather than resent. Qwen3-0.6B Q8_0, 64 tokens, median of three:
+appended to rather than resent, and activations that **stay** on the card
+across a layer. Qwen3-0.6B Q8_0, 64 tokens, median of five:
 
 | | tok/s | ms/token | effective |
 |---|---|---|---|
-| ours, `cuda` | **14.20** | 70.4 | 9.1 GB/s |
-| ours, `spin`, 8 threads | 62.59 | 16.0 | 39.9 GB/s |
-| llama.cpp, CUDA, `-ngl 99` | **337.54** | 3.0 | 214 GB/s |
+| ours, `cuda`, first working version | 12.5 | 80 | 8 GB/s |
+| ours, `cuda` | **42.4** | 23.6 | 27 GB/s |
+| ours, `spin`, 8 threads | 62.6 | 16.0 | 39.9 GB/s |
+| llama.cpp, CUDA, `-ngl 99` | **337.5** | 3.0 | 214 GB/s |
 
-**Slower than our own CPU backend, and that is the finding.** llama.cpp reaches
-48% of the card's 448 GB/s at batch 1; we reach 2%.
+**3.4x over the first version, every logit still identical to the CPU oracle,
+and still 0.68x of our own CPU backend.** llama.cpp reaches 48% of the card's
+448 GB/s at batch 1.
 
-The cause was measured, not guessed. At context 128 — where attention should be
-nearly free — the attention half is 66% of decode time, and the ratio between
-the two halves tracks their *op counts*, not their bytes. So the fixed per-call
-cost was timed directly:
+### The seam was the problem, and it was measured before it was fixed
+
+The first version was *slower than the CPU*, and the reason had nothing to do
+with kernels. The `Ops` seam takes host slices and returns host slices, so
+every operation was a round trip: upload, launch, download. A decode step runs
+~478 of them.
+
+At context 128 — where attention should be nearly free — the attention half was
+66% of decode time, and the ratio between the two halves tracked their *op
+counts*, not their bytes. That is the signature of fixed per-call cost, so the
+profiler grew a way to see it directly rather than by argument:
+
+```
+device   40176 kernel launches
+         754 up / 3872 down = 67 bus crossings per token
+         launch 10.9 us | 4 KiB up 28.0 us | down 61.6 us
+         seam costs 10.9 ms/token before any arithmetic
+```
+
+It corrected an estimate on its first run: "478 ops, two crossings each" was
+wrong — uploads outnumbered downloads nearly two to one, because a matmul sent
+its quantized activation as two buffers and RoPE sent three. Real figure at the
+time: **1329 crossings per token**.
+
+### Keeping activations on the card
+
+The seam gained three methods with no-op defaults, so `naive`, `par` and `spin`
+are untouched and still bit-identical to each other:
 
 | | |
 |---|---|
-| `cuLaunchKernel` + `cuCtxSynchronize` | 18.7 us |
-| the same wrapped in 4 KiB H2D + D2H | **56.4 us** |
-| ~450 `Ops` calls per decode step, so the floor is | **25.4 ms/token** |
+| `host_wrote(buf)` | the model wrote this directly; any device copy is stale |
+| `host_needs(buf)` | the model is about to read this; bring it back |
+| `begin_pass()` | a pass is starting; addresses may have been recycled |
 
-36% of the token is spent before any arithmetic. No kernel work recovers it:
-the `Ops` seam takes host slices and returns host slices, so every op is a round
-trip by construction. This is v3's rayon result one layer down — a fixed
-per-dispatch cost found by measuring the dispatch instead of the payload.
+These are hints *about the host*, not a buffer abstraction — who owns an
+activation is a larger question this does not answer. The backend keeps a mirror
+per host address carrying one bit: whether the device copy is at least as fresh
+as the host one. An op that writes a buffer sets it and skips the download; the
+next op to read it finds it there and skips the upload. A layer's chain of ops
+therefore touches the bus at its ends instead of twice per op.
 
-The remaining 64% is kernels written for exactness rather than for the machine:
-one thread per output row in the matmul (uncoalesced by construction) and a
-single-threaded f64 reduction in RMSNorm.
+**1329 crossings per token became 67** — the two the model actually declares
+(`k` and `v` per layer, which the host KV cache reads) plus the logits.
+
+Quantization had to move onto the device for that to work: a matmul quantizing
+its input on the host would drag every activation home.
+
+### Three things that were measured rather than assumed
+
+- **Pinned staging buffers.** The copies were 54% of a round trip and pageable
+  memory forces the driver to stage through its own pinned buffer, so this
+  looked certain. Reverted: ~20% *slower*.
+- **Repacking Q8_0 weights for coalescing.** Verified bit-exact, and reverted:
+  ~20% *slower*. The premise was wrong — one thread per row already streams its
+  row sequentially, which the cache serves well.
+- **`begin_pass` clearing the mirror map** freed and reallocated ~280 device
+  buffers per token. Invalidating in place, keeping the allocations, is what
+  made the residency win show up at all.
 
 ### Exactness
 
@@ -108,9 +152,18 @@ single-threaded f64 reduction in RMSNorm.
 | `softmax`, `silu_mul`, `attend` | ≤ 5.2e-8, about one ulp |
 
 The three that differ all call `expf`, and CUDA's is not obliged to match
-glibc's. The obstacle was not the expected one: *parallel reductions* were
-assumed to be what costs bit-exactness, but keeping each reduction serial kept
-it — what actually breaks exactness is one libm function.
+glibc's. **The obstacle was not the expected one.** Parallel reductions were
+assumed to be what costs bit-exactness; keeping each reduction serial kept it,
+and what actually breaks it is one libm function.
+
+That holds even for the fast matmul, which is one warp per row. Q8_0 has a unit
+of work that is *already* exact: within a 32-element block the sum of products
+is an **integer** sum, so it cannot round and its order does not matter. Only
+the accumulation *across* blocks is f32. So lane `b % 32` computes block `b`
+into shared memory and lane 0 adds those up in ascending `b` — the oracle's
+order exactly. Parallel where the arithmetic is order-free, serial where it is
+not. Coalescing falls out: the warp sits in 32 consecutive 34-byte blocks
+instead of 32 rows a kilobyte apart.
 
 Whole-model divergence is 1.47e-2 of logit magnitude, which is what `CLAUDE.md`
 predicts for a one-ulp perturbation amplified through 28 layers of Q8_0
@@ -120,14 +173,24 @@ Rather than argue about whether that was drift or a defect, there is a test for
 it: `only_the_expf_ops_diverge` runs the five exact kernels on the GPU and the
 three exp-dependent ones on the CPU and asserts **bit equality on all 151,936
 logits**. It passes, which leaves `expf` as the only explanation — and makes any
-future GPU divergence bisectable in one run.
+future GPU divergence bisectable in one run. It is also the first thing here to
+straddle both devices, and has to do the same host/device bookkeeping a real
+CPU/GPU layer split will need.
 
 ```bash
 cargo test --release --features cuda --test cuda_ops -- --ignored --nocapture
 ```
 
+### What is left
+
+Launch overhead. ~580 launches per token at 10.9 us is ~6.3 ms of a 23.6 ms
+token, and no amount of kernel tuning removes it — that needs fewer launches,
+i.e. fusing ops within a layer.
+
 **This tests none of the offload thesis.** The 0.6B is 0.59 GiB against 14.80
-GiB free. It bought the device path, the kernels, and the number above.
+GiB free, and ~580 launches per token is a fixed cost regardless of model size:
+at 0.6B each kernel does ~1.3 MB of work, on the 9B roughly 11x more, so the
+same overhead is a few percent there instead of a third.
 
 ## Build
 
@@ -227,6 +290,7 @@ inferred trace    -m -p     one forward pass, checksumming every tensor
 | `--profile` | off | print the profile summary. Tier 1 is always *collected*; this only controls whether it prints |
 | `--profile-detail` | off | also time each layer's attention and FFN halves. Implies `--profile` |
 | `--profile-json <PATH>` | — | write one record per token and per layer half, for diffing two runs |
+| `--profile-device` | off | with `--backend cuda`, also time a bare launch, upload and download on the live device and report what the seam costs per token. Launch and transfer *counts* are always collected and printed under `--profile` |
 
 ### `trace`
 
@@ -350,10 +414,12 @@ python scripts/check_q8_matmul.py                       # isolate the Q8_0 matmu
 
 - `qwen3` only; no MoE, no GatedDeltaNet. Quant support covers what the three
   target models use: F32, F16, BF16, Q8_0, Q5_K, Q6_K, IQ4_XS
-- The CUDA backend is a *correctness* vehicle. It runs the whole model on the
-  GPU and is 4.4x slower than our own CPU backend, for a measured reason — see
-  below. Only Q8_0 has a matmul kernel, which is every matmul in the models
-  this targets
+- The CUDA backend runs the whole model on the GPU at 0.68x our own CPU
+  backend. What remains is launch overhead, not kernels — see above. Only Q8_0
+  has a matmul kernel, which is every matmul in the models this targets
+- CUDA and `trace` are not usable together: tracing reads intermediate tensors
+  from the host, and the device backend leaves them on the card unless the
+  model asks for them back. `trace` runs on `naive`
 - Greedy sampling only
 - Scalar f32 kernels: no SIMD, no GPU, both deliberate. `spin` threads every
   matmul and attention (`-t N`) and scales out to 8 threads
