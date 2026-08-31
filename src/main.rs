@@ -57,6 +57,10 @@ enum Command {
         /// Write the profile as JSON, for diffing two runs against each other.
         #[arg(long)]
         profile_json: Option<String>,
+        /// With --backend cuda: also time a bare launch, upload and download,
+        /// and report what a per-op seam costs before any arithmetic.
+        #[arg(long)]
+        profile_device: bool,
         /// Compute threads. 1 selects the scalar `naive` oracle directly and
         /// ignores --backend; anything more selects --backend, which must
         /// produce identical bits. 0 means physical cores, taken as half the
@@ -113,6 +117,7 @@ fn main() -> ExitCode {
             profile,
             profile_detail,
             profile_json,
+            profile_device,
             threads,
             chat,
             show_special,
@@ -127,6 +132,7 @@ fn main() -> ExitCode {
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
+                device: profile_device,
                 threads,
                 chat,
                 show_special,
@@ -173,6 +179,7 @@ struct GenOpts {
     report: bool,
     detail: bool,
     json: Option<String>,
+    device: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -235,23 +242,26 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         // Borrowed, not moved, so the sticky error survives the engine. An op
         // that failed has produced meaningless output, so this is fatal.
         let run = run_generation(m, &cuda, &tk, &tokens, &text, &o);
-        return match cuda.take_error() {
-            Some(e) => Err(e),
-            None => run,
-        };
+        if let Some(e) = cuda.take_error() {
+            return Err(e);
+        }
+        if o.report || o.device {
+            report_device(&cuda, &o, tokens.len(), run.as_ref().ok().copied())?;
+        }
+        return run.map(|_| ());
     }
 
     // One thread means the oracle itself, not a pool of one -- there is no
     // reason to pay a barrier for a single worker, and it makes `-t 1` the
     // reference run the threaded backends must reproduce bit for bit.
     if n_threads <= 1 {
-        return run_generation(m, Naive, &tk, &tokens, &text, &o);
+        return run_generation(m, Naive, &tk, &tokens, &text, &o).map(|_| ());
     }
     match o.backend.as_str() {
-        "spin" => run_generation(m, Spin::new(n_threads), &tk, &tokens, &text, &o),
+        "spin" => run_generation(m, Spin::new(n_threads), &tk, &tokens, &text, &o).map(|_| ()),
         "par" => {
             Par::init(n_threads);
-            run_generation(m, Par, &tk, &tokens, &text, &o)
+            run_generation(m, Par, &tk, &tokens, &text, &o).map(|_| ())
         }
         other => Err(inferred_thoughts::Error::InconsistentArchitecture {
             what: "--backend",
@@ -267,6 +277,57 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
     }
 }
 
+/// What the backend asked the driver to do, and what that costs here.
+///
+/// Separate from the profiler proper because it is backend-specific: `spin` and
+/// `naive` have no bus to cross. It answers the question the wall-clock profile
+/// cannot — how much of a token is spent moving 4 KiB back and forth rather
+/// than computing.
+#[cfg(feature = "cuda")]
+fn report_device(
+    cuda: &inferred_thoughts::Cuda,
+    o: &GenOpts,
+    prompt_len: usize,
+    ms_per_token: Option<f64>,
+) -> inferred_thoughts::Result<()> {
+    let s = cuda.stats();
+    let tokens = (prompt_len + o.max_tokens) as u64;
+    eprintln!("
+device   {} kernel launches", s.launches);
+    eprintln!(
+        "         {} up / {} down = {:.0} bus crossings per token",
+        s.h2d_calls,
+        s.d2h_calls,
+        s.crossings_per_token(tokens),
+    );
+    eprintln!(
+        "         {:.1} MiB up, {:.1} MiB down",
+        s.h2d_bytes as f64 / 1048576.0,
+        s.d2h_bytes as f64 / 1048576.0,
+    );
+
+    if !o.device {
+        eprintln!("         --profile-device times what one crossing costs");
+        return Ok(());
+    }
+
+    let b = cuda.benchmark(2000)?;
+    eprintln!(
+        "
+         launch {:.1} us | 4 KiB up {:.1} us | down {:.1} us",
+        b.launch_us, b.h2d_us, b.d2h_us,
+    );
+    let seam = b.predicted_ms(&s, tokens);
+    eprintln!("         seam costs {seam:.1} ms/token before any arithmetic");
+    if let Some(actual) = ms_per_token {
+        eprintln!(
+            "         {:.0}% of the {actual:.1} ms/token measured is moving 4 KiB about",
+            100.0 * seam / actual,
+        );
+    }
+    Ok(())
+}
+
 fn run_generation<O: inferred_thoughts::Ops>(
     model: inferred_thoughts::Qwen3<'_>,
     ops: O,
@@ -274,7 +335,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
     tokens: &[u32],
     prompt_text: &str,
     o: &GenOpts,
-) -> inferred_thoughts::Result<()> {
+) -> inferred_thoughts::Result<f64> {
     use inferred_thoughts::Engine;
     use std::io::Write;
 
@@ -305,6 +366,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
         }
     })?;
     let secs = started.elapsed().as_secs_f64();
+    let ms_per_token = secs * 1000.0 / produced.len().max(1) as f64;
     println!();
 
     // Reported, not inferred: the engine knows which of the three it was.
@@ -313,7 +375,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
         "\n{} tokens in {secs:.1}s ({:.2} tok/s, {:.0} ms/token)",
         produced.len(),
         produced.len() as f64 / secs.max(1e-9),
-        secs * 1000.0 / produced.len().max(1) as f64
+        ms_per_token
     );
 
     if o.report {
@@ -330,7 +392,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
         })?;
         eprintln!("profile written to {path}");
     }
-    Ok(())
+    Ok(ms_per_token)
 }
 
 // ----------------------------------------------------------------------- trace

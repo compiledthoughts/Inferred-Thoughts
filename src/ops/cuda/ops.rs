@@ -55,39 +55,50 @@ mod slot {
     pub const Q: usize = 8;
 }
 
-fn h2d<T: Copy>(dst: ffi::CUdeviceptr, data: &[T]) -> Result<()> {
-    let bytes = std::mem::size_of_val(data);
-    if bytes == 0 {
-        return Ok(());
-    }
-    // SAFETY: `data` is valid for `bytes`; `dst` was sized by `Cuda::pooled`.
-    unsafe {
-        check(
-            ffi::cuMemcpyHtoD_v2(dst, data.as_ptr() as *const c_void, bytes),
-            "cuMemcpyHtoD",
-        )
-    }
-}
-
-fn d2h<T: Copy>(out: &mut [T], src: ffi::CUdeviceptr) -> Result<()> {
-    let bytes = std::mem::size_of_val(out);
-    if bytes == 0 {
-        return Ok(());
-    }
-    // SAFETY: as above, in the other direction.
-    unsafe {
-        check(
-            ffi::cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, src, bytes),
-            "cuMemcpyDtoH",
-        )
-    }
-}
-
 fn arg<T>(v: &mut T) -> *mut c_void {
     v as *mut T as *mut c_void
 }
 
 impl Cuda {
+    /// Host to device, counted.
+    fn h2d<T: Copy>(&self, dst: ffi::CUdeviceptr, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.bump(|s| {
+            s.h2d_calls += 1;
+            s.h2d_bytes += bytes as u64;
+        });
+        // SAFETY: `data` is valid for `bytes`; `dst` was sized by `pooled` or
+        // `resident`.
+        unsafe {
+            check(
+                ffi::cuMemcpyHtoD_v2(dst, data.as_ptr() as *const c_void, bytes),
+                "cuMemcpyHtoD",
+            )
+        }
+    }
+
+    /// Device to host, counted.
+    fn d2h<T: Copy>(&self, out: &mut [T], src: ffi::CUdeviceptr) -> Result<()> {
+        let bytes = std::mem::size_of_val(out);
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.bump(|s| {
+            s.d2h_calls += 1;
+            s.d2h_bytes += bytes as u64;
+        });
+        // SAFETY: as above, in the other direction.
+        unsafe {
+            check(
+                ffi::cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, src, bytes),
+                "cuMemcpyDtoH",
+            )
+        }
+    }
+
     /// Device copy of a host buffer that does not change, uploaded on first
     /// sight and kept for the life of the backend.
     ///
@@ -178,7 +189,7 @@ impl Cuda {
         let w = self.resident(weight)?;
         let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
         let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        h2d(xd, x)?;
+        self.h2d(xd, x)?;
 
         let (mut n, mut eps) = (x.len() as i32, eps);
         let (mut xd, mut w, mut od) = (xd, w, od);
@@ -192,7 +203,7 @@ impl Cuda {
         // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
         // sized from the slice it mirrors.
         unsafe { self.launch("rms_norm", 1, 256, &mut params)? };
-        d2h(out, od)
+        self.d2h(out, od)
     }
 
     fn rms_norm_heads_impl(
@@ -205,14 +216,14 @@ impl Cuda {
         let n_heads = x.len() / head_dim;
         let w = self.resident(weight)?;
         let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        h2d(xd, x)?;
+        self.h2d(xd, x)?;
 
         let (mut hd, mut eps) = (head_dim as i32, eps);
         let (mut w, mut xd) = (w, xd);
         let mut params = [arg(&mut hd), arg(&mut w), arg(&mut eps), arg(&mut xd)];
         // SAFETY: as above; one block per head, which is the grid below.
         unsafe { self.launch("rms_norm_heads", n_heads as u32, 256, &mut params)? };
-        d2h(x, xd)
+        self.d2h(x, xd)
     }
 
     fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
@@ -237,8 +248,8 @@ impl Cuda {
         let sd = self.pooled(slot::QSCALES, std::mem::size_of_val(qx.scales()))?;
         let qd = self.pooled(slot::QUANTS, std::mem::size_of_val(qx.quants()))?;
         let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        h2d(sd, qx.scales())?;
-        h2d(qd, qx.quants())?;
+        self.h2d(sd, qx.scales())?;
+        self.h2d(qd, qx.quants())?;
 
         let (mut n_in, mut n_out) = (w.n_in as i32, w.n_out as i32);
         let (mut wd, mut sd, mut qd, mut od) = (wd, sd, qd, od);
@@ -261,7 +272,7 @@ impl Cuda {
                 &mut params,
             )?
         };
-        d2h(out, od)
+        self.d2h(out, od)
     }
 
     fn rope_impl(
@@ -288,9 +299,9 @@ impl Cuda {
         let cd = self.pooled(slot::COS, half * 4)?;
         let sd = self.pooled(slot::SIN, half * 4)?;
         let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        h2d(cd, &cos)?;
-        h2d(sd, &sin)?;
-        h2d(xd, x)?;
+        self.h2d(cd, &cos)?;
+        self.h2d(sd, &sin)?;
+        self.h2d(xd, x)?;
 
         let (mut hd, mut nh) = (head_dim as i32, n_heads as i32);
         let (mut cd, mut sd, mut xd) = (cd, sd, xd);
@@ -312,19 +323,19 @@ impl Cuda {
                 &mut params,
             )?
         };
-        d2h(x, xd)
+        self.d2h(x, xd)
     }
 
     fn softmax_impl(&self, x: &mut [f32]) -> Result<()> {
         let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        h2d(xd, x)?;
+        self.h2d(xd, x)?;
 
         let (mut n, mut rows) = (x.len() as i32, 1i32);
         let mut xd = xd;
         let mut params = [arg(&mut n), arg(&mut rows), arg(&mut xd)];
         // SAFETY: parameters match `softmax_rows`; one row, so one thread.
         unsafe { self.launch("softmax_rows", 1, 1, &mut params)? };
-        d2h(x, xd)
+        self.d2h(x, xd)
     }
 
     fn attend_impl(&self, a: &Attn<'_>, out: &mut [f32]) -> Result<()> {
@@ -333,7 +344,7 @@ impl Cuda {
         let qd = self.pooled(slot::Q, std::mem::size_of_val(a.q))?;
         let sd = self.pooled(slot::SCORES, a.n_head * a.n_pos * 4)?;
         let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        h2d(qd, a.q)?;
+        self.h2d(qd, a.q)?;
 
         let mut n_pos = a.n_pos as i32;
         let mut kv_dim = a.kv_dim as i32;
@@ -366,14 +377,14 @@ impl Cuda {
                 &mut params,
             )?
         };
-        d2h(out, od)
+        self.d2h(out, od)
     }
 
     fn silu_mul_impl(&self, gate: &mut [f32], up: &[f32]) -> Result<()> {
         let gd = self.pooled(slot::X, std::mem::size_of_val(gate))?;
         let ud = self.pooled(slot::AUX, std::mem::size_of_val(up))?;
-        h2d(gd, gate)?;
-        h2d(ud, up)?;
+        self.h2d(gd, gate)?;
+        self.h2d(ud, up)?;
 
         let mut n = gate.len() as i32;
         let (mut gd, mut ud) = (gd, ud);
@@ -388,14 +399,14 @@ impl Cuda {
                 &mut params,
             )?
         };
-        d2h(gate, gd)
+        self.d2h(gate, gd)
     }
 
     fn add_assign_impl(&self, a: &mut [f32], b: &[f32]) -> Result<()> {
         let ad = self.pooled(slot::X, std::mem::size_of_val(a))?;
         let bd = self.pooled(slot::AUX, std::mem::size_of_val(b))?;
-        h2d(ad, a)?;
-        h2d(bd, b)?;
+        self.h2d(ad, a)?;
+        self.h2d(bd, b)?;
 
         let mut n = a.len() as i32;
         let (mut ad, mut bd) = (ad, bd);
@@ -410,7 +421,7 @@ impl Cuda {
                 &mut params,
             )?
         };
-        d2h(a, ad)
+        self.d2h(a, ad)
     }
 }
 

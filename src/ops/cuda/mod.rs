@@ -21,7 +21,7 @@
 pub mod ffi;
 mod ops;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 
@@ -83,6 +83,65 @@ pub struct Cuda {
     /// call and building its argument allocates a `CString`; a decode step
     /// makes ~478 launches, so neither belongs on that path.
     functions: RefCell<HashMap<&'static str, ffi::CUfunction>>,
+
+    /// What this backend actually asked the driver to do. See [`DeviceStats`].
+    stats: Cell<DeviceStats>,
+}
+
+/// Driver traffic, counted rather than derived.
+///
+/// `CLAUDE.md`'s profiler rule is "derive bytes, do not count them", because
+/// weight and KV traffic are functions of shapes and a counter would recompute
+/// a constant. **This is the case that rule does not cover.** How many times a
+/// backend crosses the bus is a property of the backend, not of the model, and
+/// it is exactly the quantity the `Ops` seam determines — so it has to be
+/// observed. Two increments per op, off any inner loop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeviceStats {
+    pub launches: u64,
+    pub h2d_calls: u64,
+    pub h2d_bytes: u64,
+    pub d2h_calls: u64,
+    pub d2h_bytes: u64,
+}
+
+impl DeviceStats {
+    /// Bus crossings per token, given how many tokens produced these counts.
+    pub fn crossings_per_token(&self, tokens: u64) -> f64 {
+        if tokens == 0 {
+            return 0.0;
+        }
+        (self.h2d_calls + self.d2h_calls) as f64 / tokens as f64
+    }
+}
+
+/// What one round trip through the `Ops` seam costs on this device, measured
+/// rather than assumed. Produced by [`Cuda::benchmark`].
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceBench {
+    pub launch_us: f64,
+    pub h2d_us: f64,
+    pub d2h_us: f64,
+    pub round_trip_us: f64,
+}
+
+impl DeviceBench {
+    /// Milliseconds per token the seam costs, before any arithmetic.
+    ///
+    /// Built from the counts actually observed rather than from an assumed two
+    /// crossings per op: uploads and downloads are not symmetric, because a
+    /// matmul uploads a quantized activation as two buffers and RoPE uploads
+    /// three. Multiplying a round-trip average by "ops per token" gets this
+    /// wrong in both directions.
+    pub fn predicted_ms(&self, stats: &DeviceStats, tokens: u64) -> f64 {
+        if tokens == 0 {
+            return 0.0;
+        }
+        let total = stats.h2d_calls as f64 * self.h2d_us
+            + stats.d2h_calls as f64 * self.d2h_us
+            + stats.launches as f64 * self.launch_us;
+        total / tokens as f64 / 1000.0
+    }
 }
 
 /// A device mirror of a host KV slab, and how much of it is current.
@@ -179,6 +238,7 @@ impl Cuda {
                 pool: RefCell::new(Vec::new()),
                 error: RefCell::new(None),
                 functions: RefCell::new(HashMap::new()),
+                stats: Cell::new(DeviceStats::default()),
             })
         }
     }
@@ -268,11 +328,67 @@ impl Cuda {
                 "cuLaunchKernel",
             )?
         };
+        self.bump(|s| s.launches += 1);
         // Deliberately no `sync` here. Every `Ops` method ends in a
         // device-to-host copy on the null stream, which is ordered after this
         // kernel and is itself synchronous, so an explicit barrier is a second
         // driver call buying nothing. A launch failure surfaces at that copy.
         Ok(())
+    }
+
+    /// Update the counters. `Cell` rather than atomics: this backend is used
+    /// from one thread, and the whole point is that it costs nothing.
+    pub(super) fn bump(&self, f: impl FnOnce(&mut DeviceStats)) {
+        let mut s = self.stats.get();
+        f(&mut s);
+        self.stats.set(s);
+    }
+
+    /// Driver traffic so far.
+    pub fn stats(&self) -> DeviceStats {
+        self.stats.get()
+    }
+
+    /// Time a launch, an upload, a download, and the three together.
+    ///
+    /// Synthetic on purpose: a 4 KiB payload is about the size of this model's
+    /// residual stream, so the result is the *fixed* cost of using the seam,
+    /// with as little real work attached as possible.
+    pub fn benchmark(&self, reps: u32) -> Result<DeviceBench> {
+        use std::time::Instant;
+
+        let n = 1024usize;
+        let host = vec![1.0f32; n];
+        let x = DeviceBuffer::from_slice(&host)?;
+        let y = DeviceBuffer::from_slice(&host)?;
+        let mut back = vec![0.0f32; n];
+
+        // Resolve the kernel and let the JIT settle before anything is timed.
+        self.saxpy(1.0, &x, &y, n)?;
+
+        let time = |f: &mut dyn FnMut() -> Result<()>| -> Result<f64> {
+            let t = Instant::now();
+            for _ in 0..reps {
+                f()?;
+            }
+            Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
+        };
+
+        let launch_us = time(&mut || self.saxpy(1.0, &x, &y, n))?;
+        let h2d_us = time(&mut || x.write(&host))?;
+        let d2h_us = time(&mut || y.read(&mut back))?;
+        let round_trip_us = time(&mut || {
+            x.write(&host)?;
+            self.saxpy(1.0, &x, &y, n)?;
+            y.read(&mut back)
+        })?;
+
+        Ok(DeviceBench {
+            launch_us,
+            h2d_us,
+            d2h_us,
+            round_trip_us,
+        })
     }
 
     /// A kernel handle, resolved once per symbol.
