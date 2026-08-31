@@ -103,9 +103,35 @@
 //!    is why `attn_q` is `{n_embd, head_dim * 2 * n_head}` and there is no
 //!    separate gate tensor on those layers.
 //!
-//! RoPE on the attention layers is **mRoPE** with sections `{11, 11, 10, 0}`
-//! over `rope.dimension_count = 64` of the 256-wide head — partial rotation,
-//! the rest passed through.
+//! # mRoPE reduces to ordinary RoPE for text, and the sections are inert
+//!
+//! The attention layers call `ggml_rope_multi` with sections `{11, 11, 10, 0}`
+//! over `rope.dimension_count = 64` of the 256-wide head. That looks like a
+//! fourth thing to implement. It is not, for text-only input:
+//!
+//! * `llm_graph_input_pos::set_input` fills the four position components as
+//!   `p_t = p_h = p_w = pos` and `p_e = 0` when the batch is tokens rather than
+//!   an image.
+//! * `indep_sects` in `ggml_mrope_cache_init` is `is_vision`, false here, so
+//!   all four thetas start from their base and are scaled identically each
+//!   step. With three of them equal, the section a dimension falls in cannot
+//!   change its angle.
+//! * The fourth theta is the only one that differs, and it is selected only
+//!   when `sector >= sections[0] + sections[1] + sections[2] = 32`. But
+//!   `sect_dims` is also 32 and `sector = (i0 / 2) % sect_dims`, so `sector` is
+//!   never 32 or more. `theta_e` is unreachable.
+//!
+//! So what actually has to be implemented is **partial RoPE**: rotate the first
+//! `n_rot = 64` of each 256-wide head, pass the remaining 192 through
+//! unchanged. The sections can be read, asserted to sum to `n_rot / 2`, and
+//! otherwise ignored — but *only* while input is text. An image path would
+//! make them live, which is why the reasoning is recorded rather than the
+//! conclusion alone.
+//!
+//! **Unverified:** whether `qwen35` uses NEOX pairing (dimension `i` with
+//! `i + n_rot / 2`) as `qwen3` does, or the adjacent-pair variant. It is one
+//! lookup in `llama-arch.cpp`'s rope-type table, and getting it wrong would
+//! look exactly like a numerics bug rather than a structural one.
 
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
