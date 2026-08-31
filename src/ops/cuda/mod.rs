@@ -86,6 +86,42 @@ pub struct Cuda {
 
     /// What this backend actually asked the driver to do. See [`DeviceStats`].
     stats: Cell<DeviceStats>,
+
+    /// Device copies of the model's activation buffers, keyed on host address.
+    /// See `Cuda::mirror_in`.
+    mirrors: RefCell<HashMap<usize, Mirror>>,
+
+    /// The position the RoPE sin/cos table on the device was built for.
+    ///
+    /// Every layer rotates at the same position within one token, so the table
+    /// is identical across all 28 of them — it was being rebuilt and re-sent 56
+    /// times per token for no reason.
+    rope_pos: Cell<Option<(usize, usize, u32)>>,
+}
+
+/// A device copy of one host activation buffer.
+struct Mirror {
+    buf: DeviceBuffer,
+    /// Whether the device copy is at least as fresh as the host one.
+    device_current: bool,
+    /// This buffer quantized to Q8_0, and whether that is still current.
+    ///
+    /// A layer feeds the *same* normed activation to three matmuls (q, k, v)
+    /// and then to two more (gate, up). Quantizing is a function of the buffer
+    /// alone, so doing it per matmul repeated identical work five times a
+    /// layer.
+    quant: Option<(DeviceBuffer, DeviceBuffer)>,
+    quant_valid: bool,
+}
+
+impl Mirror {
+    /// Invalidate without freeing. Allocation is the expensive part — a token
+    /// touches ~280 activation slices, and reallocating each one cost more than
+    /// the launches saved by caching in the first place.
+    fn invalidate(&mut self) {
+        self.device_current = false;
+        self.quant_valid = false;
+    }
 }
 
 /// Driver traffic, counted rather than derived.
@@ -239,6 +275,8 @@ impl Cuda {
                 error: RefCell::new(None),
                 functions: RefCell::new(HashMap::new()),
                 stats: Cell::new(DeviceStats::default()),
+                mirrors: RefCell::new(HashMap::new()),
+                rope_pos: Cell::new(None),
             })
         }
     }
@@ -391,7 +429,44 @@ impl Cuda {
             Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
         };
 
-        let launch_us = time(&mut || self.saxpy(1.0, &x, &y, n))?;
+        // Launches are timed in a batch against a single sync, because that is
+        // how the backend issues them. Timing one launch plus one
+        // `cuCtxSynchronize` measures a barrier the forward pass never pays.
+        let launch_us = {
+            let f = self.cached_function("saxpy")?;
+            let (mut n_arg, mut a_arg) = (n as i32, 1.0f32);
+            let (mut x_arg, mut y_arg) = (x.ptr, y.ptr);
+            let mut params = [
+                &mut n_arg as *mut _ as *mut c_void,
+                &mut a_arg as *mut _ as *mut c_void,
+                &mut x_arg as *mut _ as *mut c_void,
+                &mut y_arg as *mut _ as *mut c_void,
+            ];
+            let t = Instant::now();
+            for _ in 0..reps {
+                // SAFETY: parameters match `saxpy`; both buffers hold `n` floats.
+                unsafe {
+                    check(
+                        ffi::cuLaunchKernel(
+                            f,
+                            n.div_ceil(256) as u32,
+                            1,
+                            1,
+                            256,
+                            1,
+                            1,
+                            0,
+                            std::ptr::null_mut(),
+                            params.as_mut_ptr(),
+                            std::ptr::null_mut(),
+                        ),
+                        "cuLaunchKernel",
+                    )?
+                };
+            }
+            self.sync()?;
+            t.elapsed().as_secs_f64() * 1e6 / f64::from(reps)
+        };
         let h2d_us = time(&mut || x.write(&host))?;
         let d2h_us = time(&mut || y.read(&mut back))?;
         let round_trip_us = time(&mut || {

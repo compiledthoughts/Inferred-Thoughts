@@ -270,10 +270,21 @@ impl<'a> Qwen3<'a> {
 
         let step = ctx.prof.begin_step();
 
+        // A device backend keys its copies on host addresses, and the buffers
+        // below are allocated fresh each pass, so last pass's addresses must
+        // not be trusted. No-op on the CPU backends.
+        ops.begin_pass();
+
         // Residual stream, one row of n_embd per token in this batch.
         let mut x = vec![0.0f32; n * c.n_embd];
         for (t, &id) in tokens.iter().enumerate() {
             self.embed(id, &mut x[t * c.n_embd..(t + 1) * c.n_embd])?;
+        }
+        // Written here rather than by an op, so a device copy would be stale.
+        // Per row, because that is the granularity the ops below work at and
+        // therefore the granularity a device backend keys its copies on.
+        for t in 0..n {
+            ops.host_wrote(&x[t * c.n_embd..(t + 1) * c.n_embd]);
         }
         ctx.trace("inp_embd", 0, &x);
 
@@ -362,6 +373,13 @@ impl<'a> Qwen3<'a> {
             // written by this same call. The cache rounds to f16 on the way in
             // — that is where llama.cpp's f16 KV semantics now live, replacing
             // the explicit round-trip Stage 4 did here.
+            // The cache is host memory and `store` reads these directly, so
+            // this is one of the two points in the pass where a device copy has
+            // to come home. The other is the logits.
+            for t in 0..n {
+                ops.host_needs(&mut k[t * kd..(t + 1) * kd]);
+                ops.host_needs(&mut v[t * kd..(t + 1) * kd]);
+            }
             for t in 0..n {
                 cache.store(
                     il,
@@ -480,6 +498,7 @@ impl<'a> Qwen3<'a> {
 
         let mut logits = vec![0.0f32; c.n_vocab];
         ops.matmul(&self.output, &normed, &mut logits);
+        ops.host_needs(&mut logits);
         ctx.trace("result_output", 0, &logits);
 
         Ok(logits)

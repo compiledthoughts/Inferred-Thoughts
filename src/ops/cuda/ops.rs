@@ -36,7 +36,7 @@
 
 use std::ffi::c_void;
 
-use super::{Cuda, DeviceBuffer, KvMirror, check, ffi};
+use super::{Cuda, DeviceBuffer, KvMirror, Mirror, check, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
 use crate::ops::naive::QuantizedRow;
@@ -60,6 +60,136 @@ fn arg<T>(v: &mut T) -> *mut c_void {
 }
 
 impl Cuda {
+    /// The device copy of a model-owned activation, brought up to date.
+    ///
+    /// This is the whole residency mechanism. A mirror is keyed on the host
+    /// address and carries one bit: whether the device copy is at least as
+    /// fresh as the host one. An op that *writes* a buffer sets that bit and
+    /// skips the download; the next op to read the same buffer then finds it
+    /// already there and skips the upload. A chain of ops inside a layer
+    /// therefore touches the bus once, at the ends, instead of twice per op.
+    ///
+    /// The bit is cleared by `host_wrote` and by `begin_pass`, which are the
+    /// only two ways the host can get ahead of the device.
+    fn mirror_in(&self, data: &[f32]) -> Result<ffi::CUdeviceptr> {
+        let key = data.as_ptr() as usize;
+        let bytes = std::mem::size_of_val(data);
+        let (ptr, fresh) = self.slot_for(key, bytes)?;
+        if !fresh {
+            self.h2d(ptr, data)?;
+            if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
+                m.device_current = true;
+            }
+        }
+        Ok(ptr)
+    }
+
+    /// The device buffer an op is about to *write*, without uploading first.
+    ///
+    /// Marked current on the way out, so the download never happens unless the
+    /// model asks for it through `host_needs`.
+    fn mirror_out(&self, data: &[f32]) -> Result<ffi::CUdeviceptr> {
+        let key = data.as_ptr() as usize;
+        let bytes = std::mem::size_of_val(data);
+        let (ptr, _) = self.slot_for(key, bytes)?;
+        if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
+            m.device_current = true;
+            // The contents are about to change, so a quantization of them is
+            // stale — but the buffer holding it is kept.
+            m.quant_valid = false;
+        }
+        Ok(ptr)
+    }
+
+    /// The mirror for `key`, allocating only if there is not already one big
+    /// enough. Returns its pointer and whether the device copy is current.
+    fn slot_for(&self, key: usize, bytes: usize) -> Result<(ffi::CUdeviceptr, bool)> {
+        let mut map = self.mirrors.borrow_mut();
+        let reusable = match map.get(&key) {
+            Some(m) => m.buf.len_bytes() >= bytes,
+            None => false,
+        };
+        if !reusable {
+            map.insert(
+                key,
+                Mirror {
+                    buf: DeviceBuffer::new(bytes)?,
+                    device_current: false,
+                    quant: None,
+                    quant_valid: false,
+                },
+            );
+        }
+        match map.get(&key) {
+            Some(m) => Ok((m.buf.ptr, m.device_current)),
+            None => Err(Error::Cuda {
+                what: "slot_for",
+                detail: "mirror vanished between insert and lookup".to_string(),
+            }),
+        }
+    }
+
+    /// This activation quantized to Q8_0 on the device, computed once.
+    ///
+    /// Returns `(scales, quants)` device pointers. The result is cached on the
+    /// buffer's mirror and dropped the moment anything writes that buffer, so
+    /// the five matmuls a layer runs against two distinct activations do two
+    /// quantizations rather than five.
+    fn quantized(
+        &self,
+        x: &[f32],
+        n_blocks: usize,
+    ) -> Result<(ffi::CUdeviceptr, ffi::CUdeviceptr)> {
+        let key = x.as_ptr() as usize;
+        let xd = self.mirror_in(x)?;
+
+        let existing = match self.mirrors.borrow().get(&key) {
+            Some(m) => match &m.quant {
+                Some((s, q)) if s.len_bytes() >= n_blocks * 4 => {
+                    if m.quant_valid {
+                        return Ok((s.ptr, q.ptr));
+                    }
+                    Some((s.ptr, q.ptr))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let (sd, qd, fresh_bufs) = match existing {
+            // Buffers already the right size; only the contents are stale.
+            Some((s, q)) => (s, q, None),
+            None => {
+                let scales = DeviceBuffer::new(n_blocks * 4)?;
+                let quants = DeviceBuffer::new(n_blocks * 32)?;
+                let (s, q) = (scales.ptr, quants.ptr);
+                (s, q, Some((scales, quants)))
+            }
+        };
+        {
+            let (mut nb, mut xd, mut sd, mut qd) = (n_blocks as i32, xd, sd, qd);
+            let mut params = [arg(&mut nb), arg(&mut xd), arg(&mut sd), arg(&mut qd)];
+            let block = 64u32;
+            // SAFETY: parameters match `quantize_q8_0`; the grid covers exactly
+            // `n_blocks` blocks and both outputs are sized for them.
+            unsafe {
+                self.launch(
+                    "quantize_q8_0",
+                    n_blocks.div_ceil(block as usize) as u32,
+                    block,
+                    &mut params,
+                )?
+            };
+        }
+        if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
+            if let Some(bufs) = fresh_bufs {
+                m.quant = Some(bufs);
+            }
+            m.quant_valid = true;
+        }
+        Ok((sd, qd))
+    }
+
     /// Host to device, counted.
     fn h2d<T: Copy>(&self, dst: ffi::CUdeviceptr, data: &[T]) -> Result<()> {
         let bytes = std::mem::size_of_val(data);
@@ -187,9 +317,8 @@ impl Cuda {
 
     fn rms_norm_impl(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) -> Result<()> {
         let w = self.resident(weight)?;
-        let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        self.h2d(xd, x)?;
+        let xd = self.mirror_in(x)?;
+        let od = self.mirror_out(out)?;
 
         let (mut n, mut eps) = (x.len() as i32, eps);
         let (mut xd, mut w, mut od) = (xd, w, od);
@@ -203,7 +332,7 @@ impl Cuda {
         // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
         // sized from the slice it mirrors.
         unsafe { self.launch("rms_norm", 1, 256, &mut params)? };
-        self.d2h(out, od)
+        Ok(())
     }
 
     fn rms_norm_heads_impl(
@@ -215,15 +344,14 @@ impl Cuda {
     ) -> Result<()> {
         let n_heads = x.len() / head_dim;
         let w = self.resident(weight)?;
-        let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        self.h2d(xd, x)?;
+        let xd = self.mirror_in(x)?;
 
         let (mut hd, mut eps) = (head_dim as i32, eps);
         let (mut w, mut xd) = (w, xd);
         let mut params = [arg(&mut hd), arg(&mut w), arg(&mut eps), arg(&mut xd)];
         // SAFETY: as above; one block per head, which is the grid below.
         unsafe { self.launch("rms_norm_heads", n_heads as u32, 256, &mut params)? };
-        self.d2h(x, xd)
+        self.mirror_out(x).map(|_| ())
     }
 
     fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
@@ -238,18 +366,16 @@ impl Cuda {
             });
         }
 
-        // Quantized on the host, deliberately. `quantize_row_q8_0_ref` rounds a
-        // scale through f16, and reproducing that rounding in CUDA is a risk
-        // taken for no gain: it is one pass over a 1024-element activation, and
-        // doing it here means the device sees byte-identical input to the
-        // oracle.
-        let qx = QuantizedRow::from_f32(x);
+        // Quantized on the device. It began on the host, because the scale
+        // round-trips through f16 and a differing rounding mode there would be
+        // invisible until it moved a quant; `tests/cuda_ops.rs` now checks that
+        // against the oracle on real data. Doing it here is what lets a
+        // matmul's input stay on the card instead of coming back to be
+        // quantized and going out again.
+        let n_blocks = w.n_in / 32;
         let wd = self.resident(w.data)?;
-        let sd = self.pooled(slot::QSCALES, std::mem::size_of_val(qx.scales()))?;
-        let qd = self.pooled(slot::QUANTS, std::mem::size_of_val(qx.quants()))?;
-        let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        self.h2d(sd, qx.scales())?;
-        self.h2d(qd, qx.quants())?;
+        let (sd, qd) = self.quantized(x, n_blocks)?;
+        let od = self.mirror_out(out)?;
 
         let (mut n_in, mut n_out) = (w.n_in as i32, w.n_out as i32);
         let (mut wd, mut sd, mut qd, mut od) = (wd, sd, qd, od);
@@ -264,7 +390,7 @@ impl Cuda {
         // 128 threads is four warps, so four output rows per block.
         let block = 128u32;
         let rows_per_block = (block / 32) as usize;
-        let shared = (rows_per_block * (w.n_in / 32) * 4) as u32;
+        let shared = (rows_per_block * n_blocks * 4) as u32;
         // SAFETY: parameters match `matmul_q8_0_warp`; the grid covers exactly
         // `n_out` rows and `shared` is `warps * n_blocks` floats, which is what
         // the kernel indexes.
@@ -277,7 +403,7 @@ impl Cuda {
                 &mut params,
             )?
         };
-        self.d2h(out, od)
+        Ok(())
     }
 
     fn rope_impl(
@@ -292,21 +418,25 @@ impl Cuda {
         // does. CUDA's double `pow` and `sincos` are not obliged to return
         // glibc's bits, and a one-ulp angle is a real output difference.
         let half = head_dim / 2;
-        let mut cos = Vec::with_capacity(half);
-        let mut sin = Vec::with_capacity(half);
-        for i in 0..half {
-            let freq = (theta_base as f64).powf(-2.0 * i as f64 / head_dim as f64);
-            let (s, c) = (pos as f64 * freq).sin_cos();
-            cos.push(c as f32);
-            sin.push(s as f32);
-        }
-
         let cd = self.pooled(slot::COS, half * 4)?;
         let sd = self.pooled(slot::SIN, half * 4)?;
-        let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        self.h2d(cd, &cos)?;
-        self.h2d(sd, &sin)?;
-        self.h2d(xd, x)?;
+
+        // Same table for every layer of a token, so build and send it once.
+        let key = (pos, head_dim, theta_base.to_bits());
+        if self.rope_pos.get() != Some(key) {
+            let mut cos = Vec::with_capacity(half);
+            let mut sin = Vec::with_capacity(half);
+            for i in 0..half {
+                let freq = (theta_base as f64).powf(-2.0 * i as f64 / head_dim as f64);
+                let (s, c) = (pos as f64 * freq).sin_cos();
+                cos.push(c as f32);
+                sin.push(s as f32);
+            }
+            self.h2d(cd, &cos)?;
+            self.h2d(sd, &sin)?;
+            self.rope_pos.set(Some(key));
+        }
+        let xd = self.mirror_in(x)?;
 
         let (mut hd, mut nh) = (head_dim as i32, n_heads as i32);
         let (mut cd, mut sd, mut xd) = (cd, sd, xd);
@@ -328,28 +458,26 @@ impl Cuda {
                 &mut params,
             )?
         };
-        self.d2h(x, xd)
+        self.mirror_out(x).map(|_| ())
     }
 
     fn softmax_impl(&self, x: &mut [f32]) -> Result<()> {
-        let xd = self.pooled(slot::X, std::mem::size_of_val(x))?;
-        self.h2d(xd, x)?;
+        let xd = self.mirror_in(x)?;
 
         let (mut n, mut rows) = (x.len() as i32, 1i32);
         let mut xd = xd;
         let mut params = [arg(&mut n), arg(&mut rows), arg(&mut xd)];
         // SAFETY: parameters match `softmax_rows`; one row, so one thread.
         unsafe { self.launch("softmax_rows", 1, 1, &mut params)? };
-        self.d2h(x, xd)
+        self.mirror_out(x).map(|_| ())
     }
 
     fn attend_impl(&self, a: &Attn<'_>, out: &mut [f32]) -> Result<()> {
         let kd = self.kv_resident(a.k, a.n_pos, a.kv_dim)?;
         let vd = self.kv_resident(a.v, a.n_pos, a.kv_dim)?;
-        let qd = self.pooled(slot::Q, std::mem::size_of_val(a.q))?;
+        let qd = self.mirror_in(a.q)?;
         let sd = self.pooled(slot::SCORES, a.n_head * a.n_pos * 4)?;
-        let od = self.pooled(slot::OUT, std::mem::size_of_val(out))?;
-        self.h2d(qd, a.q)?;
+        let od = self.mirror_out(out)?;
 
         let mut n_pos = a.n_pos as i32;
         let mut kv_dim = a.kv_dim as i32;
@@ -382,14 +510,12 @@ impl Cuda {
                 &mut params,
             )?
         };
-        self.d2h(out, od)
+        Ok(())
     }
 
     fn silu_mul_impl(&self, gate: &mut [f32], up: &[f32]) -> Result<()> {
-        let gd = self.pooled(slot::X, std::mem::size_of_val(gate))?;
-        let ud = self.pooled(slot::AUX, std::mem::size_of_val(up))?;
-        self.h2d(gd, gate)?;
-        self.h2d(ud, up)?;
+        let gd = self.mirror_in(gate)?;
+        let ud = self.mirror_in(up)?;
 
         let mut n = gate.len() as i32;
         let (mut gd, mut ud) = (gd, ud);
@@ -404,14 +530,12 @@ impl Cuda {
                 &mut params,
             )?
         };
-        self.d2h(gate, gd)
+        self.mirror_out(gate).map(|_| ())
     }
 
     fn add_assign_impl(&self, a: &mut [f32], b: &[f32]) -> Result<()> {
-        let ad = self.pooled(slot::X, std::mem::size_of_val(a))?;
-        let bd = self.pooled(slot::AUX, std::mem::size_of_val(b))?;
-        self.h2d(ad, a)?;
-        self.h2d(bd, b)?;
+        let ad = self.mirror_in(a)?;
+        let bd = self.mirror_in(b)?;
 
         let mut n = a.len() as i32;
         let (mut ad, mut bd) = (ad, bd);
@@ -426,7 +550,7 @@ impl Cuda {
                 &mut params,
             )?
         };
-        self.d2h(a, ad)
+        self.mirror_out(a).map(|_| ())
     }
 }
 
@@ -461,6 +585,33 @@ impl Ops for Cuda {
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
         self.note(self.add_assign_impl(a, b));
+    }
+
+    fn host_wrote(&self, buf: &[f32]) {
+        if let Some(m) = self.mirrors.borrow_mut().get_mut(&(buf.as_ptr() as usize)) {
+            m.invalidate();
+        }
+    }
+
+    fn host_needs(&self, buf: &mut [f32]) {
+        let key = buf.as_ptr() as usize;
+        let ptr = match self.mirrors.borrow().get(&key) {
+            Some(m) if m.device_current => m.buf.ptr,
+            _ => return,
+        };
+        self.note(self.d2h(buf, ptr));
+    }
+
+    fn begin_pass(&self) {
+        // Activation buffers are allocated per pass, so an address from the
+        // last pass may name a different buffer now. Every mirror is marked
+        // stale, which forces a re-upload before anything reads it — that is
+        // what makes keying on an address safe. The device allocations are
+        // kept: freeing and reallocating ~280 of them per token costs far more
+        // than it saves.
+        for m in self.mirrors.borrow_mut().values_mut() {
+            m.invalidate();
+        }
     }
 }
 
@@ -497,5 +648,17 @@ impl Ops for &Cuda {
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
         (*self).add_assign(a, b)
+    }
+
+    fn host_wrote(&self, buf: &[f32]) {
+        (*self).host_wrote(buf)
+    }
+
+    fn host_needs(&self, buf: &mut [f32]) {
+        (*self).host_needs(buf)
+    }
+
+    fn begin_pass(&self) {
+        (*self).begin_pass()
     }
 }

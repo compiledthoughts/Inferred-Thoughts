@@ -298,4 +298,37 @@ __global__ void matmul_q8_0_warp(int n_in, int n_out,
     }
 }
 
+// Quantize an activation to Q8_0, one thread per 32-element block.
+//
+// This exists so a matmul's input never has to come back to the host. It was
+// done on the CPU at first precisely because it is the one place a rounding
+// mode could differ: the scale is stored as f16 and read back, so `d` must
+// round the way `quant::half::f32_to_f16` rounds it. Both are round-to-nearest-
+// even, and `tests/cuda_ops.rs` checks that on real data rather than trusting
+// the docs.
+//
+// Mirrors `quantize_row_q8_0_ref` in ggml-quants.c, as ops::naive does.
+__global__ void quantize_q8_0(int n_blocks, const float *__restrict__ x,
+                              float *__restrict__ scales,
+                              signed char *__restrict__ quants) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+
+    const float *blk = x + (size_t)b * 32;
+    float amax = 0.0f;
+    for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(blk[k]));
+
+    const float d = amax / 127.0f;
+    const float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+
+    // Stored as f16 and read back, exactly as the reference does.
+    scales[b] = __half2float(__float2half(d));
+
+    signed char *q = quants + (size_t)b * 32;
+    for (int k = 0; k < 32; ++k) {
+        // roundf is half-away-from-zero, which is what Rust's f32::round does.
+        q[k] = (signed char)roundf(blk[k] * id);
+    }
+}
+
 } // extern "C"

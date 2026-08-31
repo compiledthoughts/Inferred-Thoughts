@@ -124,4 +124,32 @@ pub trait Ops {
 
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);
+
+    // ------------------------------------------------------- residency hints
+    //
+    // Three no-ops that exist for backends whose memory is not the caller's.
+    //
+    // A CPU backend reads and writes the very slices the model owns, so it
+    // needs none of this and gets the defaults. A device backend keeps its own
+    // copy, and then "the model wrote this" and "the model is about to read
+    // this" stop being free facts — they are exactly the moments the two copies
+    // have to agree. Naming those moments is what lets a device keep an
+    // activation resident across a whole layer instead of shipping it home
+    // after every operation.
+    //
+    // Deliberately *hints about the host*, not a buffer abstraction. Who owns
+    // an activation, and whether a tensor handle should replace `&[f32]`
+    // wholesale, is a larger question; this is the smallest thing that lets the
+    // GPU stop round-tripping without answering it.
+
+    /// The model wrote `buf` directly. Any device copy is now stale.
+    fn host_wrote(&self, _buf: &[f32]) {}
+
+    /// The model is about to read `buf`. Bring back whatever the device has.
+    fn host_needs(&self, _buf: &mut [f32]) {}
+
+    /// A forward pass is starting. Activation buffers are allocated per pass,
+    /// so an address seen last time may be a different buffer now; anything
+    /// remembered about host addresses must be dropped.
+    fn begin_pass(&self) {}
 }

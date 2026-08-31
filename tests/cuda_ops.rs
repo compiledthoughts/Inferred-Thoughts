@@ -15,6 +15,12 @@
 //!   ulp, not a fudge factor: if one of these is off by more than that, the
 //!   accumulation order is wrong, not the library.
 //!
+//! Each op is bracketed by `begin_pass` and `host_needs`, which is the
+//! residency contract the seam now carries: a device backend leaves its result
+//! on the card and the caller says when it wants it on the host. Without the
+//! `host_needs` these comparisons read an untouched buffer — which is exactly
+//! how this test caught the first version of that change.
+//!
 //! ```text
 //! cargo test --release --features cuda --test cuda_ops -- --ignored --nocapture
 //! ```
@@ -109,7 +115,9 @@ fn every_op_agrees_with_the_oracle() {
         let w = noise(n, 2);
         let (mut a, mut b) = (vec![0.0; n], vec![0.0; n]);
         Naive.rms_norm(&x, &w, eps, &mut a);
+        gpu.begin_pass();
         gpu.rms_norm(&x, &w, eps, &mut b);
+        gpu.host_needs(&mut b);
         exact("rms_norm", &a, &b);
     }
 
@@ -120,7 +128,9 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let w = noise(head_dim, 4);
         Naive.rms_norm_heads(&mut a, &w, head_dim, eps);
+        gpu.begin_pass();
         gpu.rms_norm_heads(&mut b, &w, head_dim, eps);
+        gpu.host_needs(&mut b);
         exact("rms_norm_heads", &a, &b);
     }
 
@@ -138,7 +148,9 @@ fn every_op_agrees_with_the_oracle() {
         let x = noise(n_in, 6);
         let (mut a, mut b) = (vec![0.0; n_out], vec![0.0; n_out]);
         Naive.matmul(&w, &x, &mut a);
+        gpu.begin_pass();
         gpu.matmul(&w, &x, &mut b);
+        gpu.host_needs(&mut b);
         exact("matmul_q8_0", &a, &b);
     }
 
@@ -148,7 +160,9 @@ fn every_op_agrees_with_the_oracle() {
         let mut a = noise(head_dim * n_heads, 7);
         let mut b = a.clone();
         Naive.rope_neox(&mut a, 37, head_dim, n_heads, 1.0e6);
+        gpu.begin_pass();
         gpu.rope_neox(&mut b, 37, head_dim, n_heads, 1.0e6);
+        gpu.host_needs(&mut b);
         exact("rope_neox", &a, &b);
     }
 
@@ -158,7 +172,9 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let other = noise(n, 9);
         Naive.add_assign(&mut a, &other);
+        gpu.begin_pass();
         gpu.add_assign(&mut b, &other);
+        gpu.host_needs(&mut b);
         exact("add_assign", &a, &b);
     }
 
@@ -167,7 +183,9 @@ fn every_op_agrees_with_the_oracle() {
         let mut a = noise(384, 10);
         let mut b = a.clone();
         Naive.softmax(&mut a);
+        gpu.begin_pass();
         gpu.softmax(&mut b);
+        gpu.host_needs(&mut b);
         close("softmax", &a, &b, 1e-7);
     }
 
@@ -177,7 +195,9 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let up = noise(n, 12);
         Naive.silu_mul(&mut a, &up);
+        gpu.begin_pass();
         gpu.silu_mul(&mut b, &up);
+        gpu.host_needs(&mut b);
         close("silu_mul", &a, &b, 1e-6);
     }
 
@@ -204,7 +224,9 @@ fn every_op_agrees_with_the_oracle() {
         };
         let (mut a, mut b) = (vec![0.0; n_head * head_dim], vec![0.0; n_head * head_dim]);
         Naive.attend(&attn, &mut a);
+        gpu.begin_pass();
         gpu.attend(&attn, &mut b);
+        gpu.host_needs(&mut b);
         close("attend", &a, &b, 1e-6);
     }
 
@@ -296,31 +318,57 @@ fn only_the_expf_ops_diverge() {
 
     /// The five exact kernels on the GPU, the three exp-dependent ones on the
     /// CPU. Not a backend anyone should run — a bisection instrument.
+    ///
+    /// It is also the first thing in this project to straddle the two devices,
+    /// and it has to honour the residency contract to do it: every GPU result
+    /// is pulled home so the following CPU op can read it, and every CPU write
+    /// is announced so a later GPU op does not trust a stale copy. That is the
+    /// same bookkeeping a real CPU/GPU layer split will need, at a granularity
+    /// no real split would choose.
     struct ExactOnly<'a>(&'a Cuda);
     impl Ops for ExactOnly<'_> {
         fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
-            self.0.rms_norm(x, w, eps, out)
+            self.0.rms_norm(x, w, eps, out);
+            self.0.host_needs(out);
         }
         fn rms_norm_heads(&self, x: &mut [f32], w: &[f32], head_dim: usize, eps: f32) {
-            self.0.rms_norm_heads(x, w, head_dim, eps)
+            self.0.rms_norm_heads(x, w, head_dim, eps);
+            self.0.host_needs(x);
         }
         fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
-            self.0.matmul(w, x, out)
+            self.0.matmul(w, x, out);
+            self.0.host_needs(out);
         }
         fn rope_neox(&self, x: &mut [f32], p: usize, hd: usize, nh: usize, theta: f32) {
-            self.0.rope_neox(x, p, hd, nh, theta)
+            self.0.rope_neox(x, p, hd, nh, theta);
+            self.0.host_needs(x);
         }
         fn add_assign(&self, a: &mut [f32], b: &[f32]) {
-            self.0.add_assign(a, b)
+            self.0.add_assign(a, b);
+            self.0.host_needs(a);
         }
+
         fn softmax(&self, x: &mut [f32]) {
-            Naive.softmax(x)
+            Naive.softmax(x);
+            self.0.host_wrote(x);
         }
         fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
-            Naive.silu_mul(gate, up)
+            Naive.silu_mul(gate, up);
+            self.0.host_wrote(gate);
         }
         fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
-            Naive.attend(a, out)
+            Naive.attend(a, out);
+            self.0.host_wrote(out);
+        }
+
+        fn host_wrote(&self, buf: &[f32]) {
+            self.0.host_wrote(buf)
+        }
+        fn host_needs(&self, buf: &mut [f32]) {
+            self.0.host_needs(buf)
+        }
+        fn begin_pass(&self) {
+            self.0.begin_pass()
         }
     }
 
