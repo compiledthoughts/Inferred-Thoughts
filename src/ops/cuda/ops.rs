@@ -486,30 +486,76 @@ impl Cuda {
         let mut n_head_kv = a.n_head_kv as i32;
         let mut scale = a.scale;
         let (mut qd, mut kd, mut vd, mut sd, mut od) = (qd, kd, vd, sd, od);
-        let mut params = [
-            arg(&mut n_pos),
-            arg(&mut kv_dim),
-            arg(&mut head_dim),
-            arg(&mut n_head),
-            arg(&mut n_head_kv),
-            arg(&mut scale),
-            arg(&mut qd),
-            arg(&mut kd),
-            arg(&mut vd),
-            arg(&mut sd),
-            arg(&mut od),
-        ];
-        let block = 32u32;
-        // SAFETY: parameters match `attend`; the KV mirrors hold at least
-        // `n_pos` positions and `scores` is `n_head * n_pos` floats.
-        unsafe {
-            self.launch(
-                "attend",
-                a.n_head.div_ceil(block as usize) as u32,
-                block,
-                &mut params,
-            )?
-        };
+        let block = 256u32;
+
+        // Pass 1: one thread per (query head, position).
+        {
+            let mut params = [
+                arg(&mut n_pos),
+                arg(&mut kv_dim),
+                arg(&mut head_dim),
+                arg(&mut n_head),
+                arg(&mut n_head_kv),
+                arg(&mut scale),
+                arg(&mut qd),
+                arg(&mut kd),
+                arg(&mut sd),
+            ];
+            let total = a.n_head * a.n_pos;
+            // SAFETY: parameters match `attn_scores`; the KV mirror holds at
+            // least `n_pos` positions and `scores` is n_head * n_pos floats.
+            unsafe {
+                self.launch(
+                    "attn_scores",
+                    total.div_ceil(block as usize) as u32,
+                    block,
+                    &mut params,
+                )?
+            };
+        }
+
+        // Pass 2: softmax each query head's row of scores, serially, which is
+        // the same kernel the seam's `softmax` uses.
+        {
+            let (mut n, mut rows) = (a.n_pos as i32, a.n_head as i32);
+            let mut params = [arg(&mut n), arg(&mut rows), arg(&mut sd)];
+            let rb = 32u32;
+            // SAFETY: parameters match `softmax_rows`; `scores` holds exactly
+            // `rows` rows of `n`.
+            unsafe {
+                self.launch(
+                    "softmax_rows",
+                    a.n_head.div_ceil(rb as usize) as u32,
+                    rb,
+                    &mut params,
+                )?
+            };
+        }
+
+        // Pass 3: one thread per (query head, element).
+        {
+            let mut params = [
+                arg(&mut n_pos),
+                arg(&mut kv_dim),
+                arg(&mut head_dim),
+                arg(&mut n_head),
+                arg(&mut n_head_kv),
+                arg(&mut vd),
+                arg(&mut sd),
+                arg(&mut od),
+            ];
+            let total = a.n_head * a.head_dim;
+            // SAFETY: parameters match `attn_output`; `out` is n_head *
+            // head_dim floats, which is what the grid covers.
+            unsafe {
+                self.launch(
+                    "attn_output",
+                    total.div_ceil(block as usize) as u32,
+                    block,
+                    &mut params,
+                )?
+            };
+        }
         Ok(())
     }
 

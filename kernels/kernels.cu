@@ -170,52 +170,73 @@ __global__ void softmax_rows(int n, int n_rows, float *__restrict__ x) {
     for (int i = 0; i < n; ++i) row[i] /= sum;
 }
 
-// Whole-token attention, **one thread per query head**.
+// Attention in three passes, each parallel over something the oracle treats as
+// independent. Still bit-exact apart from softmax's `expf`.
 //
-// That is a deliberately poor decomposition for a GPU — 16 threads for the
-// 0.6B, so 16 of 36 SMs hold one warp lane each — but it is the decomposition
-// that reproduces the oracle: every dot product and every weighted sum keeps
-// its serial index order, and each query head owns disjoint output. Splitting a
-// head across threads is the next kernel, and it is where the accumulation
-// order has to change.
+// The first version of this ran **one thread per query head** — sixteen threads
+// on a thirty-six SM card — walking every position serially. It was chosen
+// because it obviously reproduced `ops::naive`'s accumulation order, and it
+// made attention 96% of decode time and the only term that grew with context.
 //
-// `scores` is caller-provided scratch, n_head * n_pos floats.
-__global__ void attend(int n_pos, int kv_dim, int head_dim, int n_head,
-                       int n_head_kv, float scale, const float *__restrict__ q,
-                       const unsigned short *__restrict__ k,
-                       const unsigned short *__restrict__ v,
-                       float *__restrict__ scores, float *__restrict__ out) {
-    int hq = blockIdx.x * blockDim.x + threadIdx.x;
-    if (hq >= n_head) return;
+// The order can be kept with far more parallelism, because two of the three
+// loops are over genuinely independent outputs:
+//
+//   scores   one thread per (query head, position). The dot over head_dim stays
+//            serial inside the thread, so it is the oracle's order.
+//   softmax  one thread per query head, serial over positions. Unchanged.
+//   output   one thread per (query head, element). Each thread accumulates over
+//            positions in ascending order, which is the order `naive` uses —
+//            it walks positions outermost and elements innermost, so element
+//            `i` sees the same additions in the same sequence.
+//
+// Only the reduction *within* a dot product would have to be split to go
+// further, and that is the one that would cost exactness.
 
-    const int group = n_head / n_head_kv;
-    const int off = (hq / group) * head_dim;   // this query head's kv head
+// Attention scores: q . k, scaled. One thread per (query head, position).
+__global__ void attn_scores(int n_pos, int kv_dim, int head_dim, int n_head,
+                            int n_head_kv, float scale,
+                            const float *__restrict__ q,
+                            const unsigned short *__restrict__ k,
+                            float *__restrict__ scores) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * n_pos) return;
+
+    const int hq = idx / n_pos;
+    const int s = idx % n_pos;
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+
     const float *qh = q + (size_t)hq * head_dim;
-    float *sc = scores + (size_t)hq * n_pos;
+    const unsigned short *key = k + (size_t)s * kv_dim + off;
 
-    for (int s = 0; s < n_pos; ++s) {
-        const unsigned short *key = k + (size_t)s * kv_dim + off;
-        float dot = 0.0f;
-        for (int i = 0; i < head_dim; ++i) dot += qh[i] * h2f(key[i]);
-        sc[s] = dot * scale;
-    }
+    float dot = 0.0f;
+    for (int i = 0; i < head_dim; ++i) dot += qh[i] * h2f(key[i]);
+    scores[(size_t)hq * n_pos + s] = dot * scale;
+}
 
-    float mx = -INFINITY;
-    for (int s = 0; s < n_pos; ++s) mx = fmaxf(mx, sc[s]);
-    float sum = 0.0f;
-    for (int s = 0; s < n_pos; ++s) {
-        sc[s] = expf(sc[s] - mx);
-        sum += sc[s];
-    }
-    for (int s = 0; s < n_pos; ++s) sc[s] /= sum;
+// Weighted sum of values. One thread per (query head, element of head_dim).
+//
+// Adjacent threads hold adjacent `i`, and read `v[s*kv_dim + off + i]`, so the
+// warp covers consecutive elements — coalesced, and it falls out of the
+// decomposition rather than being arranged for.
+__global__ void attn_output(int n_pos, int kv_dim, int head_dim, int n_head,
+                            int n_head_kv,
+                            const unsigned short *__restrict__ v,
+                            const float *__restrict__ scores,
+                            float *__restrict__ out) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_head * head_dim) return;
 
-    float *o = out + (size_t)hq * head_dim;
-    for (int i = 0; i < head_dim; ++i) o[i] = 0.0f;
+    const int hq = idx / head_dim;
+    const int i = idx % head_dim;
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+
+    const float *sc = scores + (size_t)hq * n_pos;
+
+    float acc = 0.0f;
     for (int s = 0; s < n_pos; ++s) {
-        const unsigned short *val = v + (size_t)s * kv_dim + off;
-        const float w = sc[s];
-        for (int i = 0; i < head_dim; ++i) o[i] += w * h2f(val[i]);
+        acc += sc[s] * h2f(v[(size_t)s * kv_dim + off + i]);
     }
+    out[(size_t)hq * head_dim + i] = acc;
 }
 
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.
