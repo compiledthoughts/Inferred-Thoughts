@@ -19,7 +19,10 @@
 //! builds and tests the rest of the crate.
 
 pub mod ffi;
+mod ops;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 
 use crate::error::{Error, Result};
@@ -50,6 +53,39 @@ pub struct Cuda {
     capability: (i32, i32),
     sm_count: i32,
     total_mem: usize,
+
+    /// Host pointer -> its device copy, for anything that does not change
+    /// between calls: quantized weight matrices and the f32 norm vectors.
+    ///
+    /// Without this the backend would re-upload every weight it touches on
+    /// every call. The 0.6B reads 0.59 GiB per forward pass, which at the
+    /// measured 28.6 GB/s is ~22 ms of PCIe per token against a 16.4 ms CPU
+    /// token — the GPU path would lose to the CPU for reasons that have
+    /// nothing to do with any kernel. Keying on the mmap pointer works because
+    /// `Weights` borrows the mapping, so the address is stable for the run.
+    weights: RefCell<HashMap<usize, DeviceBuffer>>,
+
+    /// Host pointer -> device mirror of one layer's K or V slab.
+    ///
+    /// The KV cache only ever appends, so each call uploads the positions
+    /// added since the last one rather than the whole slab. Re-uploading would
+    /// be ~8 MB per layer per token at 4k context; the delta is 2 KB.
+    kv: RefCell<HashMap<usize, KvMirror>>,
+
+    /// Reusable device scratch, indexed by role. Growable, never shrunk, so a
+    /// steady-state token allocates nothing.
+    pool: RefCell<Vec<DeviceBuffer>>,
+
+    /// The first driver error any op hit. See `Cuda::take_error`.
+    error: RefCell<Option<Error>>,
+}
+
+/// A device mirror of a host KV slab, and how much of it is current.
+struct KvMirror {
+    buf: DeviceBuffer,
+    /// Positions already copied. A smaller `n_pos` than this means the cache
+    /// was reset, so the mirror is refilled from the start.
+    uploaded: usize,
 }
 
 // SAFETY: a CUDA context is usable from any thread that has it current, and we
@@ -133,6 +169,10 @@ impl Cuda {
                 capability,
                 sm_count,
                 total_mem,
+                weights: RefCell::new(HashMap::new()),
+                kv: RefCell::new(HashMap::new()),
+                pool: RefCell::new(Vec::new()),
+                error: RefCell::new(None),
             })
         }
     }
@@ -182,6 +222,47 @@ impl Cuda {
     pub fn sync(&self) -> Result<()> {
         // SAFETY: no arguments; only reports the context's status.
         unsafe { check(ffi::cuCtxSynchronize(), "cuCtxSynchronize") }
+    }
+
+    /// Launch a kernel by name over a 1-D grid, then block until it finishes.
+    ///
+    /// Synchronizing on every launch is the naive shape, and deliberate: the
+    /// `Ops` seam hands each method host slices and expects host slices back,
+    /// so every call is a self-contained round trip whatever we do here. What
+    /// that costs is one of the things this backend exists to measure.
+    ///
+    /// # Safety
+    /// `params` must match the named kernel's signature, and every device
+    /// pointer in it must address an allocation large enough for the extents
+    /// the kernel will walk.
+    unsafe fn launch(
+        &self,
+        name: &'static str,
+        grid: u32,
+        block: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        let f = self.function(name)?;
+        // SAFETY: the caller's contract, documented above.
+        unsafe {
+            check(
+                ffi::cuLaunchKernel(
+                    f,
+                    grid,
+                    1,
+                    1,
+                    block,
+                    1,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )?
+        };
+        self.sync()
     }
 
     /// `y = a * x + y`, elementwise. The toolchain proof.
@@ -338,6 +419,36 @@ impl DeviceBuffer {
         unsafe {
             check(
                 ffi::cuMemcpyHtoD_v2(self.ptr, data.as_ptr() as *const c_void, bytes),
+                "cuMemcpyHtoD",
+            )
+        }
+    }
+
+    /// Copy a host slice in at a byte offset, for appending to a buffer whose
+    /// earlier contents are still wanted.
+    pub fn write_at<T: Copy>(&self, offset_bytes: usize, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if offset_bytes + bytes > self.bytes {
+            return Err(Error::Cuda {
+                what: "cuMemcpyHtoD",
+                detail: format!(
+                    "{bytes} bytes at offset {offset_bytes} into a {} byte buffer",
+                    self.bytes
+                ),
+            });
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        // SAFETY: `data` is valid for `bytes` and the device range was checked
+        // above. `T: Copy` means there is nothing to drop or relocate.
+        unsafe {
+            check(
+                ffi::cuMemcpyHtoD_v2(
+                    self.ptr + offset_bytes as u64,
+                    data.as_ptr() as *const c_void,
+                    bytes,
+                ),
                 "cuMemcpyHtoD",
             )
         }

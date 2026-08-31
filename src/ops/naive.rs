@@ -272,6 +272,16 @@ pub(crate) struct QuantizedRow {
 }
 
 impl QuantizedRow {
+    /// One f16-rounded scale per 32 elements.
+    pub(crate) fn scales(&self) -> &[f32] {
+        &self.scales
+    }
+
+    /// The quantized elements, 32 per scale.
+    pub(crate) fn quants(&self) -> &[i8] {
+        &self.quants
+    }
+
     pub(crate) fn from_f32(x: &[f32]) -> Self {
         let n_blocks = x.len() / QK8_0;
         let mut scales = Vec::with_capacity(n_blocks);

@@ -4,13 +4,18 @@ A from-scratch Rust inference engine for GGUF models. Built toward serving an
 MoE model whose weights do not fit in VRAM — see `HANDOFF.md` for why, and
 `CLAUDE.md` for how.
 
-**Status:** Stages 1–6 complete, plus a CUDA toolchain spike and the `qwen35`
-architecture decoded. Loads a GGUF, tokenizes exactly like llama.cpp, and
-generates coherent text on Qwen3-0.6B at **~59 tok/s** decode — within
-**1.09–1.15x** of llama.cpp on the same CPU, with scalar f32 kernels and
-results bit-identical to a single-threaded oracle. KV cache, prefill/decode
-split, threaded attention, a spin-waiting thread pool, a chat template, and a
-profiler. 116 tests, plus 15 more that need a model on disk. Runs on CPU.
+**Status: v0.1.** Stages 1–6 complete, the `qwen35` architecture decoded, and
+the forward pass running on **both CPU and GPU**. Loads a GGUF, tokenizes
+exactly like llama.cpp, and generates coherent text on Qwen3-0.6B at **~59
+tok/s** decode on the CPU — within **1.09–1.15x** of llama.cpp on the same
+CPU, with scalar f32 kernels and results bit-identical to a single-threaded
+oracle. KV cache, prefill/decode split, threaded attention, a spin-waiting
+thread pool, a chat template, and a profiler. 116 tests by default, 120 with
+`--features cuda`, plus 19 that need a model or a device.
+
+The CUDA backend is **correct and slow on purpose** — 14.2 tok/s against the
+CPU's 62.6 and llama.cpp's 337.5 on the same card. See "The CUDA backend"
+below for what that measured.
 
 ## Progress
 
@@ -24,6 +29,7 @@ All figures are Qwen3-0.6B Q8_0 on the machine in `CLAUDE.md` — Ryzen 7 9700X,
 | **v2** | **19.9 tok/s @ d384**<br>*24.0 @ d64* | + `Ops::attend`, threaded over kv heads | block-wise f16 conversion, `--chat`, `--show-special`, honest stop reasons | 94 tests + 11 model-backed; forward pass **byte-identical** to v1 | Attention growth cut **3.4x** (29.5 → 8.6 ms over 320 positions) with **zero** numeric change — f16→f32 is lossless, so hoisting it out of the dot product cannot move a bit |
 | **v3** | **46.9 tok/s @ d384**<br>*58.4 @ d64* | + `spin` — persistent spin-waiting pool, every matmul threaded | `src/ops/pool.rs`, the crate's only `unsafe`; `naive` is now `#![forbid(unsafe_code)]` | 106 tests + 13 model-backed; bit-identical to `naive` at 2/3/5/8 threads | **A rayon parallel region costs ~430 µs here; a spin barrier costs 0.40 µs — 1088x.** Threading was never the problem, dispatch was. Decode bandwidth 12 → **37 GB/s** |
 | **v4** | **53.0 tok/s @ d384**<br>*59.5 @ d64* | same, built for the actual CPU | branch-free `f16_to_f32`; `-C target-cpu=native` | 108 tests + 13 model-backed; forward pass still **byte-identical** to v1 | We had been compiling **SSE2-only on a Zen 5**. Enabling AVX-512 doubled attention (2.05x) and did **nothing** for the dense matmuls — the cleanest confirmation yet that one is compute-bound and the other DDR5-bound |
+| **v0.1** | **14.2 tok/s**<br>*on the GPU* | + `cuda` — all eight ops as kernels | weights resident in VRAM, KV mirrored on device, `--backend cuda` | 120 tests + 19 device/model-backed; five kernels **bit-identical** to `naive` through the whole model | **The seam costs 25.4 ms of a 70.4 ms token.** A round trip through `Ops` is 56.4 us and a decode step makes ~450 of them, so 36% of the token is spent before any arithmetic. Same shape as v3's rayon finding, one layer down |
 | **since v4**<br>`402d262`<br>`29b6f02`<br>`e34ec08` | unchanged | same | Q5_K, Q6_K, IQ4_XS; a CUDA driver-API spike — sm_120 PTX from `build.rs` and one bit-exact kernel; the `qwen35` config decoded and shape-checked | 116 tests + 15 model-backed; the three new quants **bit-exact** against `gguf.quants` on 65,536 real weights each, taken from the 35B itself | Reading the 35B rather than trusting notes about it: **40 blocks not 41, embedding 2048 not 4096**, and it needs **three** k-quant formats — `Q6_K` appeared on no prior list. Structural unit tests hold independently of the fixtures, so a regenerated fixture cannot bless a layout error |
 
 For scale, llama.cpp on the same CPU, same model, same 16-token prompt:
@@ -53,6 +59,75 @@ tok/s on Qwen3.6-35B-A3B (60 with MTP), which is where the offload policy
 actually matters. For the other end of that range: the same model with no GPU
 at all decodes at **5.17 tok/s**. The running log in `HANDOFF.md` records that
 measurement, and also why it is not yet trustworthy.
+
+## The CUDA backend
+
+```bash
+cargo build --release --features cuda
+$B generate -m $MODEL -p "..." -n 64 --backend cuda
+```
+
+The whole forward pass runs on the GPU: all eight `Ops` methods as kernels,
+weights uploaded once and kept in VRAM, the KV cache mirrored on device and
+appended to rather than resent. Qwen3-0.6B Q8_0, 64 tokens, median of three:
+
+| | tok/s | ms/token | effective |
+|---|---|---|---|
+| ours, `cuda` | **14.20** | 70.4 | 9.1 GB/s |
+| ours, `spin`, 8 threads | 62.59 | 16.0 | 39.9 GB/s |
+| llama.cpp, CUDA, `-ngl 99` | **337.54** | 3.0 | 214 GB/s |
+
+**Slower than our own CPU backend, and that is the finding.** llama.cpp reaches
+48% of the card's 448 GB/s at batch 1; we reach 2%.
+
+The cause was measured, not guessed. At context 128 — where attention should be
+nearly free — the attention half is 66% of decode time, and the ratio between
+the two halves tracks their *op counts*, not their bytes. So the fixed per-call
+cost was timed directly:
+
+| | |
+|---|---|
+| `cuLaunchKernel` + `cuCtxSynchronize` | 18.7 us |
+| the same wrapped in 4 KiB H2D + D2H | **56.4 us** |
+| ~450 `Ops` calls per decode step, so the floor is | **25.4 ms/token** |
+
+36% of the token is spent before any arithmetic. No kernel work recovers it:
+the `Ops` seam takes host slices and returns host slices, so every op is a round
+trip by construction. This is v3's rayon result one layer down — a fixed
+per-dispatch cost found by measuring the dispatch instead of the payload.
+
+The remaining 64% is kernels written for exactness rather than for the machine:
+one thread per output row in the matmul (uncoalesced by construction) and a
+single-threaded f64 reduction in RMSNorm.
+
+### Exactness
+
+| kernels | against `naive` |
+|---|---|
+| `matmul`, `rms_norm`, `rms_norm_heads`, `rope_neox`, `add_assign` | **bit-identical** |
+| `softmax`, `silu_mul`, `attend` | ≤ 5.2e-8, about one ulp |
+
+The three that differ all call `expf`, and CUDA's is not obliged to match
+glibc's. The obstacle was not the expected one: *parallel reductions* were
+assumed to be what costs bit-exactness, but keeping each reduction serial kept
+it — what actually breaks exactness is one libm function.
+
+Whole-model divergence is 1.47e-2 of logit magnitude, which is what `CLAUDE.md`
+predicts for a one-ulp perturbation amplified through 28 layers of Q8_0
+re-quantization. Greedy decoding does flip a token within a dozen.
+
+Rather than argue about whether that was drift or a defect, there is a test for
+it: `only_the_expf_ops_diverge` runs the five exact kernels on the GPU and the
+three exp-dependent ones on the CPU and asserts **bit equality on all 151,936
+logits**. It passes, which leaves `expf` as the only explanation — and makes any
+future GPU divergence bisectable in one run.
+
+```bash
+cargo test --release --features cuda --test cuda_ops -- --ignored --nocapture
+```
+
+**This tests none of the offload thesis.** The 0.6B is 0.59 GiB against 14.80
+GiB free. It bought the device path, the kernels, and the number above.
 
 ## Build
 
@@ -145,7 +220,7 @@ inferred trace    -m -p     one forward pass, checksumming every tensor
 | `-n`, `--max-tokens <N>` | `16` | a ceiling, not a target — EOS stops earlier unless `--ignore-eos` |
 | `-c`, `--ctx <N>` | `4096` | KV positions, allocated up front. Trades memory for the longest usable context; the banner prints the resulting resident size |
 | `-t`, `--threads <N>` | `0` | `0` means physical cores, taken as half the logical count — SMT siblings do not help a memory-bound kernel. **`1` bypasses the pool entirely and runs `naive`**, the scalar oracle |
-| `--backend <NAME>` | `spin` | `spin` or `par`. Ignored at `-t 1`. An unknown name is an error, not a fallback |
+| `--backend <NAME>` | `spin` | `spin`, `par`, or `cuda` when built with `--features cuda`. `cuda` ignores `-t`; the other two are ignored at `-t 1`. An unknown name is an error, not a fallback |
 | `--chat` | off | wrap the prompt as a chat turn (see above) |
 | `--show-special` | off | render special tokens such as `<think>` instead of dropping them |
 | `--ignore-eos` | off | keep decoding past the end-of-sequence token |
@@ -275,8 +350,10 @@ python scripts/check_q8_matmul.py                       # isolate the Q8_0 matmu
 
 - `qwen3` only; no MoE, no GatedDeltaNet. Quant support covers what the three
   target models use: F32, F16, BF16, Q8_0, Q5_K, Q6_K, IQ4_XS
-- CUDA is a toolchain spike, not a backend: device, memory, PTX and one
-  bit-exact kernel work, but there is no `Ops` impl so the model runs on CPU
+- The CUDA backend is a *correctness* vehicle. It runs the whole model on the
+  GPU and is 4.4x slower than our own CPU backend, for a measured reason — see
+  below. Only Q8_0 has a matmul kernel, which is every matmul in the models
+  this targets
 - Greedy sampling only
 - Scalar f32 kernels: no SIMD, no GPU, both deliberate. `spin` threads every
   matmul and attention (`-t N`) and scales out to 8 threads

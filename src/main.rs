@@ -71,10 +71,11 @@ enum Command {
         /// Render special tokens such as <think> instead of dropping them.
         #[arg(long)]
         show_special: bool,
-        /// Threaded backend: `spin` (persistent spinning pool) or `par`
-        /// (rayon). Both must produce identical bits to `naive`; `spin` exists
-        /// because a rayon parallel region costs ~430 us on this machine
-        /// against 0.4 us for a spin barrier.
+        /// Backend: `spin` (persistent spinning pool), `par` (rayon), or
+        /// `cuda` if the feature is built. `spin` and `par` must produce
+        /// identical bits to `naive`; `spin` exists because a rayon parallel
+        /// region costs ~430 us on this machine against 0.4 us for a spin
+        /// barrier. `cuda` ignores -t and runs on the GPU.
         #[arg(long, default_value = "spin")]
         backend: String,
     },
@@ -201,7 +202,9 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         o.threads
     };
 
-    let label = if n_threads <= 1 {
+    let label = if o.backend == "cuda" {
+        "cuda".to_string()
+    } else if n_threads <= 1 {
         "naive (1 thread)".to_string()
     } else {
         format!("{} ({n_threads} threads)", o.backend)
@@ -214,6 +217,29 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         if o.chat { " (chat)" } else { "" },
         o.n_ctx,
     );
+
+    // CUDA is checked before the thread count, which it ignores: the device
+    // decides its own parallelism and `-t` describes CPU workers.
+    #[cfg(feature = "cuda")]
+    if o.backend == "cuda" {
+        let cuda = inferred_thoughts::Cuda::new(0)?;
+        let (free, total) = cuda.mem_info()?;
+        let (major, minor) = cuda.capability();
+        eprintln!(
+            "device {} | sm_{major}{minor} | {} SMs | {:.2} of {:.2} GiB free",
+            cuda.name(),
+            cuda.sm_count(),
+            free as f64 / 1073741824.0,
+            total as f64 / 1073741824.0,
+        );
+        // Borrowed, not moved, so the sticky error survives the engine. An op
+        // that failed has produced meaningless output, so this is fatal.
+        let run = run_generation(m, &cuda, &tk, &tokens, &text, &o);
+        return match cuda.take_error() {
+            Some(e) => Err(e),
+            None => run,
+        };
+    }
 
     // One thread means the oracle itself, not a pool of one -- there is no
     // reason to pay a barrier for a single worker, and it makes `-t 1` the
@@ -229,7 +255,14 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         }
         other => Err(inferred_thoughts::Error::InconsistentArchitecture {
             what: "--backend",
-            detail: format!("{other:?} is not a backend; expected \"spin\" or \"par\""),
+            detail: format!(
+                "{other:?} is not a backend; expected \"spin\", \"par\"{}",
+                if cfg!(feature = "cuda") {
+                    " or \"cuda\""
+                } else {
+                    " (\"cuda\" needs --features cuda)"
+                }
+            ),
         }),
     }
 }
