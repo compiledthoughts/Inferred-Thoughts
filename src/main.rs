@@ -30,8 +30,11 @@ enum Command {
     /// Generate text greedily, prefilling the prompt and decoding against a
     /// KV cache.
     Generate {
+        /// Path to the .gguf file. Only the `qwen3` architecture loads today.
         #[arg(short, long)]
         model: String,
+        /// The prompt, as text. Special tokens in it are parsed, so chat
+        /// markers can be written by hand; --chat does it for you.
         #[arg(short, long)]
         prompt: String,
         /// Maximum new tokens to produce.
@@ -54,9 +57,10 @@ enum Command {
         /// Write the profile as JSON, for diffing two runs against each other.
         #[arg(long)]
         profile_json: Option<String>,
-        /// Compute threads. 1 selects the scalar `naive` oracle directly;
-        /// anything more selects `par`, which must produce identical bits.
-        /// 0 means physical cores.
+        /// Compute threads. 1 selects the scalar `naive` oracle directly and
+        /// ignores --backend; anything more selects --backend, which must
+        /// produce identical bits. 0 means physical cores, taken as half the
+        /// logical count when the platform reports an even number.
         #[arg(short = 't', long, default_value_t = 0)]
         threads: usize,
         /// Wrap the prompt as a chat turn, so an instruct model answers instead
@@ -78,8 +82,10 @@ enum Command {
     /// Run one forward pass and print a checksum of every intermediate tensor,
     /// for diffing against `llama-eval-callback`.
     Trace {
+        /// Path to the .gguf file.
         #[arg(short, long)]
         model: String,
+        /// The prompt, as text. One forward pass is run over all of it.
         #[arg(short, long)]
         prompt: String,
         /// Also write every intermediate tensor's full contents here, so a
@@ -156,10 +162,6 @@ fn inspect(path: &str, json: bool, max_array: usize) -> inferred_thoughts::Resul
 
 // -------------------------------------------------------------------- generate
 
-/// Greedy generation, recomputing the whole sequence per token.
-///
-/// This exists so the engine is usable end to end before the KV cache lands.
-/// Cost is quadratic in sequence length by construction; Stage 5 replaces it.
 /// Everything `generate` takes beyond the model and prompt. A struct rather
 /// than nine positional arguments, which is how the wrong flag ends up in the
 /// wrong slot.
