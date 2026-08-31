@@ -378,22 +378,40 @@ fn per_op_round_trip_cost() {
     // Warm the module and the JIT before timing anything.
     gpu.saxpy(1.0, &x, &y, n).expect("warmup");
 
-    let t = Instant::now();
-    for _ in 0..reps {
-        gpu.saxpy(1.0, &x, &y, n).expect("saxpy");
-    }
-    let launch = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    let bench = |label: &str, f: &mut dyn FnMut()| {
+        let t = Instant::now();
+        for _ in 0..reps {
+            f();
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!("  {label:<22} {us:>7.1} us");
+        us
+    };
 
-    let t = Instant::now();
-    for _ in 0..reps {
+    let launch = bench("launch + sync", &mut || {
+        gpu.saxpy(1.0, &x, &y, n).expect("saxpy");
+    });
+    let up = bench("4 KiB h2d", &mut || {
+        x.write(&host).expect("h2d");
+    });
+    let down = bench("4 KiB d2h", &mut || {
+        y.read(&mut back).expect("d2h");
+    });
+    let round_trip = bench("full round trip", &mut || {
         x.write(&host).expect("h2d");
         gpu.saxpy(1.0, &x, &y, n).expect("saxpy");
         y.read(&mut back).expect("d2h");
-    }
-    let round_trip = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    });
 
-    println!("  launch + sync        {launch:>7.1} us");
-    println!("  + 4 KiB h2d/d2h      {round_trip:>7.1} us");
-    println!("  a decode step runs ~450 ops, so the floor is {:.1} ms/token",
-             round_trip * 450.0 / 1000.0);
+    println!(
+        "  -> launch {:.0}%, h2d {:.0}%, d2h {:.0}% of a round trip",
+        100.0 * launch / round_trip,
+        100.0 * up / round_trip,
+        100.0 * down / round_trip
+    );
+    println!(
+        "  a decode step runs ~478 ops, so the floor is {:.1} ms/token \
+         against the CPU's 16.0",
+        round_trip * 478.0 / 1000.0
+    );
 }

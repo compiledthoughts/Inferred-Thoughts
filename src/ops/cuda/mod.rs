@@ -78,6 +78,11 @@ pub struct Cuda {
 
     /// The first driver error any op hit. See `Cuda::take_error`.
     error: RefCell<Option<Error>>,
+
+    /// Resolved kernel handles, by symbol. `cuModuleGetFunction` is a driver
+    /// call and building its argument allocates a `CString`; a decode step
+    /// makes ~478 launches, so neither belongs on that path.
+    functions: RefCell<HashMap<&'static str, ffi::CUfunction>>,
 }
 
 /// A device mirror of a host KV slab, and how much of it is current.
@@ -173,6 +178,7 @@ impl Cuda {
                 kv: RefCell::new(HashMap::new()),
                 pool: RefCell::new(Vec::new()),
                 error: RefCell::new(None),
+                functions: RefCell::new(HashMap::new()),
             })
         }
     }
@@ -242,7 +248,7 @@ impl Cuda {
         block: u32,
         params: &mut [*mut c_void],
     ) -> Result<()> {
-        let f = self.function(name)?;
+        let f = self.cached_function(name)?;
         // SAFETY: the caller's contract, documented above.
         unsafe {
             check(
@@ -262,7 +268,22 @@ impl Cuda {
                 "cuLaunchKernel",
             )?
         };
-        self.sync()
+        // Deliberately no `sync` here. Every `Ops` method ends in a
+        // device-to-host copy on the null stream, which is ordered after this
+        // kernel and is itself synchronous, so an explicit barrier is a second
+        // driver call buying nothing. A launch failure surfaces at that copy.
+        Ok(())
+    }
+
+    /// A kernel handle, resolved once per symbol.
+    fn cached_function(&self, name: &'static str) -> Result<ffi::CUfunction> {
+        let mut map = self.functions.borrow_mut();
+        if let Some(f) = map.get(name) {
+            return Ok(*f);
+        }
+        let f = self.function(name)?;
+        map.insert(name, f);
+        Ok(f)
     }
 
     /// `y = a * x + y`, elementwise. The toolchain proof.
