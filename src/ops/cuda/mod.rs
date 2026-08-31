@@ -308,6 +308,23 @@ impl Cuda {
         block: u32,
         params: &mut [*mut c_void],
     ) -> Result<()> {
+        // SAFETY: forwarded to the caller's contract.
+        unsafe { self.launch_shared(name, grid, block, 0, params) }
+    }
+
+    /// As [`Cuda::launch`], with dynamic shared memory.
+    ///
+    /// # Safety
+    /// As [`Cuda::launch`], and `shared_bytes` must cover what the kernel
+    /// indexes through its `extern __shared__` array.
+    unsafe fn launch_shared(
+        &self,
+        name: &'static str,
+        grid: u32,
+        block: u32,
+        shared_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
         let f = self.cached_function(name)?;
         // SAFETY: the caller's contract, documented above.
         unsafe {
@@ -320,7 +337,7 @@ impl Cuda {
                     block,
                     1,
                     1,
-                    0,
+                    shared_bytes,
                     std::ptr::null_mut(),
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),

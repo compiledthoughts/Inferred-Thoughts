@@ -234,4 +234,68 @@ __global__ void add_assign(int n, float *__restrict__ a,
     if (i < n) a[i] += b[i];
 }
 
+// Q8_0 matrix-vector, **one warp per output row, one Q8_0 block per lane**.
+//
+// This is the fast kernel, and it is still bit-exact. The earlier attempt to
+// get coalescing by repacking the weight was measured and reverted for being
+// slower; the mistake there was treating the layout as the problem. The layout
+// is fine — what was wrong was giving a whole row to a single thread.
+//
+// The trick is that Q8_0 has a natural unit of work that is *already* exact.
+// Within one 32-element block the sum of products is an **integer** sum, so it
+// cannot round at all, and the order it happens in does not matter. The only
+// f32 accumulation in the whole dot product is the one across blocks:
+//
+//     sumf += (float)sumi * (dw * x_scales[b])      for b = 0, 1, 2, ...
+//
+// So: lane `b % 32` computes block `b` and leaves its f32 contribution in
+// shared memory, then lane 0 adds those up **in ascending b** — the oracle's
+// order, exactly. Parallel where the arithmetic is order-free, serial where it
+// is not.
+//
+// The reads come out right as a side effect. At any instant the warp's 32 lanes
+// are inside 32 consecutive 34-byte blocks, so they cover a 1088-byte window
+// that is fully used, instead of 32 separate rows a kilobyte apart.
+//
+// Shared memory is `warps_per_block * n_blocks` floats, sized at launch.
+__global__ void matmul_q8_0_warp(int n_in, int n_out,
+                                 const unsigned char *__restrict__ w,
+                                 const float *__restrict__ x_scales,
+                                 const signed char *__restrict__ x_quants,
+                                 float *__restrict__ out) {
+    extern __shared__ float partial[];
+
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    float *mine = partial + (size_t)warp * n_blocks;
+    const unsigned char *row = w + (size_t)j * (size_t)n_blocks * 34;
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        const unsigned char *blk = row + (size_t)b * 34;
+        unsigned short dbits =
+            (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        float dw = __half2float(__ushort_as_half(dbits));
+
+        // Integer, so exact and order-free.
+        int sumi = 0;
+        const signed char *xq = x_quants + b * 32;
+        for (int k = 0; k < 32; ++k) {
+            sumi += (int)((signed char)blk[2 + k]) * (int)xq[k];
+        }
+        mine[b] = (float)sumi * (dw * x_scales[b]);
+    }
+    __syncwarp();
+
+    // The one ordered accumulation, kept serial and ascending.
+    if (lane == 0) {
+        float sumf = 0.0f;
+        for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
+        out[j] = sumf;
+    }
+}
+
 } // extern "C"

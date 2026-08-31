@@ -261,14 +261,19 @@ impl Cuda {
             arg(&mut qd),
             arg(&mut od),
         ];
+        // 128 threads is four warps, so four output rows per block.
         let block = 128u32;
-        // SAFETY: parameters match `matmul_q8_0`; the weight buffer is the
-        // whole tensor and the grid covers exactly `n_out` rows.
+        let rows_per_block = (block / 32) as usize;
+        let shared = (rows_per_block * (w.n_in / 32) * 4) as u32;
+        // SAFETY: parameters match `matmul_q8_0_warp`; the grid covers exactly
+        // `n_out` rows and `shared` is `warps * n_blocks` floats, which is what
+        // the kernel indexes.
         unsafe {
-            self.launch(
-                "matmul_q8_0",
-                w.n_out.div_ceil(block as usize) as u32,
+            self.launch_shared(
+                "matmul_q8_0_warp",
+                w.n_out.div_ceil(rows_per_block) as u32,
                 block,
+                shared,
                 &mut params,
             )?
         };
