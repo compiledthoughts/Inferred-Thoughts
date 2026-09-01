@@ -186,6 +186,54 @@ impl DeviceBench {
     }
 }
 
+/// One kernel argument, by value.
+///
+/// The driver wants an array of *pointers* to arguments, which is fine when a
+/// launch is a transient thing built from locals. It stops being fine the
+/// moment those arguments have to outlive the call — which is what building a
+/// CUDA graph needs, since a node keeps its parameters and they are updated
+/// later rather than rebuilt.
+///
+/// So launches carry values and the pointer array is built at the last moment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum KArg {
+    I32(i32),
+    F32(f32),
+    Ptr(ffi::CUdeviceptr),
+}
+
+/// Argument values in a stable place, plus the pointer array the driver reads.
+///
+/// Every slot is eight bytes and the driver reads four for an `i32` or `f32`.
+/// That works because this targets little-endian x86_64 only, which the
+/// platform scope in `CLAUDE.md` already fixes.
+struct ArgPack {
+    slots: Vec<u64>,
+}
+
+impl ArgPack {
+    fn new(args: &[KArg]) -> Self {
+        Self {
+            slots: args
+                .iter()
+                .map(|a| match *a {
+                    KArg::I32(v) => v as u32 as u64,
+                    KArg::F32(v) => v.to_bits() as u64,
+                    KArg::Ptr(p) => p,
+                })
+                .collect(),
+        }
+    }
+
+    /// Pointers into `slots`. Borrowed mutably so the array cannot outlive it.
+    fn ptrs(&mut self) -> Vec<*mut c_void> {
+        self.slots
+            .iter_mut()
+            .map(|s| s as *mut u64 as *mut c_void)
+            .collect()
+    }
+}
+
 /// A device mirror of a host KV slab, and how much of it is current.
 struct KvMirror {
     buf: DeviceBuffer,
@@ -353,15 +401,9 @@ impl Cuda {
     /// `params` must match the named kernel's signature, and every device
     /// pointer in it must address an allocation large enough for the extents
     /// the kernel will walk.
-    unsafe fn launch(
-        &self,
-        name: &'static str,
-        grid: u32,
-        block: u32,
-        params: &mut [*mut c_void],
-    ) -> Result<()> {
+    unsafe fn launch(&self, name: &'static str, grid: u32, block: u32, args: &[KArg]) -> Result<()> {
         // SAFETY: forwarded to the caller's contract.
-        unsafe { self.launch_shared(name, grid, block, 0, params) }
+        unsafe { self.launch_shared(name, grid, block, 0, args) }
     }
 
     /// As [`Cuda::launch_shared`], with a two-dimensional grid.
@@ -379,9 +421,11 @@ impl Cuda {
         grid_y: u32,
         block: u32,
         shared_bytes: u32,
-        params: &mut [*mut c_void],
+        args: &[KArg],
     ) -> Result<()> {
         let f = self.cached_function(name)?;
+        let mut pack = ArgPack::new(args);
+        let mut params = pack.ptrs();
         let started = std::time::Instant::now();
         // SAFETY: the caller's contract, documented above.
         unsafe {
@@ -425,9 +469,11 @@ impl Cuda {
         grid: u32,
         block: u32,
         shared_bytes: u32,
-        params: &mut [*mut c_void],
+        args: &[KArg],
     ) -> Result<()> {
         let f = self.cached_function(name)?;
+        let mut pack = ArgPack::new(args);
+        let mut params = pack.ptrs();
         let started = std::time::Instant::now();
         // SAFETY: the caller's contract, documented above.
         unsafe {

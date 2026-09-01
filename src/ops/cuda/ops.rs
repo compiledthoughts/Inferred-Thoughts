@@ -26,7 +26,7 @@
 
 use std::ffi::c_void;
 
-use super::{Cuda, DeviceBuffer, KvMirror, Mirror, check, ffi};
+use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
 use crate::ops::naive::QuantizedRow;
@@ -45,10 +45,6 @@ mod slot {
     pub const COS: usize = 6;
     pub const SIN: usize = 7;
     pub const Q: usize = 8;
-}
-
-fn arg<T>(v: &mut T) -> *mut c_void {
-    v as *mut T as *mut c_void
 }
 
 impl Cuda {
@@ -159,8 +155,12 @@ impl Cuda {
             }
         };
         {
-            let (mut nb, mut xd, mut sd, mut qd) = (n_blocks as i32, xd, sd, qd);
-            let mut params = [arg(&mut nb), arg(&mut xd), arg(&mut sd), arg(&mut qd)];
+            let args = [
+                KArg::I32(n_blocks as i32),
+                KArg::Ptr(xd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+            ];
             let block = 64u32;
             // SAFETY: parameters match `quantize_q8_0`; the grid covers exactly
             // `n_blocks` blocks and both outputs are sized for them.
@@ -169,7 +169,7 @@ impl Cuda {
                     "quantize_q8_0",
                     n_blocks.div_ceil(block as usize) as u32,
                     block,
-                    &mut params,
+                    &args,
                 )?
             };
         }
@@ -324,20 +324,18 @@ impl Cuda {
         let xd = self.mirror_in(x)?;
         let od = self.mirror_out(out)?;
 
-        let (mut n, mut eps) = (x.len() as i32, eps);
-        let (mut xd, mut w, mut od) = (xd, w, od);
-        let mut params = [
-            arg(&mut n),
-            arg(&mut xd),
-            arg(&mut w),
-            arg(&mut eps),
-            arg(&mut od),
+        let args = [
+            KArg::I32(x.len() as i32),
+            KArg::Ptr(xd),
+            KArg::Ptr(w),
+            KArg::F32(eps),
+            KArg::Ptr(od),
         ];
         // 256 threads, matching the fixed shared array the block reduction
         // declares. Changing one without the other is a silent wrong answer.
         // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
         // sized from the slice it mirrors.
-        unsafe { self.launch("rms_norm", 1, 256, &mut params)? };
+        unsafe { self.launch("rms_norm", 1, 256, &args)? };
         Ok(())
     }
 
@@ -352,11 +350,14 @@ impl Cuda {
         let w = self.resident(weight)?;
         let xd = self.mirror_in(x)?;
 
-        let (mut hd, mut eps) = (head_dim as i32, eps);
-        let (mut w, mut xd) = (w, xd);
-        let mut params = [arg(&mut hd), arg(&mut w), arg(&mut eps), arg(&mut xd)];
+        let args = [
+            KArg::I32(head_dim as i32),
+            KArg::Ptr(w),
+            KArg::F32(eps),
+            KArg::Ptr(xd),
+        ];
         // SAFETY: as above; one block per head, which is the grid below.
-        unsafe { self.launch("rms_norm_heads", n_heads as u32, 256, &mut params)? };
+        unsafe { self.launch("rms_norm_heads", n_heads as u32, 256, &args)? };
         self.mirror_out(x).map(|_| ())
     }
 
@@ -383,15 +384,13 @@ impl Cuda {
         let (sd, qd) = self.quantized(x, n_blocks)?;
         let od = self.mirror_out(out)?;
 
-        let (mut n_in, mut n_out) = (w.n_in as i32, w.n_out as i32);
-        let (mut wd, mut sd, mut qd, mut od) = (wd, sd, qd, od);
-        let mut params = [
-            arg(&mut n_in),
-            arg(&mut n_out),
-            arg(&mut wd),
-            arg(&mut sd),
-            arg(&mut qd),
-            arg(&mut od),
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
         ];
         // 128 threads is four warps, so four output rows per block.
         let block = 128u32;
@@ -406,7 +405,7 @@ impl Cuda {
                 w.n_out.div_ceil(rows_per_block) as u32,
                 block,
                 shared,
-                &mut params,
+                &args,
             )?
         };
         Ok(())
@@ -444,14 +443,12 @@ impl Cuda {
         }
         let xd = self.mirror_in(x)?;
 
-        let (mut hd, mut nh) = (head_dim as i32, n_heads as i32);
-        let (mut cd, mut sd, mut xd) = (cd, sd, xd);
-        let mut params = [
-            arg(&mut hd),
-            arg(&mut nh),
-            arg(&mut cd),
-            arg(&mut sd),
-            arg(&mut xd),
+        let args = [
+            KArg::I32(head_dim as i32),
+            KArg::I32(n_heads as i32),
+            KArg::Ptr(cd),
+            KArg::Ptr(sd),
+            KArg::Ptr(xd),
         ];
         let (block, total) = (256u32, n_heads * half);
         // SAFETY: parameters match `rope_neox`; the grid covers exactly the
@@ -461,7 +458,7 @@ impl Cuda {
                 "rope_neox",
                 total.div_ceil(block as usize) as u32,
                 block,
-                &mut params,
+                &args,
             )?
         };
         self.mirror_out(x).map(|_| ())
@@ -470,11 +467,9 @@ impl Cuda {
     fn softmax_impl(&self, x: &mut [f32]) -> Result<()> {
         let xd = self.mirror_in(x)?;
 
-        let (mut n, mut rows) = (x.len() as i32, 1i32);
-        let mut xd = xd;
-        let mut params = [arg(&mut n), arg(&mut rows), arg(&mut xd)];
+        let args = [KArg::I32(x.len() as i32), KArg::I32(1), KArg::Ptr(xd)];
         // SAFETY: parameters match `softmax_rows`; one row, so one thread.
-        unsafe { self.launch("softmax_rows", 1, 1, &mut params)? };
+        unsafe { self.launch("softmax_rows", 1, 1, &args)? };
         self.mirror_out(x).map(|_| ())
     }
 
@@ -493,29 +488,20 @@ impl Cuda {
         let pm = self.pooled(slot::PART_M, a.n_head * n_split * 4)?;
         let pl = self.pooled(slot::PART_L, a.n_head * n_split * 4)?;
 
-        let mut n_pos = a.n_pos as i32;
-        let mut kv_dim = a.kv_dim as i32;
-        let mut head_dim = a.head_dim as i32;
-        let mut n_head = a.n_head as i32;
-        let mut n_head_kv = a.n_head_kv as i32;
-        let mut scale = a.scale;
-        let (mut qd, mut kd, mut vd) = (qd, kd, vd);
-        let (mut pa, mut pm, mut pl, mut od) = (pa, pm, pl, od);
-
         {
-            let mut params = [
-                arg(&mut n_pos),
-                arg(&mut kv_dim),
-                arg(&mut head_dim),
-                arg(&mut n_head),
-                arg(&mut n_head_kv),
-                arg(&mut scale),
-                arg(&mut qd),
-                arg(&mut kd),
-                arg(&mut vd),
-                arg(&mut pa),
-                arg(&mut pm),
-                arg(&mut pl),
+            let args = [
+                KArg::I32(a.n_pos as i32),
+                KArg::I32(a.kv_dim as i32),
+                KArg::I32(a.head_dim as i32),
+                KArg::I32(a.n_head as i32),
+                KArg::I32(a.n_head_kv as i32),
+                KArg::F32(a.scale),
+                KArg::Ptr(qd),
+                KArg::Ptr(kd),
+                KArg::Ptr(vd),
+                KArg::Ptr(pa),
+                KArg::Ptr(pm),
+                KArg::Ptr(pl),
             ];
             let shared = ((a.head_dim + 2 * CHUNK) * 4) as u32;
             // SAFETY: parameters match `attn_flash`; the grid is one block per
@@ -528,20 +514,19 @@ impl Cuda {
                     n_split as u32,
                     CHUNK as u32,
                     shared,
-                    &mut params,
+                    &args,
                 )?
             };
         }
 
         {
-            let mut ns = n_split as i32;
-            let mut params = [
-                arg(&mut ns),
-                arg(&mut head_dim),
-                arg(&mut pa),
-                arg(&mut pm),
-                arg(&mut pl),
-                arg(&mut od),
+            let args = [
+                KArg::I32(n_split as i32),
+                KArg::I32(a.head_dim as i32),
+                KArg::Ptr(pa),
+                KArg::Ptr(pm),
+                KArg::Ptr(pl),
+                KArg::Ptr(od),
             ];
             let shared = (n_split * 4) as u32;
             // SAFETY: parameters match `attn_flash_combine`; one block per
@@ -552,7 +537,7 @@ impl Cuda {
                     a.n_head as u32,
                     CHUNK as u32,
                     shared,
-                    &mut params,
+                    &args,
                 )?
             };
         }
@@ -598,8 +583,7 @@ impl Cuda {
         // `src` is already on the device -- it is the model's k or v buffer,
         // which rope wrote there.
         let sd = self.mirror_in(src)?;
-        let (mut n, mut sd, mut dst) = (src.len() as i32, sd, dst);
-        let mut params = [arg(&mut n), arg(&mut sd), arg(&mut dst)];
+        let args = [KArg::I32(src.len() as i32), KArg::Ptr(sd), KArg::Ptr(dst)];
         let block = 256u32;
         // SAFETY: parameters match `kv_write_f16`; `dst` is inside the mirror,
         // which the model sized, and the grid covers exactly `src.len()`.
@@ -608,7 +592,7 @@ impl Cuda {
                 "kv_write_f16",
                 src.len().div_ceil(block as usize) as u32,
                 block,
-                &mut params,
+                &args,
             )?
         };
         Ok(())
@@ -618,9 +602,7 @@ impl Cuda {
         let gd = self.mirror_in(gate)?;
         let ud = self.mirror_in(up)?;
 
-        let mut n = gate.len() as i32;
-        let (mut gd, mut ud) = (gd, ud);
-        let mut params = [arg(&mut n), arg(&mut gd), arg(&mut ud)];
+        let args = [KArg::I32(gate.len() as i32), KArg::Ptr(gd), KArg::Ptr(ud)];
         let block = 256u32;
         // SAFETY: parameters match `silu_mul`; both buffers hold `n` floats.
         unsafe {
@@ -628,7 +610,7 @@ impl Cuda {
                 "silu_mul",
                 gate.len().div_ceil(block as usize) as u32,
                 block,
-                &mut params,
+                &args,
             )?
         };
         self.mirror_out(gate).map(|_| ())
@@ -638,9 +620,7 @@ impl Cuda {
         let ad = self.mirror_in(a)?;
         let bd = self.mirror_in(b)?;
 
-        let mut n = a.len() as i32;
-        let (mut ad, mut bd) = (ad, bd);
-        let mut params = [arg(&mut n), arg(&mut ad), arg(&mut bd)];
+        let args = [KArg::I32(a.len() as i32), KArg::Ptr(ad), KArg::Ptr(bd)];
         let block = 256u32;
         // SAFETY: parameters match `add_assign`; both buffers hold `n` floats.
         unsafe {
@@ -648,7 +628,7 @@ impl Cuda {
                 "add_assign",
                 a.len().div_ceil(block as usize) as u32,
                 block,
-                &mut params,
+                &args,
             )?
         };
         self.mirror_out(a).map(|_| ())
