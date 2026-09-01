@@ -11,9 +11,16 @@
 //!   `add_assign`. Integer and f32 arithmetic in the oracle's order, with
 //!   `--fmad=false` preventing contraction. Anything less is a bug.
 //! * **Close** — `softmax`, `silu_mul`, `attend`. These call `expf`, and CUDA's
-//!   is not obliged to match glibc's to the last bit. The tolerance is a few
-//!   ulp, not a fudge factor: if one of these is off by more than that, the
-//!   accumulation order is wrong, not the library.
+//!   is not obliged to match glibc's to the last bit. For `softmax` and
+//!   `silu_mul` the tolerance is a few ulp: nothing else differs, so anything
+//!   larger means the accumulation order is wrong rather than the library.
+//!
+//!   `attend` is the one op that also reorders. It is flash-decoding, which
+//!   accumulates per chunk of the KV sequence and combines, so it cannot
+//!   reproduce a single serial pass. Its tolerance is **derived from the
+//!   decomposition** — see `attend_tolerance` — rather than set to whatever
+//!   passes, which is what `CLAUDE.md` asks for when a tolerance is
+//!   unavoidable.
 //!
 //! Each op is bracketed by `begin_pass` and `host_needs`, which is the
 //! residency contract the seam now carries: a device backend leaves its result
@@ -98,6 +105,27 @@ fn close(name: &str, cpu: &[f32], gpu: &[f32], tol: f32) {
         "{name} differs by {worst:e}, over the {tol:e} allowed for an expf disagreement. \
          That is too large to be the library; suspect the accumulation order."
     );
+}
+
+/// The error flash-decoding is allowed, derived from how it decomposes.
+///
+/// The kernel splits the KV sequence into chunks of 128. Within a chunk the max
+/// is a tree, which is exact because max never rounds, and the sum is a tree,
+/// so ~log2(128) = 7 roundings. The combine across chunks is serial in one
+/// thread, so ~`n_split` roundings. Add a few for the rescaling and `expf`.
+///
+/// Output is a convex combination of the values, so the absolute error scales
+/// with their magnitude rather than with anything larger.
+///
+/// This is a *bound*, not a fitted constant: the measured error sits well
+/// under it, and it is written this way so that a real regression — an
+/// indexing slip, a missed rescale — exceeds it rather than hiding beneath a
+/// number chosen after the fact.
+fn attend_tolerance(n_pos: usize, reference: &[f32]) -> f32 {
+    let n_split = n_pos.div_ceil(128) as f32;
+    let roundings = 7.0 + n_split + 4.0;
+    let magnitude = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    roundings * f32::EPSILON * magnitude.max(1.0)
 }
 
 #[test]
@@ -227,7 +255,7 @@ fn every_op_agrees_with_the_oracle() {
         gpu.begin_pass();
         gpu.attend(&attn, &mut b);
         gpu.host_needs(&mut b);
-        close("attend", &a, &b, 1e-6);
+        close("attend", &a, &b, attend_tolerance(n_pos, &a));
     }
 
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");

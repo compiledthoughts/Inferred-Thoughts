@@ -1,38 +1,28 @@
 //! `Ops` on the GPU, one kernel per method.
 //!
-//! **This is the naive CUDA backend, in the same sense `ops::naive` is the
-//! naive CPU one.** Every kernel reproduces the oracle's arithmetic in the
-//! oracle's order, and the decomposition is chosen for that rather than for
-//! occupancy — attention runs one thread per query head, and RMSNorm's f64
-//! reduction runs on a single thread while its block waits. The point is a
-//! forward pass that is *known correct on the device*, and a first honest
-//! number, not a fast one.
-//!
-//! # What this backend does not do
-//!
-//! The [`Ops`] seam takes and returns host slices, so every method here is a
-//! round trip: upload the activation, launch, synchronize, download the
-//! result. A decode step runs roughly 196 matmuls plus norms and attention, so
-//! that is ~250 round trips per token. Removing them means keeping activations
-//! resident across a layer, which the seam cannot express — a design change,
-//! not a tuning change, and the same one `CLAUDE.md` records as blocking
-//! coarser CPU parallelism.
-//!
-//! Two things are cached anyway, because without them the measurement would be
-//! meaningless rather than merely naive: weight matrices (uploaded once, keyed
-//! on the mmap pointer) and the KV slabs (appended to, not resent).
+//! Activations stay resident on the device across a layer; see `mirror_in`.
+//! The seam's `host_wrote` / `host_needs` / `begin_pass` are what make that
+//! safe, and they are no-ops for the CPU backends.
 //!
 //! # Exactness
 //!
 //! Bit-identical to [`crate::ops::naive`]: `matmul`, `rms_norm`,
 //! `rms_norm_heads`, `rope_neox`, `add_assign`. These are integer and f32
 //! arithmetic in a fixed order, with `--fmad=false` keeping the compiler from
-//! contracting a multiply-add.
+//! contracting a multiply-add. `matmul` earns this despite being a fast
+//! warp-per-row kernel, because Q8_0's 32-element block is an integer sum and
+//! therefore order-free; only the accumulation across blocks is f32, and that
+//! is kept serial and ascending.
 //!
-//! Not bit-identical: `softmax`, `silu_mul`, `attend`. All three call `expf`,
-//! and CUDA's is not obliged to agree with glibc's to the last bit. The
-//! accumulation order is still the oracle's; the difference is one library
-//! function, and it is why the differential test for these takes a tolerance.
+//! Not bit-identical, for two different reasons:
+//!
+//! * `softmax` and `silu_mul` call `expf`, which CUDA is not obliged to round
+//!   as glibc does. Order is unchanged; the gap is one ulp.
+//! * `attend` is flash-decoding — it accumulates per chunk of the KV sequence
+//!   and combines — so it genuinely reorders. That was a deliberate trade: the
+//!   previous order-preserving version parallelized only over `n_head`, so its
+//!   cost grew with context while its parallelism did not. Its tolerance is
+//!   derived from the decomposition in `tests/cuda_ops.rs`.
 
 use std::ffi::c_void;
 
@@ -50,6 +40,8 @@ mod slot {
     pub const QSCALES: usize = 3;
     pub const QUANTS: usize = 4;
     pub const SCORES: usize = 5;
+    pub const PART_M: usize = 9;
+    pub const PART_L: usize = 10;
     pub const COS: usize = 6;
     pub const SIN: usize = 7;
     pub const Q: usize = 8;
@@ -475,11 +467,19 @@ impl Cuda {
     }
 
     fn attend_impl(&self, a: &Attn<'_>, out: &mut [f32]) -> Result<()> {
+        const CHUNK: usize = 128;
+        let n_split = a.n_pos.div_ceil(CHUNK);
+
         let kd = self.kv_resident(a.k, a.n_pos, a.kv_dim)?;
         let vd = self.kv_resident(a.v, a.n_pos, a.kv_dim)?;
         let qd = self.mirror_in(a.q)?;
-        let sd = self.pooled(slot::SCORES, a.n_head * a.n_pos * 4)?;
         let od = self.mirror_out(out)?;
+
+        // Per-chunk partials: an output vector, plus the max and sum that let
+        // chunks be combined without ever materializing the scores.
+        let pa = self.pooled(slot::SCORES, a.n_head * n_split * a.head_dim * 4)?;
+        let pm = self.pooled(slot::PART_M, a.n_head * n_split * 4)?;
+        let pl = self.pooled(slot::PART_L, a.n_head * n_split * 4)?;
 
         let mut n_pos = a.n_pos as i32;
         let mut kv_dim = a.kv_dim as i32;
@@ -487,10 +487,9 @@ impl Cuda {
         let mut n_head = a.n_head as i32;
         let mut n_head_kv = a.n_head_kv as i32;
         let mut scale = a.scale;
-        let (mut qd, mut kd, mut vd, mut sd, mut od) = (qd, kd, vd, sd, od);
-        let block = 256u32;
+        let (mut qd, mut kd, mut vd) = (qd, kd, vd);
+        let (mut pa, mut pm, mut pl, mut od) = (pa, pm, pl, od);
 
-        // Pass 1: one thread per (query head, position).
         {
             let mut params = [
                 arg(&mut n_pos),
@@ -501,59 +500,46 @@ impl Cuda {
                 arg(&mut scale),
                 arg(&mut qd),
                 arg(&mut kd),
-                arg(&mut sd),
-            ];
-            let total = a.n_head * a.n_pos;
-            // SAFETY: parameters match `attn_scores`; the KV mirror holds at
-            // least `n_pos` positions and `scores` is n_head * n_pos floats.
-            unsafe {
-                self.launch(
-                    "attn_scores",
-                    total.div_ceil(block as usize) as u32,
-                    block,
-                    &mut params,
-                )?
-            };
-        }
-
-        // Pass 2: softmax each query head's row of scores, serially, which is
-        // the same kernel the seam's `softmax` uses.
-        {
-            let (mut n, mut rows) = (a.n_pos as i32, a.n_head as i32);
-            let mut params = [arg(&mut n), arg(&mut rows), arg(&mut sd)];
-            let rb = 32u32;
-            // SAFETY: parameters match `softmax_rows`; `scores` holds exactly
-            // `rows` rows of `n`.
-            unsafe {
-                self.launch(
-                    "softmax_rows",
-                    a.n_head.div_ceil(rb as usize) as u32,
-                    rb,
-                    &mut params,
-                )?
-            };
-        }
-
-        // Pass 3: one thread per (query head, element).
-        {
-            let mut params = [
-                arg(&mut n_pos),
-                arg(&mut kv_dim),
-                arg(&mut head_dim),
-                arg(&mut n_head),
-                arg(&mut n_head_kv),
                 arg(&mut vd),
-                arg(&mut sd),
+                arg(&mut pa),
+                arg(&mut pm),
+                arg(&mut pl),
+            ];
+            let shared = ((a.head_dim + 2 * CHUNK) * 4) as u32;
+            // SAFETY: parameters match `attn_flash`; the grid is one block per
+            // (query head, chunk) so no block sees an empty range, and `shared`
+            // is head_dim + 2 * FD_CHUNK floats, which is what it indexes.
+            unsafe {
+                self.launch_grid2(
+                    "attn_flash",
+                    a.n_head as u32,
+                    n_split as u32,
+                    CHUNK as u32,
+                    shared,
+                    &mut params,
+                )?
+            };
+        }
+
+        {
+            let mut ns = n_split as i32;
+            let mut params = [
+                arg(&mut ns),
+                arg(&mut head_dim),
+                arg(&mut pa),
+                arg(&mut pm),
+                arg(&mut pl),
                 arg(&mut od),
             ];
-            let total = a.n_head * a.head_dim;
-            // SAFETY: parameters match `attn_output`; `out` is n_head *
-            // head_dim floats, which is what the grid covers.
+            let shared = (n_split * 4) as u32;
+            // SAFETY: parameters match `attn_flash_combine`; one block per
+            // query head, and `shared` is `n_split` floats.
             unsafe {
-                self.launch(
-                    "attn_output",
-                    total.div_ceil(block as usize) as u32,
-                    block,
+                self.launch_shared(
+                    "attn_flash_combine",
+                    a.n_head as u32,
+                    CHUNK as u32,
+                    shared,
                     &mut params,
                 )?
             };

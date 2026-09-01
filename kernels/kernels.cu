@@ -81,89 +81,60 @@ __device__ inline float h2f(unsigned short bits) {
 
 // RMSNorm, one block for the whole vector.
 //
-// **This splits a reduction, which `CLAUDE.md` forbids by default.** The reason
-// it is allowed here is specific and checked rather than assumed.
+// Thread 0 accumulates the sum of squares serially in *double*, which is what
+// ggml_compute_forward_rms_norm_f32 does and what ops::naive::rms_scale
+// reproduces. That accumulator is load-bearing: summing 1024 squares in f32
+// shifts the scale enough to move activations across Q8_0 boundaries in every
+// matmul downstream. A parallel tree reduction would be far faster and would
+// not be the same number, so the block waits.
 //
-// The reference accumulates the sum of squares serially in double, and that
-// double accumulator is load-bearing — summing 1024 squares in f32 shifts the
-// scale enough to move activations across Q8_0 boundaries downstream. A serial
-// f64 fold on one thread is also 1024 *dependent* adds, and dependency latency,
-// not bandwidth, made this the largest single kernel cost in a token.
+// **A tree reduction was tried here and reverted.** It was measurably faster —
+// ~61 us a call down to the sync floor, worth ~10 tok/s at short context — and
+// it passed the bit-exactness tests, because the `(float)` cast of `mean` two
+// lines later is five orders of magnitude coarser than the ~1e-13 the reorder
+// moves things by. It was still the wrong trade: the rule that a redistributing
+// backend reproduces the oracle exactly is what lets every differential test in
+// this project demand equal bits instead of a tolerance, and that is worth more
+// than the milliseconds. At the context lengths the model is actually used at,
+// the win had shrunk to about 1 ms of an 18 ms token anyway.
 //
-// What makes a tree safe here is the line after the sum:
-//
-//     let mean = (sum / n as f64) as f32;
-//
-// A tree and a serial fold over the same non-negative terms differ by at most
-// about n * eps_f64, ~1e-13 relative. `mean` is then rounded to **f32**, whose
-// spacing is ~6e-8 relative — five orders of magnitude coarser. The difference
-// is absorbed by that cast unless the value sits within 1e-13 of an f32
-// rounding boundary.
-//
-// "Almost always" is not this project's standard, so it is not left at that:
-// `tests/cuda_ops.rs` compares this against the scalar oracle bit for bit, per
-// op and across the whole model. If a boundary case ever lands, that test says
-// so rather than a tolerance hiding it.
-//
-// Every term is exact in f64 to begin with: an f32 product needs 48 mantissa
-// bits and f64 has 53, so `(double)(v*v)` never rounds. Only the summing does.
+// The cost is real and understood: 1024 *dependent* f64 adds, each waiting on
+// the one before. That is latency, not bandwidth — cooperatively loading the
+// squares into shared memory first was also tried, and changed nothing.
 __global__ void rms_norm(int n, const float *__restrict__ x,
                          const float *__restrict__ w, float eps,
                          float *__restrict__ out) {
-    __shared__ double partial[256];
     __shared__ float scale;
-
-    double acc = 0.0;
-    for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = x[i];
-        acc += (double)(v * v);
-    }
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
-        __syncthreads();
-    }
-
     if (threadIdx.x == 0) {
-        float mean = (float)(partial[0] / (double)n);
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) {
+            float v = x[i];
+            sum += (double)(v * v);
+        }
+        float mean = (float)(sum / (double)n);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
-
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         out[i] = x[i] * scale * w[i];
     }
 }
 
-// Per-head RMSNorm, in place. One block per head, same argument as above.
+// Per-head RMSNorm, in place. One block per head, same serial-double rule.
 __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
                                float eps, float *__restrict__ x) {
-    __shared__ double partial[256];
     __shared__ float scale;
-
     float *head = x + (size_t)blockIdx.x * head_dim;
-
-    double acc = 0.0;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = head[i];
-        acc += (double)(v * v);
-    }
-    partial[threadIdx.x] = acc;
-    __syncthreads();
-
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
-        __syncthreads();
-    }
-
     if (threadIdx.x == 0) {
-        float mean = (float)(partial[0] / (double)head_dim);
+        double sum = 0.0;
+        for (int i = 0; i < head_dim; ++i) {
+            float v = head[i];
+            sum += (double)(v * v);
+        }
+        float mean = (float)(sum / (double)head_dim);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
-
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         head[i] = head[i] * scale * w[i];
     }
@@ -213,73 +184,163 @@ __global__ void softmax_rows(int n, int n_rows, float *__restrict__ x) {
     for (int i = 0; i < n; ++i) row[i] /= sum;
 }
 
-// Attention in three passes, each parallel over something the oracle treats as
-// independent. Still bit-exact apart from softmax's `expf`.
+// Flash-decoding attention: split over the KV sequence, online softmax.
 //
-// The first version of this ran **one thread per query head** — sixteen threads
-// on a thirty-six SM card — walking every position serially. It was chosen
-// because it obviously reproduced `ops::naive`'s accumulation order, and it
-// made attention 96% of decode time and the only term that grew with context.
+// # Why the previous shape had to go
 //
-// The order can be kept with far more parallelism, because two of the three
-// loops are over genuinely independent outputs:
+// Attention here ran as three kernels — scores, softmax, weighted sum — each
+// parallel over something the oracle treats as independent, which kept the
+// accumulation order and therefore the bit-exactness. The trouble is what it
+// was parallel *over*: `n_head`, which is 16. `softmax_rows` ran sixteen
+// threads on a thirty-six SM card, each making three serial passes over every
+// position, so its cost grew with context while its parallelism did not.
+// Measured at ~29 us a call near depth 500 and ~120 us near depth 1000: a
+// cliff, not a slope.
 //
-//   scores   one thread per (query head, position). The dot over head_dim stays
-//            serial inside the thread, so it is the oracle's order.
-//   softmax  one thread per query head, serial over positions. Unchanged.
-//   output   one thread per (query head, element). Each thread accumulates over
-//            positions in ascending order, which is the order `naive` uses —
-//            it walks positions outermost and elements innermost, so element
-//            `i` sees the same additions in the same sequence.
+// The published answer is to split along the **KV sequence** instead
+// (Flash-Decoding). Each block takes the same query and a different chunk of
+// positions, so parallelism scales with context rather than being capped by
+// head count — which is precisely the regime batch-1 decode lives in.
 //
-// Only the reduction *within* a dot product would have to be split to go
-// further, and that is the one that would cost exactness.
+// # Online softmax
+//
+// Milakov & Gimelshein's trick makes one pass do what three did. A chunk
+// computes its own max `m` and its own sum of exponentials `l` relative to that
+// max, plus a partial output. Combining two chunks is then exact algebra:
+// rescale each by `exp(m_chunk - m_global)` and add. So the scores array never
+// has to exist — memory goes from O(n_pos) to O(head_dim) per chunk — and the
+// three launches per layer become two.
+//
+// # What this costs in numerics, stated plainly
+//
+// This is the first kernel here that does **not** reproduce the oracle's
+// summation order, and it cannot: chunked accumulation is the whole point.
+// `attend` was already outside the bit-exact set because it calls `expf`, so
+// the change is inexact -> differently-inexact rather than exact -> inexact.
+//
+// The error is bounded and derived, not measured-then-blessed. Within a chunk
+// the max is a tree, which is exact because max never rounds; the sum is a tree
+// over 128, so ~7 eps; the combine is serial over `n_split`, so ~n_split eps.
+// Total relative error is about `(7 + n_split + a few) * eps_f32`. The test
+// derives its tolerance from that expression rather than from what passes.
+//
+// Worth noting the tree sums are *more* accurate than the oracle's serial one —
+// error grows as O(log n) rather than O(n). They are simply different.
 
-// Attention scores: q . k, scaled. One thread per (query head, position).
-__global__ void attn_scores(int n_pos, int kv_dim, int head_dim, int n_head,
-                            int n_head_kv, float scale,
-                            const float *__restrict__ q,
-                            const unsigned short *__restrict__ k,
-                            float *__restrict__ scores) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_head * n_pos) return;
+#define FD_CHUNK 128
 
-    const int hq = idx / n_pos;
-    const int s = idx % n_pos;
+// One block per (query head, chunk of positions).
+//
+// Shared memory: head_dim floats for the query, FD_CHUNK for the exponentials,
+// FD_CHUNK for the reduction scratch.
+__global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
+                           int n_head_kv, float scale,
+                           const float *__restrict__ q,
+                           const unsigned short *__restrict__ k,
+                           const unsigned short *__restrict__ v,
+                           float *__restrict__ part_acc,
+                           float *__restrict__ part_m,
+                           float *__restrict__ part_l) {
+    extern __shared__ float smem[];
+    float *sq = smem;                 // [head_dim]  the query, read n_pos times
+    float *se = sq + head_dim;        // [FD_CHUNK]  exp(score - m) per position
+    float *red = se + FD_CHUNK;       // [FD_CHUNK]  reduction scratch
+
+    const int hq = blockIdx.x;
+    const int split = blockIdx.y;
+    const int lo = split * FD_CHUNK;
+    const int len = min(FD_CHUNK, n_pos - lo);
     const int off = (hq / (n_head / n_head_kv)) * head_dim;
 
-    const float *qh = q + (size_t)hq * head_dim;
-    const unsigned short *key = k + (size_t)s * kv_dim + off;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        sq[i] = q[(size_t)hq * head_dim + i];
+    }
+    __syncthreads();
 
-    float dot = 0.0f;
-    for (int i = 0; i < head_dim; ++i) dot += qh[i] * h2f(key[i]);
-    scores[(size_t)hq * n_pos + s] = dot * scale;
+    // One position per thread; the dot over head_dim stays serial in-thread.
+    float score = -INFINITY;
+    if (threadIdx.x < len) {
+        const unsigned short *key =
+            k + (size_t)(lo + threadIdx.x) * kv_dim + off;
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i) dot += sq[i] * h2f(key[i]);
+        score = dot * scale;
+    }
+
+    // Chunk max. A tree here is *exact* — max never rounds — so this costs
+    // nothing in accuracy.
+    red[threadIdx.x] = score;
+    __syncthreads();
+    for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        }
+        __syncthreads();
+    }
+    const float m = red[0];
+    __syncthreads();
+
+    const float e = (threadIdx.x < len) ? expf(score - m) : 0.0f;
+    se[threadIdx.x] = e;
+    red[threadIdx.x] = e;
+    __syncthreads();
+    for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    const float l = red[0];
+
+    // Weighted sum of this chunk's values. Adjacent threads hold adjacent
+    // elements and read adjacent halves of V, so the reads coalesce.
+    const size_t base = (size_t)hq * gridDim.y + split;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < len; ++t) {
+            acc += se[t] * h2f(v[(size_t)(lo + t) * kv_dim + off + i]);
+        }
+        part_acc[base * head_dim + i] = acc;
+    }
+    if (threadIdx.x == 0) {
+        part_m[base] = m;
+        part_l[base] = l;
+    }
 }
 
-// Weighted sum of values. One thread per (query head, element of head_dim).
+// Combine the per-chunk partials. One block per query head.
 //
-// Adjacent threads hold adjacent `i`, and read `v[s*kv_dim + off + i]`, so the
-// warp covers consecutive elements — coalesced, and it falls out of the
-// decomposition rather than being arranged for.
-__global__ void attn_output(int n_pos, int kv_dim, int head_dim, int n_head,
-                            int n_head_kv,
-                            const unsigned short *__restrict__ v,
-                            const float *__restrict__ scores,
-                            float *__restrict__ out) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_head * head_dim) return;
+// The algebra is exact: a chunk's numbers are relative to its own max, so
+// rescaling by exp(m_chunk - m_global) puts them all on one reference before
+// they are added.
+__global__ void attn_flash_combine(int n_split, int head_dim,
+                                   const float *__restrict__ part_acc,
+                                   const float *__restrict__ part_m,
+                                   const float *__restrict__ part_l,
+                                   float *__restrict__ out) {
+    extern __shared__ float w[];   // [n_split] rescaling weights
+    __shared__ float total;
 
-    const int hq = idx / head_dim;
-    const int i = idx % head_dim;
-    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+    const int hq = blockIdx.x;
+    const float *pm = part_m + (size_t)hq * n_split;
+    const float *pl = part_l + (size_t)hq * n_split;
 
-    const float *sc = scores + (size_t)hq * n_pos;
-
-    float acc = 0.0f;
-    for (int s = 0; s < n_pos; ++s) {
-        acc += sc[s] * h2f(v[(size_t)s * kv_dim + off + i]);
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (int s = 0; s < n_split; ++s) m = fmaxf(m, pm[s]);
+        float l = 0.0f;
+        for (int s = 0; s < n_split; ++s) {
+            w[s] = expf(pm[s] - m);
+            l += pl[s] * w[s];
+        }
+        total = l;
     }
-    out[(size_t)hq * head_dim + i] = acc;
+    __syncthreads();
+
+    const float *pa = part_acc + (size_t)hq * n_split * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int s = 0; s < n_split; ++s) acc += pa[(size_t)s * head_dim + i] * w[s];
+        out[(size_t)hq * head_dim + i] = acc / total;
+    }
 }
 
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.

@@ -358,6 +358,56 @@ impl Cuda {
         unsafe { self.launch_shared(name, grid, block, 0, params) }
     }
 
+    /// As [`Cuda::launch_shared`], with a two-dimensional grid.
+    ///
+    /// Flash-decoding wants one block per (query head, chunk of positions),
+    /// which is what makes its parallelism scale with context instead of with
+    /// head count.
+    ///
+    /// # Safety
+    /// As [`Cuda::launch_shared`].
+    unsafe fn launch_grid2(
+        &self,
+        name: &'static str,
+        grid_x: u32,
+        grid_y: u32,
+        block: u32,
+        shared_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<()> {
+        let f = self.cached_function(name)?;
+        let started = std::time::Instant::now();
+        // SAFETY: the caller's contract, documented above.
+        unsafe {
+            check(
+                ffi::cuLaunchKernel(
+                    f,
+                    grid_x,
+                    grid_y,
+                    1,
+                    block,
+                    1,
+                    1,
+                    shared_bytes,
+                    std::ptr::null_mut(),
+                    params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                ),
+                "cuLaunchKernel",
+            )?
+        };
+        self.bump(|s| s.launches += 1);
+        if self.time_kernels.get() {
+            self.sync()?;
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut map = self.kernel_ms.borrow_mut();
+            let e = map.entry(name).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ms;
+        }
+        Ok(())
+    }
+
     /// As [`Cuda::launch`], with dynamic shared memory.
     ///
     /// # Safety
