@@ -81,46 +81,89 @@ __device__ inline float h2f(unsigned short bits) {
 
 // RMSNorm, one block for the whole vector.
 //
-// Thread 0 accumulates the sum of squares serially in *double*, which is what
-// ggml_compute_forward_rms_norm_f32 does and what ops::naive::rms_scale
-// reproduces. That accumulator is load-bearing: summing 1024 squares in f32
-// shifts the scale enough to move activations across Q8_0 boundaries in every
-// matmul downstream. A parallel tree reduction would be far faster and would
-// not be the same number, so the block waits.
+// **This splits a reduction, which `CLAUDE.md` forbids by default.** The reason
+// it is allowed here is specific and checked rather than assumed.
+//
+// The reference accumulates the sum of squares serially in double, and that
+// double accumulator is load-bearing — summing 1024 squares in f32 shifts the
+// scale enough to move activations across Q8_0 boundaries downstream. A serial
+// f64 fold on one thread is also 1024 *dependent* adds, and dependency latency,
+// not bandwidth, made this the largest single kernel cost in a token.
+//
+// What makes a tree safe here is the line after the sum:
+//
+//     let mean = (sum / n as f64) as f32;
+//
+// A tree and a serial fold over the same non-negative terms differ by at most
+// about n * eps_f64, ~1e-13 relative. `mean` is then rounded to **f32**, whose
+// spacing is ~6e-8 relative — five orders of magnitude coarser. The difference
+// is absorbed by that cast unless the value sits within 1e-13 of an f32
+// rounding boundary.
+//
+// "Almost always" is not this project's standard, so it is not left at that:
+// `tests/cuda_ops.rs` compares this against the scalar oracle bit for bit, per
+// op and across the whole model. If a boundary case ever lands, that test says
+// so rather than a tolerance hiding it.
+//
+// Every term is exact in f64 to begin with: an f32 product needs 48 mantissa
+// bits and f64 has 53, so `(double)(v*v)` never rounds. Only the summing does.
 __global__ void rms_norm(int n, const float *__restrict__ x,
                          const float *__restrict__ w, float eps,
                          float *__restrict__ out) {
+    __shared__ double partial[256];
     __shared__ float scale;
+
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        acc += (double)(v * v);
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+        __syncthreads();
+    }
+
     if (threadIdx.x == 0) {
-        double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            float v = x[i];
-            sum += (double)(v * v);
-        }
-        float mean = (float)(sum / (double)n);
+        float mean = (float)(partial[0] / (double)n);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
+
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         out[i] = x[i] * scale * w[i];
     }
 }
 
-// Per-head RMSNorm, in place. One block per head, same serial-double rule.
+// Per-head RMSNorm, in place. One block per head, same argument as above.
 __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
                                float eps, float *__restrict__ x) {
+    __shared__ double partial[256];
     __shared__ float scale;
+
     float *head = x + (size_t)blockIdx.x * head_dim;
+
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = head[i];
+        acc += (double)(v * v);
+    }
+    partial[threadIdx.x] = acc;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+        __syncthreads();
+    }
+
     if (threadIdx.x == 0) {
-        double sum = 0.0;
-        for (int i = 0; i < head_dim; ++i) {
-            float v = head[i];
-            sum += (double)(v * v);
-        }
-        float mean = (float)(sum / (double)head_dim);
+        float mean = (float)(partial[0] / (double)head_dim);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
+
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         head[i] = head[i] * scale * w[i];
     }

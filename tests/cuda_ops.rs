@@ -376,15 +376,31 @@ fn only_the_expf_ops_diverge() {
     let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
     let tokens = tk.encode("The capital of France is", true, true);
 
+    // Prefill *and* sixteen decode steps. Prefill alone exercised only ~285
+    // rms_norm calls, which is thin evidence for a kernel whose block
+    // reduction is allowed to depart from the oracle's summation order — the
+    // argument is that the f32 cast of `mean` absorbs the difference, and a
+    // boundary case would show up as a rare flip rather than a systematic one.
+    // More calls, and decode's changing activations, make that a real test.
+    let steps = 16;
+
     let cpu = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, Naive, tokens.len() + 4, false);
-        e.prefill(&tokens).expect("prefill")
+        let mut e = Engine::new(m, Naive, tokens.len() + steps + 4, false);
+        let mut all = e.prefill(&tokens).expect("prefill");
+        for _ in 0..steps {
+            all = e.decode(Qwen3::argmax(&all)).expect("decode");
+        }
+        all
     };
     let mixed = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, ExactOnly(&gpu), tokens.len() + 4, false);
-        e.prefill(&tokens).expect("prefill")
+        let mut e = Engine::new(m, ExactOnly(&gpu), tokens.len() + steps + 4, false);
+        let mut all = e.prefill(&tokens).expect("prefill");
+        for _ in 0..steps {
+            all = e.decode(Qwen3::argmax(&all)).expect("decode");
+        }
+        all
     };
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 

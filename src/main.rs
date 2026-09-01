@@ -61,6 +61,10 @@ enum Command {
         /// and report what a per-op seam costs before any arithmetic.
         #[arg(long)]
         profile_device: bool,
+        /// With --backend cuda: attribute time to individual kernels. Needs a
+        /// device sync per launch, so it inflates the total -- read the shares.
+        #[arg(long)]
+        profile_kernels: bool,
         /// Compute threads. 1 selects the scalar `naive` oracle directly and
         /// ignores --backend; anything more selects --backend, which must
         /// produce identical bits. 0 means physical cores, taken as half the
@@ -118,6 +122,7 @@ fn main() -> ExitCode {
             profile_detail,
             profile_json,
             profile_device,
+            profile_kernels,
             threads,
             chat,
             show_special,
@@ -133,6 +138,7 @@ fn main() -> ExitCode {
                 detail: profile_detail,
                 json: profile_json,
                 device: profile_device,
+                kernels: profile_kernels,
                 threads,
                 chat,
                 show_special,
@@ -180,6 +186,7 @@ struct GenOpts {
     detail: bool,
     json: Option<String>,
     device: bool,
+    kernels: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -230,6 +237,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
     #[cfg(feature = "cuda")]
     if o.backend == "cuda" {
         let cuda = inferred_thoughts::Cuda::new(0)?;
+        cuda.time_kernels(o.kernels);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(
@@ -245,7 +253,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         if let Some(e) = cuda.take_error() {
             return Err(e);
         }
-        if o.report || o.device {
+        if o.report || o.device || o.kernels {
             report_device(&cuda, &o, tokens.len(), run.as_ref().ok().copied())?;
         }
         return run.map(|_| ());
@@ -292,6 +300,20 @@ fn report_device(
 ) -> inferred_thoughts::Result<()> {
     let s = cuda.stats();
     let tokens = (prompt_len + o.max_tokens) as u64;
+
+    if o.kernels {
+        let times = cuda.kernel_times();
+        let total: f64 = times.iter().map(|(_, _, ms)| ms).sum();
+        eprintln!("\nper-kernel (synchronized, so totals are inflated; read the share)");
+        eprintln!("  {:<22} {:>8} {:>10} {:>7}", "kernel", "calls", "ms", "share");
+        for (name, calls, ms) in &times {
+            eprintln!(
+                "  {name:<22} {calls:>8} {ms:>10.1} {:>6.1}%",
+                100.0 * ms / total.max(1e-9)
+            );
+        }
+        eprintln!("  {:<22} {:>8} {total:>10.1}", "total", "");
+    }
     eprintln!("
 device   {} kernel launches", s.launches);
     eprintln!(

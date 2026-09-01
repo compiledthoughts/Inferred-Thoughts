@@ -91,6 +91,12 @@ pub struct Cuda {
     /// See `Cuda::mirror_in`.
     mirrors: RefCell<HashMap<usize, Mirror>>,
 
+    /// Per-kernel wall time, when `time_kernels` is on. See [`Cuda::kernel_times`].
+    kernel_ms: RefCell<HashMap<&'static str, (u64, f64)>>,
+
+    /// Whether to synchronize after each launch and attribute the time.
+    time_kernels: Cell<bool>,
+
     /// The position the RoPE sin/cos table on the device was built for.
     ///
     /// Every layer rotates at the same position within one token, so the table
@@ -277,6 +283,8 @@ impl Cuda {
                 stats: Cell::new(DeviceStats::default()),
                 mirrors: RefCell::new(HashMap::new()),
                 rope_pos: Cell::new(None),
+                kernel_ms: RefCell::new(HashMap::new()),
+                time_kernels: Cell::new(false),
             })
         }
     }
@@ -364,6 +372,7 @@ impl Cuda {
         params: &mut [*mut c_void],
     ) -> Result<()> {
         let f = self.cached_function(name)?;
+        let started = std::time::Instant::now();
         // SAFETY: the caller's contract, documented above.
         unsafe {
             check(
@@ -384,11 +393,46 @@ impl Cuda {
             )?
         };
         self.bump(|s| s.launches += 1);
+        if self.time_kernels.get() {
+            // Synchronizing here is the whole point and also the whole cost:
+            // without it the elapsed time measures the CPU-side enqueue, not
+            // the kernel. It inflates the total, so read the *shares* rather
+            // than the absolute milliseconds.
+            self.sync()?;
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            let mut map = self.kernel_ms.borrow_mut();
+            let e = map.entry(name).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += ms;
+        }
         // Deliberately no `sync` here. Every `Ops` method ends in a
         // device-to-host copy on the null stream, which is ordered after this
         // kernel and is itself synchronous, so an explicit barrier is a second
         // driver call buying nothing. A launch failure surfaces at that copy.
         Ok(())
+    }
+
+    /// Attribute time to individual kernels, at the cost of a device sync
+    /// after every launch.
+    ///
+    /// The half-level profile says *where* in a layer the time goes; this says
+    /// *which kernel*. Off by default because the sync it needs changes the
+    /// thing it measures — the absolute total rises, so the useful output is
+    /// each kernel's share, not its milliseconds.
+    pub fn time_kernels(&self, on: bool) {
+        self.time_kernels.set(on);
+    }
+
+    /// Per-kernel `(calls, milliseconds)`, busiest first.
+    pub fn kernel_times(&self) -> Vec<(&'static str, u64, f64)> {
+        let mut v: Vec<_> = self
+            .kernel_ms
+            .borrow()
+            .iter()
+            .map(|(k, (n, ms))| (*k, *n, *ms))
+            .collect();
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        v
     }
 
     /// Update the counters. `Cell` rather than atomics: this backend is used

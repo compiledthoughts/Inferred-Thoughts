@@ -329,6 +329,8 @@ impl Cuda {
             arg(&mut eps),
             arg(&mut od),
         ];
+        // 256 threads, matching the fixed shared array the block reduction
+        // declares. Changing one without the other is a silent wrong answer.
         // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
         // sized from the slice it mirrors.
         unsafe { self.launch("rms_norm", 1, 256, &mut params)? };
