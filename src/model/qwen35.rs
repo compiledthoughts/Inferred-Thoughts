@@ -50,7 +50,23 @@
 //! `{128}`.
 //!
 //! Note `n_v_heads` is **twice** `n_k_heads`, so the delta rule is grouped the
-//! way GQA is: value head `h` reads key/query head `h / 2`.
+//! way GQA is — but **by modulo, not by division**: value head `h` reads
+//! key/query head `h % n_k_heads`. Verified against both of llama.cpp's paths,
+//! which have to agree:
+//!
+//! * the unfused path calls `ggml_repeat_4d(q_conv, head_k_dim, num_v_heads, ..)`,
+//!   and `ggml_compute_forward_repeat_f32` *tiles* — `dst[i1*ne01 + k1]` reads
+//!   `src[k1]`, so destination head `h` reads source head `h % ne01`;
+//! * the fused kernel says it outright:
+//!   `const int64_t iq1 = iv1 % neq1; const int64_t ik1 = iv1 % nek1;`
+//!   (`ggml_compute_forward_gated_delta_net_one_chunk`).
+//!
+//! An earlier version of this note said `h / 2`. That is blocked grouping, it
+//! is what GQA does elsewhere in this file, and it is wrong here — it agrees
+//! with the truth only for `h = 0` and `h = 1`. It would have produced
+//! plausible garbage rather than an error, which is exactly the failure mode
+//! `HANDOFF.md` warned about when it called the key-vs-value axis the risky
+//! part of this layer.
 //!
 //! # The GatedDeltaNet layer
 //!
@@ -116,10 +132,8 @@
 //!   all four thetas start from their base and are scaled identically each
 //!   step. With three of them equal, the section a dimension falls in cannot
 //!   change its angle.
-//! * The fourth theta is the only one that differs, and it is selected only
-//!   when `sector >= sections[0] + sections[1] + sections[2] = 32`. But
-//!   `sect_dims` is also 32 and `sector = (i0 / 2) % sect_dims`, so `sector` is
-//!   never 32 or more. `theta_e` is unreachable.
+//! * `theta_e` is the only one that differs, and it is never selected. See
+//!   below for why — the reason is not the obvious one.
 //!
 //! So what actually has to be implemented is **partial RoPE**: rotate the first
 //! `n_rot = 64` of each 256-wide head, pass the remaining 192 through
@@ -128,10 +142,40 @@
 //! make them live, which is why the reasoning is recorded rather than the
 //! conclusion alone.
 //!
-//! **Unverified:** whether `qwen35` uses NEOX pairing (dimension `i` with
-//! `i + n_rot / 2`) as `qwen3` does, or the adjacent-pair variant. It is one
-//! lookup in `llama-arch.cpp`'s rope-type table, and getting it wrong would
-//! look exactly like a numerics bug rather than a structural one.
+//! ## It is IMROPE, not MROPE, and the earlier derivation was of the wrong branch
+//!
+//! `llama-model.cpp` puts `qwen35` and `qwen35moe` with the Qwen3VL family on
+//! `LLAMA_ROPE_TYPE_IMROPE` — *interleaved* mRoPE — not `LLAMA_ROPE_TYPE_MROPE`.
+//! `ggml_mrope_cache_init` branches on that, and the two branches select thetas
+//! completely differently:
+//!
+//! ```c
+//! if (is_imrope) {                                     // ours
+//!     if      (sector % 3 == 1 && sector < 3*sections[1]) theta = theta_h;
+//!     else if (sector % 3 == 2 && sector < 3*sections[2]) theta = theta_w;
+//!     else if (sector % 3 == 0 && sector < 3*sections[0]) theta = theta_t;
+//!     else                                               theta = theta_e;
+//! } else {                                             // plain MROPE
+//!     if      (sector >= sections[0] && sector < sec_w) theta = theta_h;
+//!     ...
+//! }
+//! ```
+//!
+//! An earlier version of this note derived `theta_e`'s unreachability from the
+//! `else` branch — the one this architecture does not take. The conclusion
+//! survives, by different arithmetic: with sections `{11, 11, 10, 0}`,
+//! `sect_dims = 32` and `n_rot = 64`, `sector = (i0/2) % 32` covers 0..=31, and
+//! every one of those satisfies one of the three modular tests. The tightest is
+//! `sector % 3 == 2 && sector < 30`, whose largest qualifying value is 29. So
+//! the `else` is never reached and `theta_e` stays unused.
+//!
+//! ## Pairing is NEOX — verified, no longer an open question
+//!
+//! `ggml-cpu/ops.cpp` falls `GGML_ROPE_TYPE_IMROPE` through to the same call
+//! NEOX makes, `rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data)`, so
+//! dimension `i` pairs with `i + n_rot/2` and `Ops::rope_neox` is the right
+//! kernel. This was flagged unverified precisely because getting it wrong would
+//! look like a numerics bug rather than a structural one.
 
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
