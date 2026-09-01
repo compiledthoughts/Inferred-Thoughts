@@ -73,6 +73,63 @@ impl Attn<'_> {
     }
 }
 
+/// One token's inputs to the gated delta rule — GatedDeltaNet's recurrent core.
+///
+/// A struct for the same reason [`Attn`] is one: this has four dimensions and
+/// two head counts that differ, and positional arguments are how a
+/// `head_k_dim` and an `n_v_heads` end up swapped.
+///
+/// `alpha` and `beta` arrive **raw**, straight from their projections, and the
+/// activations are applied inside the op. That keeps `softplus` and `sigmoid`
+/// off the seam entirely: they act on `n_v_heads` values, which is 32 here, and
+/// a seam method per elementwise function would be four more implementations
+/// for arithmetic that costs nothing.
+pub struct Delta<'a> {
+    /// Queries, `n_k_heads * head_k_dim`, already convolved and l2-normalized.
+    pub q: &'a [f32],
+    /// Keys, same shape and same treatment.
+    pub k: &'a [f32],
+    /// Values, `n_v_heads * head_v_dim`, convolved but **not** normalized.
+    pub v: &'a [f32],
+    /// Raw `ssm_alpha @ x`, one per value head. `softplus(alpha + dt_bias)`
+    /// scaled by `ssm_a` gives the log decay.
+    pub alpha: &'a [f32],
+    /// Raw `ssm_beta @ x`, one per value head. Passed through `sigmoid`.
+    pub beta: &'a [f32],
+    /// Per-head decay scale. Negative — it is `-A_log.exp()` upstream — which
+    /// is what makes `exp(gate)` a value in `(0, 1)` rather than a blow-up.
+    pub ssm_a: &'a [f32],
+    /// Per-head bias added to `alpha` before `softplus`.
+    pub dt_bias: &'a [f32],
+    pub head_k_dim: usize,
+    pub head_v_dim: usize,
+    pub n_k_heads: usize,
+    pub n_v_heads: usize,
+}
+
+impl Delta<'_> {
+    /// The key/query head that value head `h` reads.
+    ///
+    /// **Modulo, not division.** llama.cpp reaches this two ways and both say
+    /// so: the unfused path calls `ggml_repeat_4d`, which *tiles*, and the
+    /// fused kernel writes `iq1 = iv1 % neq1` outright. Blocked grouping —
+    /// `h / (n_v_heads / n_k_heads)`, which is what GQA does for attention in
+    /// this same model — agrees only for `h = 0` and `h = 1`.
+    pub fn key_head(&self, value_head: usize) -> usize {
+        value_head % self.n_k_heads
+    }
+
+    /// `1/sqrt(head_k_dim)`, applied to `q` before the readout.
+    pub fn scale(&self) -> f32 {
+        1.0 / (self.head_k_dim as f32).sqrt()
+    }
+
+    /// Elements of recurrent state per value head: a `[key][value]` matrix.
+    pub fn state_per_head(&self) -> usize {
+        self.head_k_dim * self.head_v_dim
+    }
+}
+
 /// Every primitive the qwen3 forward pass needs.
 ///
 /// Methods write into caller-provided buffers so a backend never allocates on
@@ -121,6 +178,58 @@ pub trait Ops {
 
     /// `gate = silu(gate) * up`, in place — the SwiGLU nonlinearity.
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]);
+
+    /// L2 normalization per `head_dim`-sized slice, in place. No weight.
+    ///
+    /// **Not RMSNorm, despite looking like it.** `ggml_compute_forward_l2_norm_f32`
+    /// scales by `1 / max(sqrt(sum(x^2)), eps)`: there is no division by `n`,
+    /// and `eps` clamps the *norm* where RMSNorm adds it under the square root.
+    /// Same-looking output, different function — which is why GatedDeltaNet's
+    /// q and k get this and not [`Ops::rms_norm_heads`].
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32);
+
+    /// Depthwise causal conv1d over a per-channel window, then `silu`.
+    ///
+    /// `window` is `[n_channels][kernel]` with the **oldest sample first**, so
+    /// tap `t` of the kernel multiplies `window[c][t]` and the newest sample is
+    /// at `window[c][kernel - 1]`. That ordering is llama.cpp's: `build_conv_state`
+    /// concatenates the stored state and then this token along the time axis,
+    /// and keeps the last `kernel - 1` entries as the next state.
+    ///
+    /// Depthwise means no mixing across channels — each of the 8192 channels
+    /// has its own `kernel` weights and sees only its own history.
+    ///
+    /// The accumulator is **f32, deliberately**. `ggml_compute_forward_ssm_conv_f32`
+    /// says so in a comment: "not using ggml_vec_dot_f32, because its sum is in
+    /// double precision". Four taps, so nothing is lost, but the oracle has to
+    /// agree with the reference rather than be better than it.
+    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]);
+
+    /// The gated delta rule for one token, every value head, state updated in
+    /// place.
+    ///
+    /// Per value head `h`, with state `S` indexed `[value][key]` — key
+    /// contiguous, matching ggml's `[S_v, S_v, H_v]` where `ne[0]` is the
+    /// contraction axis:
+    ///
+    /// ```text
+    /// g       = exp(softplus(alpha[h] + dt_bias[h]) * ssm_a[h])
+    /// S      *= g                                  // scalar forget gate
+    /// pred[j] = sum_i S[j][i] * k[i]               // what S currently predicts
+    /// d[j]    = sigmoid(beta[h]) * (v[j] - pred[j])
+    /// S[j][i] += k[i] * d[j]                       // rank-1 correction
+    /// out[j]  = sum_i S[j][i] * q[i] / sqrt(head_k_dim)
+    /// ```
+    ///
+    /// A per-head associative memory that *corrects* its stored value for the
+    /// current key rather than merely accumulating it. Cost is
+    /// `O(head_k_dim * head_v_dim)` per token and **independent of context
+    /// length** — which is why 30 of the 35B's 40 layers need no KV cache at
+    /// all, and why a 262,144-token context is plausible on this hardware.
+    ///
+    /// `state` is `n_v_heads * head_k_dim * head_v_dim` and is both read and
+    /// written. `out` is `n_v_heads * head_v_dim`.
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]);
 
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);

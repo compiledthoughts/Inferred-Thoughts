@@ -35,7 +35,7 @@ use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
 use crate::ops::naive::QuantizedRow;
-use crate::ops::{Attn, Ops, Weights};
+use crate::ops::{Attn, Delta, Ops, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
 mod slot {
@@ -654,6 +654,19 @@ impl Cuda {
     }
 }
 
+/// The error every GatedDeltaNet primitive returns until it has a kernel.
+///
+/// Named rather than inlined so the three call sites cannot drift, and so that
+/// deleting it is the obvious signal that the CUDA path landed.
+fn no_gdn_kernel(what: &'static str) -> Error {
+    Error::Cuda {
+        what,
+        detail: "GatedDeltaNet has no CUDA kernel yet; run the qwen35 \
+                 architectures on --backend spin until one exists"
+            .to_string(),
+    }
+}
+
 impl Ops for Cuda {
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
         self.note(self.rms_norm_impl(x, weight, eps, out));
@@ -685,6 +698,29 @@ impl Ops for Cuda {
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
         self.note(self.add_assign_impl(a, b));
+    }
+
+    // GatedDeltaNet has no CUDA path yet, and says so rather than quietly
+    // falling back to the host.
+    //
+    // A host fallback would work, and would be a trap: each of these sits
+    // inside a GDN layer, so running one on the CPU drags the whole activation
+    // home and back, undoing the residency the seam exists for -- and it would
+    // read as a mysterious slowdown rather than a missing kernel. It would also
+    // break graph capture, which needs an identical launch sequence every pass.
+    //
+    // The sticky error is the same mechanism `matmul` uses for a quant type it
+    // has no kernel for.
+    fn l2_norm_heads(&self, _x: &mut [f32], _head_dim: usize, _eps: f32) {
+        self.note(Err(no_gdn_kernel("l2_norm_heads")));
+    }
+
+    fn ssm_conv(&self, _window: &[f32], _weight: &[f32], _kernel: usize, _out: &mut [f32]) {
+        self.note(Err(no_gdn_kernel("ssm_conv")));
+    }
+
+    fn delta_rule(&self, _d: &Delta<'_>, _state: &mut [f32], _out: &mut [f32]) {
+        self.note(Err(no_gdn_kernel("delta_rule")));
     }
 
     fn host_wrote(&self, buf: &[f32]) {
@@ -759,6 +795,18 @@ impl Ops for &Cuda {
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
         (*self).add_assign(a, b)
+    }
+
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+        (*self).l2_norm_heads(x, head_dim, eps)
+    }
+
+    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
+        (*self).ssm_conv(window, weight, kernel, out)
+    }
+
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+        (*self).delta_rule(d, state, out)
     }
 
     fn host_wrote(&self, buf: &[f32]) {

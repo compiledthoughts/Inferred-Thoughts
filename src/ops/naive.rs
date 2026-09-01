@@ -19,7 +19,7 @@
 // module, never inside it.
 #![forbid(unsafe_code)]
 
-use super::{Attn, Ops, Weights};
+use super::{Attn, Delta, Ops, Weights};
 use crate::gguf::GgmlType;
 use crate::quant::half::{f16_to_f32, f32_to_f16};
 
@@ -126,6 +126,95 @@ impl Ops for Naive {
         for i in 0..gate.len() {
             let g = gate[i];
             gate[i] = g / (1.0 + (-g).exp()) * up[i];
+        }
+    }
+
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+        debug_assert_eq!(x.len() % head_dim, 0);
+
+        for head in x.chunks_exact_mut(head_dim) {
+            // Transcribed from ggml_compute_forward_l2_norm_f32. Two details
+            // that a glance at RMSNorm would get wrong: the sum is not divided
+            // by n, and eps clamps the norm from below instead of being added
+            // under the root. The f64 accumulator is the reference's
+            // `ggml_float`, and `sqrtf` takes a float, so the narrowing before
+            // the root is the reference's too and not an accident here.
+            let mut sum = 0.0f64;
+            for &v in head.iter() {
+                sum += f64::from(v * v);
+            }
+            let scale = 1.0f32 / (sum as f32).sqrt().max(eps);
+            for v in head.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+
+    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
+        debug_assert_eq!(window.len(), out.len() * kernel);
+        debug_assert_eq!(weight.len(), out.len() * kernel);
+
+        for (c, o) in out.iter_mut().enumerate() {
+            // f32, not f64. ggml_compute_forward_ssm_conv_f32 says outright
+            // that it avoids ggml_vec_dot_f32 "because its sum is in double
+            // precision", so accumulating wider here would make the oracle
+            // disagree with the reference it exists to reproduce.
+            let mut sum = 0.0f32;
+            for t in 0..kernel {
+                sum += window[c * kernel + t] * weight[c * kernel + t];
+            }
+            *o = sum / (1.0 + (-sum).exp()); // silu, fused in as the reference does
+        }
+    }
+
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+        debug_assert_eq!(state.len(), d.n_v_heads * d.state_per_head());
+        debug_assert_eq!(out.len(), d.n_v_heads * d.head_v_dim);
+        debug_assert_eq!(d.v.len(), d.n_v_heads * d.head_v_dim);
+        debug_assert_eq!(d.q.len(), d.n_k_heads * d.head_k_dim);
+
+        let (sk, sv) = (d.head_k_dim, d.head_v_dim);
+        let q_scale = d.scale();
+
+        for h in 0..d.n_v_heads {
+            let kh = d.key_head(h);
+            let q = &d.q[kh * sk..(kh + 1) * sk];
+            let k = &d.k[kh * sk..(kh + 1) * sk];
+            let v = &d.v[h * sv..(h + 1) * sv];
+            let s = &mut state[h * sk * sv..(h + 1) * sk * sv];
+
+            // exp(softplus(alpha + dt) * ssm_a). The 20.0 cutoff is the
+            // reference's (ggml_compute_softplus_f32), not a guard added here:
+            // above it, log(1 + exp(x)) is x to f32 precision anyway.
+            let a = d.alpha[h] + d.dt_bias[h];
+            let softplus = if a > 20.0 { a } else { (1.0 + a.exp()).ln() };
+            let g = (softplus * d.ssm_a[h]).exp();
+            let beta = 1.0 / (1.0 + (-d.beta[h]).exp());
+
+            for x in s.iter_mut() {
+                *x *= g;
+            }
+
+            // Row j of the state holds the value axis; the key axis is
+            // contiguous within it, which makes all three loops below
+            // sequential reads and matches ggml's `ne[0]` being the axis that
+            // `sum_rows` contracts over.
+            for j in 0..sv {
+                let row = &mut s[j * sk..(j + 1) * sk];
+                let mut pred = 0.0f32;
+                for i in 0..sk {
+                    pred += row[i] * k[i];
+                }
+                let delta = beta * (v[j] - pred);
+                for i in 0..sk {
+                    row[i] += k[i] * delta;
+                }
+                let mut o = 0.0f32;
+                for i in 0..sk {
+                    o += row[i] * (q[i] * q_scale);
+                }
+                out[h * sv + j] = o;
+            }
         }
     }
 
@@ -460,6 +549,180 @@ mod tests {
         Naive.softmax(&mut big);
         assert!(big.iter().all(|v| v.is_finite()), "{big:?}");
         assert!((big.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn l2_norm_divides_by_the_norm_not_the_rms() {
+        // The whole reason this op exists separately from rms_norm. For [3, 4]
+        // the L2 norm is 5, so the result is [0.6, 0.8] and has unit norm.
+        // RMSNorm would divide by sqrt(mean) = 3.5355 and give [0.849, 1.13],
+        // a vector of norm sqrt(2). Confusing the two produces plausible
+        // numbers that are wrong by exactly sqrt(n).
+        let mut x = [3.0f32, 4.0];
+        Naive.l2_norm_heads(&mut x, 2, 0.0);
+        assert!((x[0] - 0.6).abs() < 1e-6, "{x:?}");
+        assert!((x[1] - 0.8).abs() < 1e-6, "{x:?}");
+        assert!((x[0] * x[0] + x[1] * x[1] - 1.0).abs() < 1e-6, "unit norm");
+    }
+
+    #[test]
+    fn l2_norm_eps_clamps_the_norm_from_below() {
+        // eps bounds the norm itself, so a tiny vector is scaled by 1/eps
+        // rather than exploding. RMSNorm puts eps under the root instead and
+        // would not produce this value.
+        let mut x = [1e-6f32, 0.0];
+        Naive.l2_norm_heads(&mut x, 2, 1e-3);
+        assert!((x[0] - 1e-3).abs() < 1e-9, "{x:?}");
+    }
+
+    #[test]
+    fn l2_norm_treats_each_head_independently() {
+        let mut x = [3.0f32, 4.0, 30.0, 40.0];
+        Naive.l2_norm_heads(&mut x, 2, 0.0);
+        assert!((x[0] - x[2]).abs() < 1e-6, "{x:?}");
+        assert!((x[1] - x[3]).abs() < 1e-6, "{x:?}");
+    }
+
+    #[test]
+    fn ssm_conv_is_depthwise_and_reads_oldest_first() {
+        // Two channels, kernel 3. Channel 0 has window [1,2,3] oldest-first
+        // against weights [100,10,1], giving 100+20+3 = 123. That pins the tap
+        // order: newest-first would give 1+20+300 = 321.
+        //
+        // Channel 1 is all zeros, so any cross-channel mixing would show up as
+        // an output other than silu(0) = 0.
+        let window = [1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0];
+        let weight = [100.0f32, 10.0, 1.0, 100.0, 10.0, 1.0];
+        let mut out = [0.0f32; 2];
+        Naive.ssm_conv(&window, &weight, 3, &mut out);
+        let silu = |x: f32| x / (1.0 + (-x).exp());
+        assert!((out[0] - silu(123.0)).abs() < 1e-3, "{out:?}");
+        assert_eq!(out[1], 0.0, "depthwise: channel 1 saw only its own zeros");
+    }
+
+    /// A single-head [`Delta`] for tests to perturb.
+    fn delta_fixture<'a>(
+        q: &'a [f32],
+        k: &'a [f32],
+        v: &'a [f32],
+        alpha: &'a [f32],
+        beta: &'a [f32],
+        ssm_a: &'a [f32],
+        dt: &'a [f32],
+        dim: usize,
+    ) -> Delta<'a> {
+        Delta {
+            q,
+            k,
+            v,
+            alpha,
+            beta,
+            ssm_a,
+            dt_bias: dt,
+            head_k_dim: dim,
+            head_v_dim: dim,
+            n_k_heads: 1,
+            n_v_heads: 1,
+        }
+    }
+
+    #[test]
+    fn delta_rule_writes_a_value_it_can_read_back() {
+        // From an empty state with beta = 1 and no decay (ssm_a = 0, so the
+        // gate is exp(0) = 1), one step stores v at key k. Reading with q = k
+        // returns v scaled by |k|^2 / sqrt(d), which for a unit k and d = 4 is
+        // v/2.
+        //
+        // This is the test that catches a transposed state: writing at [i][j]
+        // and reading at [j][i] returns zero here rather than a scaled v.
+        let k = [0.5f32, 0.5, 0.5, 0.5];
+        let v = [1.0f32, 2.0, 3.0, 4.0];
+        let (alpha, beta, ssm_a, dt) = ([0.0f32], [40.0f32], [0.0f32], [0.0f32]);
+        let d = delta_fixture(&k, &k, &v, &alpha, &beta, &ssm_a, &dt, 4);
+        let mut state = vec![0.0f32; 16];
+        let mut out = vec![0.0f32; 4];
+        Naive.delta_rule(&d, &mut state, &mut out);
+        for j in 0..4 {
+            assert!((out[j] - v[j] * 0.5).abs() < 1e-4, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn delta_rule_forgets_at_the_rate_the_gate_says() {
+        // Store, then take a step whose beta is ~0 so nothing new is written
+        // and whose gate is exp(softplus(0) * -1) = exp(-ln 2) = 0.5. The
+        // readout must halve.
+        let k = [0.5f32, 0.5, 0.5, 0.5];
+        let v = [1.0f32, 2.0, 3.0, 4.0];
+        let mut state = vec![0.0f32; 16];
+        let mut out = vec![0.0f32; 4];
+
+        let (a0, b0, s0, dt) = ([0.0f32], [40.0f32], [0.0f32], [0.0f32]);
+        let write = delta_fixture(&k, &k, &v, &a0, &b0, &s0, &dt, 4);
+        Naive.delta_rule(&write, &mut state, &mut out);
+        let first = out.clone();
+
+        let (a1, b1, s1) = ([0.0f32], [-40.0f32], [-1.0f32]);
+        let zeros = [0.0f32; 4];
+        let decay = delta_fixture(&k, &k, &zeros, &a1, &b1, &s1, &dt, 4);
+        Naive.delta_rule(&decay, &mut state, &mut out);
+        for j in 0..4 {
+            assert!((out[j] - first[j] * 0.5).abs() < 1e-3, "{out:?} vs {first:?}");
+        }
+    }
+
+    #[test]
+    fn delta_rule_groups_value_heads_by_modulo_not_division() {
+        // Four value heads over two key heads. Modulo maps 0,1,2,3 to key
+        // 0,1,0,1; division would map them to 0,0,1,1. The two disagree on
+        // heads 1 and 2, which is what this pins.
+        let q = [1.0f32, 0.0, 0.0, 1.0];
+        let v = [1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+        let alpha = [0.0f32; 4];
+        let beta = [40.0f32; 4];
+        let ssm_a = [0.0f32; 4];
+        let dt = [0.0f32; 4];
+        let d = Delta {
+            q: &q,
+            k: &q,
+            v: &v,
+            alpha: &alpha,
+            beta: &beta,
+            ssm_a: &ssm_a,
+            dt_bias: &dt,
+            head_k_dim: 2,
+            head_v_dim: 2,
+            n_k_heads: 2,
+            n_v_heads: 4,
+        };
+        assert_eq!(
+            (0..4).map(|h| d.key_head(h)).collect::<Vec<_>>(),
+            vec![0, 1, 0, 1],
+            "value to key head must tile, matching ggml_repeat and iv1 % neq1"
+        );
+        let mut state = vec![0.0f32; 4 * 4];
+        let mut out = vec![0.0f32; 8];
+        Naive.delta_rule(&d, &mut state, &mut out);
+        assert!(out[2] > 0.0, "head 1 read back nothing: {out:?}");
+        assert!((out[0] - out[2]).abs() < 1e-6, "heads 0 and 1 are symmetric");
+    }
+
+    #[test]
+    fn delta_rule_corrects_rather_than_accumulates() {
+        // Write v twice at the same key with beta = 1 and no decay. A pure
+        // accumulator would double the stored value; the delta rule subtracts
+        // what it already predicts, so the second write is a no-op.
+        let k = [0.5f32, 0.5, 0.5, 0.5];
+        let v = [1.0f32, 2.0, 3.0, 4.0];
+        let (alpha, beta, ssm_a, dt) = ([0.0f32], [40.0f32], [0.0f32], [0.0f32]);
+        let d = delta_fixture(&k, &k, &v, &alpha, &beta, &ssm_a, &dt, 4);
+        let mut state = vec![0.0f32; 16];
+        let (mut a, mut b) = (vec![0.0f32; 4], vec![0.0f32; 4]);
+        Naive.delta_rule(&d, &mut state, &mut a);
+        Naive.delta_rule(&d, &mut state, &mut b);
+        for j in 0..4 {
+            assert!((a[j] - b[j]).abs() < 1e-4, "second write moved it: {a:?} {b:?}");
+        }
     }
 
     #[test]

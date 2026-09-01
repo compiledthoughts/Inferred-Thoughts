@@ -30,7 +30,7 @@
 use rayon::prelude::*;
 
 use super::naive::{self, Naive};
-use super::{Attn, Ops, Weights};
+use super::{Attn, Delta, Ops, Weights};
 use crate::gguf::GgmlType;
 
 /// Rows handed to one task.
@@ -208,6 +208,23 @@ impl Ops for Par {
 
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
         Naive.silu_mul(gate, up)
+    }
+
+    // GatedDeltaNet's three primitives forward to the oracle for now. Each is
+    // either tiny (l2_norm_heads, ssm_conv over 4 taps) or a sequential scan
+    // whose parallel decomposition is over value heads -- worth threading only
+    // once the 9B says these show up in a profile. `PARALLEL_THRESHOLD` records
+    // why guessing at that is a losing move here.
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+        Naive.l2_norm_heads(x, head_dim, eps)
+    }
+
+    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
+        Naive.ssm_conv(window, weight, kernel, out)
+    }
+
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+        Naive.delta_rule(d, state, out)
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
