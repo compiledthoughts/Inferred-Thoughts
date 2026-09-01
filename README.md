@@ -1,8 +1,14 @@
 # inferredThoughts
 
 A from-scratch Rust inference engine for GGUF models. Built toward serving an
-MoE model whose weights do not fit in VRAM — see `HANDOFF.md` for why, and
-`CLAUDE.md` for how.
+MoE model whose weights do not fit in VRAM.
+
+| | |
+|---|---|
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | the shape — module map, the `Ops` seam, where exactness stops |
+| [`BENCHMARKS.md`](BENCHMARKS.md) | every number in sequence, with the method to reproduce it |
+| [`HANDOFF.md`](HANDOFF.md) | why the project exists, and what did not survive contact |
+| [`CLAUDE.md`](CLAUDE.md) | the rules and the current state |
 
 **Status: v0.1.** Stages 1–6 complete, the `qwen35` architecture decoded, and
 the forward pass running on **both CPU and GPU**. Loads a GGUF, tokenizes
