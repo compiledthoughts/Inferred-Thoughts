@@ -423,15 +423,32 @@ fn run_generation<O: inferred_thoughts::Ops>(
 
     // Reported, not inferred: the engine knows which of the three it was.
     eprintln!("[stopped: {}]", why.label());
-    eprintln!(
-        "\n{} tokens in {secs:.1}s ({:.2} tok/s, {:.0} ms/token)",
-        produced.len(),
-        produced.len() as f64 / secs.max(1e-9),
-        ms_per_token
+
+    // The phase breakdown is free -- the profiler collects it on every run --
+    // so it is printed on every run rather than behind `--profile`. A single
+    // blended rate over a short prompt and a long generation describes neither
+    // phase: prefill batches the whole prompt, decode does one token against
+    // the cache, and on this model they differ by an order of magnitude.
+    let mut err = std::io::stderr();
+    let _ = writeln!(err);
+    let _ = engine.prof.phases(&mut err);
+
+    // Wall clock over both phases, so its token count is the sum and not
+    // `produced` -- dividing prefill-plus-decode time by decode tokens alone
+    // would report a rate that is neither phase's and flatter the longer the
+    // prompt. The remainder is what the run spends outside the model:
+    // detokenizing the whole sequence and printing what is new, once a token.
+    let total_tokens = engine.prof.prefill_tokens + produced.len() as u64;
+    let outside_ms =
+        secs * 1000.0 - (engine.prof.prefill_ns + engine.prof.decode_ns) as f64 / 1e6;
+    let _ = writeln!(
+        err,
+        "wall     {total_tokens:>6} tok  {:>9.1} ms  {:>8.2} tok/s  {outside_ms:>7.1} ms outside the model",
+        secs * 1000.0,
+        total_tokens as f64 / secs.max(1e-9),
     );
 
     if o.report {
-        let mut err = std::io::stderr();
         let _ = writeln!(err);
         let _ = engine.prof.report(&mut err);
     }

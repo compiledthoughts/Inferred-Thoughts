@@ -210,12 +210,19 @@ impl Profile {
             .collect()
     }
 
-    /// Human-readable summary. Never called on the hot path.
-    pub fn report(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    /// The two phases, one line each.
+    ///
+    /// Separated from [`Profile::report`] because these are the numbers every
+    /// run wants and the rest are the numbers an investigation wants. Printing
+    /// them from one place is what keeps the bare summary and `--profile` from
+    /// disagreeing about the same run.
+    ///
+    /// The two are worth reading apart rather than as one average. Prefill is a
+    /// batch over the whole prompt and decode is one token against the cache,
+    /// so they differ by an order of magnitude on the same model — and a single
+    /// blended tok/s over a short prompt and a long generation reports neither.
+    pub fn phases(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
         let ms = |ns: u64| ns as f64 / 1e6;
-        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-
-        writeln!(out, "--- profile ---")?;
 
         if self.prefill_tokens > 0 {
             let s = self.prefill_ns as f64 / 1e9;
@@ -238,6 +245,19 @@ impl Profile {
                 ms(self.decode_ns) / self.decode_tokens as f64,
             )?;
         }
+        Ok(())
+    }
+
+    /// Everything beyond the phases. Never called on the hot path.
+    ///
+    /// Deliberately does *not* repeat [`Profile::phases`]. Those are printed on
+    /// every run, so a caller that also asks for this has already shown them,
+    /// and printing them again here would put them after the wall-clock line
+    /// that summarizes them.
+    pub fn report(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+
+        writeln!(out, "--- profile ---")?;
 
         // The thesis is about bytes, so time alone measures only the symptom.
         // One decode step reads every weight exactly once, which makes the
@@ -245,7 +265,7 @@ impl Profile {
         // figures in CLAUDE.md.
         writeln!(
             out,
-            "\nweights  {:.3} GiB per forward pass",
+            "weights  {:.3} GiB per forward pass",
             gib(self.weight_bytes)
         )?;
         if self.decode_tokens > 0 {
