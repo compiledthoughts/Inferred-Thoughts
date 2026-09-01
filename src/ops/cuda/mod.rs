@@ -1036,6 +1036,42 @@ impl Cuda {
         Ok(())
     }
 
+    /// Time `reps` launches of a diagnostic kernel taking `(int n, const float
+    /// *x, float *out)`, in microseconds per launch.
+    ///
+    /// Launches are timed as a batch against a single synchronize, because that
+    /// is how the backend issues them; timing each against its own barrier
+    /// measures a barrier the forward pass never pays.
+    pub fn bench_kernel(
+        &self,
+        name: &'static str,
+        n: usize,
+        shared_floats: usize,
+        reps: u32,
+    ) -> Result<f64> {
+        let host: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.01 - 0.5).collect();
+        let x = DeviceBuffer::from_slice(&host)?;
+        let out = DeviceBuffer::new(4)?;
+        let args = [KArg::I32(n as i32), KArg::Ptr(x.ptr), KArg::Ptr(out.ptr)];
+        let shared = (shared_floats * 4) as u32;
+
+        let was = self.pass_graph.replace(false);
+        // SAFETY: the arguments match every kernel in the diagnostic set, and
+        // `shared` is what the caller says the kernel indexes.
+        let run = |reps: u32| -> Result<f64> {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                unsafe { self.launch_shared(name, 1, 256, shared, &args)? };
+            }
+            self.sync()?;
+            Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
+        };
+        run(64)?; // warm the module and let clocks settle
+        let us = run(reps);
+        self.pass_graph.set(was);
+        us
+    }
+
     /// Turn graph capture off.
     ///
     /// A graph batches a whole pass and runs it at `end_pass`, so a caller that

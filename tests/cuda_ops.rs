@@ -531,3 +531,43 @@ fn per_op_round_trip_cost() {
         round_trip * 478.0 / 1000.0
     );
 }
+
+/// Why is RMSNorm's serial f64 sum so expensive?
+///
+/// It is ~40% of device time and the largest single kernel in a token. The
+/// obvious explanation — "f64 is slow on a consumer card" — is about
+/// *throughput*, and a dependent chain is a latency problem. At ~59 us for 1024
+/// adds, that is ~164 cycles each at 2.84 GHz, which is far more than an FP64
+/// add should cost even here.
+///
+/// So this varies one thing at a time. If the cost turns out to be memory or
+/// occupancy rather than FP64 latency, it is recoverable without trading any
+/// exactness away, which is much the better outcome.
+///
+/// A measurement, not an assertion.
+#[test]
+#[ignore = "needs an sm_120 device; a measurement, not an assertion"]
+fn why_is_the_rms_reduction_slow() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    let n = 1024;
+    let reps = 2000;
+
+    let cases = [
+        ("serial f64, global", "bench_serial_f64_global", 0usize),
+        ("serial f32, global", "bench_serial_f32_global", 0),
+        ("serial f64, shared", "bench_shared_f64", n),
+        ("serial f32, shared", "bench_shared_f32", n),
+        ("tree f64", "bench_tree_f64", 0),
+    ];
+
+    println!("  {:<22} {:>9} {:>14}", "variant", "us/call", "cycles/element");
+    for (label, kernel, shared) in cases {
+        let us = gpu
+            .bench_kernel(kernel, n, shared, reps)
+            .expect("bench kernel");
+        // 2.84 GHz, the clock nvidia-smi reports under load on this card.
+        let cycles = us * 2840.0 / n as f64;
+        println!("  {label:<22} {us:>9.2} {cycles:>14.0}");
+    }
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+}

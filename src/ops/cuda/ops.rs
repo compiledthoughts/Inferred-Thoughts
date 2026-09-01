@@ -338,11 +338,12 @@ impl Cuda {
             KArg::F32(eps),
             KArg::Ptr(od),
         ];
-        // 256 threads, matching the fixed shared array the block reduction
-        // declares. Changing one without the other is a silent wrong answer.
+        // Shared memory holds one square per element; the block fills it
+        // cooperatively before the serial reduction walks it.
+        let shared = (x.len() * 4) as u32;
         // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
-        // sized from the slice it mirrors.
-        unsafe { self.launch("rms_norm", 1, 256, &args)? };
+        // sized from the slice it mirrors, and `shared` is `n` floats.
+        unsafe { self.launch_shared("rms_norm", 1, 256, shared, &args)? };
         Ok(())
     }
 
@@ -363,8 +364,10 @@ impl Cuda {
             KArg::F32(eps),
             KArg::Ptr(xd),
         ];
-        // SAFETY: as above; one block per head, which is the grid below.
-        unsafe { self.launch("rms_norm_heads", n_heads as u32, 256, &args)? };
+        let shared = (head_dim * 4) as u32;
+        // SAFETY: as above; one block per head, and `shared` is `head_dim`
+        // floats.
+        unsafe { self.launch_shared("rms_norm_heads", n_heads as u32, 256, shared, &args)? };
         self.mirror_out(x).map(|_| ())
     }
 

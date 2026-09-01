@@ -81,60 +81,85 @@ __device__ inline float h2f(unsigned short bits) {
 
 // RMSNorm, one block for the whole vector.
 //
-// Thread 0 accumulates the sum of squares serially in *double*, which is what
+// The sum of squares is accumulated serially in *double*, which is what
 // ggml_compute_forward_rms_norm_f32 does and what ops::naive::rms_scale
-// reproduces. That accumulator is load-bearing: summing 1024 squares in f32
-// shifts the scale enough to move activations across Q8_0 boundaries in every
-// matmul downstream. A parallel tree reduction would be far faster and would
-// not be the same number, so the block waits.
+// reproduces. The double accumulator is load-bearing and the serial order is
+// load-bearing, for two different reasons.
 //
-// **A tree reduction was tried here and reverted.** It was measurably faster —
-// ~61 us a call down to the sync floor, worth ~10 tok/s at short context — and
-// it passed the bit-exactness tests, because the `(float)` cast of `mean` two
-// lines later is five orders of magnitude coarser than the ~1e-13 the reorder
-// moves things by. It was still the wrong trade: the rule that a redistributing
-// backend reproduces the oracle exactly is what lets every differential test in
-// this project demand equal bits instead of a tolerance, and that is worth more
-// than the milliseconds. At the context lengths the model is actually used at,
-// the win had shrunk to about 1 ms of an 18 ms token anyway.
+// **Double, because f32 is a known bug.** Summing 1024 squares in f32 shifts
+// the scale by ~1e-5 relative, which is invisible in a printed tensor and is
+// enough to move activations across Q8_0 boundaries in every matmul
+// downstream. That was found the hard way and is recorded in `CLAUDE.md`.
 //
-// The cost is real and understood: 1024 *dependent* f64 adds, each waiting on
-// the one before. That is latency, not bandwidth — cooperatively loading the
-// squares into shared memory first was also tried, and changed nothing.
+// **Serial, because the rule is that a redistributing backend reproduces the
+// oracle exactly**, which is what lets every differential test here demand
+// equal bits rather than a tolerance.
+//
+// # What that costs, measured
+//
+// `tests/cuda_ops.rs::why_is_the_rms_reduction_slow` varies one thing at a
+// time, in us for 1024 elements:
+//
+//     serial f64, global   62.5      serial f32, global   13.0
+//     serial f64, shared   51.6      serial f32, shared    8.4
+//     tree f64             11.7
+//
+// So the cost is **FP64 latency on a dependent chain** — 4.8x on the same
+// memory path — and not the compiler, the loads, or occupancy, which is what
+// was assumed the first time. FP64 *throughput* here is 1/64 of FP32, but a
+// dependent chain is a latency problem and the two are not the same number.
+//
+// Staging through shared memory is worth a real 18% and changes no bit, since
+// the squares are per-element and independent; only the sum is ordered. That
+// is taken below. The remaining 4x needs the chain broken, which is a tree, and
+// a tree is a different answer rather than a faster one.
 __global__ void rms_norm(int n, const float *__restrict__ x,
                          const float *__restrict__ w, float eps,
                          float *__restrict__ out) {
+    extern __shared__ float sq[];
     __shared__ float scale;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        sq[i] = v * v;
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
         double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            float v = x[i];
-            sum += (double)(v * v);
-        }
+        for (int i = 0; i < n; ++i) sum += (double)sq[i];
         float mean = (float)(sum / (double)n);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
+
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         out[i] = x[i] * scale * w[i];
     }
 }
 
-// Per-head RMSNorm, in place. One block per head, same serial-double rule.
+// Per-head RMSNorm, in place. One block per head, same rule and same shape.
 __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
                                float eps, float *__restrict__ x) {
+    extern __shared__ float sq[];
     __shared__ float scale;
+
     float *head = x + (size_t)blockIdx.x * head_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = head[i];
+        sq[i] = v * v;
+    }
+    __syncthreads();
+
     if (threadIdx.x == 0) {
         double sum = 0.0;
-        for (int i = 0; i < head_dim; ++i) {
-            float v = head[i];
-            sum += (double)(v * v);
-        }
+        for (int i = 0; i < head_dim; ++i) sum += (double)sq[i];
         float mean = (float)(sum / (double)head_dim);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
+
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         head[i] = head[i] * scale * w[i];
     }
@@ -471,6 +496,96 @@ __global__ void kv_write_f16(int n, const float *__restrict__ src,
                              unsigned short *__restrict__ dst) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __half_as_ushort(__float2half(src[i]));
+}
+
+// ------------------------------------------------------------- diagnostics
+//
+// Not used by the forward pass. These exist to answer one question: why does a
+// serial f64 sum of 1024 values cost ~59 us, when that is ~164 cycles per add
+// at 2.84 GHz and an FP64 add should be nowhere near that?
+//
+// FP64 *throughput* on a consumer part is 1/64 of FP32, but a dependent chain
+// is a latency problem, not a throughput one. If the answer is memory or
+// occupancy rather than FP64 latency, the cost is recoverable without touching
+// the arithmetic — which is the outcome worth checking for before trading any
+// exactness away.
+//
+// The five below vary one thing at a time:
+//   serial_f64_global  what the real kernel does
+//   serial_f32_global  the same with an f32 accumulator, isolating FP64
+//   shared_f64         the same values, staged through shared memory first
+//   shared_f32         both changes, for the corner of the square
+//   tree_f64           the parallel alternative, as a floor
+
+__global__ void bench_serial_f64_global(int n, const float *__restrict__ x,
+                                        float *__restrict__ out) {
+    if (threadIdx.x == 0) {
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) {
+            float v = x[i];
+            sum += (double)(v * v);
+        }
+        out[0] = (float)sum;
+    }
+}
+
+__global__ void bench_serial_f32_global(int n, const float *__restrict__ x,
+                                        float *__restrict__ out) {
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+            float v = x[i];
+            sum += v * v;
+        }
+        out[0] = sum;
+    }
+}
+
+__global__ void bench_shared_f64(int n, const float *__restrict__ x,
+                                 float *__restrict__ out) {
+    extern __shared__ float sq[];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        sq[i] = v * v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) sum += (double)sq[i];
+        out[0] = (float)sum;
+    }
+}
+
+__global__ void bench_shared_f32(int n, const float *__restrict__ x,
+                                 float *__restrict__ out) {
+    extern __shared__ float sq[];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        sq[i] = v * v;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) sum += sq[i];
+        out[0] = sum;
+    }
+}
+
+__global__ void bench_tree_f64(int n, const float *__restrict__ x,
+                               float *__restrict__ out) {
+    __shared__ double p[256];
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        acc += (double)(v * v);
+    }
+    p[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) p[threadIdx.x] += p[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = (float)p[0];
 }
 
 } // extern "C"
