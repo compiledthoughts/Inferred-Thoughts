@@ -29,7 +29,35 @@ pub type CUstream = *mut c_void;
 /// we care about.
 pub type CUdeviceptr = u64;
 
+pub type CUgraph = *mut c_void;
+pub type CUgraphExec = *mut c_void;
+pub type CUgraphNode = *mut c_void;
+
 pub const CUDA_SUCCESS: CUresult = 0;
+
+/// `CUDA_KERNEL_NODE_PARAMS_v2` from `cuda.h`.
+///
+/// The v2 layout appeared in CUDA 12 and added `kern` and `ctx` on the end, so
+/// the symbol below is the `_v2` one explicitly rather than the unversioned
+/// alias — a mismatch between struct and entry point would be read as garbage
+/// grid dimensions rather than as an error. Set `func` and leave `kern` and
+/// `ctx` null; they are the alternative way of naming the same thing.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KernelNodeParams {
+    pub func: CUfunction,
+    pub grid_x: c_uint,
+    pub grid_y: c_uint,
+    pub grid_z: c_uint,
+    pub block_x: c_uint,
+    pub block_y: c_uint,
+    pub block_z: c_uint,
+    pub shared_bytes: c_uint,
+    pub params: *mut *mut c_void,
+    pub extra: *mut *mut c_void,
+    pub kern: *mut c_void,
+    pub ctx: CUcontext,
+}
 
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`, from `cuda.h`.
 pub const ATTR_CC_MAJOR: c_int = 75;
@@ -77,6 +105,28 @@ unsafe extern "C" {
         stream: CUstream,
         params: *mut *mut c_void,
         extra: *mut *mut c_void,
+    ) -> CUresult;
+
+    pub fn cuGraphCreate(graph: *mut CUgraph, flags: c_uint) -> CUresult;
+    pub fn cuGraphDestroy(graph: CUgraph) -> CUresult;
+    pub fn cuGraphAddKernelNode_v2(
+        node: *mut CUgraphNode,
+        graph: CUgraph,
+        deps: *const CUgraphNode,
+        n_deps: usize,
+        params: *const KernelNodeParams,
+    ) -> CUresult;
+    pub fn cuGraphInstantiateWithFlags(
+        exec: *mut CUgraphExec,
+        graph: CUgraph,
+        flags: u64,
+    ) -> CUresult;
+    pub fn cuGraphExecDestroy(exec: CUgraphExec) -> CUresult;
+    pub fn cuGraphLaunch(exec: CUgraphExec, stream: CUstream) -> CUresult;
+    pub fn cuGraphExecKernelNodeSetParams_v2(
+        exec: CUgraphExec,
+        node: CUgraphNode,
+        params: *const KernelNodeParams,
     ) -> CUresult;
 
     pub fn cuGetErrorName(error: CUresult, str_: *mut *const c_char) -> CUresult;

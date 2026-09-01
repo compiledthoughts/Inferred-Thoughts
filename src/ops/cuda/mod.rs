@@ -91,6 +91,16 @@ pub struct Cuda {
     /// See `Cuda::mirror_in`.
     mirrors: RefCell<HashMap<usize, Mirror>>,
 
+    /// The decode step as a CUDA graph. See [`GraphState`].
+    graph: RefCell<GraphState>,
+    /// Whether the pass now running is eligible to use the graph.
+    pass_graph: Cell<bool>,
+    /// Master switch. Off for callers that drive ops one at a time.
+    graphs_enabled: Cell<bool>,
+    /// Decode passes seen. The first few run eagerly so every buffer the graph
+    /// will point at has been allocated and settled.
+    warmups: Cell<u32>,
+
     /// Per-kernel wall time, when `time_kernels` is on. See [`Cuda::kernel_times`].
     kernel_ms: RefCell<HashMap<&'static str, (u64, f64)>>,
 
@@ -184,6 +194,66 @@ impl DeviceBench {
             + stats.launches as f64 * self.launch_us;
         total / tokens as f64 / 1000.0
     }
+}
+
+/// A decode step, recorded once and replayed per token.
+///
+/// # Why this exists
+///
+/// A decode step issues ~673 kernels and each `cuLaunchKernel` costs ~7 us of
+/// *CPU* time — driver bookkeeping, not arithmetic. That is ~4.7 ms of an 11 ms
+/// token, a third of it spent describing work rather than doing it, which is
+/// why the card drew 50 W of a possible 180 and sat at 55-80% utilization.
+///
+/// A graph is the same sequence recorded once and replayed with a single call.
+///
+/// # Why it is built by hand rather than captured
+///
+/// Stream capture is the usual route and it does not fit here: `n_pos` grows
+/// every token, so attention's grid and several arguments change, and a
+/// captured graph would be stale on the very next token. Re-capturing each
+/// token costs about what the launches did.
+///
+/// Building the nodes ourselves means we keep every handle, so a replay can
+/// update just the parameters that moved — roughly 112 of 673 nodes — with
+/// `cuGraphExecKernelNodeSetParams`. The rest are untouched.
+///
+/// # The safety property that matters
+///
+/// A graph is only correct if the launch sequence is *identical* every pass.
+/// That holds for single-token decode and not for prefill, so only decode is
+/// eligible. Rather than trust that, replay checks each launch against the node
+/// it is standing in for and **fails loudly** on any divergence in name, count
+/// or order. A wrong graph would otherwise produce plausible garbage.
+enum GraphState {
+    /// Launching eagerly.
+    Off,
+    /// Building the node list. Kernels are added, not run; the pass that
+    /// records is also the pass that first replays, so no token is skipped.
+    Recording {
+        graph: ffi::CUgraph,
+        nodes: Vec<RecordedNode>,
+        prev: Option<ffi::CUgraphNode>,
+    },
+    /// Instantiated. Each pass walks `cursor` through `nodes`, updating any
+    /// whose parameters have changed, then launches once.
+    Ready {
+        graph: ffi::CUgraph,
+        exec: ffi::CUgraphExec,
+        nodes: Vec<RecordedNode>,
+        cursor: usize,
+    },
+}
+
+/// One node, plus the launch it was recorded from, so a replay can tell what
+/// changed.
+struct RecordedNode {
+    node: ffi::CUgraphNode,
+    name: &'static str,
+    grid: (u32, u32),
+    block: u32,
+    shared: u32,
+    args: Vec<KArg>,
 }
 
 /// One kernel argument, by value.
@@ -337,6 +407,10 @@ impl Cuda {
                 stats: Cell::new(DeviceStats::default()),
                 mirrors: RefCell::new(HashMap::new()),
                 rope_pos: Cell::new(None),
+                graph: RefCell::new(GraphState::Off),
+                pass_graph: Cell::new(false),
+                graphs_enabled: Cell::new(true),
+                warmups: Cell::new(0),
                 kernel_ms: RefCell::new(HashMap::new()),
                 time_kernels: Cell::new(false),
             })
@@ -423,6 +497,9 @@ impl Cuda {
         shared_bytes: u32,
         args: &[KArg],
     ) -> Result<()> {
+        if self.pass_graph.get() {
+            return self.graph_launch(name, grid_x, grid_y, block, shared_bytes, args);
+        }
         let f = self.cached_function(name)?;
         let mut pack = ArgPack::new(args);
         let mut params = pack.ptrs();
@@ -471,6 +548,9 @@ impl Cuda {
         shared_bytes: u32,
         args: &[KArg],
     ) -> Result<()> {
+        if self.pass_graph.get() {
+            return self.graph_launch(name, grid, 1, block, shared_bytes, args);
+        }
         let f = self.cached_function(name)?;
         let mut pack = ArgPack::new(args);
         let mut params = pack.ptrs();
@@ -629,6 +709,256 @@ impl Cuda {
         })
     }
 
+    /// Record or replay one launch, instead of issuing it.
+    fn graph_launch(
+        &self,
+        name: &'static str,
+        grid_x: u32,
+        grid_y: u32,
+        block: u32,
+        shared: u32,
+        args: &[KArg],
+    ) -> Result<()> {
+        let f = self.cached_function(name)?;
+        let mut state = self.graph.borrow_mut();
+        match &mut *state {
+            GraphState::Recording { graph, nodes, prev } => {
+                let mut pack = ArgPack::new(args);
+                let mut ptrs = pack.ptrs();
+                let p = ffi::KernelNodeParams {
+                    func: f,
+                    grid_x,
+                    grid_y,
+                    grid_z: 1,
+                    block_x: block,
+                    block_y: 1,
+                    block_z: 1,
+                    shared_bytes: shared,
+                    params: ptrs.as_mut_ptr(),
+                    extra: std::ptr::null_mut(),
+                    kern: std::ptr::null_mut(),
+                    ctx: std::ptr::null_mut(),
+                };
+                let mut node: ffi::CUgraphNode = std::ptr::null_mut();
+                let deps = prev.map(|n| [n]);
+                let (dep_ptr, n_deps) = match &deps {
+                    Some(d) => (d.as_ptr(), 1usize),
+                    None => (std::ptr::null(), 0usize),
+                };
+                // SAFETY: `p` matches CUDA_KERNEL_NODE_PARAMS_v2 and names a
+                // function from our own module; the driver copies both it and
+                // the parameter array during this call.
+                unsafe {
+                    check(
+                        ffi::cuGraphAddKernelNode_v2(&mut node, *graph, dep_ptr, n_deps, &p),
+                        "cuGraphAddKernelNode",
+                    )?
+                };
+                *prev = Some(node);
+                nodes.push(RecordedNode {
+                    node,
+                    name,
+                    grid: (grid_x, grid_y),
+                    block,
+                    shared,
+                    args: args.to_vec(),
+                });
+                Ok(())
+            }
+            GraphState::Ready {
+                exec,
+                nodes,
+                cursor,
+                ..
+            } => {
+                let i = *cursor;
+                *cursor += 1;
+                let n = match nodes.get_mut(i) {
+                    Some(n) if n.name == name => n,
+                    _ => {
+                        return Err(Error::Cuda {
+                            what: "graph replay",
+                            detail: format!(
+                                "launch {i} is {name:?}, but the recorded step has {} \
+                                 there. The kernel sequence is not identical between \
+                                 passes, which a graph cannot express.",
+                                nodes.get(i).map(|n| n.name).unwrap_or("nothing")
+                            ),
+                        });
+                    }
+                };
+                if n.grid == (grid_x, grid_y)
+                    && n.block == block
+                    && n.shared == shared
+                    && n.args == args
+                {
+                    return Ok(());
+                }
+                let mut pack = ArgPack::new(args);
+                let mut ptrs = pack.ptrs();
+                let p = ffi::KernelNodeParams {
+                    func: f,
+                    grid_x,
+                    grid_y,
+                    grid_z: 1,
+                    block_x: block,
+                    block_y: 1,
+                    block_z: 1,
+                    shared_bytes: shared,
+                    params: ptrs.as_mut_ptr(),
+                    extra: std::ptr::null_mut(),
+                    kern: std::ptr::null_mut(),
+                    ctx: std::ptr::null_mut(),
+                };
+                // SAFETY: as above; `n.node` belongs to the graph `exec` was
+                // instantiated from.
+                unsafe {
+                    check(
+                        ffi::cuGraphExecKernelNodeSetParams_v2(*exec, n.node, &p),
+                        "cuGraphExecKernelNodeSetParams",
+                    )?
+                };
+                n.grid = (grid_x, grid_y);
+                n.block = block;
+                n.shared = shared;
+                n.args.clear();
+                n.args.extend_from_slice(args);
+                Ok(())
+            }
+            GraphState::Off => Err(Error::Cuda {
+                what: "graph launch",
+                detail: "the pass claimed to use a graph but none is active".to_string(),
+            }),
+        }
+    }
+
+    /// Begin a pass. `n_tokens` decides eligibility: only single-token decode
+    /// has a fixed kernel sequence.
+    fn graph_begin(&self, n_tokens: usize) -> Result<()> {
+        // Per-kernel timing needs a launch it can time, which a graph is not.
+        let eligible = n_tokens == 1 && !self.time_kernels.get() && self.graphs_enabled.get();
+        self.pass_graph.set(eligible);
+        if !eligible {
+            return Ok(());
+        }
+
+        let warm = self.warmups.get();
+        let mut state = self.graph.borrow_mut();
+        match &mut *state {
+            GraphState::Ready { cursor, .. } => *cursor = 0,
+            GraphState::Off => {
+                // A few eager passes first, so every buffer the graph will
+                // point at has been allocated and stopped moving.
+                if warm < 3 {
+                    self.warmups.set(warm + 1);
+                    self.pass_graph.set(false);
+                    return Ok(());
+                }
+                let mut graph: ffi::CUgraph = std::ptr::null_mut();
+                // SAFETY: valid out-pointer; flags must be zero.
+                unsafe { check(ffi::cuGraphCreate(&mut graph, 0), "cuGraphCreate")? };
+                *state = GraphState::Recording {
+                    graph,
+                    nodes: Vec::new(),
+                    prev: None,
+                };
+            }
+            GraphState::Recording { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// End a pass: instantiate if this was the recording pass, then launch.
+    fn graph_end(&self) -> Result<()> {
+        if !self.pass_graph.get() {
+            return Ok(());
+        }
+        let mut state = self.graph.borrow_mut();
+        let taken = std::mem::replace(&mut *state, GraphState::Off);
+        match taken {
+            GraphState::Recording { graph, nodes, .. } => {
+                let mut exec: ffi::CUgraphExec = std::ptr::null_mut();
+                // SAFETY: `graph` is ours and fully built; flags zero.
+                unsafe {
+                    check(
+                        ffi::cuGraphInstantiateWithFlags(&mut exec, graph, 0),
+                        "cuGraphInstantiate",
+                    )?
+                };
+                // SAFETY: `exec` was just instantiated; the null stream is the
+                // one every copy in this backend uses, so ordering holds.
+                unsafe {
+                    check(
+                        ffi::cuGraphLaunch(exec, std::ptr::null_mut()),
+                        "cuGraphLaunch",
+                    )?
+                };
+                self.bump(|s| s.launches += 1);
+                *state = GraphState::Ready {
+                    graph,
+                    exec,
+                    nodes,
+                    cursor: 0,
+                };
+                Ok(())
+            }
+            GraphState::Ready {
+                graph,
+                exec,
+                nodes,
+                cursor,
+            } => {
+                if cursor != nodes.len() {
+                    let (a, b) = (cursor, nodes.len());
+                    *state = GraphState::Ready {
+                        graph,
+                        exec,
+                        nodes,
+                        cursor,
+                    };
+                    return Err(Error::Cuda {
+                        what: "graph replay",
+                        detail: format!(
+                            "this pass issued {a} launches, the recorded step has {b}. \
+                             The kernel sequence is not identical between passes."
+                        ),
+                    });
+                }
+                // SAFETY: as above.
+                unsafe {
+                    check(
+                        ffi::cuGraphLaunch(exec, std::ptr::null_mut()),
+                        "cuGraphLaunch",
+                    )?
+                };
+                self.bump(|s| s.launches += 1);
+                *state = GraphState::Ready {
+                    graph,
+                    exec,
+                    nodes,
+                    cursor,
+                };
+                Ok(())
+            }
+            GraphState::Off => Ok(()),
+        }
+    }
+
+    /// Turn graph capture off.
+    ///
+    /// A graph batches a whole pass and runs it at `end_pass`, so a caller that
+    /// issues one op and immediately reads the result — the per-op differential
+    /// tests, or a backend that mixes CPU and GPU at op granularity — must not
+    /// use one. Those callers say so here rather than being silently wrong.
+    pub fn use_graphs(&self, on: bool) {
+        self.graphs_enabled.set(on);
+    }
+
+    /// Whether a decode step is currently replaying from a graph.
+    pub fn graph_active(&self) -> bool {
+        matches!(&*self.graph.borrow(), GraphState::Ready { .. })
+    }
+
     /// A kernel handle, resolved once per symbol.
     fn cached_function(&self, name: &'static str) -> Result<ffi::CUfunction> {
         let mut map = self.functions.borrow_mut();
@@ -735,8 +1065,34 @@ impl Cuda {
     }
 }
 
+impl GraphState {
+    /// Free the driver handles.
+    ///
+    /// Called from `Cuda`'s `Drop` rather than being a `Drop` of its own:
+    /// implementing `Drop` here would forbid moving fields out of the state,
+    /// which is exactly what the Recording-to-Ready transition does.
+    fn destroy(&mut self) {
+        // SAFETY: each handle came from the matching create/instantiate call
+        // and is freed once. The exec goes first, as the driver requires.
+        unsafe {
+            match self {
+                GraphState::Recording { graph, .. } => {
+                    ffi::cuGraphDestroy(*graph);
+                }
+                GraphState::Ready { graph, exec, .. } => {
+                    ffi::cuGraphExecDestroy(*exec);
+                    ffi::cuGraphDestroy(*graph);
+                }
+                GraphState::Off => {}
+            }
+        }
+        *self = GraphState::Off;
+    }
+}
+
 impl Drop for Cuda {
     fn drop(&mut self) {
+        self.graph.borrow_mut().destroy();
         // SAFETY: both handles were produced by the driver and are dropped
         // exactly once, module before context, as the driver requires.
         unsafe {

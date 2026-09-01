@@ -148,10 +148,18 @@ pub trait Ops {
     /// The model is about to read `buf`. Bring back whatever the device has.
     fn host_needs(&self, _buf: &mut [f32]) {}
 
-    /// A forward pass is starting. Activation buffers are allocated per pass,
-    /// so an address seen last time may be a different buffer now; anything
-    /// remembered about host addresses must be dropped.
-    fn begin_pass(&self) {}
+    /// A forward pass over `n_tokens` is starting. Activation buffers are
+    /// allocated per pass, so an address seen last time may be a different
+    /// buffer now; anything remembered about host addresses must be dropped.
+    ///
+    /// `n_tokens` is passed because a backend may treat single-token decode
+    /// differently from prefill — the GPU records it as a CUDA graph, which is
+    /// only sound when the kernel sequence is fixed.
+    fn begin_pass(&self, _n_tokens: usize) {}
+
+    /// The pass is finished issuing work. A backend that batched it has to be
+    /// told when to run it; the model must not read a result before this.
+    fn end_pass(&self) {}
 
     /// Round `src` to f16 and write it into `slab` at `offset` elements in.
     ///

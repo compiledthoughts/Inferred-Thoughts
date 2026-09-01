@@ -687,7 +687,12 @@ impl Ops for Cuda {
         self.note(self.kv_write_impl(slab, offset, src));
     }
 
-    fn begin_pass(&self) {
+    fn end_pass(&self) {
+        self.note(self.graph_end());
+    }
+
+    fn begin_pass(&self, n_tokens: usize) {
+        self.note(self.graph_begin(n_tokens));
         // Activation buffers are allocated per pass, so an address from the
         // last pass may name a different buffer now. Every mirror is marked
         // stale, which forces a re-upload before anything reads it — that is
@@ -743,8 +748,12 @@ impl Ops for &Cuda {
         (*self).host_needs(buf)
     }
 
-    fn begin_pass(&self) {
-        (*self).begin_pass()
+    fn begin_pass(&self, n_tokens: usize) {
+        (*self).begin_pass(n_tokens)
+    }
+
+    fn end_pass(&self) {
+        (*self).end_pass()
     }
 
     fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {

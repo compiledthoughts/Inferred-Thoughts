@@ -132,6 +132,9 @@ fn attend_tolerance(n_pos: usize, reference: &[f32]) -> f32 {
 #[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
 fn every_op_agrees_with_the_oracle() {
     let gpu = Cuda::new(0).expect("cuda device");
+    // One op at a time, read straight back. A graph defers the whole pass to
+    // `end_pass`, so it cannot serve this shape.
+    gpu.use_graphs(false);
     println!("device {} sm_{}{}", gpu.name(), gpu.capability().0, gpu.capability().1);
 
     let n = 1024usize;
@@ -143,7 +146,7 @@ fn every_op_agrees_with_the_oracle() {
         let w = noise(n, 2);
         let (mut a, mut b) = (vec![0.0; n], vec![0.0; n]);
         Naive.rms_norm(&x, &w, eps, &mut a);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.rms_norm(&x, &w, eps, &mut b);
         gpu.host_needs(&mut b);
         exact("rms_norm", &a, &b);
@@ -156,7 +159,7 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let w = noise(head_dim, 4);
         Naive.rms_norm_heads(&mut a, &w, head_dim, eps);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.rms_norm_heads(&mut b, &w, head_dim, eps);
         gpu.host_needs(&mut b);
         exact("rms_norm_heads", &a, &b);
@@ -176,7 +179,7 @@ fn every_op_agrees_with_the_oracle() {
         let x = noise(n_in, 6);
         let (mut a, mut b) = (vec![0.0; n_out], vec![0.0; n_out]);
         Naive.matmul(&w, &x, &mut a);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.matmul(&w, &x, &mut b);
         gpu.host_needs(&mut b);
         exact("matmul_q8_0", &a, &b);
@@ -188,7 +191,7 @@ fn every_op_agrees_with_the_oracle() {
         let mut a = noise(head_dim * n_heads, 7);
         let mut b = a.clone();
         Naive.rope_neox(&mut a, 37, head_dim, n_heads, 1.0e6);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.rope_neox(&mut b, 37, head_dim, n_heads, 1.0e6);
         gpu.host_needs(&mut b);
         exact("rope_neox", &a, &b);
@@ -200,7 +203,7 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let other = noise(n, 9);
         Naive.add_assign(&mut a, &other);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.add_assign(&mut b, &other);
         gpu.host_needs(&mut b);
         exact("add_assign", &a, &b);
@@ -211,7 +214,7 @@ fn every_op_agrees_with_the_oracle() {
         let mut a = noise(384, 10);
         let mut b = a.clone();
         Naive.softmax(&mut a);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.softmax(&mut b);
         gpu.host_needs(&mut b);
         close("softmax", &a, &b, 1e-7);
@@ -223,7 +226,7 @@ fn every_op_agrees_with_the_oracle() {
         let mut b = a.clone();
         let up = noise(n, 12);
         Naive.silu_mul(&mut a, &up);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.silu_mul(&mut b, &up);
         gpu.host_needs(&mut b);
         close("silu_mul", &a, &b, 1e-6);
@@ -252,7 +255,7 @@ fn every_op_agrees_with_the_oracle() {
         };
         let (mut a, mut b) = (vec![0.0; n_head * head_dim], vec![0.0; n_head * head_dim]);
         Naive.attend(&attn, &mut a);
-        gpu.begin_pass();
+        gpu.begin_pass(1);
         gpu.attend(&attn, &mut b);
         gpu.host_needs(&mut b);
         close("attend", &a, &b, attend_tolerance(n_pos, &a));
@@ -282,15 +285,30 @@ fn the_model_agrees_with_the_oracle_to_the_quantization_floor() {
     let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
     let tokens = tk.encode("The capital of France is", true, true);
 
+    // Twelve decode steps, which is past the point where the GPU stops
+    // launching kernels one by one and starts replaying the step as a CUDA
+    // graph. That transition is invisible to this comparison and should stay
+    // that way, so this is where it gets checked.
+    let steps = 12;
+
     let cpu_logits = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, Naive, tokens.len() + 4, false);
-        e.prefill(&tokens).expect("prefill")
+        let mut e = Engine::new(m, Naive, tokens.len() + steps + 4, false);
+        let mut l = e.prefill(&tokens).expect("prefill");
+        for _ in 0..steps {
+            l = e.decode(Qwen3::argmax(&l)).expect("decode");
+        }
+        l
     };
     let gpu_logits = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, &gpu, tokens.len() + 4, false);
-        e.prefill(&tokens).expect("prefill")
+        let mut e = Engine::new(m, &gpu, tokens.len() + steps + 4, false);
+        let mut l = e.prefill(&tokens).expect("prefill");
+        for _ in 0..steps {
+            l = e.decode(Qwen3::argmax(&l)).expect("decode");
+        }
+        assert!(gpu.graph_active(), "the graph never engaged, so this tested the eager path");
+        l
     };
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 
@@ -343,6 +361,9 @@ fn the_model_agrees_with_the_oracle_to_the_quantization_floor() {
 fn only_the_expf_ops_diverge() {
     common::model_or_skip!(path);
     let gpu = Cuda::new(0).expect("cuda device");
+    // This mixes CPU and GPU op by op, so every GPU result is read
+    // immediately. A graph batches the pass and would defer them all.
+    gpu.use_graphs(false);
 
     /// The five exact kernels on the GPU, the three exp-dependent ones on the
     /// CPU. Not a backend anyone should run — a bisection instrument.
@@ -395,8 +416,11 @@ fn only_the_expf_ops_diverge() {
         fn host_needs(&self, buf: &mut [f32]) {
             self.0.host_needs(buf)
         }
-        fn begin_pass(&self) {
-            self.0.begin_pass()
+        fn begin_pass(&self, n_tokens: usize) {
+            self.0.begin_pass(n_tokens)
+        }
+        fn end_pass(&self) {
+            self.0.end_pass()
         }
     }
 

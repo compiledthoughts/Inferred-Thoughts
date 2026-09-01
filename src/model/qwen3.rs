@@ -273,7 +273,7 @@ impl<'a> Qwen3<'a> {
         // A device backend keys its copies on host addresses, and the buffers
         // below are allocated fresh each pass, so last pass's addresses must
         // not be trusted. No-op on the CPU backends.
-        ops.begin_pass();
+        ops.begin_pass(n);
 
         // Residual stream, one row of n_embd per token in this batch.
         let mut x = vec![0.0f32; n * c.n_embd];
@@ -498,6 +498,9 @@ impl<'a> Qwen3<'a> {
 
         let mut logits = vec![0.0f32; c.n_vocab];
         ops.matmul(&self.output, &normed, &mut logits);
+        // Everything above may only have been *queued*; this is where a
+        // batched backend runs it, and it must happen before the read below.
+        ops.end_pass();
         ops.host_needs(&mut logits);
         ctx.trace("result_output", 0, &logits);
 
