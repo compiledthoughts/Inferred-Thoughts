@@ -300,6 +300,7 @@ fn report_device(
 ) -> inferred_thoughts::Result<()> {
     let s = cuda.stats();
     let tokens = (prompt_len + o.max_tokens) as u64;
+    let per = |ns: u64| ns as f64 / tokens.max(1) as f64 / 1e6;
 
     if o.kernels {
         let times = cuda.kernel_times();
@@ -314,14 +315,33 @@ fn report_device(
         }
         eprintln!("  {:<22} {:>8} {total:>10.1}", "total", "");
     }
+    // Where a token's time actually goes. `gpu` is device-stream time from
+    // CUDA events, `issue` is host time spent putting work there, and `wait` is
+    // host time blocked on a copy. They are measured independently and do not
+    // have to sum to the wall clock -- issuing overlaps execution, which is the
+    // point of an asynchronous API. What matters is the ratio.
+    if s.passes > 0 {
+        eprintln!("
+time     gpu    {:>6.2} ms/token   device stream, from CUDA events", per(s.gpu_ns));
+        eprintln!("         issue  {:>6.2} ms/token   host, launching and bookkeeping", per(s.issue_ns));
+        eprintln!("         wait   {:>6.2} ms/token   host, blocked on a copy", per(s.wait_ns));
+        if let Some(total) = ms_per_token {
+            eprintln!(
+                "         total  {total:>6.2} ms/token   wall clock, so the GPU is busy {:.0}% of it",
+                100.0 * per(s.gpu_ns) / total,
+            );
+        }
+    }
+
     eprintln!("
 device   {} kernel launches", s.launches);
     eprintln!(
-        "         {} up / {} down = {:.0} bus crossings per token",
-        s.h2d_calls,
-        s.d2h_calls,
+        "         {:.1} launches / {:.1} crossings / {:.1} syncs per token",
+        s.launches as f64 / tokens.max(1) as f64,
         s.crossings_per_token(tokens),
+        s.syncs as f64 / tokens.max(1) as f64,
     );
+    eprintln!("         {} up / {} down", s.h2d_calls, s.d2h_calls);
     eprintln!(
         "         {:.1} MiB up, {:.1} MiB down",
         s.h2d_bytes as f64 / 1048576.0,

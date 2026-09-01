@@ -29,6 +29,7 @@ pub type CUstream = *mut c_void;
 /// we care about.
 pub type CUdeviceptr = u64;
 
+pub type CUevent = *mut c_void;
 pub type CUgraph = *mut c_void;
 pub type CUgraphExec = *mut c_void;
 pub type CUgraphNode = *mut c_void;
@@ -106,6 +107,12 @@ unsafe extern "C" {
         params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> CUresult;
+
+    pub fn cuEventCreate(event: *mut CUevent, flags: c_uint) -> CUresult;
+    pub fn cuEventDestroy_v2(event: CUevent) -> CUresult;
+    pub fn cuEventRecord(event: CUevent, stream: CUstream) -> CUresult;
+    pub fn cuEventSynchronize(event: CUevent) -> CUresult;
+    pub fn cuEventElapsedTime(ms: *mut f32, start: CUevent, end: CUevent) -> CUresult;
 
     pub fn cuGraphCreate(graph: *mut CUgraph, flags: c_uint) -> CUresult;
     pub fn cuGraphDestroy(graph: CUgraph) -> CUresult;

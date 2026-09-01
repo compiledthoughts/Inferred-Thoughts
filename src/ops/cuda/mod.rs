@@ -101,6 +101,15 @@ pub struct Cuda {
     /// will point at has been allocated and settled.
     warmups: Cell<u32>,
 
+    /// Events bracketing a pass, so device time can be separated from wall
+    /// time. Created lazily; the pair is reused every pass.
+    events: RefCell<Option<(ffi::CUevent, ffi::CUevent)>>,
+    /// Whether a pass is open, i.e. whether the event pair holds a live pair of
+    /// timestamps still to be read.
+    pass_open: Cell<bool>,
+    /// When the host started issuing the current pass.
+    issue_start: Cell<Option<std::time::Instant>>,
+
     /// Per-kernel wall time, when `time_kernels` is on. See [`Cuda::kernel_times`].
     kernel_ms: RefCell<HashMap<&'static str, (u64, f64)>>,
 
@@ -155,6 +164,23 @@ pub struct DeviceStats {
     pub h2d_bytes: u64,
     pub d2h_calls: u64,
     pub d2h_bytes: u64,
+
+    /// Forward passes seen, so the rest can be reported per pass.
+    pub passes: u64,
+    /// Times the host blocked on the device: an explicit synchronize, or a
+    /// device-to-host copy, which cannot start until prior work has finished.
+    pub syncs: u64,
+    /// Device execution time, from CUDA events bracketing each pass.
+    ///
+    /// This is time on the *stream*, so it includes any gap where the device
+    /// had nothing queued — which is the point. A token where `gpu_ns` is far
+    /// below the wall clock is a token the card spent waiting for the CPU.
+    pub gpu_ns: u64,
+    /// Host time spent issuing a pass: everything between `begin_pass` and
+    /// `end_pass` returning. Launches, bookkeeping, the model's own code.
+    pub issue_ns: u64,
+    /// Host time spent blocked in a device-to-host copy.
+    pub wait_ns: u64,
 }
 
 impl DeviceStats {
@@ -411,6 +437,9 @@ impl Cuda {
                 pass_graph: Cell::new(false),
                 graphs_enabled: Cell::new(true),
                 warmups: Cell::new(0),
+                events: RefCell::new(None),
+                pass_open: Cell::new(false),
+                issue_start: Cell::new(None),
                 kernel_ms: RefCell::new(HashMap::new()),
                 time_kernels: Cell::new(false),
             })
@@ -942,6 +971,69 @@ impl Cuda {
             }
             GraphState::Off => Ok(()),
         }
+    }
+
+    /// Start the clocks for a pass, and bank the previous pass's device time.
+    ///
+    /// The elapsed time is read at the *start* of the next pass rather than at
+    /// the end of this one, because reading it requires the stop event to have
+    /// completed and waiting for that here would be the very stall this is
+    /// meant to measure.
+    fn timing_begin(&self) -> Result<()> {
+        let mut slot = self.events.borrow_mut();
+        if slot.is_none() {
+            let (mut a, mut b): (ffi::CUevent, ffi::CUevent) =
+                (std::ptr::null_mut(), std::ptr::null_mut());
+            // SAFETY: valid out-pointers; flags zero is CU_EVENT_DEFAULT, which
+            // is the timing-enabled one.
+            unsafe {
+                check(ffi::cuEventCreate(&mut a, 0), "cuEventCreate")?;
+                check(ffi::cuEventCreate(&mut b, 0), "cuEventCreate")?;
+            }
+            *slot = Some((a, b));
+        }
+        let (start, stop) = match *slot {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        if self.pass_open.get() {
+            let mut ms = 0.0f32;
+            // SAFETY: both events were recorded during the previous pass, and
+            // that pass ended in a blocking copy, so `stop` has completed.
+            unsafe {
+                check(ffi::cuEventSynchronize(stop), "cuEventSynchronize")?;
+                check(
+                    ffi::cuEventElapsedTime(&mut ms, start, stop),
+                    "cuEventElapsedTime",
+                )?;
+            }
+            let ns = (f64::from(ms) * 1e6) as u64;
+            self.bump(|s| s.gpu_ns += ns);
+            self.pass_open.set(false);
+        }
+
+        // SAFETY: `start` is ours; the null stream is the one everything uses.
+        unsafe { check(ffi::cuEventRecord(start, std::ptr::null_mut()), "cuEventRecord")? };
+        self.issue_start.set(Some(std::time::Instant::now()));
+        self.bump(|s| s.passes += 1);
+        Ok(())
+    }
+
+    /// Stop the clocks for a pass.
+    fn timing_end(&self) -> Result<()> {
+        let stop = match *self.events.borrow() {
+            Some((_, stop)) => stop,
+            None => return Ok(()),
+        };
+        // SAFETY: as above.
+        unsafe { check(ffi::cuEventRecord(stop, std::ptr::null_mut()), "cuEventRecord")? };
+        self.pass_open.set(true);
+        if let Some(t) = self.issue_start.replace(None) {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.bump(|s| s.issue_ns += ns);
+        }
+        Ok(())
     }
 
     /// Turn graph capture off.

@@ -208,17 +208,24 @@ impl Cuda {
         if bytes == 0 {
             return Ok(());
         }
-        self.bump(|s| {
-            s.d2h_calls += 1;
-            s.d2h_bytes += bytes as u64;
-        });
+        // A device-to-host copy cannot start until the work before it has
+        // finished, so this is where the host blocks and it is timed as such.
+        let started = std::time::Instant::now();
         // SAFETY: as above, in the other direction.
-        unsafe {
+        let r = unsafe {
             check(
                 ffi::cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, src, bytes),
                 "cuMemcpyDtoH",
             )
-        }
+        };
+        let waited = started.elapsed().as_nanos() as u64;
+        self.bump(|s| {
+            s.d2h_calls += 1;
+            s.d2h_bytes += bytes as u64;
+            s.syncs += 1;
+            s.wait_ns += waited;
+        });
+        r
     }
 
     /// Device copy of a host buffer that does not change, uploaded on first
@@ -689,9 +696,11 @@ impl Ops for Cuda {
 
     fn end_pass(&self) {
         self.note(self.graph_end());
+        self.note(self.timing_end());
     }
 
     fn begin_pass(&self, n_tokens: usize) {
+        self.note(self.timing_begin());
         self.note(self.graph_begin(n_tokens));
         // Activation buffers are allocated per pass, so an address from the
         // last pass may name a different buffer now. Every mirror is marked
