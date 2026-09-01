@@ -21,6 +21,10 @@
 //! walks positions for a fixed head, so it strides by `kv_dim` — the same
 //! access pattern the Stage 4 code had over its full-sequence buffers.
 
+pub mod recurrent;
+
+pub use recurrent::RecurrentState;
+
 use crate::error::{Error, Result};
 use crate::quant::half::{f16_to_f32, f32_to_f16};
 

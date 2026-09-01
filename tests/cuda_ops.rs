@@ -49,7 +49,7 @@
 
 #![cfg(feature = "cuda")]
 
-use inferred_thoughts::ops::{Attn, Ops, Weights};
+use inferred_thoughts::ops::{Attn, Delta, Ops, Weights};
 use inferred_thoughts::quant::half::f32_to_f16;
 use inferred_thoughts::{Cuda, Engine, GgufFile, Naive, Qwen3, Tokenizer};
 
@@ -419,6 +419,18 @@ fn only_the_expf_ops_diverge() {
         fn rms_norm_heads(&self, x: &mut [f32], w: &[f32], head_dim: usize, eps: f32) {
             self.0.rms_norm_heads(x, w, head_dim, eps);
             self.0.host_needs(x);
+        }
+        // GatedDeltaNet is not part of what this instrument bisects: it runs
+        // qwen3, which has no recurrent layers. Forwarding to the oracle keeps
+        // the impl total without pretending the GPU has these kernels.
+        fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+            Naive.l2_norm_heads(x, head_dim, eps);
+        }
+        fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
+            Naive.ssm_conv(window, weight, kernel, out);
+        }
+        fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+            Naive.delta_rule(d, state, out);
         }
         fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
             self.0.matmul(w, x, out);

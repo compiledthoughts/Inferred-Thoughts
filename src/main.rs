@@ -204,11 +204,11 @@ struct GenOpts {
 
 fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<()> {
     use inferred_thoughts::tok::chat::ChatMl;
-    use inferred_thoughts::{Naive, Par, Qwen3, Spin, Tokenizer};
+    use inferred_thoughts::{Model, Naive, Par, Spin, Tokenizer};
 
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
-    let m = Qwen3::load(&f)?;
+    let m = Model::load(&f)?;
 
     // Wrapping happens before tokenization so the markers go through
     // `parse_special` and encode as single tokens, not as literal text.
@@ -233,9 +233,11 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         format!("{} ({n_threads} threads)", o.backend)
     };
     eprintln!(
-        "model {} | {} layers | {} prompt tokens{} | ctx {} | {label}",
+        "model {} | {} | {} layers ({} with kv) | {} prompt tokens{} | ctx {} | {label}",
         f.path.file_name().unwrap_or_default().to_string_lossy(),
-        m.cfg.n_layer,
+        m.arch(),
+        m.n_layer(),
+        m.n_kv_layer(),
         tokens.len(),
         if o.chat { " (chat)" } else { "" },
         o.n_ctx,
@@ -381,7 +383,7 @@ device   {} kernel launches", s.launches);
 }
 
 fn run_generation<O: inferred_thoughts::Ops>(
-    model: inferred_thoughts::Qwen3<'_>,
+    model: inferred_thoughts::Model<'_>,
     ops: O,
     tk: &inferred_thoughts::Tokenizer,
     tokens: &[u32],
@@ -392,9 +394,17 @@ fn run_generation<O: inferred_thoughts::Ops>(
     use std::io::Write;
 
     let mut engine = Engine::new(model, ops, o.n_ctx, o.detail);
+    let rs_bytes = engine.recurrent_capacity_bytes();
     eprintln!(
-        "kv cache {:.0} MiB resident",
-        engine.kv_capacity_bytes() as f64 / 1048576.0
+        "kv cache {:.0} MiB resident{}",
+        engine.kv_capacity_bytes() as f64 / 1048576.0,
+        if rs_bytes > 0 {
+            // Reported separately because it does not grow with context, which
+            // is the property the hybrid architecture exists for.
+            format!(", recurrent state {:.0} MiB", rs_bytes as f64 / 1048576.0)
+        } else {
+            String::new()
+        }
     );
 
     print!("{prompt_text}");

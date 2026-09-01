@@ -177,8 +177,14 @@
 //! kernel. This was flagged unverified precisely because getting it wrong would
 //! look like a numerics bug rather than a structural one.
 
+use crate::cache::{KvCache, RecurrentState, recurrent};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
+use crate::ops::{Attn, Delta, Ops, Weights};
+use crate::profile::{Ctx, Part};
+use crate::quant::{dequantize, dequantize_into};
+
+use super::{matrix, tensor, vector};
 
 /// Everything the forward pass needs, read from metadata.
 #[derive(Debug, Clone)]
@@ -421,6 +427,529 @@ impl Config {
 
         Ok(cfg)
     }
+}
+
+/// One block's weights. Two shapes share a struct because the trunk tensors —
+/// the two norms and the dense FFN — are identical either way, and only the
+/// mixer differs.
+enum Mixer<'a> {
+    /// A full-attention block. `wq` emits query *and* gate interleaved per
+    /// head, which is why there is no separate gate tensor here.
+    Attn {
+        wq: Weights<'a>,
+        wk: Weights<'a>,
+        wv: Weights<'a>,
+        wo: Weights<'a>,
+        q_norm: Vec<f32>,
+        k_norm: Vec<f32>,
+    },
+    /// A GatedDeltaNet block.
+    Delta {
+        wqkv: Weights<'a>,
+        wgate: Weights<'a>,
+        conv1d: Vec<f32>,
+        ssm_beta: Weights<'a>,
+        ssm_alpha: Weights<'a>,
+        ssm_a: Vec<f32>,
+        dt_bias: Vec<f32>,
+        ssm_norm: Vec<f32>,
+        ssm_out: Weights<'a>,
+    },
+}
+
+struct Layer<'a> {
+    attn_norm: Vec<f32>,
+    /// Named `post_attention_norm` in the file; plays the role `ffn_norm` does
+    /// in `qwen3`.
+    ffn_norm: Vec<f32>,
+    mixer: Mixer<'a>,
+    ffn_gate: Weights<'a>,
+    ffn_up: Weights<'a>,
+    ffn_down: Weights<'a>,
+}
+
+pub struct Qwen35<'a> {
+    pub cfg: Config,
+    tok_embd: Weights<'a>,
+    output_norm: Vec<f32>,
+    output: Weights<'a>,
+    layers: Vec<Layer<'a>>,
+    /// Absolute layer index to KV slab. Only attention layers have one.
+    ///
+    /// **Worth the second numbering here, unlike the recurrent state.** On the
+    /// 35B at its full 262,144 context, a slab per absolute layer would be
+    /// ~21.5 GiB against ~5.4 for the 10 layers that actually attend -- the
+    /// difference between fitting on this card and not. `RecurrentState` makes
+    /// the opposite call for the opposite reason: there the waste is tens of
+    /// megabytes, and one numbering is worth more than the memory.
+    kv_slot: Vec<usize>,
+    n_kv_layer: usize,
+}
+
+impl<'a> Qwen35<'a> {
+    pub fn load(f: &'a GgufFile) -> Result<Self> {
+        let cfg = Config::from_gguf(f)?;
+        let (n_embd, n_ff) = (cfg.n_embd, cfg.n_ff);
+
+        let tok_embd = matrix(f, "token_embd.weight", n_embd, cfg.n_vocab)?;
+        // Same fallback llama.cpp uses (TENSOR_DUPLICATED): tie to the
+        // embedding when the file carries no separate head. The 9B has one; the
+        // 35B has one too, at Q6_K.
+        let output = match f.tensor("output.weight") {
+            Some(_) => matrix(f, "output.weight", n_embd, cfg.n_vocab)?,
+            None => tok_embd,
+        };
+
+        // MTP blocks are loaded by llama.cpp but not executed in a normal pass,
+        // and they carry tensors this engine has no use for. Skipping them here
+        // rather than loading and ignoring them keeps a missing-tensor error
+        // meaningful.
+        let mut layers = Vec::with_capacity(cfg.n_main_layer());
+        for i in 0..cfg.n_main_layer() {
+            let p = |name: &str| format!("blk.{i}.{name}");
+            let mixer = if cfg.is_recurrent(i) {
+                Mixer::Delta {
+                    wqkv: matrix(f, &p("attn_qkv.weight"), n_embd, cfg.conv_dim())?,
+                    wgate: matrix(f, &p("attn_gate.weight"), n_embd, cfg.value_dim())?,
+                    // Stored {kernel, conv_dim} in ggml order, which is
+                    // channel-major with the taps contiguous — the layout
+                    // `Ops::ssm_conv` reads.
+                    conv1d: conv_weights(f, &p("ssm_conv1d.weight"), cfg.ssm_d_conv, cfg.conv_dim())?,
+                    ssm_beta: matrix(f, &p("ssm_beta.weight"), n_embd, cfg.n_v_heads())?,
+                    ssm_alpha: matrix(f, &p("ssm_alpha.weight"), n_embd, cfg.n_v_heads())?,
+                    ssm_a: vector(f, &p("ssm_a"), cfg.n_v_heads())?,
+                    dt_bias: vector(f, &p("ssm_dt.bias"), cfg.n_v_heads())?,
+                    ssm_norm: vector(f, &p("ssm_norm.weight"), cfg.head_v_dim())?,
+                    ssm_out: matrix(f, &p("ssm_out.weight"), cfg.value_dim(), n_embd)?,
+                }
+            } else {
+                Mixer::Attn {
+                    wq: matrix(f, &p("attn_q.weight"), n_embd, cfg.q_gate_dim())?,
+                    wk: matrix(f, &p("attn_k.weight"), n_embd, cfg.kv_dim())?,
+                    wv: matrix(f, &p("attn_v.weight"), n_embd, cfg.kv_dim())?,
+                    wo: matrix(f, &p("attn_output.weight"), cfg.head_dim * cfg.n_head, n_embd)?,
+                    q_norm: vector(f, &p("attn_q_norm.weight"), cfg.head_dim)?,
+                    k_norm: vector(f, &p("attn_k_norm.weight"), cfg.head_dim)?,
+                }
+            };
+            layers.push(Layer {
+                attn_norm: vector(f, &p("attn_norm.weight"), n_embd)?,
+                ffn_norm: vector(f, &p("post_attention_norm.weight"), n_embd)?,
+                mixer,
+                ffn_gate: matrix(f, &p("ffn_gate.weight"), n_embd, n_ff)?,
+                ffn_up: matrix(f, &p("ffn_up.weight"), n_embd, n_ff)?,
+                ffn_down: matrix(f, &p("ffn_down.weight"), n_ff, n_embd)?,
+            });
+        }
+
+        // Slab per attention layer, assigned in order, so a recurrent layer
+        // costs nothing. Recurrent entries hold the next free slot and are
+        // never read -- `attention` is the only caller and it runs only on
+        // attention layers.
+        let mut kv_slot = Vec::with_capacity(cfg.n_main_layer());
+        let mut next = 0;
+        for il in 0..cfg.n_main_layer() {
+            kv_slot.push(next);
+            if !cfg.is_recurrent(il) {
+                next += 1;
+            }
+        }
+
+        Ok(Self {
+            cfg,
+            tok_embd,
+            output_norm: vector(f, "output_norm.weight", n_embd)?,
+            output,
+            layers,
+            kv_slot,
+            n_kv_layer: next,
+        })
+    }
+
+    /// KV slabs the cache must hold: one per attention layer, not per layer.
+    pub fn n_kv_layer(&self) -> usize {
+        self.n_kv_layer
+    }
+
+    fn embed(&self, id: u32, out: &mut [f32]) -> Result<()> {
+        if id as usize >= self.cfg.n_vocab {
+            return Err(Error::TokenOutOfRange {
+                id,
+                vocab_size: self.cfg.n_vocab,
+            });
+        }
+        dequantize_into(self.tok_embd.row(id as usize), self.tok_embd.ty, out)
+    }
+
+    /// Bytes of quantized weight one forward pass reads.
+    ///
+    /// Derived from shapes rather than counted, per rule 3 in
+    /// [`crate::profile`]. Recurrent state is excluded because it is not a
+    /// weight; the KV cache is accounted separately.
+    pub fn weight_bytes_per_pass(&self) -> u64 {
+        let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
+        let per_layer: u64 = self
+            .layers
+            .iter()
+            .map(|l| {
+                let mixer = match &l.mixer {
+                    Mixer::Attn { wq, wk, wv, wo, .. } => w(wq) + w(wk) + w(wv) + w(wo),
+                    Mixer::Delta {
+                        wqkv,
+                        wgate,
+                        ssm_beta,
+                        ssm_alpha,
+                        ssm_out,
+                        ..
+                    } => w(wqkv) + w(wgate) + w(ssm_beta) + w(ssm_alpha) + w(ssm_out),
+                };
+                mixer + w(&l.ffn_gate) + w(&l.ffn_up) + w(&l.ffn_down)
+            })
+            .sum();
+        per_layer + w(&self.output)
+    }
+
+    /// One token against the recurrent state and the KV cache.
+    ///
+    /// **Single token only, deliberately, for now.** The delta rule is a
+    /// sequential scan — token `t`'s state update feeds token `t+1` — so a
+    /// batched prefill is a different algorithm (llama.cpp has a whole chunked
+    /// path for it), not a loop tightening. Prefill therefore runs this once
+    /// per prompt token, which is correct and slow, and the chunked form is a
+    /// later optimization rather than a correctness question.
+    ///
+    /// That is a real departure from [`super::Qwen3::forward`], where one
+    /// function serving both phases is what makes the cache acceptance test
+    /// exact. Here the equivalent property comes for free: there is only one
+    /// path, so prefill and decode cannot disagree.
+    pub fn forward<O: Ops>(
+        &self,
+        ops: &O,
+        token: u32,
+        pos: usize,
+        kv: &mut KvCache,
+        rs: &mut RecurrentState,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        rs.check(c.n_main_layer(), c.conv_state_len(), c.ssm_state_len())?;
+        if kv.kv_dim() != c.kv_dim() {
+            return Err(Error::InconsistentArchitecture {
+                what: "kv cache",
+                detail: format!(
+                    "cache holds {} lanes per position, model needs {}",
+                    kv.kv_dim(),
+                    c.kv_dim()
+                ),
+            });
+        }
+        if pos >= kv.n_ctx() {
+            return Err(Error::ContextOverflow {
+                pos,
+                n_ctx: kv.n_ctx(),
+            });
+        }
+
+        let step = ctx.prof.begin_step();
+        ops.begin_pass(1);
+
+        let (nd, nf) = (c.n_embd, c.n_ff);
+        let mut x = vec![0.0f32; nd];
+        self.embed(token, &mut x)?;
+        ops.host_wrote(&x);
+        ctx.trace("inp_embd", 0, &x);
+
+        let mut normed = vec![0.0f32; nd];
+        let mut mixed = vec![0.0f32; nd];
+        let mut gate = vec![0.0f32; nf];
+        let mut up = vec![0.0f32; nf];
+        let mut ffn_out = vec![0.0f32; nd];
+
+        for il in 0..c.n_main_layer() {
+            let layer = &self.layers[il];
+            let t_mix = ctx.prof.layer_begin();
+
+            ops.rms_norm(&x, &layer.attn_norm, c.rms_eps, &mut normed);
+            ctx.trace("attn_norm", il, &normed);
+
+            match &layer.mixer {
+                Mixer::Attn { .. } => self.attention(ops, layer, il, pos, &normed, kv, &mut mixed, ctx)?,
+                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, &normed, rs, &mut mixed, ctx)?,
+            }
+            ops.add_assign(&mut x, &mixed);
+            ctx.trace("attn_residual", il, &x);
+            ctx.prof.layer_end(t_mix, step, il, Part::Attn);
+
+            let t_ffn = ctx.prof.layer_begin();
+            ops.rms_norm(&x, &layer.ffn_norm, c.rms_eps, &mut normed);
+            ops.matmul(&layer.ffn_gate, &normed, &mut gate);
+            ops.matmul(&layer.ffn_up, &normed, &mut up);
+            ops.silu_mul(&mut gate, &up);
+            ops.matmul(&layer.ffn_down, &gate, &mut ffn_out);
+            ops.add_assign(&mut x, &ffn_out);
+            ctx.trace("post_ffn", il, &x);
+            ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
+        }
+
+        ops.rms_norm(&x, &self.output_norm, c.rms_eps, &mut normed);
+        ctx.trace("result_norm", 0, &normed);
+
+        let mut logits = vec![0.0f32; c.n_vocab];
+        ops.matmul(&self.output, &normed, &mut logits);
+        ops.end_pass();
+        ops.host_needs(&mut logits);
+        ctx.trace("result_output", 0, &logits);
+        Ok(logits)
+    }
+
+    /// A full-attention block.
+    ///
+    /// Two things here are not in `qwen3`. `attn_q` emits query *and* gate
+    /// interleaved per head with stride `head_dim * 2`, and the attention
+    /// output is multiplied by `sigmoid(gate)` before the output projection.
+    /// And RoPE is partial: only the first `n_rot` of each `head_dim` rotate,
+    /// the rest pass through. See the module header for why mRoPE reduces to
+    /// exactly that for text.
+    #[allow(clippy::too_many_arguments)]
+    fn attention<O: Ops>(
+        &self,
+        ops: &O,
+        layer: &Layer<'_>,
+        il: usize,
+        pos: usize,
+        normed: &[f32],
+        kv: &mut KvCache,
+        out: &mut [f32],
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Mixer::Attn {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+        } = &layer.mixer
+        else {
+            return Err(Error::InconsistentArchitecture {
+                what: "layer kind",
+                detail: format!("layer {il} is recurrent but was routed to attention"),
+            });
+        };
+
+        let (hd, kd) = (c.head_dim, c.kv_dim());
+        let qd = hd * c.n_head;
+
+        let mut qg = vec![0.0f32; c.q_gate_dim()];
+        ops.matmul(wq, normed, &mut qg);
+        ctx.trace("Qcur_full", il, &qg);
+
+        // De-interleave. Per head the projection emits [q | gate], so head h's
+        // query starts at h * 2 * head_dim and its gate half a head later.
+        let mut q = vec![0.0f32; qd];
+        let mut g = vec![0.0f32; qd];
+        for h in 0..c.n_head {
+            let src = h * 2 * hd;
+            q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
+            g[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
+        }
+        ops.host_wrote(&q);
+        ops.host_wrote(&g);
+
+        let mut k = vec![0.0f32; kd];
+        let mut v = vec![0.0f32; kd];
+        ops.matmul(wk, normed, &mut k);
+        ops.matmul(wv, normed, &mut v);
+
+        // QK-norm strictly before RoPE, as in qwen3.
+        ops.rms_norm_heads(&mut q, q_norm, hd, c.rms_eps);
+        ctx.trace("Qcur_normed", il, &q);
+        ops.rms_norm_heads(&mut k, k_norm, hd, c.rms_eps);
+        ctx.trace("Kcur_normed", il, &k);
+
+        rope_partial(ops, &mut q, pos, hd, c.n_rot, c.n_head, c.rope_theta);
+        ctx.trace("Qcur", il, &q);
+        rope_partial(ops, &mut k, pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
+        ctx.trace("Kcur", il, &k);
+
+        let slot = self.kv_slot[il];
+        ops.kv_write(kv.k_layer_mut(slot), pos * kd, &k);
+        ops.kv_write(kv.v_layer_mut(slot), pos * kd, &v);
+
+        let mut attn = vec![0.0f32; qd];
+        let a = Attn {
+            q: &q,
+            k: kv.k_layer(slot),
+            v: kv.v_layer(slot),
+            kv_dim: kd,
+            n_pos: pos + 1,
+            head_dim: hd,
+            n_head: c.n_head,
+            n_head_kv: c.n_head_kv,
+            scale: 1.0 / (hd as f32).sqrt(),
+        };
+        ops.attend(&a, &mut attn);
+        ctx.trace("attn_pregate", il, &attn);
+
+        // sigmoid(gate) * attention, then the output projection.
+        ops.host_needs(&mut attn);
+        for (a, &gv) in attn.iter_mut().zip(g.iter()) {
+            *a *= 1.0 / (1.0 + (-gv).exp());
+        }
+        ops.host_wrote(&attn);
+        ctx.trace("attn_gated", il, &attn);
+
+        ops.matmul(wo, &attn, out);
+        ctx.trace("attn_output", il, out);
+        Ok(())
+    }
+
+    /// A GatedDeltaNet block.
+    ///
+    /// The order is load-bearing and is the module header's, verified against
+    /// `build_layer_attn_linear`: project, convolve over the stored window,
+    /// l2-normalize q and k but not v, run the delta rule, then normalize the
+    /// output by `ssm_norm` and gate it with `silu(z)` before projecting out.
+    #[allow(clippy::too_many_arguments)]
+    fn gated_delta<O: Ops>(
+        &self,
+        ops: &O,
+        layer: &Layer<'_>,
+        il: usize,
+        normed: &[f32],
+        rs: &mut RecurrentState,
+        out: &mut [f32],
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Mixer::Delta {
+            wqkv,
+            wgate,
+            conv1d,
+            ssm_beta,
+            ssm_alpha,
+            ssm_a,
+            dt_bias,
+            ssm_norm,
+            ssm_out,
+        } = &layer.mixer
+        else {
+            return Err(Error::InconsistentArchitecture {
+                what: "layer kind",
+                detail: format!("layer {il} is attention but was routed to the delta rule"),
+            });
+        };
+
+        let (kdim, vdim, cdim) = (c.key_dim(), c.value_dim(), c.conv_dim());
+        let keep = c.ssm_d_conv - 1;
+
+        let mut qkv = vec![0.0f32; cdim];
+        ops.matmul(wqkv, normed, &mut qkv);
+        ctx.trace("linear_attn_qkv_mixed", il, &qkv);
+
+        let mut z = vec![0.0f32; vdim];
+        ops.matmul(wgate, normed, &mut z);
+        ctx.trace("z", il, &z);
+
+        let mut alpha = vec![0.0f32; c.n_v_heads()];
+        let mut beta = vec![0.0f32; c.n_v_heads()];
+        ops.matmul(ssm_alpha, normed, &mut alpha);
+        ops.matmul(ssm_beta, normed, &mut beta);
+
+        // The convolution needs its inputs on the host: the window is assembled
+        // from recurrent state that lives here. A device backend has no kernel
+        // for this path yet and says so rather than pretending.
+        ops.host_needs(&mut qkv);
+
+        let mut window = vec![0.0f32; cdim * c.ssm_d_conv];
+        recurrent::conv_window(rs.conv(il), &qkv, keep, &mut window);
+        let mut conv = vec![0.0f32; cdim];
+        ops.ssm_conv(&window, conv1d, c.ssm_d_conv, &mut conv);
+        ctx.trace("conv_output_silu", il, &conv);
+        recurrent::push_conv(rs.conv_mut(il), &qkv, keep);
+
+        // The convolved output is [q | k | v] concatenated along the channel
+        // axis, in that order — the same order `attn_qkv` emits and the same
+        // one the conv preserved, since it is depthwise.
+        let (q_part, rest) = conv.split_at_mut(kdim);
+        let (k_part, v_part) = rest.split_at_mut(kdim);
+        ops.l2_norm_heads(q_part, c.head_k_dim(), c.rms_eps);
+        ops.l2_norm_heads(k_part, c.head_k_dim(), c.rms_eps);
+        ctx.trace("q_conv_predelta", il, q_part);
+        ctx.trace("k_conv_predelta", il, k_part);
+
+        let mut core = vec![0.0f32; vdim];
+        let d = Delta {
+            q: q_part,
+            k: k_part,
+            v: v_part,
+            alpha: &alpha,
+            beta: &beta,
+            ssm_a,
+            dt_bias,
+            head_k_dim: c.head_k_dim(),
+            head_v_dim: c.head_v_dim(),
+            n_k_heads: c.n_k_heads(),
+            n_v_heads: c.n_v_heads(),
+        };
+        ops.delta_rule(&d, rs.ssm_mut(il), &mut core);
+        ctx.trace("dnet_out", il, &core);
+
+        // build_norm_gated: rms_norm(core, ssm_norm) * silu(z). Per head over
+        // head_v_dim, with ssm_norm shared across heads.
+        ops.rms_norm_heads(&mut core, ssm_norm, c.head_v_dim(), c.rms_eps);
+        ops.silu_mul(&mut z, &core);
+        ctx.trace("final_output", il, &z);
+
+        ops.matmul(ssm_out, &z, out);
+        ctx.trace("linear_attn_out", il, out);
+        Ok(())
+    }
+}
+
+/// Partial NEOX RoPE: rotate the first `n_rot` of each `head_dim`, leave the
+/// rest.
+///
+/// `Ops::rope_neox` rotates a whole head, so this hands it a view of just the
+/// rotating prefix — which works only because NEOX pairs `i` with
+/// `i + n_rot/2`, both inside that prefix. It would be wrong for the
+/// adjacent-pair variant, and the module header records how the pairing was
+/// verified.
+fn rope_partial<O: Ops>(
+    ops: &O,
+    x: &mut [f32],
+    pos: usize,
+    head_dim: usize,
+    n_rot: usize,
+    n_heads: usize,
+    theta: f32,
+) {
+    if n_rot == head_dim {
+        ops.rope_neox(x, pos, head_dim, n_heads, theta);
+        return;
+    }
+    for h in 0..n_heads {
+        let head = &mut x[h * head_dim..h * head_dim + n_rot];
+        ops.rope_neox(head, pos, n_rot, 1, theta);
+    }
+}
+
+/// `ssm_conv1d.weight`, dequantized and shape-checked as `{kernel, channels}`.
+///
+/// A 1-D `vector` helper will not do: this is 2-D in the file, and it is small
+/// enough (128 KB) that keeping it unpacked costs nothing while letting
+/// `Ops::ssm_conv` index it as plain floats.
+fn conv_weights(f: &GgufFile, name: &str, kernel: usize, channels: usize) -> Result<Vec<f32>> {
+    let info = tensor(f, name)?;
+    if info.dims != vec![kernel as u64, channels as u64] {
+        return Err(Error::TensorShapeMismatch {
+            name: name.to_string(),
+            expected: vec![kernel as u64, channels as u64],
+            got: info.dims.clone(),
+        });
+    }
+    dequantize(f.tensor_bytes(info), info.ty, kernel * channels)
 }
 
 #[cfg(test)]
