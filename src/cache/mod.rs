@@ -123,6 +123,24 @@ impl KvCache {
     /// itself and thread over heads. The ops layer sees raw bits and a stride,
     /// never this type.
     #[inline]
+    /// One layer's key slab, mutably, for a backend that fills it itself.
+    ///
+    /// A device backend writes f16 straight into VRAM and never brings K and V
+    /// home, so **after a CUDA run the host copy of this slab is stale.** That
+    /// is deliberate: the cache is per layer, so a layer's history belongs
+    /// wherever that layer runs, and nothing needs to migrate. Read it back
+    /// through the seam's `host_needs` if a host consumer ever needs it.
+    pub fn k_layer_mut(&mut self, il: usize) -> &mut [u16] {
+        let (lo, hi) = (il * self.n_ctx * self.kv_dim, (il + 1) * self.n_ctx * self.kv_dim);
+        &mut self.k[lo..hi]
+    }
+
+    /// One layer's value slab, mutably. See [`KvCache::k_layer_mut`].
+    pub fn v_layer_mut(&mut self, il: usize) -> &mut [u16] {
+        let (lo, hi) = (il * self.n_ctx * self.kv_dim, (il + 1) * self.n_ctx * self.kv_dim);
+        &mut self.v[lo..hi]
+    }
+
     pub fn k_layer(&self, il: usize) -> &[u16] {
         let at = self.offset(il, 0);
         &self.k[at..at + self.n_ctx * self.kv_dim]

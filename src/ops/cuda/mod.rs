@@ -189,9 +189,15 @@ impl DeviceBench {
 /// A device mirror of a host KV slab, and how much of it is current.
 struct KvMirror {
     buf: DeviceBuffer,
-    /// Positions already copied. A smaller `n_pos` than this means the cache
-    /// was reset, so the mirror is refilled from the start.
+    /// Positions already copied from the host. A smaller `n_pos` than this
+    /// means the cache was reset, so the mirror is refilled from the start.
     uploaded: usize,
+    /// Whether this backend has written the slab itself.
+    ///
+    /// Once it has, the host copy is stale and must never be uploaded over the
+    /// device one. This is what turns the KV cache from something that shuttles
+    /// back and forth into something a GPU layer simply owns.
+    device_written: bool,
 }
 
 // SAFETY: a CUDA context is usable from any thread that has it current, and we

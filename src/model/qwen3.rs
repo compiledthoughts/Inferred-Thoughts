@@ -373,20 +373,20 @@ impl<'a> Qwen3<'a> {
             // written by this same call. The cache rounds to f16 on the way in
             // — that is where llama.cpp's f16 KV semantics now live, replacing
             // the explicit round-trip Stage 4 did here.
-            // The cache is host memory and `store` reads these directly, so
-            // this is one of the two points in the pass where a device copy has
-            // to come home. The other is the logits.
-            for t in 0..n {
-                ops.host_needs(&mut k[t * kd..(t + 1) * kd]);
-                ops.host_needs(&mut v[t * kd..(t + 1) * kd]);
+            // Publishing goes through the seam, so a device backend can
+            // convert and store without the keys and values ever coming home.
+            // On the CPU backends this is the same f16 rounding `KvCache::store`
+            // did, in the same place.
+            if start_pos + n > cache.n_ctx() {
+                return Err(Error::ContextOverflow {
+                    pos: start_pos + n - 1,
+                    n_ctx: cache.n_ctx(),
+                });
             }
             for t in 0..n {
-                cache.store(
-                    il,
-                    start_pos + t,
-                    &k[t * kd..(t + 1) * kd],
-                    &v[t * kd..(t + 1) * kd],
-                )?;
+                let at = (start_pos + t) * kd;
+                ops.kv_write(cache.k_layer_mut(il), at, &k[t * kd..(t + 1) * kd]);
+                ops.kv_write(cache.v_layer_mut(il), at, &v[t * kd..(t + 1) * kd]);
             }
 
             let scale = 1.0 / (c.head_dim as f32).sqrt();

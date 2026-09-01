@@ -249,7 +249,14 @@ impl Cuda {
         let mut map = self.kv.borrow_mut();
         if !map.contains_key(&key) {
             let buf = DeviceBuffer::new(std::mem::size_of_val(host))?;
-            map.insert(key, KvMirror { buf, uploaded: 0 });
+            map.insert(
+                key,
+                KvMirror {
+                    buf,
+                    uploaded: 0,
+                    device_written: false,
+                },
+            );
         }
         let m = match map.get_mut(&key) {
             Some(m) => m,
@@ -260,6 +267,11 @@ impl Cuda {
                 });
             }
         };
+        // Once this backend has written the slab, the host copy is stale and
+        // uploading it would undo the work.
+        if m.device_written {
+            return Ok(m.buf.ptr);
+        }
         if n_pos < m.uploaded {
             m.uploaded = 0;
         }
@@ -547,6 +559,61 @@ impl Cuda {
         Ok(())
     }
 
+    /// Convert and store K or V without either ever leaving the card.
+    fn kv_write_impl(&self, slab: &mut [u16], offset: usize, src: &[f32]) -> Result<()> {
+        let key = slab.as_ptr() as usize;
+        let bytes = std::mem::size_of_val(slab);
+        {
+            let mut map = self.kv.borrow_mut();
+            if !map.contains_key(&key) {
+                map.insert(
+                    key,
+                    KvMirror {
+                        buf: DeviceBuffer::new(bytes)?,
+                        uploaded: 0,
+                        device_written: false,
+                    },
+                );
+            }
+            match map.get_mut(&key) {
+                Some(m) => m.device_written = true,
+                None => {
+                    return Err(Error::Cuda {
+                        what: "kv_write",
+                        detail: "mirror vanished between insert and lookup".to_string(),
+                    });
+                }
+            }
+        }
+        let dst = match self.kv.borrow().get(&key) {
+            Some(m) => m.buf.ptr + (offset * 2) as u64,
+            None => {
+                return Err(Error::Cuda {
+                    what: "kv_write",
+                    detail: "mirror vanished".to_string(),
+                });
+            }
+        };
+
+        // `src` is already on the device -- it is the model's k or v buffer,
+        // which rope wrote there.
+        let sd = self.mirror_in(src)?;
+        let (mut n, mut sd, mut dst) = (src.len() as i32, sd, dst);
+        let mut params = [arg(&mut n), arg(&mut sd), arg(&mut dst)];
+        let block = 256u32;
+        // SAFETY: parameters match `kv_write_f16`; `dst` is inside the mirror,
+        // which the model sized, and the grid covers exactly `src.len()`.
+        unsafe {
+            self.launch(
+                "kv_write_f16",
+                src.len().div_ceil(block as usize) as u32,
+                block,
+                &mut params,
+            )?
+        };
+        Ok(())
+    }
+
     fn silu_mul_impl(&self, gate: &mut [f32], up: &[f32]) -> Result<()> {
         let gd = self.mirror_in(gate)?;
         let ud = self.mirror_in(up)?;
@@ -636,6 +703,10 @@ impl Ops for Cuda {
         self.note(self.d2h(buf, ptr));
     }
 
+    fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
+        self.note(self.kv_write_impl(slab, offset, src));
+    }
+
     fn begin_pass(&self) {
         // Activation buffers are allocated per pass, so an address from the
         // last pass may name a different buffer now. Every mirror is marked
@@ -694,5 +765,9 @@ impl Ops for &Cuda {
 
     fn begin_pass(&self) {
         (*self).begin_pass()
+    }
+
+    fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
+        (*self).kv_write(slab, offset, src)
     }
 }

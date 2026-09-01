@@ -152,4 +152,21 @@ pub trait Ops {
     /// so an address seen last time may be a different buffer now; anything
     /// remembered about host addresses must be dropped.
     fn begin_pass(&self) {}
+
+    /// Round `src` to f16 and write it into `slab` at `offset` elements in.
+    ///
+    /// This is how K and V enter the cache. It goes through the seam rather
+    /// than being done by the model because *where* the cache lives follows
+    /// where the layer runs: a CPU layer's history belongs in host RAM, a GPU
+    /// layer's in VRAM. Passing a slab and an offset rather than a `KvCache`
+    /// keeps the seam uncoupled from the type this project exists to iterate
+    /// on.
+    ///
+    /// A device backend writes into its own copy and leaves `slab` untouched,
+    /// so a host reader must go through [`Ops::host_needs`] first.
+    fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
+        for (d, &s) in slab[offset..offset + src.len()].iter_mut().zip(src) {
+            *d = crate::quant::half::f32_to_f16(s);
+        }
+    }
 }

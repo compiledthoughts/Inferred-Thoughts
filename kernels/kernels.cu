@@ -456,4 +456,21 @@ __global__ void quantize_q8_0(int n_blocks, const float *__restrict__ x,
     }
 }
 
+// Round f32 to f16 and store, which is how K and V enter the cache.
+//
+// This exists so a GPU layer's keys and values never leave the card. They used
+// to: the model computed them on the device, shipped them home so host code
+// could convert and write the cache, and then shipped them straight back up for
+// attention — 56 needless bus crossings a token, and a host barrier in the
+// middle of every layer that no CUDA graph could span.
+//
+// `__float2half` rounds to nearest even, which is what `quant::half::f32_to_f16`
+// does. That equivalence is not assumed: the same pairing is already relied on
+// for the Q8_0 scale in `quantize_q8_0` and checked against the oracle there.
+__global__ void kv_write_f16(int n, const float *__restrict__ src,
+                             unsigned short *__restrict__ dst) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __half_as_ushort(__float2half(src[i]));
+}
+
 } // extern "C"
