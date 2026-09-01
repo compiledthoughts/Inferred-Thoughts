@@ -19,7 +19,7 @@ oracle. KV cache, prefill/decode split, threaded attention, a spin-waiting
 thread pool, a chat template, and a profiler. 116 tests by default, 120 with
 `--features cuda`, plus 19 that need a model or a device.
 
-The CUDA backend runs the whole model on the GPU at **~126 tok/s** at d384,
+The CUDA backend runs the whole model on the GPU at **~215 tok/s** at d384,
 flat from short context out to at least d1792, against the CPU's ~54 at the same
 depth and llama.cpp's ~308. The decode step is recorded once as a CUDA graph and
 replayed: 13 kernel launches a token instead of 673, and the GPU is now busy
@@ -38,7 +38,8 @@ All figures are Qwen3-0.6B Q8_0 on the machine in `CLAUDE.md` — Ryzen 7 9700X,
 | **v3** | **46.9 tok/s @ d384**<br>*58.4 @ d64* | + `spin` — persistent spin-waiting pool, every matmul threaded | `src/ops/pool.rs`, the crate's only `unsafe`; `naive` is now `#![forbid(unsafe_code)]` | 106 tests + 13 model-backed; bit-identical to `naive` at 2/3/5/8 threads | **A rayon parallel region costs ~430 µs here; a spin barrier costs 0.40 µs — 1088x.** Threading was never the problem, dispatch was. Decode bandwidth 12 → **37 GB/s** |
 | **v4** | **53.0 tok/s @ d384**<br>*59.5 @ d64* | same, built for the actual CPU | branch-free `f16_to_f32`; `-C target-cpu=native` | 108 tests + 13 model-backed; forward pass still **byte-identical** to v1 | We had been compiling **SSE2-only on a Zen 5**. Enabling AVX-512 doubled attention (2.05x) and did **nothing** for the dense matmuls — the cleanest confirmation yet that one is compute-bound and the other DDR5-bound |
 | **v0.1** | **12.5 tok/s**<br>*on the GPU* | + `cuda` — all eight ops as kernels | weights resident in VRAM, KV mirrored on device, `--backend cuda` | 120 tests + 19 device/model-backed; five kernels **bit-identical** to `naive` through the whole model | **Slower than our own CPU.** A round trip through `Ops` costs ~66 us and a decode step makes ~478 of them, so a third of the token goes before any arithmetic. Same shape as v3's rayon finding, one layer down |
-| **v0.5** | **126 tok/s**<br>*@ d384, flat to d1792* | same | RMSNorm squares staged through shared memory | 120 tests + 20 device/model-backed | **We are GPU-bound now** — the card is busy ~92% of a token, which retires the megakernel plan. `rms_norm` is the largest remaining kernel, and the cost is **FP64 latency on a dependent chain**, not the loads or the compiler as guessed |
+| **v0.6** | **215 tok/s**<br>*@ d384* | same | RMSNorm's sum of squares reduced as a tree, by default; the serial walk kept behind `--rms-serial` | 120 tests + 21 device/model-backed; `rms_serial_restores_bit_equality` tests that the flag buys exactness back | **The standing refusal was reversed on evidence.** The serial f64 walk is linear in `n`, so on the 35B it would cost ~7.9 ms against a ~13.3 ms predicted token. An order-free accumulator was built to get the speed *and* keep equal bits; it works, but not without also changing the oracle. The tolerance turns out to be set by the **f32 cast of `mean`**, not by the reorder |
+| **v0.5** | 126 tok/s<br>*@ d384, flat to d1792* | same | RMSNorm squares staged through shared memory | 120 tests + 20 device/model-backed | **We are GPU-bound now** — the card is busy ~92% of a token, which retires the megakernel plan. `rms_norm` is the largest remaining kernel, and the cost is **FP64 latency on a dependent chain**, not the loads or the compiler as guessed |
 | **v0.4** | 117 tok/s<br>*@ d384, flat to d1792* | same | the decode step recorded once as a CUDA graph and replayed | 120 tests + 19 device/model-backed; the whole-model test now asserts the graph engaged | **673 kernel launches a token became 13.** A `cuLaunchKernel` is ~7 us of CPU bookkeeping, so a third of the token was the CPU describing work. Built by hand rather than captured, because `n_pos` grows every token and a captured graph is stale immediately |
 | **v0.3** | 93 tok/s<br>*on the GPU, flat to d1792* | same | flash-decoding attention (split-KV, online softmax); KV cache written as f16 straight into VRAM | 120 tests + 19 device/model-backed | **Attention parallelism was capped by `n_head` = 16**, so its cost grew with context while its parallelism did not — a cliff past d1400, not a slope. And the KV cache round trip was a host barrier in the middle of every layer: 67 bus crossings per token became **5** |
 | **v0.2** | **42.4 tok/s**<br>*on the GPU* | same, activations stay on the card | `host_wrote` / `host_needs` / `begin_pass` on the seam (no-ops on CPU); warp-per-row matmul; device-side Q8_0 quantize; `--profile-device` | same counts; still bit-identical, and `naive`/`spin` unchanged | **1329 bus crossings per token became 67**, for 3.4x. And the expected trade never came due: Q8_0's block structure hands you a split that is parallel where the arithmetic is order-free and serial where it is not, so the fast matmul is *still* bit-exact |
@@ -159,13 +160,25 @@ its input on the host would drag every activation home.
 
 | kernels | against `naive` |
 |---|---|
-| `matmul`, `rms_norm`, `rms_norm_heads`, `rope_neox`, `add_assign` | **bit-identical** |
+| `matmul`, `rope_neox`, `add_assign` | **bit-identical** |
+| `rms_norm`, `rms_norm_heads` | derived tolerance; **bit-identical under `--rms-serial`** |
 | `softmax`, `silu_mul`, `attend` | ≤ 5.2e-8, about one ulp |
 
-The three that differ all call `expf`, and CUDA's is not obliged to match
-glibc's. **The obstacle was not the expected one.** Parallel reductions were
-assumed to be what costs bit-exactness; keeping each reduction serial kept it,
-and what actually breaks it is one libm function.
+Three of these call `expf`, and CUDA's is not obliged to match glibc's. **The
+obstacle was not the expected one.** Parallel reductions were assumed to be what
+costs bit-exactness; keeping each reduction serial kept it, and what actually
+breaks it is one libm function.
+
+The two RMSNorm kernels are the one place that was traded deliberately. Their
+sum of squares is reduced as a tree, which is worth **1.63x end to end** because
+the serial f64 walk was dependent-chain FP64 latency and ~40% of device time.
+f64 addition rounds, so a tree is a *different answer* — measurably so: it
+returns four different results at four block sizes on an adversarial input.
+The tolerance is derived not from that reorder, which moves the sum by 1.5e-16,
+but from the **f32 cast of `mean`** that follows it, whose grid is a million
+times coarser; two orders land on the same f32 unless a rounding boundary falls
+between them. `--rms-serial` restores the serial walk and with it bit-equality,
+because determinism is hard to recover once it is given up.
 
 That holds even for the fast matmul, which is one warp per row. Q8_0 has a unit
 of work that is *already* exact: within a 32-element block the sum of products
