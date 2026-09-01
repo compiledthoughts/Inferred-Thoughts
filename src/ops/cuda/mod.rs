@@ -97,6 +97,13 @@ pub struct Cuda {
     pass_graph: Cell<bool>,
     /// Master switch. Off for callers that drive ops one at a time.
     graphs_enabled: Cell<bool>,
+    /// Reduce RMSNorm's sum of squares serially rather than as a tree.
+    ///
+    /// The tree is the default and is ~4x faster, but f64 addition rounds and
+    /// is therefore not associative, so it cannot be bit-identical to the
+    /// oracle. This restores that at the cost of ~2.3 ms a token. See
+    /// `rms_norm_tree` in kernels.cu.
+    rms_serial: Cell<bool>,
     /// Decode passes seen. The first few run eagerly so every buffer the graph
     /// will point at has been allocated and settled.
     warmups: Cell<u32>,
@@ -436,6 +443,7 @@ impl Cuda {
                 graph: RefCell::new(GraphState::Off),
                 pass_graph: Cell::new(false),
                 graphs_enabled: Cell::new(true),
+                rms_serial: Cell::new(false),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),
@@ -1037,21 +1045,49 @@ impl Cuda {
     }
 
     /// Time `reps` launches of a diagnostic kernel taking `(int n, const float
-    /// *x, float *out)`, in microseconds per launch.
+    /// *x, float *out)`, and return microseconds per launch *and* what the
+    /// kernel computed.
     ///
     /// Launches are timed as a batch against a single synchronize, because that
     /// is how the backend issues them; timing each against its own barrier
-    /// measures a barrier the forward pass never pays.
+    /// measures a barrier the forward pass never pays. The consequence is a
+    /// **floor at the launch issue cost**, ~8-12 us here, so a variant that
+    /// reports near that is launch-bound and its true cost is unresolved.
+    ///
+    /// The result comes back as **f64**, and that is load-bearing rather than
+    /// tidy: the question these kernels exist to answer is whether a reduction
+    /// is order-free, and reading the answer back through an f32 cast destroys
+    /// the ~1e-13 that separates one summation order from another. It is the
+    /// same f32 cast that makes a tree reduction pass every exactness test in
+    /// the real kernel, which is exactly why a diagnostic must not repeat it.
+    ///
+    /// `mode` picks the input. 0 is benign. 1 spans ~39 binades, the kind of
+    /// dynamic range an outlier feature gives a residual stream. 2 is
+    /// adversarial — one enormous term among many equal small ones, the
+    /// classic case where *where* a term is added decides whether it survives.
+    /// A reduction that only agrees on well-conditioned input has not been
+    /// tested.
     pub fn bench_kernel(
         &self,
         name: &'static str,
         n: usize,
         shared_floats: usize,
+        threads: u32,
+        mode: u8,
         reps: u32,
-    ) -> Result<f64> {
-        let host: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.01 - 0.5).collect();
+    ) -> Result<(f64, f64)> {
+        let host: Vec<f32> = (0..n)
+            .map(|i| {
+                let base = (i % 97) as f32 * 0.01 - 0.5;
+                match mode {
+                    1 => base * 2.0f32.powi((i % 35) as i32 - 17),
+                    2 => if i % 512 == 0 { 1.0e8 } else { 1.0 },
+                    _ => base,
+                }
+            })
+            .collect();
         let x = DeviceBuffer::from_slice(&host)?;
-        let out = DeviceBuffer::new(4)?;
+        let out = DeviceBuffer::new(8)?;
         let args = [KArg::I32(n as i32), KArg::Ptr(x.ptr), KArg::Ptr(out.ptr)];
         let shared = (shared_floats * 4) as u32;
 
@@ -1061,15 +1097,17 @@ impl Cuda {
         let run = |reps: u32| -> Result<f64> {
             let t = std::time::Instant::now();
             for _ in 0..reps {
-                unsafe { self.launch_shared(name, 1, 256, shared, &args)? };
+                unsafe { self.launch_shared(name, 1, threads, shared, &args)? };
             }
             self.sync()?;
             Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
         };
         run(64)?; // warm the module and let clocks settle
-        let us = run(reps);
+        let us = run(reps)?;
         self.pass_graph.set(was);
-        us
+        let mut got = [0.0f64];
+        out.read(&mut got)?;
+        Ok((us, got[0]))
     }
 
     /// Turn graph capture off.
@@ -1080,6 +1118,26 @@ impl Cuda {
     /// use one. Those callers say so here rather than being silently wrong.
     pub fn use_graphs(&self, on: bool) {
         self.graphs_enabled.set(on);
+    }
+
+    /// Reduce RMSNorm serially, trading ~2.3 ms a token for bit-equality with
+    /// the `naive` oracle.
+    ///
+    /// Set it before the first pass. A recorded graph holds whichever kernel
+    /// was chosen when it was built, and replay verifies the kernel sequence,
+    /// so flipping this mid-run would fail loudly rather than silently.
+    pub fn rms_serial(&self, on: bool) {
+        self.rms_serial.set(on);
+    }
+
+    /// Which RMSNorm kernels are selected. Named here so the dispatch and the
+    /// tests cannot drift apart.
+    pub(crate) fn rms_kernels(&self) -> (&'static str, &'static str) {
+        if self.rms_serial.get() {
+            ("rms_norm", "rms_norm_heads")
+        } else {
+            ("rms_norm_tree", "rms_norm_heads_tree")
+        }
     }
 
     /// Whether a decode step is currently replaying from a graph.

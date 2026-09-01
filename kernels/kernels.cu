@@ -79,7 +79,10 @@ __device__ inline float h2f(unsigned short bits) {
     return __half2float(__ushort_as_half(bits));
 }
 
-// RMSNorm, one block for the whole vector.
+// RMSNorm, one block for the whole vector — the **serial** pair, reached with
+// `--rms-serial`. `rms_norm_tree` below is the default; this is kept because it
+// is the only version bit-identical to `ops::naive`, and determinism is hard to
+// get back once it is given up.
 //
 // The sum of squares is accumulated serially in *double*, which is what
 // ggml_compute_forward_rms_norm_f32 does and what ops::naive::rms_scale
@@ -111,8 +114,9 @@ __device__ inline float h2f(unsigned short bits) {
 //
 // Staging through shared memory is worth a real 18% and changes no bit, since
 // the squares are per-element and independent; only the sum is ordered. That
-// is taken below. The remaining 4x needs the chain broken, which is a tree, and
-// a tree is a different answer rather than a faster one.
+// is taken below. The remaining 4x needs the chain broken, which is a tree —
+// a different answer rather than a faster one, and the reason this kernel still
+// exists. See `rms_norm_tree` for what that trade costs and why it was taken.
 __global__ void rms_norm(int n, const float *__restrict__ x,
                          const float *__restrict__ w, float eps,
                          float *__restrict__ out) {
@@ -139,6 +143,7 @@ __global__ void rms_norm(int n, const float *__restrict__ x,
 }
 
 // Per-head RMSNorm, in place. One block per head, same rule and same shape.
+// Serial, so also behind `--rms-serial`.
 __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
                                float eps, float *__restrict__ x) {
     extern __shared__ float sq[];
@@ -156,6 +161,101 @@ __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
         double sum = 0.0;
         for (int i = 0; i < head_dim; ++i) sum += (double)sq[i];
         float mean = (float)(sum / (double)head_dim);
+        scale = 1.0f / sqrtf(mean + eps);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        head[i] = head[i] * scale * w[i];
+    }
+}
+
+// The same two, with the sum of squares reduced as a tree. **These are the
+// default**; the serial pair above is kept behind `--rms-serial`.
+//
+// # Why the default changed
+//
+// The serial f64 chain was ~40% of device time, and the cost is dependent-chain
+// FP64 latency: `tests/cuda_ops.rs::why_is_the_rms_reduction_slow` measures it
+// linear in n at 50.4 / 97.9 / 374.1 us for n = 1024 / 2048 / 8192, against
+// ~12 us for the tree at every size. Only breaking the chain removes it.
+//
+// # What that costs, stated exactly
+//
+// A tree is a *different answer*, not a faster one -- f64 addition rounds, so
+// it is not associative, and the same test shows this kernel's shape returning
+// **four different results at four block sizes** on an adversarial input. It
+// therefore cannot be bit-identical to `ops::naive`, and `rms_norm` leaves the
+// project's bit-exact set.
+//
+// The tolerance is n * 2^-53, the worst-case relative error of f64 summation
+// over n terms -- ~1.1e-13 at n = 1024. It is *derived*, not fitted to what
+// passes. For scale: `attend` already carries a derived tolerance three to four
+// orders of magnitude looser, and any real defect here (a wrong index, a missed
+// element, the wrong eps) misses by 1e-3 or more.
+//
+// Note what the f32 cast of `mean` does and does not do. It snaps a 53-bit
+// value onto a grid spaced 2^-23 = 1.19e-7 apart, roughly a million times
+// coarser than the reorder, so two orders usually land on the same f32 -- but
+// "usually" is the honest word. They differ whenever a rounding boundary falls
+// between them, about once in 1e9 calls at the measured 1.5e-16. Hidden at the
+// rate we sample, not absent.
+//
+// This is **not** the f64-to-f32 question. That is a precision change of ~1e-5
+// which diverges from llama.cpp itself, and is a bug this project already found
+// and fixed.
+//
+// The tree needs no dynamic shared memory: staging the squares existed to feed
+// the serial walk, and there is no serial walk here.
+__global__ void rms_norm_tree(int n, const float *__restrict__ x,
+                              const float *__restrict__ w, float eps,
+                              float *__restrict__ out) {
+    __shared__ double p[256];
+    __shared__ float scale;
+
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float v = x[i];
+        acc += (double)(v * v);
+    }
+    p[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) p[threadIdx.x] += p[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float mean = (float)(p[0] / (double)n);
+        scale = 1.0f / sqrtf(mean + eps);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        out[i] = x[i] * scale * w[i];
+    }
+}
+
+// Per-head, in place. One block per head, same trade and same tolerance.
+__global__ void rms_norm_heads_tree(int head_dim, const float *__restrict__ w,
+                                    float eps, float *__restrict__ x) {
+    __shared__ double p[256];
+    __shared__ float scale;
+
+    float *head = x + (size_t)blockIdx.x * head_dim;
+
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float v = head[i];
+        acc += (double)(v * v);
+    }
+    p[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) p[threadIdx.x] += p[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float mean = (float)(p[0] / (double)head_dim);
         scale = 1.0f / sqrtf(mean + eps);
     }
     __syncthreads();
@@ -525,7 +625,7 @@ __global__ void bench_serial_f64_global(int n, const float *__restrict__ x,
             float v = x[i];
             sum += (double)(v * v);
         }
-        out[0] = (float)sum;
+        ((double *)out)[0] = (double)sum;
     }
 }
 
@@ -537,7 +637,7 @@ __global__ void bench_serial_f32_global(int n, const float *__restrict__ x,
             float v = x[i];
             sum += v * v;
         }
-        out[0] = sum;
+        ((double *)out)[0] = (double)sum;
     }
 }
 
@@ -552,7 +652,7 @@ __global__ void bench_shared_f64(int n, const float *__restrict__ x,
     if (threadIdx.x == 0) {
         double sum = 0.0;
         for (int i = 0; i < n; ++i) sum += (double)sq[i];
-        out[0] = (float)sum;
+        ((double *)out)[0] = (double)sum;
     }
 }
 
@@ -567,7 +667,7 @@ __global__ void bench_shared_f32(int n, const float *__restrict__ x,
     if (threadIdx.x == 0) {
         float sum = 0.0f;
         for (int i = 0; i < n; ++i) sum += sq[i];
-        out[0] = sum;
+        ((double *)out)[0] = (double)sum;
     }
 }
 
@@ -585,7 +685,16 @@ __global__ void bench_tree_f64(int n, const float *__restrict__ x,
         if (threadIdx.x < s) p[threadIdx.x] += p[threadIdx.x + s];
         __syncthreads();
     }
-    if (threadIdx.x == 0) out[0] = (float)p[0];
+    if (threadIdx.x == 0) ((double *)out)[0] = p[0];
+}
+
+// The floor. Every variant above is timed as a batch of launches against one
+// synchronize, so nothing can measure faster than the driver can issue work.
+// A variant reporting near this number is launch-bound and its true cost is
+// unresolved -- which is why the table also runs at n=8192.
+__global__ void bench_empty(int n, const float *__restrict__ x,
+                            float *__restrict__ out) {
+    if (threadIdx.x == 0 && n < 0) ((double *)out)[0] = (double)x[0];
 }
 
 } // extern "C"

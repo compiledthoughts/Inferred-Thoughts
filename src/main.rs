@@ -65,6 +65,12 @@ enum Command {
         /// device sync per launch, so it inflates the total -- read the shares.
         #[arg(long)]
         profile_kernels: bool,
+        /// With --backend cuda: reduce RMSNorm's sum of squares serially rather
+        /// than as a tree. ~2.3 ms a token slower, and the only way to get
+        /// results bit-identical to the `naive` oracle -- f64 addition rounds,
+        /// so a tree is a different answer, not just a faster one.
+        #[arg(long)]
+        rms_serial: bool,
         /// Compute threads. 1 selects the scalar `naive` oracle directly and
         /// ignores --backend; anything more selects --backend, which must
         /// produce identical bits. 0 means physical cores, taken as half the
@@ -123,6 +129,7 @@ fn main() -> ExitCode {
             profile_json,
             profile_device,
             profile_kernels,
+            rms_serial,
             threads,
             chat,
             show_special,
@@ -139,6 +146,7 @@ fn main() -> ExitCode {
                 json: profile_json,
                 device: profile_device,
                 kernels: profile_kernels,
+                rms_serial,
                 threads,
                 chat,
                 show_special,
@@ -187,6 +195,7 @@ struct GenOpts {
     json: Option<String>,
     device: bool,
     kernels: bool,
+    rms_serial: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -238,6 +247,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
     if o.backend == "cuda" {
         let cuda = inferred_thoughts::Cuda::new(0)?;
         cuda.time_kernels(o.kernels);
+        cuda.rms_serial(o.rms_serial);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(

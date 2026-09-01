@@ -7,15 +7,20 @@
 //!
 //! Two classes of result are expected, and the test encodes the difference:
 //!
-//! * **Bit-identical** — `matmul`, `rms_norm`, `rms_norm_heads`, `rope_neox`,
-//!   `add_assign`. Integer and f32 arithmetic in the oracle's order, with
-//!   `--fmad=false` preventing contraction. Anything less is a bug.
+//! * **Bit-identical** — `matmul`, `rope_neox`, `add_assign`. Integer and f32
+//!   arithmetic in the oracle's order, with `--fmad=false` preventing
+//!   contraction. Anything less is a bug.
 //! * **Close** — `softmax`, `silu_mul`, `attend`. These call `expf`, and CUDA's
 //!   is not obliged to match glibc's to the last bit. For `softmax` and
 //!   `silu_mul` the tolerance is a few ulp: nothing else differs, so anything
 //!   larger means the accumulation order is wrong rather than the library.
 //!
-//!   `attend` is the one op that also reorders. It is flash-decoding, which
+//!   `rms_norm` and `rms_norm_heads` reduce the sum of squares as a tree,
+//!   which f64 addition makes order-dependent. `rms_tolerance` derives what
+//!   that is worth, and `rms_serial_restores_bit_equality` shows the flag
+//!   buying the exactness back.
+//!
+//!   `attend` is the other op that reorders. It is flash-decoding, which
 //!   accumulates per chunk of the KV sequence and combines, so it cannot
 //!   reproduce a single serial pass. Its tolerance is **derived from the
 //!   decomposition** — see `attend_tolerance` — rather than set to whatever
@@ -29,8 +34,18 @@
 //! how this test caught the first version of that change.
 //!
 //! ```text
-//! cargo test --release --features cuda --test cuda_ops -- --ignored --nocapture
+//! cargo test --release --features cuda --test cuda_ops -- --ignored \
+//!   --nocapture --test-threads=1
 //! ```
+//!
+//! `--test-threads=1` is not optional. Every test here builds its own `Cuda`
+//! against the same device, and run concurrently they fault intermittently with
+//! `CUDA_ERROR_ILLEGAL_ADDRESS` — which is sticky, so the first test to fault
+//! takes the others down with it and the panic names an innocent line. This
+//! predates the diagnostics below (it reproduces on a clean checkout, roughly
+//! one run in two) and is recorded here rather than fixed because the cause is
+//! in how these tests share a context, not in any kernel. `CLAUDE.md` already
+//! documents the serial invocation; this header did not.
 
 #![cfg(feature = "cuda")]
 
@@ -107,6 +122,27 @@ fn close(name: &str, cpu: &[f32], gpu: &[f32], tol: f32) {
     );
 }
 
+/// The error a tree reduction is allowed in `rms_norm`, derived from where it
+/// actually lands — which is not where you would first look.
+///
+/// The reorder moves the f64 sum by at most `n * 2^-53` relative: ~1.1e-13 at
+/// n = 1024, and 1.5e-16 measured. **That is not what this covers.** `mean` is
+/// then cast to f32, whose values are spaced 2^-23 = 1.19e-7 apart, about a
+/// million times coarser. Two sums differing by 1e-13 round to the *same* f32
+/// unless a rounding boundary falls between them — and when they do, `scale` is
+/// identical bits and so is every output element.
+///
+/// So the difference is bimodal: exactly zero almost always, and about one f32
+/// ulp of `scale` when a boundary is straddled, which is roughly once in 1e9
+/// calls at the measured 1.5e-16. The tolerance has to cover the second case,
+/// so it is set by the **f32 cast**, not by the reorder — and is therefore ~1e6
+/// times larger than the reorder alone would suggest. Expect `0 of n differ` in
+/// practice; the allowance is for the rare call that straddles.
+fn rms_tolerance(reference: &[f32]) -> f32 {
+    let magnitude = reference.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    f32::EPSILON * magnitude.max(1.0)
+}
+
 /// The error flash-decoding is allowed, derived from how it decomposes.
 ///
 /// The kernel splits the KV sequence into chunks of 128. Within a chunk the max
@@ -149,7 +185,7 @@ fn every_op_agrees_with_the_oracle() {
         gpu.begin_pass(1);
         gpu.rms_norm(&x, &w, eps, &mut b);
         gpu.host_needs(&mut b);
-        exact("rms_norm", &a, &b);
+        close("rms_norm", &a, &b, rms_tolerance(&a));
     }
 
     // --- rms_norm_heads ------------------------------------------------
@@ -162,7 +198,7 @@ fn every_op_agrees_with_the_oracle() {
         gpu.begin_pass(1);
         gpu.rms_norm_heads(&mut b, &w, head_dim, eps);
         gpu.host_needs(&mut b);
-        exact("rms_norm_heads", &a, &b);
+        close("rms_norm_heads", &a, &b, rms_tolerance(&a));
     }
 
     // --- matmul, Q8_0 --------------------------------------------------
@@ -532,6 +568,61 @@ fn per_op_round_trip_cost() {
     );
 }
 
+/// `--rms-serial` buys back exactly what the tree gave up.
+///
+/// The point of keeping the serial kernel is that determinism is hard to
+/// recover once it is gone, so the claim "the flag restores bit-equality with
+/// the oracle" has to be tested rather than asserted in a comment. It also
+/// pins the default: if the serial path were ever quietly made a tree too, the
+/// first half of this fails.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn rms_serial_restores_bit_equality() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let n = 1024usize;
+    let head_dim = 128usize;
+    let eps = 1e-6f32;
+    let x = noise(n, 11);
+    let w = noise(n, 12);
+    let wh = noise(head_dim, 13);
+
+    let mut want = vec![0.0; n];
+    Naive.rms_norm(&x, &w, eps, &mut want);
+    let mut want_heads = x.clone();
+    Naive.rms_norm_heads(&mut want_heads, &wh, head_dim, eps);
+
+    for serial in [true, false] {
+        gpu.rms_serial(serial);
+        let label = if serial { "serial" } else { "tree" };
+
+        let mut got = vec![0.0; n];
+        gpu.begin_pass(1);
+        gpu.rms_norm(&x, &w, eps, &mut got);
+        gpu.host_needs(&mut got);
+
+        let mut got_heads = x.clone();
+        gpu.begin_pass(1);
+        gpu.rms_norm_heads(&mut got_heads, &wh, head_dim, eps);
+        gpu.host_needs(&mut got_heads);
+
+        if serial {
+            exact(&format!("rms_norm {label}"), &want, &got);
+            exact(&format!("rms_norm_heads {label}"), &want_heads, &got_heads);
+        } else {
+            close(&format!("rms_norm {label}"), &want, &got, rms_tolerance(&want));
+            close(
+                &format!("rms_norm_heads {label}"),
+                &want_heads,
+                &got_heads,
+                rms_tolerance(&want_heads),
+            );
+        }
+    }
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+}
+
 /// Why is RMSNorm's serial f64 sum so expensive?
 ///
 /// It is ~40% of device time and the largest single kernel in a token. The
@@ -549,25 +640,121 @@ fn per_op_round_trip_cost() {
 #[ignore = "needs an sm_120 device; a measurement, not an assertion"]
 fn why_is_the_rms_reduction_slow() {
     let gpu = Cuda::new(0).expect("cuda device");
-    let n = 1024;
-    let reps = 2000;
+    let reps = 4000;
 
+    // 1024 and 2048 are n_embd of the 0.6B and of the 35B. The chain is as long
+    // as the vector, so if the cost really is dependent-chain latency the
+    // second column is twice the first — and that is what prices the 35B's 81
+    // calls a token. 8192 is not a model dimension: it is there because the
+    // fast variants sit at the launch floor at 1024 and cannot be told apart
+    // until the work outgrows it.
+    let sizes = [1024usize, 2048, 8192];
+
+    // (label, kernel, needs n floats of dynamic shared)
     let cases = [
-        ("serial f64, global", "bench_serial_f64_global", 0usize),
-        ("serial f32, global", "bench_serial_f32_global", 0),
-        ("serial f64, shared", "bench_shared_f64", n),
-        ("serial f32, shared", "bench_shared_f32", n),
-        ("tree f64", "bench_tree_f64", 0),
+        ("serial f64, global", "bench_serial_f64_global", false),
+        ("serial f32, global", "bench_serial_f32_global", false),
+        ("serial f64, shared", "bench_shared_f64", true),
+        ("serial f32, shared", "bench_shared_f32", true),
+        ("tree f64", "bench_tree_f64", false),
     ];
 
-    println!("  {:<22} {:>9} {:>14}", "variant", "us/call", "cycles/element");
-    for (label, kernel, shared) in cases {
-        let us = gpu
-            .bench_kernel(kernel, n, shared, reps)
-            .expect("bench kernel");
-        // 2.84 GHz, the clock nvidia-smi reports under load on this card.
-        let cycles = us * 2840.0 / n as f64;
-        println!("  {label:<22} {us:>9.2} {cycles:>14.0}");
+    let (floor, _) = gpu
+        .bench_kernel("bench_empty", 1024, 0, 256, 0, reps)
+        .expect("bench kernel");
+    println!("  launch floor (empty kernel) {floor:.2} us — read every number against it");
+    println!();
+    println!(
+        "  {:<22} {:>11} {:>11} {:>11}",
+        "variant", "n=1024 us", "n=2048 us", "n=8192 us"
+    );
+    for (label, kernel, staged) in cases {
+        let mut us = [0.0f64; 3];
+        for (k, n) in sizes.iter().enumerate() {
+            let shared = if staged { *n } else { 0 };
+            // Median of three: at these durations a single run picks up clock
+            // ramp, and "no change" without a noise floor is how the shared
+            // staging result was missed the first time.
+            let mut runs: Vec<f64> = (0..3)
+                .map(|_| {
+                    gpu.bench_kernel(kernel, *n, shared, 256, 0, reps)
+                        .expect("bench kernel")
+                        .0
+                })
+                .collect();
+            runs.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a timing"));
+            us[k] = runs[1];
+        }
+        println!("  {label:<22} {:>11.2} {:>11.2} {:>11.2}", us[0], us[1], us[2]);
     }
+
+    // The measurement that decides the question, and it is not the timing.
+    //
+    // A tree is faster because it breaks the dependent chain, and it is refused
+    // because breaking the chain changes the answer. But "changes the answer"
+    // is a property of f64 addition, not of reductions in general — so vary the
+    // decomposition and see whose answer actually moves. Each variant runs at
+    // four block sizes over identical input and the f64 results are compared
+    // bit for bit.
+    //
+    // An order-free reduction reports one value across all four *by
+    // construction*. That is the property the equal-bits rule needs;
+    // serialness is only one way to get it, and it is the expensive way.
+    let n = 1024usize;
+    for (mode, name) in [
+        (0u8, "benign"),
+        (1, "wide, ~39 binades"),
+        (2, "adversarial: 1e8 among 1.0s"),
+    ] {
+        // Must mirror `bench_kernel`'s input, and the oracle's `rms_scale`: the
+        // square is rounded to f32 before it is widened, exactly as ggml does.
+        let mut want = 0.0f64;
+        for i in 0..n {
+            let base = (i % 97) as f32 * 0.01 - 0.5;
+            let v = match mode {
+                1 => base * 2.0f32.powi((i % 35) as i32 - 17),
+                2 => {
+                    if i % 512 == 0 {
+                        1.0e8
+                    } else {
+                        1.0
+                    }
+                }
+                _ => base,
+            };
+            want += f64::from(v * v);
+        }
+
+        println!();
+        println!("  n={n}, block sizes 32/64/128/256, {name} input");
+        println!("  host serial f64 reference {want:.17e}");
+        println!(
+            "  {:<22} {:>12} {:>26} {:>11}",
+            "variant", "orders", "value", "rel err"
+        );
+        for (label, kernel, staged) in cases {
+            let shared = if staged { n } else { 0 };
+            let mut seen: Vec<u64> = Vec::new();
+            let mut value = 0.0f64;
+            for threads in [32u32, 64, 128, 256] {
+                let (_, got) = gpu
+                    .bench_kernel(kernel, n, shared, threads, mode, 8)
+                    .expect("bench kernel");
+                value = got;
+                if !seen.contains(&got.to_bits()) {
+                    seen.push(got.to_bits());
+                }
+            }
+            println!(
+                "  {label:<22} {:>12} {value:>26.17e} {:>11.1e}",
+                match seen.len() {
+                    1 => "1 (exact)".to_string(),
+                    k => format!("{k} differ"),
+                },
+                (value - want) / want
+            );
+        }
+    }
+
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 }

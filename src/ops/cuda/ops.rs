@@ -6,8 +6,9 @@
 //!
 //! # Exactness
 //!
-//! Bit-identical to [`crate::ops::naive`]: `matmul`, `rms_norm`,
-//! `rms_norm_heads`, `rope_neox`, `add_assign`. These are integer and f32
+//! Bit-identical to [`crate::ops::naive`]: `matmul`, `rope_neox`,
+//! `add_assign`, and `rms_norm`/`rms_norm_heads` **under `--rms-serial`**.
+//! These are integer and f32
 //! arithmetic in a fixed order, with `--fmad=false` keeping the compiler from
 //! contracting a multiply-add. `matmul` earns this despite being a fast
 //! warp-per-row kernel, because Q8_0's 32-element block is an integer sum and
@@ -18,6 +19,10 @@
 //!
 //! * `softmax` and `silu_mul` call `expf`, which CUDA is not obliged to round
 //!   as glibc does. Order is unchanged; the gap is one ulp.
+//! * `rms_norm` and `rms_norm_heads` reduce the sum of squares as a tree by
+//!   default. f64 addition rounds and so is not associative; the tolerance is
+//!   `n * 2^-53`, derived rather than fitted. `--rms-serial` restores the
+//!   serial walk and with it bit-equality, at ~2.3 ms a token.
 //! * `attend` is flash-decoding — it accumulates per chunk of the KV sequence
 //!   and combines — so it genuinely reorders. That was a deliberate trade: the
 //!   previous order-preserving version parallelized only over `n_head`, so its
@@ -338,12 +343,15 @@ impl Cuda {
             KArg::F32(eps),
             KArg::Ptr(od),
         ];
-        // Shared memory holds one square per element; the block fills it
-        // cooperatively before the serial reduction walks it.
-        let shared = (x.len() * 4) as u32;
-        // SAFETY: parameters match `rms_norm` in kernels.cu; every buffer was
-        // sized from the slice it mirrors, and `shared` is `n` floats.
-        unsafe { self.launch_shared("rms_norm", 1, 256, shared, &args)? };
+        // The serial kernel stages one square per element in shared memory so
+        // its f64 walk reads shared rather than global — worth 18%, and worth
+        // nothing to the tree, which has no serial walk to feed.
+        let (kernel, _) = self.rms_kernels();
+        let shared = if kernel == "rms_norm" { (x.len() * 4) as u32 } else { 0 };
+        // SAFETY: parameters match both `rms_norm` and `rms_norm_tree` in
+        // kernels.cu, which share a signature; every buffer was sized from the
+        // slice it mirrors, and `shared` is `n` floats or none.
+        unsafe { self.launch_shared(kernel, 1, 256, shared, &args)? };
         Ok(())
     }
 
@@ -364,10 +372,11 @@ impl Cuda {
             KArg::F32(eps),
             KArg::Ptr(xd),
         ];
-        let shared = (head_dim * 4) as u32;
+        let (_, kernel) = self.rms_kernels();
+        let shared = if kernel == "rms_norm_heads" { (head_dim * 4) as u32 } else { 0 };
         // SAFETY: as above; one block per head, and `shared` is `head_dim`
-        // floats.
-        unsafe { self.launch_shared("rms_norm_heads", n_heads as u32, 256, shared, &args)? };
+        // floats or none.
+        unsafe { self.launch_shared(kernel, n_heads as u32, 256, shared, &args)? };
         self.mirror_out(x).map(|_| ())
     }
 
