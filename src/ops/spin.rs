@@ -167,6 +167,21 @@ impl Ops for Spin {
         Naive.ssm_conv(state, x, weight, kernel, out)
     }
 
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) {
+        Naive.gather_chunks(src, chunk, stride, offset, out)
+    }
+
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+        Naive.sigmoid_mul(x, g)
+    }
+
     fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
         Naive.delta_rule(d, state, out)
     }

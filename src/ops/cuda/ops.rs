@@ -564,6 +564,156 @@ impl Cuda {
     }
 
     /// Convert and store K or V without either ever leaving the card.
+    /// Device-resident recurrent state for one layer, uploaded once.
+    ///
+    /// Unlike `resident`, the device copy is *written* by kernels, so after the
+    /// first touch it is the authoritative one and the host slab is stale by
+    /// design -- exactly as the KV slabs are. `forget_state` is what makes a
+    /// sequence reset visible.
+    fn state_resident(&self, host: &[f32]) -> Result<ffi::CUdeviceptr> {
+        let key = host.as_ptr() as usize;
+        if let Some(b) = self.states.borrow().get(&key) {
+            return Ok(b.ptr);
+        }
+        let buf = DeviceBuffer::from_slice(host)?;
+        let ptr = buf.ptr;
+        self.states.borrow_mut().insert(key, buf);
+        Ok(ptr)
+    }
+
+    /// Copy a device-owned recurrent state slab back to the host.
+    ///
+    /// Nothing on the forward path wants this -- the whole point of the slab
+    /// living on the device is that it never comes home. It exists so a test
+    /// can check what a kernel *left behind*, which is half of what these ops
+    /// do and is invisible from the output alone.
+    pub fn read_state_into(&self, host: &mut [f32]) -> Result<()> {
+        let key = host.as_ptr() as usize;
+        let ptr = match self.states.borrow().get(&key) {
+            Some(b) => b.ptr,
+            None => return Ok(()),
+        };
+        self.sync()?;
+        self.d2h(host, ptr)
+    }
+
+    fn gather_chunks_impl(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let sd = self.mirror_in(src)?;
+        let od = self.mirror_out(out)?;
+        let args = [
+            KArg::I32(out.len() as i32),
+            KArg::I32(chunk as i32),
+            KArg::I32(stride as i32),
+            KArg::I32(offset as i32),
+            KArg::Ptr(sd),
+            KArg::Ptr(od),
+        ];
+        let blocks = out.len().div_ceil(256) as u32;
+        // SAFETY: parameters match `gather_chunks` in kernels.cu; one thread
+        // per output element, guarded against the tail.
+        unsafe { self.launch_shared("gather_chunks", blocks, 256, 0, &args)? };
+        Ok(())
+    }
+
+    fn sigmoid_mul_impl(&self, x: &mut [f32], g: &[f32]) -> Result<()> {
+        let gd = self.mirror_in(g)?;
+        let xd = self.mirror_in(x)?;
+        let args = [KArg::I32(x.len() as i32), KArg::Ptr(xd), KArg::Ptr(gd)];
+        let blocks = x.len().div_ceil(256) as u32;
+        // SAFETY: parameters match `sigmoid_mul` in kernels.cu.
+        unsafe { self.launch_shared("sigmoid_mul", blocks, 256, 0, &args)? };
+        self.mirror_out(x).map(|_| ())
+    }
+
+    fn l2_norm_heads_impl(&self, x: &mut [f32], head_dim: usize, eps: f32) -> Result<()> {
+        let n_heads = x.len() / head_dim;
+        let xd = self.mirror_in(x)?;
+        let args = [
+            KArg::I32(head_dim as i32),
+            KArg::F32(eps),
+            KArg::Ptr(xd),
+        ];
+        // SAFETY: parameters match `l2_norm_heads` in kernels.cu; one block per
+        // head, and the buffer was sized from the slice it mirrors.
+        unsafe { self.launch_shared("l2_norm_heads", n_heads as u32, 128, 0, &args)? };
+        self.mirror_out(x).map(|_| ())
+    }
+
+    fn ssm_conv_impl(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let n = out.len();
+        let sd = self.state_resident(state)?;
+        let xd = self.mirror_in(x)?;
+        let w = self.resident(weight)?;
+        let od = self.mirror_out(out)?;
+        let args = [
+            KArg::I32(n as i32),
+            KArg::I32(kernel as i32),
+            KArg::Ptr(sd),
+            KArg::Ptr(xd),
+            KArg::Ptr(w),
+            KArg::Ptr(od),
+        ];
+        let blocks = n.div_ceil(256) as u32;
+        // SAFETY: parameters match `ssm_conv` in kernels.cu; one thread per
+        // channel, guarded against the tail.
+        unsafe { self.launch_shared("ssm_conv", blocks, 256, 0, &args)? };
+        Ok(())
+    }
+
+    fn delta_rule_impl(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) -> Result<()> {
+        let sd = self.state_resident(state)?;
+        let q = self.mirror_in(d.q)?;
+        let k = self.mirror_in(d.k)?;
+        let v = self.mirror_in(d.v)?;
+        let alpha = self.mirror_in(d.alpha)?;
+        let beta = self.mirror_in(d.beta)?;
+        // ssm_a and dt_bias are weights, not activations: one upload for the
+        // life of the process.
+        let ssm_a = self.resident(d.ssm_a)?;
+        let dt = self.resident(d.dt_bias)?;
+        let od = self.mirror_out(out)?;
+
+        let args = [
+            KArg::I32(d.head_k_dim as i32),
+            KArg::I32(d.head_v_dim as i32),
+            KArg::I32(d.n_k_heads as i32),
+            KArg::F32(d.scale()),
+            KArg::Ptr(q),
+            KArg::Ptr(k),
+            KArg::Ptr(v),
+            KArg::Ptr(alpha),
+            KArg::Ptr(beta),
+            KArg::Ptr(ssm_a),
+            KArg::Ptr(dt),
+            KArg::Ptr(sd),
+            KArg::Ptr(od),
+        ];
+        // q and k for the head are staged in shared memory: every thread in the
+        // block reads all of both.
+        let shared = (2 * d.head_k_dim * 4) as u32;
+        let threads = d.head_v_dim.min(256) as u32;
+        // SAFETY: parameters match `delta_rule` in kernels.cu; one block per
+        // value head, and `shared` is the two staged vectors.
+        unsafe {
+            self.launch_shared("delta_rule", d.n_v_heads as u32, threads, shared, &args)?
+        };
+        Ok(())
+    }
+
     fn kv_write_impl(&self, slab: &mut [u16], offset: usize, src: &[f32]) -> Result<()> {
         let key = slab.as_ptr() as usize;
         let bytes = std::mem::size_of_val(slab);
@@ -711,23 +861,42 @@ impl Ops for Cuda {
     //
     // The sticky error is the same mechanism `matmul` uses for a quant type it
     // has no kernel for.
-    fn l2_norm_heads(&self, _x: &mut [f32], _head_dim: usize, _eps: f32) {
-        self.note(Err(no_gdn_kernel("l2_norm_heads")));
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+        self.note(self.l2_norm_heads_impl(x, head_dim, eps));
     }
 
     fn ssm_conv(
         &self,
-        _state: &mut [f32],
-        _x: &[f32],
-        _weight: &[f32],
-        _kernel: usize,
-        _out: &mut [f32],
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
     ) {
-        self.note(Err(no_gdn_kernel("ssm_conv")));
+        self.note(self.ssm_conv_impl(state, x, weight, kernel, out));
     }
 
-    fn delta_rule(&self, _d: &Delta<'_>, _state: &mut [f32], _out: &mut [f32]) {
-        self.note(Err(no_gdn_kernel("delta_rule")));
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) {
+        self.note(self.gather_chunks_impl(src, chunk, stride, offset, out));
+    }
+
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+        self.note(self.sigmoid_mul_impl(x, g));
+    }
+
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+        self.note(self.delta_rule_impl(d, state, out));
+    }
+
+    fn forget_state(&self) {
+        self.states.borrow_mut().clear();
     }
 
     fn host_wrote(&self, buf: &[f32]) {
@@ -819,8 +988,27 @@ impl Ops for &Cuda {
         (*self).ssm_conv(state, x, weight, kernel, out)
     }
 
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) {
+        (*self).gather_chunks(src, chunk, stride, offset, out)
+    }
+
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+        (*self).sigmoid_mul(x, g)
+    }
+
     fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
         (*self).delta_rule(d, state, out)
+    }
+
+    fn forget_state(&self) {
+        (*self).forget_state()
     }
 
     fn host_wrote(&self, buf: &[f32]) {

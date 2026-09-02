@@ -760,15 +760,13 @@ impl<'a> Qwen35<'a> {
 
         // De-interleave. Per head the projection emits [q | gate], so head h's
         // query starts at h * 2 * head_dim and its gate half a head later.
+        // Through the seam rather than as a host loop: `qg` is a matmul result,
+        // so on a device backend reading it here would drag the activation home
+        // in the middle of a layer and break graph capture.
         let mut q = vec![0.0f32; qd];
         let mut g = vec![0.0f32; qd];
-        for h in 0..c.n_head {
-            let src = h * 2 * hd;
-            q[h * hd..(h + 1) * hd].copy_from_slice(&qg[src..src + hd]);
-            g[h * hd..(h + 1) * hd].copy_from_slice(&qg[src + hd..src + 2 * hd]);
-        }
-        ops.host_wrote(&q);
-        ops.host_wrote(&g);
+        ops.gather_chunks(&qg, hd, 2 * hd, 0, &mut q);
+        ops.gather_chunks(&qg, hd, 2 * hd, hd, &mut g);
 
         let mut k = vec![0.0f32; kd];
         let mut v = vec![0.0f32; kd];
@@ -806,11 +804,7 @@ impl<'a> Qwen35<'a> {
         ctx.trace("attn_pregate", il, &attn);
 
         // sigmoid(gate) * attention, then the output projection.
-        ops.host_needs(&mut attn);
-        for (a, &gv) in attn.iter_mut().zip(g.iter()) {
-            *a *= 1.0 / (1.0 + (-gv).exp());
-        }
-        ops.host_wrote(&attn);
+        ops.sigmoid_mul(&mut attn, &g);
         ctx.trace("attn_gated", il, &attn);
 
         ops.matmul(wo, &attn, out);
@@ -881,18 +875,31 @@ impl<'a> Qwen35<'a> {
         // The convolved output is [q | k | v] concatenated along the channel
         // axis, in that order — the same order `attn_qkv` emits and the same
         // one the conv preserved, since it is depthwise.
-        let (q_part, rest) = conv.split_at_mut(kdim);
-        let (k_part, v_part) = rest.split_at_mut(kdim);
-        ops.l2_norm_heads(q_part, c.head_k_dim(), c.rms_eps);
-        ops.l2_norm_heads(k_part, c.head_k_dim(), c.rms_eps);
-        ctx.trace("q_conv_predelta", il, q_part);
-        ctx.trace("k_conv_predelta", il, k_part);
+        //
+        // **Split through the seam, not with `split_at_mut`.** A device backend
+        // keys its mirrors on the host address of a slice, so a sub-slice
+        // taken here would look like a *different* buffer starting mid-way
+        // through `conv` -- and one with no mirror, so it would be uploaded
+        // from a host copy that the convolution never wrote. That produced
+        // fluent-looking garbage on the first GPU run. Copying into owned
+        // buffers costs three small kernels and keeps every slice something the
+        // seam has seen.
+        let mut q_part = vec![0.0f32; kdim];
+        let mut k_part = vec![0.0f32; kdim];
+        let mut v_part = vec![0.0f32; vdim];
+        ops.gather_chunks(&conv, kdim, cdim, 0, &mut q_part);
+        ops.gather_chunks(&conv, kdim, cdim, kdim, &mut k_part);
+        ops.gather_chunks(&conv, vdim, cdim, 2 * kdim, &mut v_part);
+        ops.l2_norm_heads(&mut q_part, c.head_k_dim(), c.rms_eps);
+        ops.l2_norm_heads(&mut k_part, c.head_k_dim(), c.rms_eps);
+        ctx.trace("q_conv_predelta", il, &q_part);
+        ctx.trace("k_conv_predelta", il, &k_part);
 
         let mut core = vec![0.0f32; vdim];
         let d = Delta {
-            q: q_part,
-            k: k_part,
-            v: v_part,
+            q: &q_part,
+            k: &k_part,
+            v: &v_part,
             alpha: &alpha,
             beta: &beta,
             ssm_a,

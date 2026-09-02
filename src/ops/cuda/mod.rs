@@ -97,6 +97,15 @@ pub struct Cuda {
     pass_graph: Cell<bool>,
     /// Master switch. Off for callers that drive ops one at a time.
     graphs_enabled: Cell<bool>,
+    /// Device-resident recurrent state, keyed on the host slab address.
+    ///
+    /// Separate from `weights` because these are *written* by kernels and must
+    /// survive a pass, and separate from `mirrors` because `begin_pass`
+    /// invalidates every activation mirror by design -- re-uploading ~2 MB per
+    /// layer per token would undo the whole reason the seam takes a slab.
+    /// Cleared by `forget_state` when the engine resets a sequence.
+    states: RefCell<HashMap<usize, DeviceBuffer>>,
+
     /// Reduce RMSNorm's sum of squares serially rather than as a tree.
     ///
     /// The tree is the default and is ~4x faster, but f64 addition rounds and
@@ -444,6 +453,7 @@ impl Cuda {
                 pass_graph: Cell::new(false),
                 graphs_enabled: Cell::new(true),
                 rms_serial: Cell::new(false),
+                states: RefCell::new(HashMap::new()),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),

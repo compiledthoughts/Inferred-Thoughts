@@ -436,6 +436,19 @@ fn only_the_expf_ops_diverge() {
         ) {
             Naive.ssm_conv(state, x, weight, kernel, out);
         }
+        fn gather_chunks(
+            &self,
+            src: &[f32],
+            chunk: usize,
+            stride: usize,
+            offset: usize,
+            out: &mut [f32],
+        ) {
+            Naive.gather_chunks(src, chunk, stride, offset, out);
+        }
+        fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+            Naive.sigmoid_mul(x, g);
+        }
         fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
             Naive.delta_rule(d, state, out);
         }
@@ -585,6 +598,96 @@ fn per_op_round_trip_cost() {
          against the CPU's 16.0",
         round_trip * 478.0 / 1000.0
     );
+}
+
+/// The three GatedDeltaNet primitives against the oracle.
+///
+/// Split from `every_op_agrees_with_the_oracle` because these carry state: the
+/// conv window and the SSM matrix are read *and written*, so a failure can be
+/// in what came back or in what was left behind, and the test has to check
+/// both. A kernel that computes the right output and corrupts the state would
+/// pass any check of the output alone, and would then look like drift.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_gdn_ops_agree_with_the_oracle() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // The 9B's real shapes.
+    let (hk, hv, nk, nv) = (128usize, 128, 16, 32);
+    let (kdim, vdim) = (hk * nk, hv * nv);
+    let eps = 1e-6f32;
+
+    // --- l2_norm_heads --------------------------------------------------
+    {
+        let mut a = noise(kdim, 21);
+        let mut b = a.clone();
+        Naive.l2_norm_heads(&mut a, hk, eps);
+        gpu.begin_pass(1);
+        gpu.l2_norm_heads(&mut b, hk, eps);
+        gpu.host_needs(&mut b);
+        exact("l2_norm_heads", &a, &b);
+    }
+
+    // --- ssm_conv, output and the state it leaves ------------------------
+    {
+        let kernel = 4usize;
+        let n = 1024usize;
+        let x = noise(n, 22);
+        let w = noise(n * kernel, 23);
+        let mut sa = noise(n * (kernel - 1), 24);
+        let mut sb = sa.clone();
+        let (mut oa, mut ob) = (vec![0.0; n], vec![0.0; n]);
+
+        Naive.ssm_conv(&mut sa, &x, &w, kernel, &mut oa);
+        gpu.begin_pass(1);
+        gpu.ssm_conv(&mut sb, &x, &w, kernel, &mut ob);
+        gpu.host_needs(&mut ob);
+        close("ssm_conv", &oa, &ob, 6.0 * f32::EPSILON);
+
+        // The state is device-owned after the call, so read it back the same
+        // way the model would have to.
+        gpu.read_state_into(&mut sb).expect("read state back");
+        exact("ssm_conv state", &sa, &sb);
+    }
+
+    // --- delta_rule ------------------------------------------------------
+    {
+        let q = noise(kdim, 25);
+        let k = noise(kdim, 26);
+        let v = noise(vdim, 27);
+        let alpha = noise(nv, 28);
+        let beta = noise(nv, 29);
+        // ssm_a is -exp(A_log) upstream, so it is negative and the gate lands
+        // inside (0, 1). A positive value here would make the state explode and
+        // the test would pass on garbage.
+        let ssm_a: Vec<f32> = noise(nv, 30).iter().map(|v| -v.abs()).collect();
+        let dt = noise(nv, 31);
+
+        let d = Delta {
+            q: &q, k: &k, v: &v,
+            alpha: &alpha, beta: &beta, ssm_a: &ssm_a, dt_bias: &dt,
+            head_k_dim: hk, head_v_dim: hv, n_k_heads: nk, n_v_heads: nv,
+        };
+        let mut sa = noise(nv * hk * hv, 32);
+        let mut sb = sa.clone();
+        let (mut oa, mut ob) = (vec![0.0; vdim], vec![0.0; vdim]);
+
+        Naive.delta_rule(&d, &mut sa, &mut oa);
+        gpu.begin_pass(1);
+        gpu.delta_rule(&d, &mut sb, &mut ob);
+        gpu.host_needs(&mut ob);
+
+        // Tolerance is the expf class, as for softmax and silu_mul: the gate
+        // and beta go through expf and logf, which CUDA is not obliged to round
+        // as glibc does. Everything after that is the oracle's own order --
+        // one thread per value row, summing the key axis ascending -- so a
+        // larger error means the decomposition is wrong, not the library.
+        close("delta_rule", &oa, &ob, 40.0 * f32::EPSILON);
+        gpu.read_state_into(&mut sb).expect("read state back");
+        close("delta_rule state", &sa, &sb, 40.0 * f32::EPSILON);
+    }
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 }
 
 /// `--rms-serial` buys back exactly what the tree gave up.

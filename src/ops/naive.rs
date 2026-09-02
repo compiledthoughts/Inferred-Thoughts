@@ -187,6 +187,28 @@ impl Ops for Naive {
         }
     }
 
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) {
+        debug_assert_eq!(out.len() % chunk, 0);
+        for (c, dst) in out.chunks_exact_mut(chunk).enumerate() {
+            let at = c * stride + offset;
+            dst.copy_from_slice(&src[at..at + chunk]);
+        }
+    }
+
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+        debug_assert_eq!(x.len(), g.len());
+        for i in 0..x.len() {
+            x[i] *= 1.0 / (1.0 + (-g[i]).exp());
+        }
+    }
+
     fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
         debug_assert_eq!(state.len(), d.n_v_heads * d.state_per_head());
         debug_assert_eq!(out.len(), d.n_v_heads * d.head_v_dim);

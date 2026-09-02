@@ -222,6 +222,27 @@ pub trait Ops {
         out: &mut [f32],
     );
 
+    /// Copy one `chunk`-sized run out of every `stride` of `src`, starting at
+    /// `offset`.
+    ///
+    /// Generic, but it exists for one shape: `qwen35`'s `attn_q` emits query
+    /// and gate interleaved per head, so both are strided views of a single
+    /// matmul result. Doing that split in model code would mean reading a
+    /// device buffer on the host in the middle of a layer, which costs a round
+    /// trip and makes the pass ungraphable.
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    );
+
+    /// `x *= sigmoid(g)`, elementwise and in place. The sibling of
+    /// [`Ops::silu_mul`], and inexact for the same reason: `expf`.
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]);
+
     /// The gated delta rule for one token, every value head, state updated in
     /// place.
     ///
@@ -298,6 +319,15 @@ pub trait Ops {
     ///
     /// A device backend writes into its own copy and leaves `slab` untouched,
     /// so a host reader must go through [`Ops::host_needs`] first.
+    /// The engine is starting a fresh sequence; forget any device copy of
+    /// recurrent state.
+    ///
+    /// Needed because a device backend owns that state once it has touched it:
+    /// nothing brings it home, so zeroing the host slab is invisible to it.
+    /// The KV cache does not need this hint because its mirror tracks
+    /// positions, and a shorter one than last time already means a reset.
+    fn forget_state(&self) {}
+
     fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
         for (d, &s) in slab[offset..offset + src.len()].iter_mut().zip(src) {
             *d = crate::quant::half::f32_to_f16(s);

@@ -698,3 +698,189 @@ __global__ void bench_empty(int n, const float *__restrict__ x,
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------- GatedDeltaNet
+//
+// The three primitives the qwen35 recurrent layer needs. Two are trivial; the
+// third is where the architecture's cost lives.
+//
+// All three take this layer's state slab and leave it on the device. That is
+// the point of the seam taking a slab rather than an assembled window: the
+// state is ~2 MB per layer and is read and written every token, so shuttling it
+// home would cost ~96 MB a token across 24 recurrent layers -- about 3.4 ms at
+// the measured 28.6 GB/s, against a whole-token budget of roughly 20 ms on the
+// 9B.
+
+// L2 normalization per head, in place. No weight, no division by n, and eps
+// clamps the *norm* rather than sitting under the root -- see
+// ggml_compute_forward_l2_norm_f32. Confusing it with RMSNorm is wrong by
+// exactly sqrt(n).
+//
+// **Serial f64, so this stays bit-identical to the oracle.** Unlike rms_norm,
+// which walks 1024 or 2048 elements and was worth breaking the chain for, a
+// head here is 128 elements and 16 heads run as 16 concurrent blocks. The whole
+// op is ~6 us a call, so exactness is nearly free and is kept.
+extern "C" __global__ void l2_norm_heads(int head_dim, float eps,
+                                         float *__restrict__ x) {
+    __shared__ float scale;
+    float *head = x + (size_t)blockIdx.x * head_dim;
+
+    if (threadIdx.x == 0) {
+        double sum = 0.0;
+        for (int i = 0; i < head_dim; ++i) {
+            float v = head[i];
+            sum += (double)(v * v);
+        }
+        // sqrtf takes a float, so `sum` narrows before the root here exactly as
+        // it does in the reference. That narrowing is the reference's, not an
+        // accident of this transcription.
+        scale = 1.0f / fmaxf(sqrtf((float)sum), eps);
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        head[i] *= scale;
+    }
+}
+
+// Depthwise causal conv1d over the stored window and this token, then silu,
+// advancing the state.
+//
+// One thread per channel. Depthwise means no mixing, so there is nothing to
+// reduce and nothing to share -- each thread reads its own `kernel - 1` stored
+// samples, its own new sample and its own `kernel` weights.
+//
+// The accumulator is f32 because ggml_compute_forward_ssm_conv_f32 says
+// outright that it avoids ggml_vec_dot_f32 "because its sum is in double
+// precision". Bit-identical to the oracle.
+extern "C" __global__ void ssm_conv(int n_channels, int kernel,
+                                    float *__restrict__ state,
+                                    const float *__restrict__ x,
+                                    const float *__restrict__ w,
+                                    float *__restrict__ out) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+
+    const int keep = kernel - 1;
+    float *past = state + (size_t)c * keep;
+    const float *wc = w + (size_t)c * kernel;
+
+    // Oldest sample first, so tap `keep` is always this token and never comes
+    // from the state.
+    float sum = 0.0f;
+    for (int t = 0; t < keep; ++t) sum += past[t] * wc[t];
+    sum += x[c] * wc[keep];
+    out[c] = sum / (1.0f + expf(-sum));
+
+    for (int t = 0; t < keep - 1; ++t) past[t] = past[t + 1];
+    past[keep - 1] = x[c];
+}
+
+// The gated delta rule: one token, every value head, state updated in place.
+//
+// # The decomposition
+//
+// One block per value head, one thread per *value row* of that head's state.
+// Row j touches only k, v[j], q and its own 128 floats, so the rows are
+// independent and each thread keeps the oracle's serial ascending sum over the
+// key axis. That is the same escape the Q8_0 matmul found: parallelize over
+// independent outputs and the arithmetic never has to be reordered.
+//
+// # Two passes, not four
+//
+// The oracle decays the whole state, reads, corrects and reads again -- four
+// sweeps of 2 MB per layer. Folding the decay into the two reads gives the same
+// arithmetic in two sweeps: `(s*g)*k` is what the oracle computes, and
+// `(s*g) + k*d` is what it stores. With --fmad=false nothing contracts, so this
+// is bit-for-bit the oracle's order, at half the traffic.
+//
+// # What is *not* exact, and why it is accepted here
+//
+// `g` and `beta` need expf and logf, and CUDA is not obliged to round them as
+// glibc does. That puts this kernel in the same class as `softmax` and
+// `silu_mul` -- about one ulp -- rather than in the exact set.
+//
+// The alternative was to precompute both on the host, as `rope_neox` does with
+// its sin/cos table. It was rejected: alpha and beta are matmul outputs, so
+// they are already on the device, and bringing 64 floats home per layer would
+// be 48 round trips a token and would break graph capture, which needs an
+// identical launch sequence. Trading one ulp for that is a bad trade.
+extern "C" __global__ void delta_rule(int head_k_dim, int head_v_dim,
+                                      int n_k_heads, float q_scale,
+                                      const float *__restrict__ q,
+                                      const float *__restrict__ k,
+                                      const float *__restrict__ v,
+                                      const float *__restrict__ alpha,
+                                      const float *__restrict__ beta_raw,
+                                      const float *__restrict__ ssm_a,
+                                      const float *__restrict__ dt_bias,
+                                      float *__restrict__ state,
+                                      float *__restrict__ out) {
+    extern __shared__ float sh[];
+    float *qs = sh;                 // head_k_dim
+    float *ks = sh + head_k_dim;    // head_k_dim
+    __shared__ float g, beta;
+
+    const int h = blockIdx.x;
+    // Modulo, not division. Value head h reads key head h % n_k_heads: the
+    // unfused reference path tiles via ggml_repeat, and the fused kernel writes
+    // `iq1 = iv1 % neq1`. Blocked grouping agrees only for h = 0 and h = 1.
+    const int kh = h % n_k_heads;
+
+    for (int i = threadIdx.x; i < head_k_dim; i += blockDim.x) {
+        qs[i] = q[kh * head_k_dim + i];
+        ks[i] = k[kh * head_k_dim + i];
+    }
+    if (threadIdx.x == 0) {
+        float a = alpha[h] + dt_bias[h];
+        // The 20.0 cutoff is the reference's (ggml_compute_softplus_f32), not a
+        // guard invented here: above it, log(1 + exp(x)) is x to f32 precision.
+        float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+        g = expf(sp * ssm_a[h]);
+        beta = 1.0f / (1.0f + expf(-beta_raw[h]));
+    }
+    __syncthreads();
+
+    const size_t per_head = (size_t)head_k_dim * head_v_dim;
+    for (int j = threadIdx.x; j < head_v_dim; j += blockDim.x) {
+        float *row = state + (size_t)h * per_head + (size_t)j * head_k_dim;
+
+        float pred = 0.0f;
+        for (int i = 0; i < head_k_dim; ++i) pred += (row[i] * g) * ks[i];
+
+        const float d = beta * (v[h * head_v_dim + j] - pred);
+
+        float o = 0.0f;
+        for (int i = 0; i < head_k_dim; ++i) {
+            float s = row[i] * g + ks[i] * d;
+            row[i] = s;
+            o += s * (qs[i] * q_scale);
+        }
+        out[h * head_v_dim + j] = o;
+    }
+}
+
+// Pull one `chunk`-sized run out of every `stride` of `src`, starting at
+// `offset`. Generic, but it exists for one thing: qwen35's `attn_q` emits query
+// and gate interleaved per head, so the two are strided views of one matmul
+// result and the model would otherwise de-interleave them on the host --
+// dragging the activation home mid-layer and breaking graph capture.
+extern "C" __global__ void gather_chunks(int n_out, int chunk, int stride,
+                                         int offset,
+                                         const float *__restrict__ src,
+                                         float *__restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_out) return;
+    int c = i / chunk;
+    int j = i - c * chunk;
+    out[i] = src[c * stride + offset + j];
+}
+
+// x *= sigmoid(g), elementwise. The sibling of silu_mul, and inexact for the
+// same reason: expf.
+extern "C" __global__ void sigmoid_mul(int n, float *__restrict__ x,
+                                       const float *__restrict__ g) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] *= 1.0f / (1.0f + expf(-g[i]));
+}

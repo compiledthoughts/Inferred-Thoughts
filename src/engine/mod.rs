@@ -101,6 +101,9 @@ impl<'a, O: Ops> Engine<'a, O> {
         self.cache.reset();
         if let Some(r) = self.recurrent.as_mut() {
             r.reset();
+            // A device backend owns this state once it has touched it, so
+            // zeroing the host slab is invisible to it without being told.
+            self.ops.forget_state();
         }
     }
 
