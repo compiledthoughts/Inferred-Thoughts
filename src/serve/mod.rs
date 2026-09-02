@@ -103,59 +103,137 @@ fn content_text(v: &Value) -> String {
     }
 }
 
-/// One loaded model, its engine, and how much of the conversation it has seen.
+/// The profiler's running totals, so a request can be reported on its own.
+///
+/// [`crate::profile::Profile`] accumulates for the life of the process, which is
+/// what the CLI wants and not what a server does — a chat wants to know what
+/// *this turn* cost. Differencing a snapshot is enough and keeps the profiler
+/// free of a second notion of "session".
+#[derive(Clone, Copy)]
+struct Mark {
+    prefill_tokens: u64,
+    prefill_ns: u64,
+    decode_tokens: u64,
+    decode_ns: u64,
+}
+
+impl Mark {
+    fn take<O: Ops>(e: &Engine<'_, O>) -> Self {
+        Self {
+            prefill_tokens: e.prof.prefill_tokens,
+            prefill_ns: e.prof.prefill_ns,
+            decode_tokens: e.prof.decode_tokens,
+            decode_ns: e.prof.decode_ns,
+        }
+    }
+}
+
+/// Print what this turn cost, in the shape `inferred generate` prints.
+fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
+    let now = Mark::take(engine);
+    let line = |name: &str, tok: u64, ns: u64| {
+        if tok == 0 {
+            return;
+        }
+        let ms = ns as f64 / 1e6;
+        eprintln!(
+            "  {name:<9}{tok:>6} tok  {ms:>9.1} ms  {:>8.2} tok/s  {:>7.1} ms/tok",
+            tok as f64 / (ns as f64 / 1e9).max(1e-9),
+            ms / tok as f64,
+        );
+    };
+    line(
+        "prefill",
+        now.prefill_tokens - before.prefill_tokens,
+        now.prefill_ns - before.prefill_ns,
+    );
+    line(
+        "decode",
+        now.decode_tokens - before.decode_tokens,
+        now.decode_ns - before.decode_ns,
+    );
+    let kv = engine.kv_capacity_bytes() as f64 / 1048576.0;
+    let rs = engine.recurrent_capacity_bytes() as f64 / 1048576.0;
+    eprintln!(
+        "  kv       {:>6} / {} positions  {kv:.0} MiB{}",
+        engine.pos(),
+        engine.n_ctx(),
+        if rs > 0.0 {
+            format!(", recurrent {rs:.0} MiB")
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// One loaded model, its engine, and the conversation it has consumed.
+///
+/// The state that matters is `rendered`: the exact text the engine has been
+/// fed. A turn is cheap when the new conversation *starts with* that text,
+/// because then only the difference has to be tokenized and run.
+///
+/// **Matching on text rather than on tokens is the point.** The obvious design
+/// re-tokenizes the whole conversation each turn and looks for a common token
+/// prefix. It was built that way first and it barely helped: the model emits
+/// tokens, the client sends the text back, and re-tokenizing splits differently
+/// at the seam — a generated newline after a prompt that already ends in one
+/// merges into a single token, and every token after it shifts. Measured, a
+/// second turn re-ran 51 of 62 tokens that way. Comparing text sidesteps the
+/// re-tokenization entirely.
 struct Session<'a, O: Ops> {
     engine: Engine<'a, O>,
     tk: Tokenizer,
     chat: ChatMl,
-    /// Tokens the engine has already consumed, in order. The engine's caches
-    /// are valid exactly for this prefix.
-    processed: Vec<u32>,
+    /// Conversation text the engine has consumed, including its own output.
+    rendered: String,
+    /// Tokens behind `rendered`, for reporting.
+    consumed: usize,
 }
 
 impl<O: Ops> Session<'_, O> {
-    /// Bring the engine up to `tokens`, reusing what it has already seen.
+    /// Bring the engine up to `want`, reusing what it has already consumed.
     ///
-    /// Returns the logits for the last token. The whole point is the first
-    /// branch: a chat that only ever appends pays for the new turn, not for the
-    /// conversation.
-    fn advance(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, bool)> {
-        // Longest common prefix, not an exact one. Requiring the whole history
-        // to match looks right and almost never holds: the model generates a
-        // token, the client sends the *text* back, and re-tokenizing it can
-        // split differently at the seam. A first generated newline, after a
-        // prompt that already ends in one, is enough: the pair merges into a
-        // single token on the way back in and every later token shifts.
-        let lcp = self
-            .processed
-            .iter()
-            .zip(tokens)
-            .take_while(|(a, b)| a == b)
-            .count();
-
-        let reused = if lcp == self.processed.len() && !self.processed.is_empty() {
-            true
-        } else if self.engine.rewind(lcp) {
-            // Attention only: the cache is a log, so truncating it to the
-            // common prefix leaves exactly the state that prefix produced.
-            self.processed.truncate(lcp);
-            lcp > 0
+    /// Returns the last token's logits, whether the session continued, and how
+    /// many tokens actually had to run.
+    fn advance(&mut self, want: &str) -> Result<(Vec<f32>, bool, usize)> {
+        let reused = !self.rendered.is_empty() && want.starts_with(self.rendered.as_str());
+        let text = if reused {
+            &want[self.rendered.len()..]
         } else {
-            // Recurrent: nothing to truncate, so start over.
+            // An edit, a branch, or a different client. Nothing here tries to
+            // rewind: a KV cache could be truncated to a common prefix, but a
+            // GatedDeltaNet layer's state is one matrix that has absorbed every
+            // token with no record of how to remove one. Restarting is the only
+            // correct move for `qwen35`, and doing the same for `qwen3` keeps
+            // one code path.
             self.engine.reset();
-            self.processed.clear();
-            false
+            self.consumed = 0;
+            want
         };
-        let fresh = &tokens[self.processed.len()..];
-        if fresh.is_empty() {
+
+        // BOS belongs to the start of a sequence, so a continuation must not
+        // add one.
+        let tokens = self.tk.encode(text, !reused, true);
+        if tokens.is_empty() {
             return Err(Error::InconsistentArchitecture {
                 what: "chat request",
-                detail: "prompt is not longer than what has already been processed".to_string(),
+                detail: "the conversation added no new text".to_string(),
             });
         }
-        let logits = self.engine.prefill(fresh)?;
-        self.processed.extend_from_slice(fresh);
-        Ok((logits, reused))
+        let logits = self.engine.prefill(&tokens)?;
+        self.consumed += tokens.len();
+        self.rendered = want.to_string();
+        Ok((logits, reused, tokens.len()))
+    }
+
+    /// Record what the model produced, so the next turn sees it as a prefix.
+    ///
+    /// The turn-ending marker is deliberately *not* added: generation stops
+    /// before consuming it, so the engine has not seen it, and the next
+    /// request's rendering supplies it as part of the new text.
+    fn absorb(&mut self, text: &str, tokens: usize) {
+        self.rendered.push_str(text);
+        self.consumed += tokens;
     }
 }
 
@@ -170,18 +248,18 @@ pub fn serve<O: Ops>(
         path: format!("127.0.0.1:{}", opts.port),
         source,
     })?;
-    eprintln!(
-        "serving {} on http://127.0.0.1:{}/v1  (ctx {})",
-        opts.model_id,
-        opts.port,
-        engine.n_ctx()
-    );
+    let base = format!("http://127.0.0.1:{}", opts.port);
+    eprintln!("serving {} (ctx {})", opts.model_id, engine.n_ctx());
+    eprintln!("  base url   {base}          <- most clients want this");
+    eprintln!("  or         {base}/v1       <- if the client adds /chat/completions itself");
+    eprintln!("  either works; the router matches on the path suffix");
 
     let mut session = Session {
         engine,
         tk,
         chat,
-        processed: Vec::new(),
+        rendered: String::new(),
+        consumed: 0,
     };
 
     // One connection at a time. The engine holds a single session, so
@@ -213,9 +291,23 @@ fn handle<O: Ops>(
         Err(_) => return Ok(()),
     };
 
-    match (method.as_str(), path.as_str()) {
-        ("GET", "/health") => send_json(&mut stream, 200, &json!({"status": "ok"})),
-        ("GET", "/v1/models") => {
+    // Clients disagree about where the base URL ends. Some want
+    // `http://host:port` and append `/v1/chat/completions`; others want
+    // `http://host:port/v1` and append `/chat/completions`. Configure one the
+    // other way and the request arrives at `/v1/v1/chat/completions`, or with a
+    // stray `%20` from a trailing space in a settings box.
+    //
+    // A local server has nothing to gain by being strict about that, so the
+    // path is decoded, trimmed and matched on its suffix. The alternative is a
+    // 404 whose message the user has to reverse-engineer, which is exactly how
+    // this was found.
+    let route = normalize_path(&path);
+
+    match (method.as_str(), route.as_str()) {
+        ("GET", p) if p.ends_with("/health") => {
+            send_json(&mut stream, 200, &json!({"status": "ok"}))
+        }
+        ("GET", p) if p.ends_with("/models") => {
             let body = json!({
                 "object": "list",
                 "data": [{
@@ -227,12 +319,14 @@ fn handle<O: Ops>(
             });
             send_json(&mut stream, 200, &body)
         }
-        ("POST", "/v1/chat/completions") => chat_completions(session, &mut stream, &body, opts),
+        ("POST", p) if p.ends_with("/chat/completions") => {
+            chat_completions(session, &mut stream, &body, opts)
+        }
         ("OPTIONS", _) => send_head(&mut stream, 204, "text/plain", 0),
         _ => send_json(
             &mut stream,
             404,
-            &json!({"error": {"message": format!("no route for {method} {path}")}}),
+            &json!({"error": {"message": format!("no route for {method} {route}")}}),
         ),
     }
 }
@@ -263,36 +357,36 @@ fn chat_completions<O: Ops>(
         .iter()
         .map(|(r, c)| (r.as_str(), c.as_str()))
         .collect();
-    let prompt = session.chat.wrap_turns(&turns);
-    let tokens = session.tk.encode(&prompt, true, true);
+    let want = session.chat.wrap_turns(&turns);
 
     let budget = req
         .max_tokens
         .or(req.max_completion_tokens)
         .unwrap_or(opts.max_tokens);
 
-    let already = session.processed.len();
-    let (logits, reused) = match session.advance(&tokens) {
+    let mark = Mark::take(&session.engine);
+    let (logits, reused, fresh) = match session.advance(&want) {
         Ok(v) => v,
         Err(e) => {
             return send_json(stream, 400, &json!({"error": {"message": e.to_string()}}));
         }
     };
-    // What `advance` actually had to run, which is the number worth watching:
-    // on a continued session it is one turn, on a restart the whole history.
-    let new_tokens = if reused { tokens.len() - already } else { tokens.len() };
     eprintln!(
-        "chat: {} prompt tokens, {} prefilled ({}), budget {budget}",
-        tokens.len(),
-        new_tokens,
+        "chat: {} turns, {fresh} new tokens ({}), budget {budget}",
+        turns.len(),
         if reused { "continued" } else { "restarted" },
     );
 
-    if req.stream {
+    let r = if req.stream {
         stream_completion(session, stream, logits, budget, opts)
     } else {
         whole_completion(session, stream, logits, budget, opts)
-    }
+    };
+    // Reported even when the client hung up mid-stream: the work still
+    // happened, and a disconnect is exactly when it is useful to see what it
+    // cost.
+    report(&session.engine, mark);
+    r
 }
 
 /// Generate greedily, calling `emit` with each new piece of text.
@@ -305,7 +399,7 @@ fn generate<O: Ops>(
     mut logits: Vec<f32>,
     budget: usize,
     mut emit: impl FnMut(&str) -> Result<()>,
-) -> Result<(String, &'static str)> {
+) -> Result<(String, &'static str, usize)> {
     let eos = session.tk.eos_token_id;
     let mut shown = String::new();
     let mut produced: Vec<u32> = Vec::new();
@@ -318,7 +412,6 @@ fn generate<O: Ops>(
             break;
         }
         produced.push(next);
-        session.processed.push(next);
 
         if let Ok(text) = session.tk.decode(&produced, false) {
             if let Some(delta) = text.strip_prefix(shown.as_str()) {
@@ -337,7 +430,8 @@ fn generate<O: Ops>(
         }
         logits = session.engine.decode(next)?;
     }
-    Ok((shown, reason))
+    let n = produced.len();
+    Ok((shown, reason, n))
 }
 
 fn stream_completion<O: Ops>(
@@ -347,18 +441,13 @@ fn stream_completion<O: Ops>(
     budget: usize,
     opts: &ServeOpts,
 ) -> Result<()> {
-    let head = "HTTP/1.1 200 OK\r\n\
-         Content-Type: text/event-stream\r\n\
-         Cache-Control: no-cache\r\n\
-         Connection: close\r\n\
-         Access-Control-Allow-Origin: *\r\n\r\n";
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
     write_all(stream, head.as_bytes())?;
 
     let id = completion_id();
     let created = now();
     let model = opts.model_id.clone();
 
-    // The first chunk carries the role, as the OpenAI stream does.
     let first = chunk(&id, created, &model, json!({"role": "assistant"}), None);
     sse(stream, &first)?;
 
@@ -366,7 +455,8 @@ fn stream_completion<O: Ops>(
         let c = chunk(&id, created, &model, json!({"content": delta}), None);
         sse(stream, &c)
     };
-    let (_, reason) = generate(session, logits, budget, &mut sink)?;
+    let (text, reason, n) = generate(session, logits, budget, &mut sink)?;
+    session.absorb(&text, n);
 
     let last = chunk(&id, created, &model, json!({}), Some(reason));
     sse(stream, &last)?;
@@ -381,9 +471,9 @@ fn whole_completion<O: Ops>(
     budget: usize,
     opts: &ServeOpts,
 ) -> Result<()> {
-    let prompt_tokens = session.processed.len();
-    let (text, reason) = generate(session, logits, budget, |_| Ok(()))?;
-    let completion_tokens = session.processed.len() - prompt_tokens;
+    let prompt_tokens = session.consumed;
+    let (text, reason, n) = generate(session, logits, budget, |_| Ok(()))?;
+    session.absorb(&text, n);
 
     let body = json!({
         "id": completion_id(),
@@ -397,8 +487,8 @@ fn whole_completion<O: Ops>(
         }],
         "usage": {
             "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
+            "completion_tokens": n,
+            "total_tokens": prompt_tokens + n,
         },
     });
     send_json(stream, 200, &body)
@@ -425,6 +515,30 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 // ------------------------------------------------------------------- plumbing
+
+/// Decode `%XX`, drop a query string, and trim.
+///
+/// Deliberately lenient: this exists so a base URL pasted with a trailing space
+/// or a doubled `/v1` still reaches the right handler.
+fn normalize_path(raw: &str) -> String {
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).trim().trim_end_matches('/').to_string()
+}
 
 fn now() -> u64 {
     SystemTime::now()
