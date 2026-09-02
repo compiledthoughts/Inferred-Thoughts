@@ -222,6 +222,27 @@ impl<O: Ops> Session<'_, O> {
                 detail: "the conversation added no new text".to_string(),
             });
         }
+
+        // Checked before a single token runs, because prefill is one forward
+        // pass per token and finding out the hard way costs minutes. A VS Code
+        // Copilot request carries a ~78,000-character system prompt -- tool
+        // definitions, the workspace file tree, terminal state -- which is
+        // ~20,000 tokens before the user has typed anything, and the failure
+        // used to arrive three minutes in.
+        let need = self.consumed + tokens.len();
+        if need > self.engine.n_ctx() {
+            return Err(Error::InconsistentArchitecture {
+                what: "context",
+                detail: format!(
+                    "needs {need} tokens ({} held + {} new) but the context is {}. Restart with --ctx {} or larger",
+                    self.consumed,
+                    tokens.len(),
+                    self.engine.n_ctx(),
+                    need.next_power_of_two(),
+                ),
+            });
+        }
+
         let logits = self.engine.prefill(&tokens)?;
         self.consumed += tokens.len();
         self.rendered = want.to_string();
@@ -382,6 +403,12 @@ fn chat_completions<O: Ops>(
         .unwrap_or(opts.max_tokens);
 
     let mark = Mark::take(&session.engine);
+    // Announced before `advance`, because a long prefill is minutes of silence
+    // otherwise and the count is the only clue to why.
+    let approx = want.len().saturating_sub(session.rendered.len()) / 4;
+    if approx > 2048 {
+        eprintln!("chat: ~{approx} new tokens to prefill; this will take a while");
+    }
     let (logits, reused, fresh) = match session.advance(&want) {
         Ok(v) => v,
         Err(e) => {
