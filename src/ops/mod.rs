@@ -154,7 +154,23 @@ pub trait Ops {
     /// NEOX pairs dimension `i` with `i + head_dim/2`, **not** with `i + 1`.
     /// `LLM_ARCH_QWEN3` sits under llama.cpp's "the pairs of head values are
     /// offset by n_rot/2" group.
-    fn rope_neox(&self, x: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta_base: f32);
+    /// `n_rot` is how many of each `head_dim` actually rotate; the rest pass
+    /// through. `qwen3` rotates the whole head, `qwen35` rotates 64 of 256.
+    ///
+    /// It is a parameter rather than a loop in model code because the loop had
+    /// to hand the seam a *sub-slice per head*, and a device backend keys its
+    /// mirrors on the host address of a slice — so every head after the first
+    /// looked like an unmirrored buffer and was uploaded from a stale host
+    /// copy. It also cost 160 launches a token where one will do.
+    fn rope_neox(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        n_rot: usize,
+        n_heads: usize,
+        theta_base: f32,
+    );
 
     /// Numerically stable softmax, in place. Used by [`Ops::attend`]'s
     /// implementations, and by the MoE router when Stage 7 lands.

@@ -83,17 +83,21 @@ impl Ops for Naive {
         x: &mut [f32],
         pos: usize,
         head_dim: usize,
+        n_rot: usize,
         n_heads: usize,
         theta_base: f32,
     ) {
         debug_assert_eq!(x.len(), head_dim * n_heads);
-        debug_assert_eq!(head_dim % 2, 0);
+        debug_assert_eq!(n_rot % 2, 0);
+        debug_assert!(n_rot <= head_dim);
 
-        let half = head_dim / 2;
+        // Only the first `n_rot` of each head rotate; the rest pass through.
+        // The frequency divides by `n_rot`, not `head_dim` -- ggml's rope_yarn
+        // takes `theta_scale = powf(freq_base, -2/n_dims)` with n_dims = n_rot.
+        let half = n_rot / 2;
         for head in x.chunks_exact_mut(head_dim) {
             for i in 0..half {
-                // theta = pos * base^(-2i/head_dim), as in ggml_rope's NEOX path.
-                let freq = (theta_base as f64).powf(-2.0 * i as f64 / head_dim as f64);
+                let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
                 let theta = pos as f64 * freq;
                 let (sin, cos) = theta.sin_cos();
                 let (sin, cos) = (sin as f32, cos as f32);
@@ -542,7 +546,7 @@ mod tests {
         // head_dim 4 => pairs are (0,2) and (1,3). At i=0 the frequency is 1,
         // so pos=1 rotates (x0, x2) by exactly 1 radian.
         let mut x = [1.0f32, 0.0, 0.0, 0.0];
-        Naive.rope_neox(&mut x, 1, 4, 1, 10000.0);
+        Naive.rope_neox(&mut x, 1, 4, 4, 1, 10000.0);
         assert!((x[0] - 1.0f32.cos()).abs() < 1e-6, "{x:?}");
         assert!((x[2] - 1.0f32.sin()).abs() < 1e-6, "{x:?}");
         // If this were the adjacent-pair variant, index 1 would have moved.
@@ -553,7 +557,7 @@ mod tests {
     fn rope_at_position_zero_is_identity() {
         let mut x = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let before = x;
-        Naive.rope_neox(&mut x, 0, 8, 1, 1_000_000.0);
+        Naive.rope_neox(&mut x, 0, 8, 8, 1, 1_000_000.0);
         for (a, b) in x.iter().zip(&before) {
             assert!((a - b).abs() < 1e-6, "{x:?}");
         }
@@ -564,7 +568,7 @@ mod tests {
         // Rotation is orthogonal, so each pair's norm must be unchanged.
         let mut x: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01 - 0.5).collect();
         let before = x.clone();
-        Naive.rope_neox(&mut x, 37, 128, 1, 1_000_000.0);
+        Naive.rope_neox(&mut x, 37, 128, 128, 1, 1_000_000.0);
         for i in 0..64 {
             let n0 = before[i].hypot(before[i + 64]);
             let n1 = x[i].hypot(x[i + 64]);
@@ -575,7 +579,7 @@ mod tests {
     #[test]
     fn rope_treats_heads_independently() {
         let mut two = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
-        Naive.rope_neox(&mut two, 5, 4, 2, 10000.0);
+        Naive.rope_neox(&mut two, 5, 4, 4, 2, 10000.0);
         assert_eq!(two[0..4], two[4..8]);
     }
 

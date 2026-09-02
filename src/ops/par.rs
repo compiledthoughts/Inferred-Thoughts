@@ -164,8 +164,16 @@ impl Ops for Par {
         Naive.rms_norm_heads(x, weight, head_dim, eps)
     }
 
-    fn rope_neox(&self, x: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta: f32) {
-        Naive.rope_neox(x, pos, head_dim, n_heads, theta)
+    fn rope_neox(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        n_rot: usize,
+        n_heads: usize,
+        theta: f32,
+    ) {
+        Naive.rope_neox(x, pos, head_dim, n_rot, n_heads, theta)
     }
 
     fn softmax(&self, x: &mut [f32]) {

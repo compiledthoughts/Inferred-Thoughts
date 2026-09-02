@@ -468,6 +468,70 @@ struct Layer<'a> {
     ffn_down: Weights<'a>,
 }
 
+/// Every intermediate one token needs, allocated once per pass.
+///
+/// **Stable addresses are the point, not the saved `malloc`.** A device backend
+/// keys its mirrors on the host address of a buffer, and a recorded CUDA graph
+/// holds device pointers in its nodes. Allocating inside the layer loop gives
+/// each of the 32 layers fresh addresses every token, which churns the mirror
+/// map and leaves a graph's nodes pointing at buffers that no longer exist.
+/// `qwen3::forward` hoists its buffers above the loop for exactly this reason.
+///
+/// Sized for the widest layer of each kind, so an attention block and a
+/// recurrent block share the same allocations.
+struct Scratch {
+    normed: Vec<f32>,
+    mixed: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn_out: Vec<f32>,
+    // attention
+    qg: Vec<f32>,
+    q: Vec<f32>,
+    g: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    // gated delta
+    qkv: Vec<f32>,
+    z: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    conv: Vec<f32>,
+    q_part: Vec<f32>,
+    k_part: Vec<f32>,
+    v_part: Vec<f32>,
+    core: Vec<f32>,
+}
+
+impl Scratch {
+    fn new(c: &Config) -> Self {
+        let z = |n: usize| vec![0.0f32; n];
+        Self {
+            normed: z(c.n_embd),
+            mixed: z(c.n_embd),
+            gate: z(c.n_ff),
+            up: z(c.n_ff),
+            ffn_out: z(c.n_embd),
+            qg: z(c.q_gate_dim()),
+            q: z(c.head_dim * c.n_head),
+            g: z(c.head_dim * c.n_head),
+            k: z(c.kv_dim()),
+            v: z(c.kv_dim()),
+            attn: z(c.head_dim * c.n_head),
+            qkv: z(c.conv_dim()),
+            z: z(c.value_dim()),
+            alpha: z(c.n_v_heads()),
+            beta: z(c.n_v_heads()),
+            conv: z(c.conv_dim()),
+            q_part: z(c.key_dim()),
+            k_part: z(c.key_dim()),
+            v_part: z(c.value_dim()),
+            core: z(c.value_dim()),
+        }
+    }
+}
+
 pub struct Qwen35<'a> {
     pub cfg: Config,
     tok_embd: Weights<'a>,
@@ -653,40 +717,37 @@ impl<'a> Qwen35<'a> {
         let step = ctx.prof.begin_step();
         ops.begin_pass(1);
 
-        let (nd, nf) = (c.n_embd, c.n_ff);
+        let nd = c.n_embd;
         let mut x = vec![0.0f32; nd];
         self.embed(token, &mut x)?;
         ops.host_wrote(&x);
         ctx.trace("inp_embd", 0, &x);
 
-        let mut normed = vec![0.0f32; nd];
-        let mut mixed = vec![0.0f32; nd];
-        let mut gate = vec![0.0f32; nf];
-        let mut up = vec![0.0f32; nf];
-        let mut ffn_out = vec![0.0f32; nd];
+        // One allocation per pass, not per layer. See `Scratch`.
+        let mut s = Scratch::new(c);
 
         for il in 0..c.n_main_layer() {
             let layer = &self.layers[il];
             let t_mix = ctx.prof.layer_begin();
 
-            ops.rms_norm(&x, &layer.attn_norm, c.rms_eps, &mut normed);
-            ctx.trace("attn_norm", il, &normed);
+            ops.rms_norm(&x, &layer.attn_norm, c.rms_eps, &mut s.normed);
+            ctx.trace("attn_norm", il, &s.normed);
 
             match &layer.mixer {
-                Mixer::Attn { .. } => self.attention(ops, layer, il, pos, &normed, kv, &mut mixed, ctx)?,
-                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, &normed, rs, &mut mixed, ctx)?,
+                Mixer::Attn { .. } => self.attention(ops, layer, il, pos, kv, &mut s, ctx)?,
+                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, &mut s, ctx)?,
             }
-            ops.add_assign(&mut x, &mixed);
+            ops.add_assign(&mut x, &s.mixed);
             ctx.trace("attn_residual", il, &x);
             ctx.prof.layer_end(t_mix, step, il, Part::Attn);
 
             let t_ffn = ctx.prof.layer_begin();
-            ops.rms_norm(&x, &layer.ffn_norm, c.rms_eps, &mut normed);
-            ops.matmul(&layer.ffn_gate, &normed, &mut gate);
-            ops.matmul(&layer.ffn_up, &normed, &mut up);
-            ops.silu_mul(&mut gate, &up);
-            ops.matmul(&layer.ffn_down, &gate, &mut ffn_out);
-            ops.add_assign(&mut x, &ffn_out);
+            ops.rms_norm(&x, &layer.ffn_norm, c.rms_eps, &mut s.normed);
+            ops.matmul(&layer.ffn_gate, &s.normed, &mut s.gate);
+            ops.matmul(&layer.ffn_up, &s.normed, &mut s.up);
+            ops.silu_mul(&mut s.gate, &s.up);
+            ops.matmul(&layer.ffn_down, &s.gate, &mut s.ffn_out);
+            ops.add_assign(&mut x, &s.ffn_out);
             ctx.trace("post_ffn", il, &x);
             ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
         }
@@ -704,11 +765,11 @@ impl<'a> Qwen35<'a> {
         // numerical drift.
         kv.commit(pos + 1);
 
-        ops.rms_norm(&x, &self.output_norm, c.rms_eps, &mut normed);
-        ctx.trace("result_norm", 0, &normed);
+        ops.rms_norm(&x, &self.output_norm, c.rms_eps, &mut s.normed);
+        ctx.trace("result_norm", 0, &s.normed);
 
         let mut logits = vec![0.0f32; c.n_vocab];
-        ops.matmul(&self.output, &normed, &mut logits);
+        ops.matmul(&self.output, &s.normed, &mut logits);
         ops.end_pass();
         ops.host_needs(&mut logits);
         ctx.trace("result_output", 0, &logits);
@@ -730,9 +791,8 @@ impl<'a> Qwen35<'a> {
         layer: &Layer<'_>,
         il: usize,
         pos: usize,
-        normed: &[f32],
         kv: &mut KvCache,
-        out: &mut [f32],
+        s: &mut Scratch,
         ctx: &mut Ctx<'_>,
     ) -> Result<()> {
         let c = &self.cfg;
@@ -754,43 +814,37 @@ impl<'a> Qwen35<'a> {
         let (hd, kd) = (c.head_dim, c.kv_dim());
         let qd = hd * c.n_head;
 
-        let mut qg = vec![0.0f32; c.q_gate_dim()];
-        ops.matmul(wq, normed, &mut qg);
-        ctx.trace("Qcur_full", il, &qg);
+        ops.matmul(wq, &s.normed, &mut s.qg);
+        ctx.trace("Qcur_full", il, &s.qg);
 
         // De-interleave. Per head the projection emits [q | gate], so head h's
         // query starts at h * 2 * head_dim and its gate half a head later.
         // Through the seam rather than as a host loop: `qg` is a matmul result,
         // so on a device backend reading it here would drag the activation home
         // in the middle of a layer and break graph capture.
-        let mut q = vec![0.0f32; qd];
-        let mut g = vec![0.0f32; qd];
-        ops.gather_chunks(&qg, hd, 2 * hd, 0, &mut q);
-        ops.gather_chunks(&qg, hd, 2 * hd, hd, &mut g);
+        ops.gather_chunks(&s.qg, hd, 2 * hd, 0, &mut s.q);
+        ops.gather_chunks(&s.qg, hd, 2 * hd, hd, &mut s.g);
 
-        let mut k = vec![0.0f32; kd];
-        let mut v = vec![0.0f32; kd];
-        ops.matmul(wk, normed, &mut k);
-        ops.matmul(wv, normed, &mut v);
+        ops.matmul(wk, &s.normed, &mut s.k);
+        ops.matmul(wv, &s.normed, &mut s.v);
 
         // QK-norm strictly before RoPE, as in qwen3.
-        ops.rms_norm_heads(&mut q, q_norm, hd, c.rms_eps);
-        ctx.trace("Qcur_normed", il, &q);
-        ops.rms_norm_heads(&mut k, k_norm, hd, c.rms_eps);
-        ctx.trace("Kcur_normed", il, &k);
+        ops.rms_norm_heads(&mut s.q, q_norm, hd, c.rms_eps);
+        ctx.trace("Qcur_normed", il, &s.q);
+        ops.rms_norm_heads(&mut s.k, k_norm, hd, c.rms_eps);
+        ctx.trace("Kcur_normed", il, &s.k);
 
-        rope_partial(ops, &mut q, pos, hd, c.n_rot, c.n_head, c.rope_theta);
-        ctx.trace("Qcur", il, &q);
-        rope_partial(ops, &mut k, pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
-        ctx.trace("Kcur", il, &k);
+        ops.rope_neox(&mut s.q, pos, hd, c.n_rot, c.n_head, c.rope_theta);
+        ctx.trace("Qcur", il, &s.q);
+        ops.rope_neox(&mut s.k, pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
+        ctx.trace("Kcur", il, &s.k);
 
         let slot = self.kv_slot[il];
-        ops.kv_write(kv.k_layer_mut(slot), pos * kd, &k);
-        ops.kv_write(kv.v_layer_mut(slot), pos * kd, &v);
+        ops.kv_write(kv.k_layer_mut(slot), pos * kd, &s.k);
+        ops.kv_write(kv.v_layer_mut(slot), pos * kd, &s.v);
 
-        let mut attn = vec![0.0f32; qd];
         let a = Attn {
-            q: &q,
+            q: &s.q,
             k: kv.k_layer(slot),
             v: kv.v_layer(slot),
             kv_dim: kd,
@@ -800,15 +854,15 @@ impl<'a> Qwen35<'a> {
             n_head_kv: c.n_head_kv,
             scale: 1.0 / (hd as f32).sqrt(),
         };
-        ops.attend(&a, &mut attn);
-        ctx.trace("attn_pregate", il, &attn);
+        ops.attend(&a, &mut s.attn);
+        ctx.trace("attn_pregate", il, &s.attn);
 
         // sigmoid(gate) * attention, then the output projection.
-        ops.sigmoid_mul(&mut attn, &g);
-        ctx.trace("attn_gated", il, &attn);
+        ops.sigmoid_mul(&mut s.attn, &s.g);
+        ctx.trace("attn_gated", il, &s.attn);
 
-        ops.matmul(wo, &attn, out);
-        ctx.trace("attn_output", il, out);
+        ops.matmul(wo, &s.attn, &mut s.mixed);
+        ctx.trace("attn_output", il, &s.mixed);
         Ok(())
     }
 
@@ -824,9 +878,8 @@ impl<'a> Qwen35<'a> {
         ops: &O,
         layer: &Layer<'_>,
         il: usize,
-        normed: &[f32],
         rs: &mut RecurrentState,
-        out: &mut [f32],
+        s: &mut Scratch,
         ctx: &mut Ctx<'_>,
     ) -> Result<()> {
         let c = &self.cfg;
@@ -850,27 +903,22 @@ impl<'a> Qwen35<'a> {
 
         let (kdim, vdim, cdim) = (c.key_dim(), c.value_dim(), c.conv_dim());
 
-        let mut qkv = vec![0.0f32; cdim];
-        ops.matmul(wqkv, normed, &mut qkv);
-        ctx.trace("linear_attn_qkv_mixed", il, &qkv);
+        ops.matmul(wqkv, &s.normed, &mut s.qkv);
+        ctx.trace("linear_attn_qkv_mixed", il, &s.qkv);
 
-        let mut z = vec![0.0f32; vdim];
-        ops.matmul(wgate, normed, &mut z);
-        ctx.trace("z", il, &z);
+        ops.matmul(wgate, &s.normed, &mut s.z);
+        ctx.trace("z", il, &s.z);
 
-        let mut alpha = vec![0.0f32; c.n_v_heads()];
-        let mut beta = vec![0.0f32; c.n_v_heads()];
-        ops.matmul(ssm_alpha, normed, &mut alpha);
-        ops.matmul(ssm_beta, normed, &mut beta);
+        ops.matmul(ssm_alpha, &s.normed, &mut s.alpha);
+        ops.matmul(ssm_beta, &s.normed, &mut s.beta);
 
         // The seam takes the state slab and advances it, so nothing about the
         // conv window is assembled here. That is what lets a device backend
         // keep this layer's history in its own memory -- and what lets a
         // CPU-resident layer and a GPU-resident one coexist without either
         // slab migrating.
-        let mut conv = vec![0.0f32; cdim];
-        ops.ssm_conv(rs.conv_mut(il), &qkv, conv1d, c.ssm_d_conv, &mut conv);
-        ctx.trace("conv_output_silu", il, &conv);
+        ops.ssm_conv(rs.conv_mut(il), &s.qkv, conv1d, c.ssm_d_conv, &mut s.conv);
+        ctx.trace("conv_output_silu", il, &s.conv);
 
         // The convolved output is [q | k | v] concatenated along the channel
         // axis, in that order — the same order `attn_qkv` emits and the same
@@ -884,24 +932,20 @@ impl<'a> Qwen35<'a> {
         // fluent-looking garbage on the first GPU run. Copying into owned
         // buffers costs three small kernels and keeps every slice something the
         // seam has seen.
-        let mut q_part = vec![0.0f32; kdim];
-        let mut k_part = vec![0.0f32; kdim];
-        let mut v_part = vec![0.0f32; vdim];
-        ops.gather_chunks(&conv, kdim, cdim, 0, &mut q_part);
-        ops.gather_chunks(&conv, kdim, cdim, kdim, &mut k_part);
-        ops.gather_chunks(&conv, vdim, cdim, 2 * kdim, &mut v_part);
-        ops.l2_norm_heads(&mut q_part, c.head_k_dim(), c.rms_eps);
-        ops.l2_norm_heads(&mut k_part, c.head_k_dim(), c.rms_eps);
-        ctx.trace("q_conv_predelta", il, &q_part);
-        ctx.trace("k_conv_predelta", il, &k_part);
+        ops.gather_chunks(&s.conv, kdim, cdim, 0, &mut s.q_part);
+        ops.gather_chunks(&s.conv, kdim, cdim, kdim, &mut s.k_part);
+        ops.gather_chunks(&s.conv, vdim, cdim, 2 * kdim, &mut s.v_part);
+        ops.l2_norm_heads(&mut s.q_part, c.head_k_dim(), c.rms_eps);
+        ops.l2_norm_heads(&mut s.k_part, c.head_k_dim(), c.rms_eps);
+        ctx.trace("q_conv_predelta", il, &s.q_part);
+        ctx.trace("k_conv_predelta", il, &s.k_part);
 
-        let mut core = vec![0.0f32; vdim];
         let d = Delta {
-            q: &q_part,
-            k: &k_part,
-            v: &v_part,
-            alpha: &alpha,
-            beta: &beta,
+            q: &s.q_part,
+            k: &s.k_part,
+            v: &s.v_part,
+            alpha: &s.alpha,
+            beta: &s.beta,
             ssm_a,
             dt_bias,
             head_k_dim: c.head_k_dim(),
@@ -909,45 +953,18 @@ impl<'a> Qwen35<'a> {
             n_k_heads: c.n_k_heads(),
             n_v_heads: c.n_v_heads(),
         };
-        ops.delta_rule(&d, rs.ssm_mut(il), &mut core);
-        ctx.trace("dnet_out", il, &core);
+        ops.delta_rule(&d, rs.ssm_mut(il), &mut s.core);
+        ctx.trace("dnet_out", il, &s.core);
 
         // build_norm_gated: rms_norm(core, ssm_norm) * silu(z). Per head over
         // head_v_dim, with ssm_norm shared across heads.
-        ops.rms_norm_heads(&mut core, ssm_norm, c.head_v_dim(), c.rms_eps);
-        ops.silu_mul(&mut z, &core);
-        ctx.trace("final_output", il, &z);
+        ops.rms_norm_heads(&mut s.core, ssm_norm, c.head_v_dim(), c.rms_eps);
+        ops.silu_mul(&mut s.z, &s.core);
+        ctx.trace("final_output", il, &s.z);
 
-        ops.matmul(ssm_out, &z, out);
-        ctx.trace("linear_attn_out", il, out);
+        ops.matmul(ssm_out, &s.z, &mut s.mixed);
+        ctx.trace("linear_attn_out", il, &s.mixed);
         Ok(())
-    }
-}
-
-/// Partial NEOX RoPE: rotate the first `n_rot` of each `head_dim`, leave the
-/// rest.
-///
-/// `Ops::rope_neox` rotates a whole head, so this hands it a view of just the
-/// rotating prefix — which works only because NEOX pairs `i` with
-/// `i + n_rot/2`, both inside that prefix. It would be wrong for the
-/// adjacent-pair variant, and the module header records how the pairing was
-/// verified.
-fn rope_partial<O: Ops>(
-    ops: &O,
-    x: &mut [f32],
-    pos: usize,
-    head_dim: usize,
-    n_rot: usize,
-    n_heads: usize,
-    theta: f32,
-) {
-    if n_rot == head_dim {
-        ops.rope_neox(x, pos, head_dim, n_heads, theta);
-        return;
-    }
-    for h in 0..n_heads {
-        let head = &mut x[h * head_dim..h * head_dim + n_rot];
-        ops.rope_neox(head, pos, n_rot, 1, theta);
     }
 }
 

@@ -272,10 +272,13 @@ __global__ void rms_norm_heads_tree(int head_dim, const float *__restrict__ w,
 // and CUDA's double-precision pow and sincos are not obliged to return the same
 // bits. Computing the table once on the CPU costs head_dim/2 transcendentals
 // per call and makes this kernel exactly the oracle's arithmetic.
-__global__ void rope_neox(int head_dim, int n_heads,
+__global__ void rope_neox(int head_dim, int n_rot, int n_heads,
                           const float *__restrict__ cosv,
                           const float *__restrict__ sinv, float *__restrict__ x) {
-    const int half = head_dim / 2;
+    // Partial RoPE: only the first `n_rot` of each head rotate and the rest
+    // pass through, so the pair stride is n_rot/2 and the head stride stays
+    // head_dim. qwen35 rotates 64 of 256; qwen3 passes n_rot == head_dim.
+    const int half = n_rot / 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_heads * half) return;
 

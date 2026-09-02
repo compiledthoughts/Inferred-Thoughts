@@ -226,9 +226,9 @@ fn every_op_agrees_with_the_oracle() {
         let (head_dim, n_heads) = (128usize, 8usize);
         let mut a = noise(head_dim * n_heads, 7);
         let mut b = a.clone();
-        Naive.rope_neox(&mut a, 37, head_dim, n_heads, 1.0e6);
+        Naive.rope_neox(&mut a, 37, head_dim, head_dim, n_heads, 1.0e6);
         gpu.begin_pass(1);
-        gpu.rope_neox(&mut b, 37, head_dim, n_heads, 1.0e6);
+        gpu.rope_neox(&mut b, 37, head_dim, head_dim, n_heads, 1.0e6);
         gpu.host_needs(&mut b);
         exact("rope_neox", &a, &b);
     }
@@ -456,8 +456,16 @@ fn only_the_expf_ops_diverge() {
             self.0.matmul(w, x, out);
             self.0.host_needs(out);
         }
-        fn rope_neox(&self, x: &mut [f32], p: usize, hd: usize, nh: usize, theta: f32) {
-            self.0.rope_neox(x, p, hd, nh, theta);
+        fn rope_neox(
+            &self,
+            x: &mut [f32],
+            p: usize,
+            hd: usize,
+            n_rot: usize,
+            nh: usize,
+            theta: f32,
+        ) {
+            self.0.rope_neox(x, p, hd, n_rot, nh, theta);
             self.0.host_needs(x);
         }
         fn add_assign(&self, a: &mut [f32], b: &[f32]) {

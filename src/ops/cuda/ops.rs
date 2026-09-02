@@ -435,23 +435,27 @@ impl Cuda {
         x: &mut [f32],
         pos: usize,
         head_dim: usize,
+        n_rot: usize,
         n_heads: usize,
         theta_base: f32,
     ) -> Result<()> {
         // The table is built here, in f64, exactly as `ops::naive::rope_neox`
         // does. CUDA's double `pow` and `sincos` are not obliged to return
         // glibc's bits, and a one-ulp angle is a real output difference.
-        let half = head_dim / 2;
+        let half = n_rot / 2;
         let cd = self.pooled(slot::COS, half * 4)?;
         let sd = self.pooled(slot::SIN, half * 4)?;
 
         // Same table for every layer of a token, so build and send it once.
-        let key = (pos, head_dim, theta_base.to_bits());
+        // Keyed on `n_rot` rather than `head_dim`, since that is what sets the
+        // frequencies -- q and k share it, but a model mixing rotation widths
+        // would not.
+        let key = (pos, n_rot, theta_base.to_bits());
         if self.rope_pos.get() != Some(key) {
             let mut cos = Vec::with_capacity(half);
             let mut sin = Vec::with_capacity(half);
             for i in 0..half {
-                let freq = (theta_base as f64).powf(-2.0 * i as f64 / head_dim as f64);
+                let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
                 let (s, c) = (pos as f64 * freq).sin_cos();
                 cos.push(c as f32);
                 sin.push(s as f32);
@@ -464,6 +468,7 @@ impl Cuda {
 
         let args = [
             KArg::I32(head_dim as i32),
+            KArg::I32(n_rot as i32),
             KArg::I32(n_heads as i32),
             KArg::Ptr(cd),
             KArg::Ptr(sd),
@@ -830,8 +835,16 @@ impl Ops for Cuda {
         self.note(self.matmul_impl(w, x, out));
     }
 
-    fn rope_neox(&self, x: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta: f32) {
-        self.note(self.rope_impl(x, pos, head_dim, n_heads, theta));
+    fn rope_neox(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        n_rot: usize,
+        n_heads: usize,
+        theta: f32,
+    ) {
+        self.note(self.rope_impl(x, pos, head_dim, n_rot, n_heads, theta));
     }
 
     fn softmax(&self, x: &mut [f32]) {
@@ -953,8 +966,16 @@ impl Ops for &Cuda {
         (*self).matmul(w, x, out)
     }
 
-    fn rope_neox(&self, x: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, theta: f32) {
-        (*self).rope_neox(x, pos, head_dim, n_heads, theta)
+    fn rope_neox(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        n_rot: usize,
+        n_heads: usize,
+        theta: f32,
+    ) {
+        (*self).rope_neox(x, pos, head_dim, n_rot, n_heads, theta)
     }
 
     fn softmax(&self, x: &mut [f32]) {

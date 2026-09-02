@@ -352,6 +352,7 @@ impl<'a> Qwen3<'a> {
                     &mut q[t * qd..(t + 1) * qd],
                     start_pos + t,
                     c.head_dim,
+                    c.head_dim,
                     c.n_head,
                     c.rope_theta,
                 );
@@ -361,6 +362,7 @@ impl<'a> Qwen3<'a> {
                 ops.rope_neox(
                     &mut k[t * kd..(t + 1) * kd],
                     start_pos + t,
+                    c.head_dim,
                     c.head_dim,
                     c.n_head_kv,
                     c.rope_theta,
