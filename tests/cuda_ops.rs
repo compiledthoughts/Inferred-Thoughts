@@ -753,6 +753,70 @@ fn rms_serial_restores_bit_equality() {
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 }
 
+/// Where does `matmul_q8_0_warp` actually lose its bandwidth?
+///
+/// It is 66.5% of device time on the 9B and moves ~235 GB/s against the card's
+/// 448. Two candidates call for opposite fixes, so they are separated rather
+/// than guessed at — the same discipline `why_is_the_rms_reduction_slow` used,
+/// which found that three plausible explanations were all wrong.
+///
+/// * `tree` keeps the loads and replaces the serial cross-block sum with a warp
+///   reduction. Inexact, so it can never ship as-is; it prices the tail.
+/// * `u16` keeps the tail and halves the load count. `34*b` from an aligned
+///   base is even but never a multiple of four, so two bytes is the widest load
+///   the on-disk layout allows without repacking.
+///
+/// Shapes are the 9B's, because the serial tail grows with `n_in`: 128 blocks
+/// for the attention projections, 384 for `ffn_down`. The 0.6B's 32 would hide
+/// it.
+///
+/// A measurement, not an assertion.
+#[test]
+#[ignore = "needs an sm_120 device; a measurement, not an assertion"]
+fn where_does_the_matmul_lose_its_bandwidth() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    let reps = 200;
+
+    // (n_in, n_out, what it is in the 9B)
+    let shapes = [
+        (4096usize, 4096usize, "attn_out  4096x4096"),
+        (4096, 12288, "ffn_up    4096x12288"),
+        (12288, 4096, "ffn_down 12288x4096"),
+    ];
+    let median = |mut runs: Vec<f64>| -> f64 {
+        runs.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a timing"));
+        runs[1]
+    };
+
+    println!(
+        "  {:<22} {:>8} {:>8} {:>8} {:>8} {:>8}    {:>8} {:>8}",
+        "shape", "base", "tree", "u16", "packed", "pk+tree", "GB/s bas", "GB/s pk"
+    );
+    for (n_in, n_out, label) in shapes {
+        let mut us = [0.0f64; 5];
+        for (i, v) in ["bench_mm_base", "bench_mm_tree", "bench_mm_u16"].iter().enumerate() {
+            us[i] = median((0..3).map(|_| gpu.bench_matmul(v, n_in, n_out, reps).expect("bench")).collect());
+        }
+        for (i, v) in ["bench_mm_packed", "bench_mm_packed_tree"].iter().enumerate() {
+            us[3 + i] = median(
+                (0..3)
+                    .map(|_| gpu.bench_matmul_packed(v, n_in, n_out, reps).expect("bench"))
+                    .collect(),
+            );
+        }
+        // The packed layout moves the same bytes: 32 quants plus a 2-byte
+        // scale, just in two arrays instead of interleaved.
+        let bytes = (n_out * (n_in / 32) * 34) as f64;
+        println!(
+            "  {label:<22} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}    {:>8.0} {:>8.0}",
+            us[0], us[1], us[2], us[3], us[4],
+            bytes / (us[0] * 1e-6) / 1e9,
+            bytes / (us[3] * 1e-6) / 1e9
+        );
+    }
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+}
+
 /// Why is RMSNorm's serial f64 sum so expensive?
 ///
 /// It is ~40% of device time and the largest single kernel in a token. The

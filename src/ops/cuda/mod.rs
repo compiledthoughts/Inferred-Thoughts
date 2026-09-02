@@ -97,6 +97,16 @@ pub struct Cuda {
     pass_graph: Cell<bool>,
     /// Master switch. Off for callers that drive ops one at a time.
     graphs_enabled: Cell<bool>,
+    /// Q8_0 weights, repacked at upload into an aligned scale array and an
+    /// aligned quant array. Keyed on the mmap address of the tensor.
+    ///
+    /// Same total bytes as the file layout -- 2 + 32 per block either way --
+    /// but split so both operands of `__dp4a` are 16-byte aligned. On disk a
+    /// block is 34 bytes, which puts its quants at 34b+2: even, so two-byte
+    /// loads are legal, but never a multiple of four, so wide loads and
+    /// `__dp4a` are not.
+    q8: RefCell<HashMap<usize, (DeviceBuffer, DeviceBuffer)>>,
+
     /// Device-resident recurrent state, keyed on the host slab address.
     ///
     /// Separate from `weights` because these are *written* by kernels and must
@@ -454,6 +464,7 @@ impl Cuda {
                 graphs_enabled: Cell::new(true),
                 rms_serial: Cell::new(false),
                 states: RefCell::new(HashMap::new()),
+                q8: RefCell::new(HashMap::new()),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),

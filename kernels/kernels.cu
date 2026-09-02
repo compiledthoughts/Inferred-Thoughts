@@ -512,7 +512,8 @@ __global__ void add_assign(int n, float *__restrict__ a,
 //
 // Shared memory is `warps_per_block * n_blocks` floats, sized at launch.
 __global__ void matmul_q8_0_warp(int n_in, int n_out,
-                                 const unsigned char *__restrict__ w,
+                                 const unsigned short *__restrict__ w_scales,
+                                 const signed char *__restrict__ w_quants,
                                  const float *__restrict__ x_scales,
                                  const signed char *__restrict__ x_quants,
                                  float *__restrict__ out) {
@@ -525,25 +526,42 @@ __global__ void matmul_q8_0_warp(int n_in, int n_out,
     if (j >= n_out) return;
 
     float *mine = partial + (size_t)warp * n_blocks;
-    const unsigned char *row = w + (size_t)j * (size_t)n_blocks * 34;
 
     for (int b = lane; b < n_blocks; b += 32) {
-        const unsigned char *blk = row + (size_t)b * 34;
-        unsigned short dbits =
-            (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
-        float dw = __half2float(__ushort_as_half(dbits));
+        float dw = __half2float(__ushort_as_half(w_scales[(size_t)j * n_blocks + b]));
 
-        // Integer, so exact and order-free.
+        // Both operands are 16-byte aligned in the repacked layout, so a lane
+        // reads its whole 32-element block as two `int4` and reduces it with
+        // eight `__dp4a`. On disk the block is {f16 scale; int8 q[32]} = 34
+        // bytes, which puts the quants at 34b+2 -- even, but never a multiple
+        // of four, so neither wide loads nor __dp4a were reachable.
+        const int4 *wq = (const int4 *)(w_quants + (size_t)j * n_in + (size_t)b * 32);
+        const int4 *xq = (const int4 *)(x_quants + (size_t)b * 32);
+        int4 w0 = wq[0], w1 = wq[1];
+        int4 a0 = xq[0], a1 = xq[1];
+
+        // Integer, so exact and order-free -- __dp4a accumulates four int8
+        // products into an int and cannot round.
         int sumi = 0;
-        const signed char *xq = x_quants + b * 32;
-        for (int k = 0; k < 32; ++k) {
-            sumi += (int)((signed char)blk[2 + k]) * (int)xq[k];
-        }
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
+
         mine[b] = (float)sumi * (dw * x_scales[b]);
     }
     __syncwarp();
 
     // The one ordered accumulation, kept serial and ascending.
+    //
+    // Measured cost of keeping it: with the old byte loads a warp tree was
+    // worth 11-21%, which was tempting. With aligned loads it is worth 2-7%,
+    // because the tail was only ever visible behind slow loads. Bit-exactness
+    // here is close to free, so it is kept.
     if (lane == 0) {
         float sumf = 0.0f;
         for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
@@ -886,4 +904,222 @@ extern "C" __global__ void sigmoid_mul(int n, float *__restrict__ x,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     x[i] *= 1.0f / (1.0f + expf(-g[i]));
+}
+
+// ------------------------------------------------------- matmul diagnostics
+//
+// `matmul_q8_0_warp` is 66.5% of device time on the 9B and moves ~235 GB/s
+// against the card's 448. Two things in it could be responsible and they call
+// for opposite fixes, so they are separated here rather than guessed at.
+//
+//   base   what the real kernel does
+//   tree   same loads, but the cross-block sum is a warp tree instead of one
+//          lane walking it serially -- inexact, and a diagnostic only
+//   u16    same serial tail, but the quants are read two bytes at a time
+//
+// If `tree` is much faster, the cost is the dependent f32 chain at the end,
+// which is `rms_norm`'s problem again. If `u16` is, the cost is load
+// instruction count. If neither moves, it is neither.
+
+extern "C" __global__ void bench_mm_base(int n_in, int n_out,
+                                         const unsigned char *__restrict__ w,
+                                         const float *__restrict__ x_scales,
+                                         const signed char *__restrict__ x_quants,
+                                         float *__restrict__ out) {
+    extern __shared__ float partial[];
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    float *mine = partial + (size_t)warp * n_blocks;
+    const unsigned char *row = w + (size_t)j * (size_t)n_blocks * 34;
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        const unsigned char *blk = row + (size_t)b * 34;
+        unsigned short dbits = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        float dw = __half2float(__ushort_as_half(dbits));
+        int sumi = 0;
+        const signed char *xq = x_quants + b * 32;
+        for (int k = 0; k < 32; ++k) sumi += (int)((signed char)blk[2 + k]) * (int)xq[k];
+        mine[b] = (float)sumi * (dw * x_scales[b]);
+    }
+    __syncwarp();
+
+    if (lane == 0) {
+        float sumf = 0.0f;
+        for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
+        out[j] = sumf;
+    }
+}
+
+extern "C" __global__ void bench_mm_tree(int n_in, int n_out,
+                                         const unsigned char *__restrict__ w,
+                                         const float *__restrict__ x_scales,
+                                         const signed char *__restrict__ x_quants,
+                                         float *__restrict__ out) {
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    const unsigned char *row = w + (size_t)j * (size_t)n_blocks * 34;
+
+    // No shared staging: each lane keeps a running partial and the warp folds
+    // them at the end. Different summation order, hence diagnostic only.
+    float acc = 0.0f;
+    for (int b = lane; b < n_blocks; b += 32) {
+        const unsigned char *blk = row + (size_t)b * 34;
+        unsigned short dbits = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        float dw = __half2float(__ushort_as_half(dbits));
+        int sumi = 0;
+        const signed char *xq = x_quants + b * 32;
+        for (int k = 0; k < 32; ++k) sumi += (int)((signed char)blk[2 + k]) * (int)xq[k];
+        acc += (float)sumi * (dw * x_scales[b]);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) out[j] = acc;
+}
+
+extern "C" __global__ void bench_mm_u16(int n_in, int n_out,
+                                        const unsigned char *__restrict__ w,
+                                        const float *__restrict__ x_scales,
+                                        const signed char *__restrict__ x_quants,
+                                        float *__restrict__ out) {
+    extern __shared__ float partial[];
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    float *mine = partial + (size_t)warp * n_blocks;
+    const unsigned char *row = w + (size_t)j * (size_t)n_blocks * 34;
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        const unsigned char *blk = row + (size_t)b * 34;
+        unsigned short dbits = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        float dw = __half2float(__ushort_as_half(dbits));
+
+        // A block starts at 34*b from a 256-byte aligned base, and 34 is even,
+        // so the quants at +2 are 2-byte aligned but never 4-byte aligned.
+        // ushort is the widest load the layout allows without repacking.
+        const unsigned short *q16 = (const unsigned short *)(blk + 2);
+        const signed char *xq = x_quants + b * 32;
+        int sumi = 0;
+        for (int k = 0; k < 16; ++k) {
+            unsigned short pair = q16[k];
+            sumi += (int)(signed char)(pair & 0xff) * (int)xq[2 * k];
+            sumi += (int)(signed char)(pair >> 8) * (int)xq[2 * k + 1];
+        }
+        mine[b] = (float)sumi * (dw * x_scales[b]);
+    }
+    __syncwarp();
+
+    if (lane == 0) {
+        float sumf = 0.0f;
+        for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
+        out[j] = sumf;
+    }
+}
+
+// The fourth variant, and the only one that changes the weight *layout*.
+//
+// A Q8_0 block on disk is {f16 scale; int8 q[32]} = 34 bytes, so block b sits
+// at 34b and its quants at 34b+2. 34 is even but never a multiple of four, so
+// the widest legal load is two bytes and `__dp4a` -- which wants 4-byte
+// operands -- is unreachable.
+//
+// Splitting the tensor at upload into an aligned scale array and an aligned
+// quant array fixes both: quants for block b start at 32b, so a lane reads its
+// whole block as two `int4` and does eight `__dp4a` instead of 32 byte loads
+// and 32 multiplies.
+//
+// Still bit-exact. `__dp4a` accumulates four int8 products into an int, which
+// is integer arithmetic and therefore order-free, and the cross-block sum is
+// left serial and ascending exactly as before.
+//
+// Note this is *not* the repack that failed earlier. That one went element-major
+// to chase warp coalescing and gave up per-thread locality. This keeps the
+// block-major order and only separates two fields so they can be addressed.
+extern "C" __global__ void bench_mm_packed(int n_in, int n_out,
+                                           const unsigned short *__restrict__ w_scales,
+                                           const signed char *__restrict__ w_quants,
+                                           const float *__restrict__ x_scales,
+                                           const signed char *__restrict__ x_quants,
+                                           float *__restrict__ out) {
+    extern __shared__ float partial[];
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    float *mine = partial + (size_t)warp * n_blocks;
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        float dw = __half2float(__ushort_as_half(w_scales[(size_t)j * n_blocks + b]));
+
+        const int4 *wq = (const int4 *)(w_quants + (size_t)j * n_in + (size_t)b * 32);
+        const int4 *xq = (const int4 *)(x_quants + (size_t)b * 32);
+        int4 w0 = wq[0], w1 = wq[1];
+        int4 a0 = xq[0], a1 = xq[1];
+
+        int sumi = 0;
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
+
+        mine[b] = (float)sumi * (dw * x_scales[b]);
+    }
+    __syncwarp();
+
+    if (lane == 0) {
+        float sumf = 0.0f;
+        for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
+        out[j] = sumf;
+    }
+}
+
+// Both fixes at once: aligned wide loads *and* a warp-tree tail. Inexact,
+// so this is the ceiling rather than a candidate.
+extern "C" __global__ void bench_mm_packed_tree(int n_in, int n_out,
+                                                const unsigned short *__restrict__ w_scales,
+                                                const signed char *__restrict__ w_quants,
+                                                const float *__restrict__ x_scales,
+                                                const signed char *__restrict__ x_quants,
+                                                float *__restrict__ out) {
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    float acc = 0.0f;
+    for (int b = lane; b < n_blocks; b += 32) {
+        float dw = __half2float(__ushort_as_half(w_scales[(size_t)j * n_blocks + b]));
+        const int4 *wq = (const int4 *)(w_quants + (size_t)j * n_in + (size_t)b * 32);
+        const int4 *xq = (const int4 *)(x_quants + (size_t)b * 32);
+        int4 w0 = wq[0], w1 = wq[1];
+        int4 a0 = xq[0], a1 = xq[1];
+        int sumi = 0;
+        sumi = __dp4a(w0.x, a0.x, sumi);
+        sumi = __dp4a(w0.y, a0.y, sumi);
+        sumi = __dp4a(w0.z, a0.z, sumi);
+        sumi = __dp4a(w0.w, a0.w, sumi);
+        sumi = __dp4a(w1.x, a1.x, sumi);
+        sumi = __dp4a(w1.y, a1.y, sumi);
+        sumi = __dp4a(w1.z, a1.z, sumi);
+        sumi = __dp4a(w1.w, a1.w, sumi);
+        acc += (float)sumi * (dw * x_scales[b]);
+    }
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) out[j] = acc;
 }

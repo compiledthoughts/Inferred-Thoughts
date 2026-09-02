@@ -399,14 +399,15 @@ impl Cuda {
         // matmul's input stay on the card instead of coming back to be
         // quantized and going out again.
         let n_blocks = w.n_in / 32;
-        let wd = self.resident(w.data)?;
+        let (ws, wq) = self.resident_q8_0(w)?;
         let (sd, qd) = self.quantized(x, n_blocks)?;
         let od = self.mirror_out(out)?;
 
         let args = [
             KArg::I32(w.n_in as i32),
             KArg::I32(w.n_out as i32),
-            KArg::Ptr(wd),
+            KArg::Ptr(ws),
+            KArg::Ptr(wq),
             KArg::Ptr(sd),
             KArg::Ptr(qd),
             KArg::Ptr(od),
@@ -569,6 +570,166 @@ impl Cuda {
     }
 
     /// Convert and store K or V without either ever leaving the card.
+    /// The repacked device copy of a Q8_0 tensor, built once on first use.
+    ///
+    /// Returns `(scales, quants)`. The split happens on the host in chunks of
+    /// whole rows so the temporary never approaches the tensor size -- the 9B's
+    /// LM head alone is over a gigabyte, and holding a second copy of it would
+    /// undo the point of mapping the file rather than reading it.
+    fn resident_q8_0(&self, w: &Weights<'_>) -> Result<(ffi::CUdeviceptr, ffi::CUdeviceptr)> {
+        let key = w.data.as_ptr() as usize;
+        if let Some((s, q)) = self.q8.borrow().get(&key) {
+            return Ok((s.ptr, q.ptr));
+        }
+
+        let n_blocks = w.n_in / 32;
+        let scales = DeviceBuffer::new(w.n_out * n_blocks * 2)?;
+        let quants = DeviceBuffer::new(w.n_out * w.n_in)?;
+
+        // ~8 MiB of source per chunk, at least one row.
+        let row_bytes = n_blocks * 34;
+        let rows_per_chunk = (8usize << 20).div_ceil(row_bytes.max(1)).max(1);
+
+        let mut sbuf: Vec<u16> = Vec::with_capacity(rows_per_chunk * n_blocks);
+        let mut qbuf: Vec<i8> = Vec::with_capacity(rows_per_chunk * w.n_in);
+        let mut row = 0usize;
+        while row < w.n_out {
+            let rows = rows_per_chunk.min(w.n_out - row);
+            sbuf.clear();
+            qbuf.clear();
+            for r in 0..rows {
+                let base = (row + r) * row_bytes;
+                for b in 0..n_blocks {
+                    let at = base + b * 34;
+                    sbuf.push(u16::from_le_bytes([w.data[at], w.data[at + 1]]));
+                    // `i8 as u8` is a bit-preserving reinterpretation, which is
+                    // what the kernel reads back.
+                    qbuf.extend(w.data[at + 2..at + 34].iter().map(|&v| v as i8));
+                }
+            }
+            scales.write_at(row * n_blocks * 2, &sbuf)?;
+            quants.write_at(row * w.n_in, &qbuf)?;
+            row += rows;
+        }
+
+        let ptrs = (scales.ptr, quants.ptr);
+        self.q8.borrow_mut().insert(key, (scales, quants));
+        Ok(ptrs)
+    }
+
+    /// Time a matmul variant at a real weight shape.
+    ///
+    /// Weights are synthetic -- the kernels are bandwidth and instruction bound
+    /// and do not branch on values -- but the *shapes* are the 9B's, because
+    /// the serial tail at the end of the kernel grows with `n_in` and the 0.6B
+    /// would not show it.
+    pub fn bench_matmul(
+        &self,
+        name: &'static str,
+        n_in: usize,
+        n_out: usize,
+        reps: u32,
+    ) -> Result<f64> {
+        let n_blocks = n_in / 32;
+        let wbytes = n_out * n_blocks * 34;
+        let w: Vec<u8> = (0..wbytes).map(|i| (i % 251) as u8).collect();
+        let scales: Vec<f32> = (0..n_blocks).map(|i| 0.01 + (i % 7) as f32 * 0.001).collect();
+        let quants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+
+        let wd = DeviceBuffer::from_slice(&w)?;
+        let sd = DeviceBuffer::from_slice(&scales)?;
+        let qd = DeviceBuffer::from_slice(&quants)?;
+        let od = DeviceBuffer::new(n_out * 4)?;
+
+        let args = [
+            KArg::I32(n_in as i32),
+            KArg::I32(n_out as i32),
+            KArg::Ptr(wd.ptr),
+            KArg::Ptr(sd.ptr),
+            KArg::Ptr(qd.ptr),
+            KArg::Ptr(od.ptr),
+        ];
+        let block = 128u32;
+        let warps = (block / 32) as usize;
+        // `tree` keeps its partials in registers and asks for none.
+        let shared = if name.ends_with("tree") {
+            0
+        } else {
+            (warps * n_blocks * 4) as u32
+        };
+        let grid = n_out.div_ceil(warps) as u32;
+
+        let was = self.pass_graph.replace(false);
+        let run = |reps: u32| -> Result<f64> {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                // SAFETY: the argument list matches every kernel in this
+                // diagnostic set, and `shared` is what each indexes.
+                unsafe { self.launch_shared(name, grid, block, shared, &args)? };
+            }
+            self.sync()?;
+            Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
+        };
+        run(8)?;
+        let us = run(reps);
+        self.pass_graph.set(was);
+        us
+    }
+
+    /// Time a matmul variant that reads a *repacked* weight layout.
+    ///
+    /// Same shapes and same synthetic data as [`Cuda::bench_matmul`], but the
+    /// tensor is split into an aligned f16 scale array and an aligned int8
+    /// quant array, which is what makes `int4` loads and `__dp4a` legal.
+    pub fn bench_matmul_packed(
+        &self,
+        name: &'static str,
+        n_in: usize,
+        n_out: usize,
+        reps: u32,
+    ) -> Result<f64> {
+        let n_blocks = n_in / 32;
+        let wscales: Vec<u16> = (0..n_out * n_blocks).map(|i| (0x3800 + (i % 64)) as u16).collect();
+        let wquants: Vec<i8> = (0..n_out * n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+        let xscales: Vec<f32> = (0..n_blocks).map(|i| 0.01 + (i % 7) as f32 * 0.001).collect();
+        let xquants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+
+        let ws = DeviceBuffer::from_slice(&wscales)?;
+        let wq = DeviceBuffer::from_slice(&wquants)?;
+        let xs = DeviceBuffer::from_slice(&xscales)?;
+        let xq = DeviceBuffer::from_slice(&xquants)?;
+        let od = DeviceBuffer::new(n_out * 4)?;
+
+        let args = [
+            KArg::I32(n_in as i32),
+            KArg::I32(n_out as i32),
+            KArg::Ptr(ws.ptr),
+            KArg::Ptr(wq.ptr),
+            KArg::Ptr(xs.ptr),
+            KArg::Ptr(xq.ptr),
+            KArg::Ptr(od.ptr),
+        ];
+        let block = 128u32;
+        let warps = (block / 32) as usize;
+        let shared = if name.ends_with("tree") { 0 } else { (warps * n_blocks * 4) as u32 };
+        let grid = n_out.div_ceil(warps) as u32;
+
+        let was = self.pass_graph.replace(false);
+        let run = |reps: u32| -> Result<f64> {
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                // SAFETY: the argument list matches both packed variants.
+                unsafe { self.launch_shared(name, grid, block, shared, &args)? };
+            }
+            self.sync()?;
+            Ok(t.elapsed().as_secs_f64() * 1e6 / f64::from(reps))
+        };
+        run(8)?;
+        let us = run(reps);
+        self.pass_graph.set(was);
+        us
+    }
+
     /// Device-resident recurrent state for one layer, uploaded once.
     ///
     /// Unlike `resident`, the device copy is *written* by kernels, so after the
