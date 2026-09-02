@@ -188,22 +188,39 @@ pub trait Ops {
     /// q and k get this and not [`Ops::rms_norm_heads`].
     fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32);
 
-    /// Depthwise causal conv1d over a per-channel window, then `silu`.
+    /// Depthwise causal conv1d over this layer's conv state and `x`, then
+    /// `silu`, advancing the state.
     ///
-    /// `window` is `[n_channels][kernel]` with the **oldest sample first**, so
-    /// tap `t` of the kernel multiplies `window[c][t]` and the newest sample is
-    /// at `window[c][kernel - 1]`. That ordering is llama.cpp's: `build_conv_state`
-    /// concatenates the stored state and then this token along the time axis,
-    /// and keeps the last `kernel - 1` entries as the next state.
+    /// **The seam takes the state slab, not an assembled window**, for the same
+    /// reason [`Ops::kv_write`] does: a layer's history belongs wherever that
+    /// layer runs. A device backend keeps `state` in its own memory and never
+    /// brings it home; if the model assembled the window instead, ~2 MB per
+    /// layer would cross the bus every token to be handed straight back. It is
+    /// also what makes a CPU/GPU layer split work without anything migrating —
+    /// each backend sees only the slabs for its own layers.
     ///
-    /// Depthwise means no mixing across channels — each of the 8192 channels
-    /// has its own `kernel` weights and sees only its own history.
+    /// `state` is `[n_channels][kernel - 1]` with the **oldest sample first**,
+    /// and the implementation both reads it and advances it: the window is the
+    /// stored samples followed by `x`, and afterwards the state holds the last
+    /// `kernel - 1` of that. That ordering is llama.cpp's — `build_conv_state`
+    /// concatenates the stored state and this token along the time axis and
+    /// keeps the tail — and it is the part that is easy to reverse.
+    ///
+    /// Depthwise means no mixing across channels: each of the 8192 channels has
+    /// its own `kernel` weights and sees only its own history.
     ///
     /// The accumulator is **f32, deliberately**. `ggml_compute_forward_ssm_conv_f32`
     /// says so in a comment: "not using ggml_vec_dot_f32, because its sum is in
     /// double precision". Four taps, so nothing is lost, but the oracle has to
     /// agree with the reference rather than be better than it.
-    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]);
+    fn ssm_conv(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
+    );
 
     /// The gated delta rule for one token, every value head, state updated in
     /// place.

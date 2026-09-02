@@ -150,20 +150,40 @@ impl Ops for Naive {
         }
     }
 
-    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
-        debug_assert_eq!(window.len(), out.len() * kernel);
+    fn ssm_conv(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
+    ) {
+        let keep = kernel - 1;
+        debug_assert_eq!(state.len(), out.len() * keep);
+        debug_assert_eq!(x.len(), out.len());
         debug_assert_eq!(weight.len(), out.len() * kernel);
 
         for (c, o) in out.iter_mut().enumerate() {
+            let past = &mut state[c * keep..(c + 1) * keep];
+
             // f32, not f64. ggml_compute_forward_ssm_conv_f32 says outright
             // that it avoids ggml_vec_dot_f32 "because its sum is in double
             // precision", so accumulating wider here would make the oracle
             // disagree with the reference it exists to reproduce.
+            //
+            // The window is the stored samples oldest-first, then this token,
+            // so tap `keep` is always the newest sample and never comes from
+            // the state.
             let mut sum = 0.0f32;
-            for t in 0..kernel {
-                sum += window[c * kernel + t] * weight[c * kernel + t];
+            for t in 0..keep {
+                sum += past[t] * weight[c * kernel + t];
             }
+            sum += x[c] * weight[c * kernel + keep];
             *o = sum / (1.0 + (-sum).exp()); // silu, fused in as the reference does
+
+            // Advance: drop the oldest, append this token.
+            past.rotate_left(1);
+            past[keep - 1] = x[c];
         }
     }
 
@@ -591,13 +611,19 @@ mod tests {
         //
         // Channel 1 is all zeros, so any cross-channel mixing would show up as
         // an output other than silu(0) = 0.
-        let window = [1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0];
+        // State is [c0: 1,2 | c1: 0,0] and this token is [3, 0], so the
+        // windows are [1,2,3] and [0,0,0].
+        let mut state = [1.0f32, 2.0, 0.0, 0.0];
+        let x = [3.0f32, 0.0];
         let weight = [100.0f32, 10.0, 1.0, 100.0, 10.0, 1.0];
         let mut out = [0.0f32; 2];
-        Naive.ssm_conv(&window, &weight, 3, &mut out);
+        Naive.ssm_conv(&mut state, &x, &weight, 3, &mut out);
         let silu = |x: f32| x / (1.0 + (-x).exp());
         assert!((out[0] - silu(123.0)).abs() < 1e-3, "{out:?}");
         assert_eq!(out[1], 0.0, "depthwise: channel 1 saw only its own zeros");
+
+        // And the state advanced: oldest dropped, this token appended.
+        assert_eq!(state, [2.0, 3.0, 0.0, 0.0], "state must advance in place");
     }
 
     /// A single-head [`Delta`] for tests to perturb.

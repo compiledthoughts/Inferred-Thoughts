@@ -177,7 +177,7 @@
 //! kernel. This was flagged unverified precisely because getting it wrong would
 //! look like a numerics bug rather than a structural one.
 
-use crate::cache::{KvCache, RecurrentState, recurrent};
+use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
 use crate::ops::{Attn, Delta, Ops, Weights};
@@ -855,7 +855,6 @@ impl<'a> Qwen35<'a> {
         };
 
         let (kdim, vdim, cdim) = (c.key_dim(), c.value_dim(), c.conv_dim());
-        let keep = c.ssm_d_conv - 1;
 
         let mut qkv = vec![0.0f32; cdim];
         ops.matmul(wqkv, normed, &mut qkv);
@@ -870,17 +869,14 @@ impl<'a> Qwen35<'a> {
         ops.matmul(ssm_alpha, normed, &mut alpha);
         ops.matmul(ssm_beta, normed, &mut beta);
 
-        // The convolution needs its inputs on the host: the window is assembled
-        // from recurrent state that lives here. A device backend has no kernel
-        // for this path yet and says so rather than pretending.
-        ops.host_needs(&mut qkv);
-
-        let mut window = vec![0.0f32; cdim * c.ssm_d_conv];
-        recurrent::conv_window(rs.conv(il), &qkv, keep, &mut window);
+        // The seam takes the state slab and advances it, so nothing about the
+        // conv window is assembled here. That is what lets a device backend
+        // keep this layer's history in its own memory -- and what lets a
+        // CPU-resident layer and a GPU-resident one coexist without either
+        // slab migrating.
         let mut conv = vec![0.0f32; cdim];
-        ops.ssm_conv(&window, conv1d, c.ssm_d_conv, &mut conv);
+        ops.ssm_conv(rs.conv_mut(il), &qkv, conv1d, c.ssm_d_conv, &mut conv);
         ctx.trace("conv_output_silu", il, &conv);
-        recurrent::push_conv(rs.conv_mut(il), &qkv, keep);
 
         // The convolved output is [q | k | v] concatenated along the channel
         // axis, in that order — the same order `attn_qkv` emits and the same

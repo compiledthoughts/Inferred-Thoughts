@@ -715,7 +715,14 @@ impl Ops for Cuda {
         self.note(Err(no_gdn_kernel("l2_norm_heads")));
     }
 
-    fn ssm_conv(&self, _window: &[f32], _weight: &[f32], _kernel: usize, _out: &mut [f32]) {
+    fn ssm_conv(
+        &self,
+        _state: &mut [f32],
+        _x: &[f32],
+        _weight: &[f32],
+        _kernel: usize,
+        _out: &mut [f32],
+    ) {
         self.note(Err(no_gdn_kernel("ssm_conv")));
     }
 
@@ -801,8 +808,15 @@ impl Ops for &Cuda {
         (*self).l2_norm_heads(x, head_dim, eps)
     }
 
-    fn ssm_conv(&self, window: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
-        (*self).ssm_conv(window, weight, kernel, out)
+    fn ssm_conv(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
+    ) {
+        (*self).ssm_conv(state, x, weight, kernel, out)
     }
 
     fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
