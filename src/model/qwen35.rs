@@ -691,6 +691,19 @@ impl<'a> Qwen35<'a> {
             ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
         }
 
+        // Publish this token's position. Without it `KvCache::len` never moves,
+        // so `Engine::run` starts every decode step at 0: each token overwrites
+        // slot 0, attends only to itself, and is RoPE'd at position 0.
+        //
+        // That failure is nearly invisible from a single pass -- `trace` makes
+        // one `forward` call and gets its positions right internally -- and it
+        // only shows up *across* calls. The 24 GatedDeltaNet layers keep
+        // advancing correctly either way, because their state is sequential and
+        // does not care about `pos`, so the model still emits plausible text
+        // for a few tokens before collapsing. That is what made it look like
+        // numerical drift.
+        kv.commit(pos + 1);
+
         ops.rms_norm(&x, &self.output_norm, c.rms_eps, &mut normed);
         ctx.trace("result_norm", 0, &normed);
 

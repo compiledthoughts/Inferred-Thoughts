@@ -481,12 +481,12 @@ fn run_generation<O: inferred_thoughts::Ops>(
 /// The sum is accumulated in f64 and covers the whole tensor, which is what
 /// makes it comparable to the `sum = ...` line `llama-eval-callback` prints.
 fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Result<()> {
-    use inferred_thoughts::{Naive, Qwen3, Tokenizer};
+    use inferred_thoughts::{Model, Naive, Qwen3, Tokenizer};
     use std::io::Write;
 
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
-    let m = Qwen3::load(&f)?;
+    let m = Model::load(&f)?;
 
     let tokens = tk.encode(prompt, true, true);
     eprintln!("tokens ({}): {tokens:?}", tokens.len());
@@ -527,10 +527,26 @@ fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Re
 
     // A single pass at position 0, so the cache only needs room for the prompt
     // and the profiler is inert -- `trace` measures numerics, not time.
-    let mut cache = inferred_thoughts::KvCache::new(m.cfg.n_layer, m.cfg.kv_dim(), tokens.len());
+    //
+    // On `qwen35` this walks the prompt one token at a time, which is what the
+    // architecture does anyway: the delta rule is a sequential scan. The trace
+    // therefore shows the *last* prompt token's tensors, where the reference
+    // prints the whole batch. That difference matters when reading the dump and
+    // is why the comparison script slices by the reference's own ne0.
+    let mut cache = inferred_thoughts::KvCache::new(m.n_kv_layer(), m.kv_dim(), tokens.len());
+    let mut recurrent = m
+        .recurrent_dims()
+        .map(|(n, conv, ssm)| inferred_thoughts::RecurrentState::new(n, conv, ssm));
     let mut prof = inferred_thoughts::Profile::new(false);
     let mut ctx = inferred_thoughts::Ctx::new(&mut emit, &mut prof);
-    let logits = m.forward(&Naive, &tokens, 0, &mut cache, &mut ctx)?;
+    let logits = m.forward(
+        &Naive,
+        &tokens,
+        0,
+        &mut cache,
+        recurrent.as_mut(),
+        &mut ctx,
+    )?;
 
     let top = Qwen3::argmax(&logits);
     eprintln!(

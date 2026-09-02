@@ -19,6 +19,60 @@ fn shape(f: &GgufFile, name: &str) -> Vec<u64> {
         .clone()
 }
 
+/// Decoding must advance the cache position.
+///
+/// This is a regression test for a bug that was invisible everywhere it was
+/// looked for. `qwen35::forward` did not call `KvCache::commit`, so
+/// `KvCache::len` never moved and `Engine::run` began every decode step at
+/// position 0: each token overwrote KV slot 0, attended only to itself, and
+/// was rotated at position 0.
+///
+/// Nothing caught it. A single `forward` call gets its positions right
+/// internally, so the layer-by-layer trace against `llama-eval-callback`
+/// matched to 1e-8 at layer 0 and the tensor comparison looked clean. And 24 of
+/// the 32 layers are GatedDeltaNet, whose recurrent state advances correctly
+/// regardless of `pos`, so the model went on emitting plausible English for a
+/// dozen tokens before collapsing -- which reads as numerical drift rather than
+/// a positional bug. It was mistaken for exactly that.
+///
+/// Asserting the position directly is cheap and would have named it at once.
+#[test]
+#[ignore = "loads the real 9B; run with --release -- --ignored"]
+fn decoding_advances_the_cache_position() {
+    use inferred_thoughts::{Engine, Model, Spin, Tokenizer};
+
+    let Some(path) = common::find_model_named("Qwen3.5-9B-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.5-9B-Q8_0.gguf found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let m = Model::load(&f).expect("load model");
+    let mut engine = Engine::new(m, Spin::new(8), 512, false);
+
+    let prompt = tk.encode("The capital of France is", true, true);
+    assert_eq!(engine.pos(), 0, "a fresh engine is at position 0");
+
+    engine.prefill(&prompt).expect("prefill");
+    assert_eq!(
+        engine.pos(),
+        prompt.len(),
+        "prefill must leave the cache holding every prompt token"
+    );
+
+    for step in 1..=3 {
+        engine.decode(7).expect("decode");
+        assert_eq!(
+            engine.pos(),
+            prompt.len() + step,
+            "each decode step must claim the next position"
+        );
+    }
+
+    engine.reset();
+    assert_eq!(engine.pos(), 0, "reset returns to the start");
+}
+
 #[test]
 #[ignore = "loads the real 9B; run with --release -- --ignored"]
 fn config_matches_the_9b_tensor_shapes() {
