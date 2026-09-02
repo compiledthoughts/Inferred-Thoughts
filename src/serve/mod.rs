@@ -58,6 +58,8 @@ pub struct ServeOpts {
     /// asks for a different one still gets this: there is one model loaded.
     pub model_id: String,
     pub max_tokens: usize,
+    /// Print each request's body and the prompt it renders to.
+    pub verbose: bool,
 }
 
 #[derive(Deserialize)]
@@ -302,6 +304,9 @@ fn handle<O: Ops>(
     // 404 whose message the user has to reverse-engineer, which is exactly how
     // this was found.
     let route = normalize_path(&path);
+    if opts.verbose {
+        eprintln!("--> {method} {route}  ({} bytes)", body.len());
+    }
 
     match (method.as_str(), route.as_str()) {
         ("GET", p) if p.ends_with("/health") => {
@@ -358,6 +363,18 @@ fn chat_completions<O: Ops>(
         .map(|(r, c)| (r.as_str(), c.as_str()))
         .collect();
     let want = session.chat.wrap_turns(&turns);
+
+    if opts.verbose {
+        clipped("body    ", &String::from_utf8_lossy(body), 1200);
+        for (role, content) in &turns {
+            clipped(&format!("  {role:<9}"), content, 300);
+        }
+        // What actually reaches the tokenizer. Everything before this is
+        // already in the engine, so this is the only text that costs anything.
+        let new = want.strip_prefix(session.rendered.as_str()).unwrap_or(&want);
+        clipped("rendered", &want, 400);
+        clipped("new     ", new, 400);
+    }
 
     let budget = req
         .max_tokens
@@ -515,6 +532,34 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 // ------------------------------------------------------------------- plumbing
+
+/// Render control characters visibly so a prompt prints on one line.
+///
+/// A chat prompt is mostly newlines and `<|im_*|>` markers, and the whole point
+/// of printing it is to see the structure -- which a literal newline destroys.
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Print at most `limit` characters, saying how many were dropped.
+fn clipped(label: &str, text: &str, limit: usize) {
+    let shown: String = text.chars().take(limit).collect();
+    let n = text.chars().count();
+    if n > limit {
+        eprintln!("    {label} ({n} chars, first {limit}): {}", escape(&shown));
+    } else {
+        eprintln!("    {label} ({n} chars): {}", escape(&shown));
+    }
+}
 
 /// Decode `%XX`, drop a query string, and trim.
 ///

@@ -140,6 +140,9 @@ enum Command {
         /// the oracle at ~2.3 ms a token.
         #[arg(long)]
         rms_serial: bool,
+        /// Print each request's body, its turns, and the prompt they render to.
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -195,6 +198,7 @@ fn main() -> ExitCode {
             threads,
             backend,
             rms_serial,
+            verbose,
         } => serve(ServeArgs {
             model,
             port,
@@ -203,6 +207,7 @@ fn main() -> ExitCode {
             threads,
             backend,
             rms_serial,
+            verbose,
         }),
     };
 
@@ -534,6 +539,7 @@ struct ServeArgs {
     threads: usize,
     backend: String,
     rms_serial: bool,
+    verbose: bool,
 }
 
 fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
@@ -556,6 +562,7 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         port: a.port,
         model_id: format!("{name}-{}", a.backend),
         max_tokens: a.max_tokens,
+        verbose: a.verbose,
     };
 
     eprintln!(
