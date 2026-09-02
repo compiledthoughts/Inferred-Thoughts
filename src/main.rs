@@ -108,6 +108,39 @@ enum Command {
         #[arg(long)]
         dump: Option<String>,
     },
+
+    /// Serve an OpenAI-compatible endpoint, so an existing chat UI can drive
+    /// the engine.
+    ///
+    /// One model, loaded at startup. A chat client re-sends the whole
+    /// conversation each turn, and the session only prefills what is new --
+    /// which works while the conversation grows by appending, and restarts from
+    /// scratch when it does not. See `src/serve` for why a rewind cannot be
+    /// cheaper than that on a recurrent architecture.
+    Serve {
+        /// Path to the .gguf file.
+        #[arg(short, long)]
+        model: String,
+        /// Port to bind on 127.0.0.1.
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Context length. The KV cache is allocated for this up front.
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        /// Default generation budget when the request does not set one.
+        #[arg(short = 'n', long, default_value_t = 512)]
+        max_tokens: usize,
+        /// Compute threads for the CPU backends.
+        #[arg(short = 't', long, default_value_t = 0)]
+        threads: usize,
+        /// Which `ops` implementation runs the model.
+        #[arg(long, default_value = "spin")]
+        backend: String,
+        /// With --backend cuda: reduce RMSNorm serially, for bit-equality with
+        /// the oracle at ~2.3 ms a token.
+        #[arg(long)]
+        rms_serial: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -154,6 +187,23 @@ fn main() -> ExitCode {
             },
         ),
         Command::Trace { model, prompt, dump } => trace(&model, &prompt, dump.as_deref()),
+        Command::Serve {
+            model,
+            port,
+            ctx,
+            max_tokens,
+            threads,
+            backend,
+            rms_serial,
+        } => serve(ServeArgs {
+            model,
+            port,
+            ctx,
+            max_tokens,
+            threads,
+            backend,
+            rms_serial,
+        }),
     };
 
     match result {
@@ -472,6 +522,89 @@ fn run_generation<O: inferred_thoughts::Ops>(
         eprintln!("profile written to {path}");
     }
     Ok(ms_per_token)
+}
+
+// ----------------------------------------------------------------------- serve
+
+struct ServeArgs {
+    model: String,
+    port: u16,
+    ctx: usize,
+    max_tokens: usize,
+    threads: usize,
+    backend: String,
+    rms_serial: bool,
+}
+
+fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
+    use inferred_thoughts::serve::{ServeOpts, serve as run_server};
+    use inferred_thoughts::tok::chat::ChatMl;
+    use inferred_thoughts::{Engine, Model, Naive, Par, Spin, Tokenizer};
+
+    let f = GgufFile::open(&a.model)?;
+    let tk = Tokenizer::from_metadata(&f.metadata)?;
+    let m = Model::load(&f)?;
+    // Refused up front rather than per request: a server that cannot render a
+    // chat turn has nothing useful to do.
+    let chat = ChatMl::detect(&tk, &f.metadata)?;
+
+    let name = std::path::Path::new(&a.model)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model".to_string());
+    let opts = ServeOpts {
+        port: a.port,
+        model_id: format!("{name}-{}", a.backend),
+        max_tokens: a.max_tokens,
+    };
+
+    eprintln!(
+        "model {} | {} | {} layers ({} with kv) | ctx {}",
+        name,
+        m.arch(),
+        m.n_layer(),
+        m.n_kv_layer(),
+        a.ctx,
+    );
+
+    #[cfg(feature = "cuda")]
+    if a.backend == "cuda" {
+        let cuda = inferred_thoughts::Cuda::new(0)?;
+        cuda.rms_serial(a.rms_serial);
+        let (free, total) = cuda.mem_info()?;
+        eprintln!(
+            "device {} | {:.2} of {:.2} GiB free",
+            cuda.name(),
+            free as f64 / 1073741824.0,
+            total as f64 / 1073741824.0,
+        );
+        let engine = Engine::new(m, &cuda, a.ctx, false);
+        let r = run_server(engine, tk, chat, opts);
+        if let Some(e) = cuda.take_error() {
+            return Err(e);
+        }
+        return r;
+    }
+
+    let n_threads = if a.threads == 0 {
+        Par::default_threads()
+    } else {
+        a.threads
+    };
+    if n_threads <= 1 {
+        return run_server(Engine::new(m, Naive, a.ctx, false), tk, chat, opts);
+    }
+    match a.backend.as_str() {
+        "spin" => run_server(Engine::new(m, Spin::new(n_threads), a.ctx, false), tk, chat, opts),
+        "par" => {
+            Par::init(n_threads);
+            run_server(Engine::new(m, Par, a.ctx, false), tk, chat, opts)
+        }
+        other => Err(inferred_thoughts::Error::InconsistentArchitecture {
+            what: "--backend",
+            detail: format!("{other:?} is not a backend; expected \"spin\", \"par\" or \"cuda\""),
+        }),
+    }
 }
 
 // ----------------------------------------------------------------------- trace

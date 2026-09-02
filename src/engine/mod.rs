@@ -95,6 +95,26 @@ impl<'a, O: Ops> Engine<'a, O> {
         self.recurrent.as_ref().map_or(0, |r| r.capacity_bytes())
     }
 
+    /// Drop everything after `len` positions, keeping the prefix usable.
+    ///
+    /// Returns whether it could. **A recurrent architecture cannot rewind.** A
+    /// KV cache is a log — truncating it to a common prefix leaves exactly the
+    /// state that prefix would have produced. A GatedDeltaNet layer's state is
+    /// not a log but a single matrix that has absorbed every token, with no
+    /// record of how to remove one. `HANDOFF.md` §3: "the recurrent state
+    /// cannot be partially reused — it only survives via checkpoints."
+    ///
+    /// So this succeeds on `qwen3` and refuses on `qwen35`, and the caller
+    /// restarts instead. Checkpointing the state periodically would make the
+    /// refusal cheaper; it is not built.
+    pub fn rewind(&mut self, len: usize) -> bool {
+        if self.recurrent.is_some() || len > self.cache.len() {
+            return false;
+        }
+        self.cache.commit(len);
+        true
+    }
+
     /// Drop the cached history. The profile is kept, so a run that resets
     /// between prompts still reports totals across all of them.
     pub fn reset(&mut self) {

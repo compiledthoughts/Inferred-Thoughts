@@ -78,8 +78,24 @@ impl ChatMl {
     /// That is not a quirk of ours — it is why hand-writing this in a shell is
     /// fragile, since `$(...)` strips trailing newlines.
     pub fn wrap(&self, user: &str) -> String {
+        self.wrap_turns(&[("user", user)])
+    }
+
+    /// Render a whole conversation and open the assistant turn.
+    ///
+    /// Roles pass through as the caller gives them, so `system`, `user` and
+    /// `assistant` all work. Turns render in order and the assistant turn is
+    /// opened at the end, which is what makes this rendering a *prefix* of the
+    /// next request's rendering — the property the server depends on to
+    /// continue a session rather than re-run it.
+    pub fn wrap_turns(&self, turns: &[(&str, &str)]) -> String {
         let (s, e) = (&self.start, &self.end);
-        format!("{s}user\n{user}{e}\n{s}assistant\n")
+        let mut out = String::new();
+        for (role, content) in turns {
+            out.push_str(&format!("{s}{role}\n{content}{e}\n"));
+        }
+        out.push_str(&format!("{s}assistant\n"));
+        out
     }
 }
 

@@ -11,6 +11,7 @@ pub mod model;
 pub mod ops;
 pub mod profile;
 pub mod quant;
+pub mod serve;
 pub mod tok;
 
 pub use cache::{KvCache, RecurrentState};
