@@ -42,6 +42,52 @@ impl<'a> Weights<'a> {
     }
 }
 
+/// A stack of `n_expert` weight matrices stored as one 3-D tensor.
+///
+/// The MoE expert tensors are `{n_in, n_out, n_expert}` in ggml order —
+/// `ffn_gate_exps` on the 35B is `2048 x 512 x 256`. Expert `e` is a
+/// **contiguous** run of `n_out` rows, so it can be handed to an ordinary
+/// [`Weights`] with no copy and no change to the matmul.
+///
+/// That is the whole reason the seam does not grow a "MoE matmul": routing
+/// picks 8 of 256 experts, and each pick becomes a normal matmul over a
+/// borrowed sub-range. Which experts move, and when, is a *policy* question
+/// that lives above this type — which is the distinction the project exists to
+/// make.
+#[derive(Debug, Clone, Copy)]
+pub struct Experts<'a> {
+    pub data: &'a [u8],
+    pub ty: GgmlType,
+    /// Contraction dimension of one expert.
+    pub n_in: usize,
+    /// Output width of one expert.
+    pub n_out: usize,
+    pub n_expert: usize,
+}
+
+impl<'a> Experts<'a> {
+    /// Bytes one expert occupies: `n_out` rows of `n_in` quantized elements.
+    pub fn stride(&self) -> usize {
+        self.ty.n_bytes(self.n_in as u64) as usize * self.n_out
+    }
+
+    /// Expert `e` as an ordinary weight matrix, borrowed from the mmap.
+    ///
+    /// Panics only on an out-of-range index, which is a routing bug rather than
+    /// a data condition — the router cannot emit an id it was not given a
+    /// column for.
+    pub fn expert(&self, e: usize) -> Weights<'a> {
+        debug_assert!(e < self.n_expert);
+        let stride = self.stride();
+        Weights {
+            data: &self.data[e * stride..(e + 1) * stride],
+            ty: self.ty,
+            n_in: self.n_in,
+            n_out: self.n_out,
+        }
+    }
+}
+
 /// The attention inputs for a batch of queries against one layer's history.
 ///
 /// A struct rather than ten positional arguments, which is how a `head_dim` and

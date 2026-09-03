@@ -185,18 +185,93 @@ fn config_matches_the_9b_tensor_shapes() {
 /// is what makes the 9B a valid stepping stone.
 #[test]
 #[ignore = "loads the real 35B; run with --release -- --ignored"]
-fn the_35b_is_refused_by_name_but_shares_the_dimensions() {
+fn the_35b_config_reads_and_the_moe_half_appears() {
     let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
         println!("SKIPPED: no 35B found");
         return;
     };
     let f = GgufFile::open(&path).expect("open model");
-    let err = Config::from_gguf(&f).expect_err("qwen35moe is not qwen35");
-    assert!(format!("{err}").contains("qwen35moe"), "{err}");
+    let c = Config::from_gguf(&f).expect("qwen35moe config");
+
+    // The dimensions that differ from the 9B, read from the file rather than
+    // from notes -- an earlier version of CLAUDE.md had several of these wrong.
+    assert_eq!(c.n_layer, 40, "40 blocks; the 41st is MTP and lives elsewhere");
+    assert_eq!(c.n_embd, 2048);
+    assert_eq!(c.n_head, 16);
+    assert_eq!(c.n_head_kv, 2);
+    assert_eq!(c.head_dim, 256);
+    assert_eq!(c.n_vocab, 248320);
+    assert_eq!(c.full_attention_interval, 4);
 
     // Same conv and state geometry as the 9B, different width.
     assert_eq!(shape(&f, "blk.0.ssm_conv1d.weight"), vec![4, 8192]);
     assert_eq!(shape(&f, "blk.0.ssm_norm.weight"), vec![128]);
     assert_eq!(shape(&f, "blk.0.attn_qkv.weight"), vec![2048, 8192]);
-    assert!(f.tensor("blk.0.ffn_gate_exps.weight").is_some(), "MoE");
+
+    let m = c.moe.expect("qwen35moe must carry the expert config");
+    assert_eq!((m.n_expert, m.n_expert_used), (256, 8));
+    assert_eq!((m.expert_ff, m.shared_ff), (512, 512));
+
+    // `n_ff` describes one expert on the routed variant; there is no dense
+    // feed_forward_length key in the file at all.
+    assert_eq!(c.n_ff, 512);
+
+    // 30 GatedDeltaNet, 10 attention, at i % 4 == 3.
+    let attn = (0..c.n_layer).filter(|&i| !c.is_recurrent(i)).count();
+    assert_eq!(attn, 10, "10 of 40 blocks attend");
+    assert!(c.is_recurrent(0) && !c.is_recurrent(3), "attention at i % 4 == 3");
+}
+
+/// The whole 35B stack loads, and the expert tensors address correctly.
+///
+/// **The expert tensors are the one genuinely new shape**, and the two
+/// orientations are transposes of each other -- `ffn_gate_exps` is
+/// `{2048, 512, 256}` while `ffn_down_exps` is `{512, 2048, 256}`. Swapping
+/// them would produce plausible numbers rather than an error, so the check is
+/// that each expert's borrowed sub-range lands exactly where the file says.
+#[test]
+#[ignore = "loads the real 35B; run with --release -- --ignored"]
+fn the_35b_loads_and_experts_address_contiguously() {
+    use inferred_thoughts::Model;
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let m = Model::load(&f).expect("the 35B must load");
+    assert_eq!(m.arch(), "qwen35moe");
+    assert_eq!(m.n_layer(), 40);
+    assert_eq!(m.n_kv_layer(), 10, "only the attention blocks need a KV slab");
+
+    // Expert addressing, checked against the file's own byte counts.
+    for (name, n_in, n_out) in [
+        ("blk.0.ffn_gate_exps.weight", 2048usize, 512usize),
+        ("blk.0.ffn_up_exps.weight", 2048, 512),
+        ("blk.0.ffn_down_exps.weight", 512, 2048),
+    ] {
+        let info = f.tensor(name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(info.dims, vec![n_in as u64, n_out as u64, 256]);
+        let total = f.tensor_bytes(info).len();
+        assert_eq!(total % 256, 0, "{name} must divide into 256 experts");
+        // IQ4_XS is 4.25 bpw, so one expert is n_out rows of n_in elements.
+        // block_iq4_xs in ggml-common.h is
+        //   { ggml_half d; uint16_t scales_h; uint8_t scales_l[QK_K/64];
+        //     uint8_t qs[QK_K/2]; }
+        // = 2 + 2 + 4 + 128 = 136 bytes per QK_K = 256 elements.
+        assert_eq!(
+            total / 256,
+            n_out * (n_in / 256) * 136,
+            "{name}: per-expert byte count"
+        );
+    }
+
+    // A token reads 8 of 256 routed experts plus the shared one, so the
+    // per-pass figure must be far below the 17.51 GiB the file occupies.
+    let per_pass = m.weight_bytes_per_pass() as f64 / (1u64 << 30) as f64;
+    assert!(
+        (1.0..4.0).contains(&per_pass),
+        "a token should read ~2 GiB, not {per_pass:.2} GiB -- storage counted as traffic?"
+    );
+    println!("  35B reads {per_pass:.2} GiB per token");
 }

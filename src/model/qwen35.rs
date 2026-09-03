@@ -182,11 +182,11 @@ use std::cell::RefCell;
 use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
-use crate::ops::{Attn, Delta, Ops, Weights};
+use crate::ops::{Attn, Delta, Experts, Ops, Weights};
 use crate::profile::{Ctx, Part};
 use crate::quant::{dequantize, dequantize_into};
 
-use super::{matrix, tensor, vector};
+use super::{experts, matrix, tensor, vector};
 
 /// Everything the forward pass needs, read from metadata.
 #[derive(Debug, Clone)]
@@ -223,9 +223,37 @@ pub struct Config {
     /// `nextn_predict_layers` — MTP blocks appended past the main stack and not
     /// executed in a normal forward pass.
     pub nextn_predict_layers: usize,
+
+    /// Present on `qwen35moe`, absent on `qwen35`. The only structural
+    /// difference between the two architectures.
+    pub moe: Option<Moe>,
+}
+
+/// The mixture-of-experts half of `qwen35moe`.
+///
+/// A separate struct rather than four `Option` fields on [`Config`] so the
+/// invariant "either all of these or none" is held by the type instead of by
+/// convention — an FFN cannot be half routed.
+#[derive(Debug, Clone, Copy)]
+pub struct Moe {
+    /// `expert_count`, 256.
+    pub n_expert: usize,
+    /// `expert_used_count`, 8. How many of the 256 each token routes to.
+    pub n_expert_used: usize,
+    /// `expert_feed_forward_length`, 512. The FFN width of **one** expert, so
+    /// the routed FFN is 8 x 512 wide per token rather than 256 x 512.
+    pub expert_ff: usize,
+    /// `expert_shared_feed_forward_length`, 512. The always-on expert, which is
+    /// not routed and not counted in `n_expert_used`.
+    pub shared_ff: usize,
 }
 
 impl Config {
+    /// Whether this is the routed variant.
+    pub fn is_moe(&self) -> bool {
+        self.moe.is_some()
+    }
+
     /// Query heads per key/value head, on the attention layers.
     pub fn gqa_group(&self) -> usize {
         self.n_head / self.n_head_kv
@@ -305,12 +333,26 @@ impl Config {
     pub fn from_gguf(f: &GgufFile) -> Result<Self> {
         let md = &f.metadata;
         let arch = md.architecture()?;
-        if arch != "qwen35" {
+        if arch != "qwen35" && arch != "qwen35moe" {
             return Err(Error::UnsupportedArchitecture {
                 arch: arch.to_string(),
-                supported: "qwen35",
+                supported: "qwen35, qwen35moe",
             });
         }
+        // The routed variant carries `expert_count` and has no
+        // `feed_forward_length`; the dense one is the other way round. Keying
+        // on the presence of the expert keys rather than on the architecture
+        // string means a file that declares one and ships the other fails at
+        // load with a missing key, instead of later with wrong shapes.
+        let moe = match md.get_arch_u32("expert_count") {
+            Ok(n_expert) => Some(Moe {
+                n_expert: n_expert as usize,
+                n_expert_used: md.get_arch_u32("expert_used_count")? as usize,
+                expert_ff: md.get_arch_u32("expert_feed_forward_length")? as usize,
+                shared_ff: md.get_arch_u32("expert_shared_feed_forward_length")? as usize,
+            }),
+            Err(_) => None,
+        };
 
         let n_head = md.get_arch_u32("attention.head_count")? as usize;
         let n_head_kv = md.get_arch_u32("attention.head_count_kv")? as usize;
@@ -362,7 +404,12 @@ impl Config {
         let cfg = Self {
             n_layer: md.get_arch_u32("block_count")? as usize,
             n_embd: md.get_arch_u32("embedding_length")? as usize,
-            n_ff: md.get_arch_u32("feed_forward_length")? as usize,
+            // The routed variant has no dense FFN width. `n_ff` then describes
+            // one expert, which is what every buffer sized from it needs.
+            n_ff: match &moe {
+                Some(m) => m.expert_ff,
+                None => md.get_arch_u32("feed_forward_length")? as usize,
+            },
             n_head,
             n_head_kv,
             head_dim,
@@ -380,7 +427,17 @@ impl Config {
                 .get_arch_u32("full_attention_interval")
                 .unwrap_or(4) as usize,
             nextn_predict_layers: md.get_arch_u32("nextn_predict_layers").unwrap_or(0) as usize,
+            moe,
         };
+
+        if let Some(m) = &cfg.moe {
+            if m.n_expert_used == 0 || m.n_expert_used > m.n_expert {
+                return Err(Error::InconsistentArchitecture {
+                    what: "expert_used_count",
+                    detail: format!("{} of {} experts", m.n_expert_used, m.n_expert),
+                });
+            }
+        }
 
         // Relationships `qwen35.cpp` assumes without checking. If a file
         // violates one, every number downstream is wrong in a way that looks
@@ -465,9 +522,45 @@ struct Layer<'a> {
     /// in `qwen3`.
     ffn_norm: Vec<f32>,
     mixer: Mixer<'a>,
-    ffn_gate: Weights<'a>,
-    ffn_up: Weights<'a>,
-    ffn_down: Weights<'a>,
+    ffn: Ffn<'a>,
+}
+
+/// The feed-forward half of a block: dense on `qwen35`, routed on `qwen35moe`.
+///
+/// An enum for the same reason [`Mixer`] is one — the two are alternatives at
+/// the same point in the block, and the rest of the layer does not vary with
+/// which it is. This is the seam `CLAUDE.md` asked to keep the FFN behind so
+/// the MoE variant would be a delta rather than a rewrite; the delta turned out
+/// to be this type and the arm that reads it.
+enum Ffn<'a> {
+    Dense {
+        gate: Weights<'a>,
+        up: Weights<'a>,
+        down: Weights<'a>,
+    },
+    /// **8 of 256 experts per token, plus one that always runs.**
+    ///
+    /// Storage and traffic diverge sharply here, which is the whole reason this
+    /// model is interesting: the routed experts are 408 MiB per block, 94% of
+    /// the block, but a token reads 8/256 of them — 12.75 MiB. So placement of
+    /// these tensors governs a third of a token's bytes while dominating what
+    /// has to be resident.
+    Moe {
+        /// The router: `{n_embd, n_expert}`, **F32**, so its matmul is exact
+        /// and the expert choice can be checked against llama.cpp directly.
+        gate_inp: Weights<'a>,
+        gate: Experts<'a>,
+        up: Experts<'a>,
+        down: Experts<'a>,
+        /// The always-on expert, stored at Q8_0 where the routed ones are
+        /// IQ4_XS — it is read every token, so it is worth more bits.
+        shared_gate: Weights<'a>,
+        shared_up: Weights<'a>,
+        shared_down: Weights<'a>,
+        /// `ffn_gate_inp_shexp`: a length-`n_embd` vector, not a matrix. It
+        /// gates the shared expert's contribution with a sigmoid.
+        shared_gate_inp: Vec<f32>,
+    },
 }
 
 /// Every intermediate one token needs, allocated once per pass.
@@ -633,13 +726,31 @@ impl<'a> Qwen35<'a> {
                     k_norm: vector(f, &p("attn_k_norm.weight"), cfg.head_dim)?,
                 }
             };
+            let ffn = match &cfg.moe {
+                None => Ffn::Dense {
+                    gate: matrix(f, &p("ffn_gate.weight"), n_embd, n_ff)?,
+                    up: matrix(f, &p("ffn_up.weight"), n_embd, n_ff)?,
+                    down: matrix(f, &p("ffn_down.weight"), n_ff, n_embd)?,
+                },
+                Some(m) => Ffn::Moe {
+                    gate_inp: matrix(f, &p("ffn_gate_inp.weight"), n_embd, m.n_expert)?,
+                    // `{n_in, n_out, n_expert}`. Note `down` is the transpose of
+                    // the other two, which is why these go through `experts()`
+                    // rather than being reshaped by hand.
+                    gate: experts(f, &p("ffn_gate_exps.weight"), n_embd, m.expert_ff, m.n_expert)?,
+                    up: experts(f, &p("ffn_up_exps.weight"), n_embd, m.expert_ff, m.n_expert)?,
+                    down: experts(f, &p("ffn_down_exps.weight"), m.expert_ff, n_embd, m.n_expert)?,
+                    shared_gate: matrix(f, &p("ffn_gate_shexp.weight"), n_embd, m.shared_ff)?,
+                    shared_up: matrix(f, &p("ffn_up_shexp.weight"), n_embd, m.shared_ff)?,
+                    shared_down: matrix(f, &p("ffn_down_shexp.weight"), m.shared_ff, n_embd)?,
+                    shared_gate_inp: vector(f, &p("ffn_gate_inp_shexp.weight"), n_embd)?,
+                },
+            };
             layers.push(Layer {
                 attn_norm: vector(f, &p("attn_norm.weight"), n_embd)?,
                 ffn_norm: vector(f, &p("post_attention_norm.weight"), n_embd)?,
                 mixer,
-                ffn_gate: matrix(f, &p("ffn_gate.weight"), n_embd, n_ff)?,
-                ffn_up: matrix(f, &p("ffn_up.weight"), n_embd, n_ff)?,
-                ffn_down: matrix(f, &p("ffn_down.weight"), n_ff, n_embd)?,
+                ffn,
             });
         }
 
@@ -690,6 +801,8 @@ impl<'a> Qwen35<'a> {
     /// weight; the KV cache is accounted separately.
     pub fn weight_bytes_per_pass(&self) -> u64 {
         let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
+        // 8 of 256 on the routed variant; irrelevant on the dense one.
+        let n_used = self.cfg.moe.map_or(0, |m| m.n_expert_used);
         let per_layer: u64 = self
             .layers
             .iter()
@@ -705,7 +818,7 @@ impl<'a> Qwen35<'a> {
                         ..
                     } => w(wqkv) + w(wgate) + w(ssm_beta) + w(ssm_alpha) + w(ssm_out),
                 };
-                mixer + w(&l.ffn_gate) + w(&l.ffn_up) + w(&l.ffn_down)
+                mixer + ffn_bytes(&l.ffn, n_used)
             })
             .sum();
         per_layer + w(&self.output)
@@ -794,10 +907,41 @@ impl<'a> Qwen35<'a> {
 
             let t_ffn = ctx.prof.layer_begin();
             ops.rms_norm(&s.x, &layer.ffn_norm, c.rms_eps, &mut s.normed);
-            ops.matmul(&layer.ffn_gate, &s.normed, &mut s.gate);
-            ops.matmul(&layer.ffn_up, &s.normed, &mut s.up);
-            ops.silu_mul(&mut s.gate, &s.up);
-            ops.matmul(&layer.ffn_down, &s.gate, &mut s.ffn_out);
+            match &layer.ffn {
+                Ffn::Dense { gate, up, down } => {
+                    ops.matmul(gate, &s.normed, &mut s.gate);
+                    ops.matmul(up, &s.normed, &mut s.up);
+                    ops.silu_mul(&mut s.gate, &s.up);
+                    ops.matmul(down, &s.gate, &mut s.ffn_out);
+                }
+                // Deliberately not yet implemented, and refusing rather than
+                // approximating. Two things are missing and they are different
+                // kinds of missing:
+                //
+                //  - the k-quant dot products. `Ops::matmul` covers F32, F16
+                //    and Q8_0; every routed expert here is IQ4_XS. ggml's
+                //    `vec_dot_type` for IQ4_XS, Q5_K and Q6_K is **Q8_K**, so
+                //    matching it means quantizing the activation to Q8_K and
+                //    doing an integer dot, exactly as the Q8_0 path does.
+                //    Dequantizing to f32 instead would run, and would diverge
+                //    from `llama-eval-callback` systematically -- which is the
+                //    comparison that has found every architecture bug here.
+                //
+                //  - the routing rule itself: whether the router is softmaxed
+                //    or sigmoided, whether the top-k weights are renormalized,
+                //    and how the shared expert's sigmoid gate composes. Those
+                //    are constants to be read out of the llama.cpp source, not
+                //    guessed, per `CLAUDE.md`.
+                Ffn::Moe { .. } => {
+                    return Err(Error::InconsistentArchitecture {
+                        what: "qwen35moe forward",
+                        detail: "the MoE FFN loads but does not run yet: Ops::matmul has no \
+                                 IQ4_XS/Q5_K/Q6_K path (ggml pairs them with Q8_K activations) \
+                                 and the routing rule is not yet transcribed"
+                            .to_string(),
+                    });
+                }
+            }
             ops.add_assign(&mut s.x, &s.ffn_out);
             ctx.trace("post_ffn", il, &s.x);
             ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
@@ -1032,6 +1176,42 @@ impl<'a> Qwen35<'a> {
     }
 }
 
+/// Bytes one block's FFN reads for a single token.
+///
+/// **Storage and traffic differ by 32x for the routed variant**, which is the
+/// fact the whole project turns on. A block holds 408 MiB of routed experts —
+/// 94% of the block — but a token touches `n_expert_used` of `n_expert` of
+/// them, 8 of 256, so it reads 12.75 MiB. The shared expert and the router are
+/// read in full every token.
+///
+/// Counting storage here instead would overstate a token's traffic by ~15 GiB
+/// and make every bandwidth figure derived from it meaningless.
+fn ffn_bytes(ffn: &Ffn<'_>, n_used: usize) -> u64 {
+    let w = |m: &Weights<'_>| m.data.len() as u64;
+    match ffn {
+        Ffn::Dense { gate, up, down } => w(gate) + w(up) + w(down),
+        Ffn::Moe {
+            gate_inp,
+            gate,
+            up,
+            down,
+            shared_gate,
+            shared_up,
+            shared_down,
+            ..
+        } => {
+            let used = |e: &Experts<'_>| (e.stride() * n_used) as u64;
+            w(gate_inp)
+                + used(gate)
+                + used(up)
+                + used(down)
+                + w(shared_gate)
+                + w(shared_up)
+                + w(shared_down)
+        }
+    }
+}
+
 /// `ssm_conv1d.weight`, dequantized and shape-checked as `{kernel, channels}`.
 ///
 /// A 1-D `vector` helper will not do: this is 2-D in the file, and it is small
@@ -1075,6 +1255,7 @@ mod tests {
             ssm_n_group: 16,
             full_attention_interval: 4,
             nextn_predict_layers: 0,
+            moe: None,
         }
     }
 

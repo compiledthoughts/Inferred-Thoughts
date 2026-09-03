@@ -9,7 +9,7 @@ pub use qwen35::Qwen35;
 use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
 use crate::gguf::{GgufFile, TensorInfo};
-use crate::ops::{Ops, Weights};
+use crate::ops::{Experts, Ops, Weights};
 use crate::profile::Ctx;
 use crate::quant::dequantize;
 
@@ -41,10 +41,15 @@ impl<'a> Model<'a> {
     pub fn load(f: &'a GgufFile) -> Result<Self> {
         match f.metadata.architecture()? {
             "qwen3" => Ok(Model::Qwen3(Qwen3::load(f)?)),
-            "qwen35" => Ok(Model::Qwen35(Qwen35::load(f)?)),
+            // One stack serves both: `qwen35moe` is `qwen35` with the dense FFN
+            // replaced by a router, 256 experts and a shared expert. Everything
+            // else -- GatedDeltaNet, the attention blocks, the norms -- is
+            // identical, which is what `CLAUDE.md` meant by keeping the FFN
+            // behind a seam so the MoE variant is a delta rather than a rewrite.
+            "qwen35" | "qwen35moe" => Ok(Model::Qwen35(Qwen35::load(f)?)),
             other => Err(Error::UnsupportedArchitecture {
                 arch: other.to_string(),
-                supported: "qwen3, qwen35",
+                supported: "qwen3, qwen35, qwen35moe",
             }),
         }
     }
@@ -52,6 +57,7 @@ impl<'a> Model<'a> {
     pub fn arch(&self) -> &'static str {
         match self {
             Model::Qwen3(_) => "qwen3",
+            Model::Qwen35(m) if m.cfg.is_moe() => "qwen35moe",
             Model::Qwen35(_) => "qwen35",
         }
     }
@@ -186,6 +192,38 @@ pub(crate) fn matrix<'a>(
         ty: info.ty,
         n_in,
         n_out,
+    })
+}
+
+/// A 3-D stack of expert matrices, shape-checked as `{n_in, n_out, n_expert}`.
+///
+/// Separate from [`matrix`] because a wrong guess about which of the three
+/// dimensions is the contraction axis produces plausible numbers rather than an
+/// error — `ffn_gate_exps` is `{2048, 512, 256}` and `ffn_down_exps` is
+/// `{512, 2048, 256}`, so the two are transposes of each other and a swap would
+/// be invisible until the output was wrong.
+pub(crate) fn experts<'a>(
+    f: &'a GgufFile,
+    name: &str,
+    n_in: usize,
+    n_out: usize,
+    n_expert: usize,
+) -> Result<Experts<'a>> {
+    let info = tensor(f, name)?;
+    let want = vec![n_in as u64, n_out as u64, n_expert as u64];
+    if info.dims != want {
+        return Err(Error::TensorShapeMismatch {
+            name: name.to_string(),
+            expected: want,
+            got: info.dims.clone(),
+        });
+    }
+    Ok(Experts {
+        data: f.tensor_bytes(info),
+        ty: info.ty,
+        n_in,
+        n_out,
+        n_expert,
     })
 }
 
