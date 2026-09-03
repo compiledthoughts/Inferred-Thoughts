@@ -57,7 +57,12 @@ use crate::gguf::GgmlType;
 /// as wide and never loses warps. The constant is set for the model that
 /// matters, which is the larger one — the same reasoning `CLAUDE.md` applies to
 /// judging the GPU on the 0.6B at all.
-const MM_TOK: usize = 4;
+const MM_TOK: usize = 8;
+
+/// Blocks of a weight row in flight at once. **Must equal `MM_SEG` in
+/// `kernels/kernels.cu`.** It fixes the shared-memory request independently of
+/// `n_in`, which is what uncapped `MM_TOK`.
+const MM_SEG: usize = 64;
 use crate::ops::{Attn, Delta, Ops, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
@@ -440,17 +445,12 @@ impl Cuda {
         let rows_per_block = (block / 32) as usize;
         let grid_rows = w.n_out.div_ceil(rows_per_block) as u32;
 
-        // The batched kernel holds `MM_TOK` partial sums per warp per block of
-        // the row, so its shared-memory request grows with both `MM_TOK` and
-        // `n_in`. Rather than cap `MM_TOK` at whatever the widest tensor
-        // allows, narrow the *block* until the request fits: the 9B's
-        // `ffn_down` has n_in 12288, so one warp alone wants 24.5 KB at
-        // MM_TOK 8, while the 0.6B's widest wants 3 KB and keeps four warps.
-        let per_warp = MM_TOK * n_blocks * 4;
-        let b_warps = (49152 / per_warp.max(1)).clamp(1, 4);
-        let b_block = (b_warps * 32) as u32;
-        let b_grid = w.n_out.div_ceil(b_warps) as u32;
-        let b_shared = (b_warps * per_warp) as u32;
+        // The batched kernel folds each segment of the row into a running total
+        // rather than holding every partial, so its shared-memory request is
+        // `warps * MM_TOK * MM_SEG` floats and **does not grow with `n_in`**.
+        // It therefore keeps four warps on every tensor either model has, which
+        // is what lets `MM_TOK` be chosen for reuse instead of for occupancy.
+        let b_shared = (rows_per_block * MM_TOK * MM_SEG * 4) as u32;
 
         if n_tok == 1 {
             let args = [
@@ -490,9 +490,9 @@ impl Cuda {
         unsafe {
             self.launch_grid2(
                 "matmul_q8_0_batch",
-                b_grid,
+                grid_rows,
                 n_tok.div_ceil(MM_TOK) as u32,
-                b_block,
+                block,
                 b_shared,
                 &args,
             )?
