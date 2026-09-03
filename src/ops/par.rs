@@ -119,10 +119,15 @@ impl Par {
 
 impl Ops for Par {
     fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
-        debug_assert_eq!(x.len(), w.n_in);
-        debug_assert_eq!(out.len(), w.n_out);
+        debug_assert_eq!(x.len() % w.n_in, 0);
+        debug_assert_eq!(out.len(), (x.len() / w.n_in) * w.n_out);
 
-        if w.n_out < PARALLEL_THRESHOLD {
+        // `par` is kept only as the control that demonstrates rayon's dispatch
+        // cost (see the module docs), so it does not grow a batched matmul: a
+        // batch goes to the oracle, which is bit-identical and keeps this
+        // backend's one interesting property -- its decode behaviour -- exactly
+        // as it was measured.
+        if w.n_out < PARALLEL_THRESHOLD || x.len() != w.n_in {
             return Naive.matmul(w, x, out);
         }
 
@@ -197,20 +202,24 @@ impl Ops for Par {
     /// Bit-identical to [`Naive`]: same kernel, and threads change only which
     /// core runs a head, never the order within one.
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
-        debug_assert_eq!(out.len(), a.n_head * a.head_dim);
+        let n_kv = a.n_head_kv;
+        debug_assert_eq!(out.len(), a.n_q() * a.n_head * a.head_dim);
         let per_kv = a.group() * a.head_dim;
 
         // Below this there is not enough work to cover a dispatch -- the same
         // lesson PARALLEL_THRESHOLD records, applied to the other axis.
-        if a.n_pos < ATTN_POS_THRESHOLD || a.n_head_kv < 2 {
+        if a.n_pos < ATTN_POS_THRESHOLD || n_kv < 2 {
             return Naive.attend(a, out);
         }
 
+        // A batch makes the chunk index `(t, h_kv)` rather than `h_kv`: the
+        // output rows are laid out token-major, so consecutive `per_kv` chunks
+        // run through one token's kv heads before moving to the next.
         out.par_chunks_mut(per_kv)
             .enumerate()
             .for_each_init(
                 || naive::Scratch::for_attn(a),
-                |sc, (h_kv, chunk)| naive::attend_kv_head(a, h_kv, chunk, sc),
+                |sc, (u, chunk)| naive::attend_kv_head(a, u / n_kv, u % n_kv, chunk, sc),
             );
     }
 

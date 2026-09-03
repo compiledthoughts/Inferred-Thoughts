@@ -34,7 +34,30 @@ use std::ffi::c_void;
 use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
-use crate::ops::naive::QuantizedRow;
+/// Tokens one warp of `matmul_q8_0_batch` holds in registers while it loads a
+/// weight row once. **Must equal `MM_TOK` in `kernels/kernels.cu`** — it sizes
+/// both the grid and the shared-memory request, and a mismatch would read past
+/// the partials.
+///
+/// **Four is measured, and it is a trade-off rather than a maximum.** Prefill
+/// tok/s on an 841-token prompt:
+///
+/// | `MM_TOK` | 1 | 2 | 4 | 8 | 16 |
+/// |---|---|---|---|---|---|
+/// | Qwen3.5-9B | 52.6 | 83.5 | **105.2** | 103.6 | 85.4 |
+/// | Qwen3-0.6B | | | 646 | 649 | 695 |
+///
+/// 1 -> 4 is the reuse arriving, and it is the whole batched-prefill win on the
+/// GPU. Past 4 the 9B *regresses*, because its widest tensor (`ffn_down`,
+/// n_in 12288) needs `warps * MM_TOK * 384` floats of shared memory, so 8
+/// forces the block down to two warps and 16 to one. Occupancy lost exceeds
+/// reuse gained. Four is the largest tile that still keeps four warps there.
+///
+/// Note the 0.6B keeps improving to 16, because its widest tensor is a quarter
+/// as wide and never loses warps. The constant is set for the model that
+/// matters, which is the larger one — the same reasoning `CLAUDE.md` applies to
+/// judging the GPU on the 0.6B at all.
+const MM_TOK: usize = 4;
 use crate::ops::{Attn, Delta, Ops, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
@@ -332,12 +355,15 @@ impl Cuda {
     // -------------------------------------------------------------- the ops
 
     fn rms_norm_impl(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) -> Result<()> {
+        // The row length is the weight length, so a batch is self-describing.
+        let n = weight.len();
+        let rows = x.len() / n;
         let w = self.resident(weight)?;
         let xd = self.mirror_in(x)?;
         let od = self.mirror_out(out)?;
 
         let args = [
-            KArg::I32(x.len() as i32),
+            KArg::I32(n as i32),
             KArg::Ptr(xd),
             KArg::Ptr(w),
             KArg::F32(eps),
@@ -347,11 +373,12 @@ impl Cuda {
         // its f64 walk reads shared rather than global — worth 18%, and worth
         // nothing to the tree, which has no serial walk to feed.
         let (kernel, _) = self.rms_kernels();
-        let shared = if kernel == "rms_norm" { (x.len() * 4) as u32 } else { 0 };
+        let shared = if kernel == "rms_norm" { (n * 4) as u32 } else { 0 };
         // SAFETY: parameters match both `rms_norm` and `rms_norm_tree` in
-        // kernels.cu, which share a signature; every buffer was sized from the
-        // slice it mirrors, and `shared` is `n` floats or none.
-        unsafe { self.launch_shared(kernel, 1, 256, shared, &args)? };
+        // kernels.cu, which share a signature; one block per row of the batch,
+        // every buffer was sized from the slice it mirrors, and `shared` is `n`
+        // floats or none.
+        unsafe { self.launch_shared(kernel, rows as u32, 256, shared, &args)? };
         Ok(())
     }
 
@@ -399,32 +426,74 @@ impl Cuda {
         // matmul's input stay on the card instead of coming back to be
         // quantized and going out again.
         let n_blocks = w.n_in / 32;
+        let n_tok = x.len() / w.n_in;
         let (ws, wq) = self.resident_q8_0(w)?;
-        let (sd, qd) = self.quantized(x, n_blocks)?;
+        // One thread per 32-element block over the whole batch. The quantize
+        // kernel needs no batch awareness: `x` is token-major and contiguous,
+        // so its blocks already lay out as `[token][block]`, which is exactly
+        // what the matmul indexes.
+        let (sd, qd) = self.quantized(x, n_tok * n_blocks)?;
         let od = self.mirror_out(out)?;
 
+        // 128 threads is four warps, so four output rows per block.
+        let block = 128u32;
+        let rows_per_block = (block / 32) as usize;
+        let grid_rows = w.n_out.div_ceil(rows_per_block) as u32;
+
+        // The batched kernel holds `MM_TOK` partial sums per warp per block of
+        // the row, so its shared-memory request grows with both `MM_TOK` and
+        // `n_in`. Rather than cap `MM_TOK` at whatever the widest tensor
+        // allows, narrow the *block* until the request fits: the 9B's
+        // `ffn_down` has n_in 12288, so one warp alone wants 24.5 KB at
+        // MM_TOK 8, while the 0.6B's widest wants 3 KB and keeps four warps.
+        let per_warp = MM_TOK * n_blocks * 4;
+        let b_warps = (49152 / per_warp.max(1)).clamp(1, 4);
+        let b_block = (b_warps * 32) as u32;
+        let b_grid = w.n_out.div_ceil(b_warps) as u32;
+        let b_shared = (b_warps * per_warp) as u32;
+
+        if n_tok == 1 {
+            let args = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::Ptr(ws),
+                KArg::Ptr(wq),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            let shared = (rows_per_block * n_blocks * 4) as u32;
+            // SAFETY: parameters match `matmul_q8_0_warp`; the grid covers
+            // exactly `n_out` rows and `shared` is `warps * n_blocks` floats,
+            // which is what the kernel indexes.
+            unsafe { self.launch_shared("matmul_q8_0_warp", grid_rows, block, shared, &args)? };
+            return Ok(());
+        }
+
+        // **Decode keeps the kernel it was measured on.** Every published
+        // number here was taken on `matmul_q8_0_warp`, and it is the kernel the
+        // decode CUDA graph records; the batched one is strictly for prefill,
+        // where a warp amortizes one weight load across `MM_TOK` tokens.
         let args = [
             KArg::I32(w.n_in as i32),
             KArg::I32(w.n_out as i32),
+            KArg::I32(n_tok as i32),
             KArg::Ptr(ws),
             KArg::Ptr(wq),
             KArg::Ptr(sd),
             KArg::Ptr(qd),
             KArg::Ptr(od),
         ];
-        // 128 threads is four warps, so four output rows per block.
-        let block = 128u32;
-        let rows_per_block = (block / 32) as usize;
-        let shared = (rows_per_block * n_blocks * 4) as u32;
-        // SAFETY: parameters match `matmul_q8_0_warp`; the grid covers exactly
-        // `n_out` rows and `shared` is `warps * n_blocks` floats, which is what
-        // the kernel indexes.
+        // SAFETY: parameters match `matmul_q8_0_batch`; the grid covers exactly
+        // `n_out` rows by `ceil(n_tok / MM_TOK)` token tiles, and `b_shared` is
+        // `warps * MM_TOK * n_blocks` floats, which is what the kernel indexes.
         unsafe {
-            self.launch_shared(
-                "matmul_q8_0_warp",
-                w.n_out.div_ceil(rows_per_block) as u32,
-                block,
-                shared,
+            self.launch_grid2(
+                "matmul_q8_0_batch",
+                b_grid,
+                n_tok.div_ceil(MM_TOK) as u32,
+                b_block,
+                b_shared,
                 &args,
             )?
         };
@@ -444,22 +513,28 @@ impl Cuda {
         // does. CUDA's double `pow` and `sincos` are not obliged to return
         // glibc's bits, and a one-ulp angle is a real output difference.
         let half = n_rot / 2;
-        let cd = self.pooled(slot::COS, half * 4)?;
-        let sd = self.pooled(slot::SIN, half * 4)?;
+        // `pos` is row 0's position and rows are consecutive, so a batch needs
+        // `n_tok` stacked tables. Decode sends one, exactly as before.
+        let n_tok = x.len() / (head_dim * n_heads);
+        let cd = self.pooled(slot::COS, n_tok * half * 4)?;
+        let sd = self.pooled(slot::SIN, n_tok * half * 4)?;
 
         // Same table for every layer of a token, so build and send it once.
         // Keyed on `n_rot` rather than `head_dim`, since that is what sets the
         // frequencies -- q and k share it, but a model mixing rotation widths
-        // would not.
-        let key = (pos, n_rot, theta_base.to_bits());
+        // would not. `n_tok` joins the key because the table's *length* changes
+        // with it, so a decode step after a prefill must not reuse the prefill's.
+        let key = (pos, n_rot, theta_base.to_bits(), n_tok);
         if self.rope_pos.get() != Some(key) {
-            let mut cos = Vec::with_capacity(half);
-            let mut sin = Vec::with_capacity(half);
-            for i in 0..half {
-                let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
-                let (s, c) = (pos as f64 * freq).sin_cos();
-                cos.push(c as f32);
-                sin.push(s as f32);
+            let mut cos = Vec::with_capacity(n_tok * half);
+            let mut sin = Vec::with_capacity(n_tok * half);
+            for t in 0..n_tok {
+                for i in 0..half {
+                    let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
+                    let (s, c) = ((pos + t) as f64 * freq).sin_cos();
+                    cos.push(c as f32);
+                    sin.push(s as f32);
+                }
             }
             self.h2d(cd, &cos)?;
             self.h2d(sd, &sin)?;
@@ -471,11 +546,12 @@ impl Cuda {
             KArg::I32(head_dim as i32),
             KArg::I32(n_rot as i32),
             KArg::I32(n_heads as i32),
+            KArg::I32(n_tok as i32),
             KArg::Ptr(cd),
             KArg::Ptr(sd),
             KArg::Ptr(xd),
         ];
-        let (block, total) = (256u32, n_heads * half);
+        let (block, total) = (256u32, n_tok * n_heads * half);
         // SAFETY: parameters match `rope_neox`; the grid covers exactly the
         // `n_heads * head_dim/2` rotation pairs.
         unsafe {
@@ -500,6 +576,8 @@ impl Cuda {
 
     fn attend_impl(&self, a: &Attn<'_>, out: &mut [f32]) -> Result<()> {
         const CHUNK: usize = 128;
+        // Widest window in the batch, which is the last row's; it sizes the
+        // partial buffers for every row.
         let n_split = a.n_pos.div_ceil(CHUNK);
 
         let kd = self.kv_resident(a.k, a.n_pos, a.kv_dim)?;
@@ -513,9 +591,42 @@ impl Cuda {
         let pm = self.pooled(slot::PART_M, a.n_head * n_split * 4)?;
         let pl = self.pooled(slot::PART_L, a.n_head * n_split * 4)?;
 
+        // **Query rows are launched one at a time, by device pointer offset.**
+        // Every row has a different causal window, so they cannot share a grid
+        // without masking most of it away; and the offsets are applied to the
+        // device pointers rather than by sub-slicing `a.q` on the host, because
+        // this backend keys its mirrors on host addresses -- a sub-slice would
+        // look like an unmirrored buffer and be uploaded from a stale host copy,
+        // which is the bug `Ops::rope_neox` already carries a note about.
+        let (n_q, per_row) = (a.n_q(), a.n_head * a.head_dim);
+        for t in 0..n_q {
+            let n_pos = a.n_pos_of(t);
+            let qd = qd + (t * per_row * 4) as u64;
+            let od = od + (t * per_row * 4) as u64;
+            self.attend_row(a, n_pos, CHUNK, qd, kd, vd, od, pa, pm, pl)?;
+        }
+        Ok(())
+    }
+
+    /// One query row against `n_pos` cached positions — the flash-decoding pair.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_row(
+        &self,
+        a: &Attn<'_>,
+        n_pos: usize,
+        chunk: usize,
+        qd: ffi::CUdeviceptr,
+        kd: ffi::CUdeviceptr,
+        vd: ffi::CUdeviceptr,
+        od: ffi::CUdeviceptr,
+        pa: ffi::CUdeviceptr,
+        pm: ffi::CUdeviceptr,
+        pl: ffi::CUdeviceptr,
+    ) -> Result<()> {
+        let n_split = n_pos.div_ceil(chunk);
         {
             let args = [
-                KArg::I32(a.n_pos as i32),
+                KArg::I32(n_pos as i32),
                 KArg::I32(a.kv_dim as i32),
                 KArg::I32(a.head_dim as i32),
                 KArg::I32(a.n_head as i32),
@@ -528,7 +639,7 @@ impl Cuda {
                 KArg::Ptr(pm),
                 KArg::Ptr(pl),
             ];
-            let shared = ((a.head_dim + 2 * CHUNK) * 4) as u32;
+            let shared = ((a.head_dim + 2 * chunk) * 4) as u32;
             // SAFETY: parameters match `attn_flash`; the grid is one block per
             // (query head, chunk) so no block sees an empty range, and `shared`
             // is head_dim + 2 * FD_CHUNK floats, which is what it indexes.
@@ -537,7 +648,7 @@ impl Cuda {
                     "attn_flash",
                     a.n_head as u32,
                     n_split as u32,
-                    CHUNK as u32,
+                    chunk as u32,
                     shared,
                     &args,
                 )?
@@ -560,7 +671,7 @@ impl Cuda {
                 self.launch_shared(
                     "attn_flash_combine",
                     a.n_head as u32,
-                    CHUNK as u32,
+                    chunk as u32,
                     shared,
                     &args,
                 )?
@@ -820,23 +931,38 @@ impl Cuda {
         kernel: usize,
         out: &mut [f32],
     ) -> Result<()> {
-        let n = out.len();
+        // Channels per token; `n_tok` rows of them.
+        let nc = weight.len() / kernel;
+        let n_tok = out.len() / nc;
         let sd = self.state_resident(state)?;
         let xd = self.mirror_in(x)?;
         let w = self.resident(weight)?;
         let od = self.mirror_out(out)?;
-        let args = [
-            KArg::I32(n as i32),
-            KArg::I32(kernel as i32),
-            KArg::Ptr(sd),
-            KArg::Ptr(xd),
-            KArg::Ptr(w),
-            KArg::Ptr(od),
-        ];
-        let blocks = n.div_ceil(256) as u32;
-        // SAFETY: parameters match `ssm_conv` in kernels.cu; one thread per
-        // channel, guarded against the tail.
-        unsafe { self.launch_shared("ssm_conv", blocks, 256, 0, &args)? };
+        let blocks = nc.div_ceil(256) as u32;
+
+        // **Sequential in the batch**: each token convolves over the window the
+        // previous one advanced, so the tokens are launched in order against
+        // one state. The row offsets go on the device pointers rather than by
+        // sub-slicing `x` on the host, because this backend keys its mirrors on
+        // host addresses and a sub-slice would be uploaded from a stale copy.
+        //
+        // This is `n_tok` launches where a chunked algorithm would need one.
+        // The seam takes the whole batch precisely so that stays a decision
+        // inside this file.
+        for t in 0..n_tok {
+            let args = [
+                KArg::I32(nc as i32),
+                KArg::I32(kernel as i32),
+                KArg::Ptr(sd),
+                KArg::Ptr(xd + (t * nc * 4) as u64),
+                KArg::Ptr(w),
+                KArg::Ptr(od + (t * nc * 4) as u64),
+            ];
+            // SAFETY: parameters match `ssm_conv` in kernels.cu; one thread per
+            // channel, guarded against the tail, and both offsets stay inside
+            // buffers sized for `n_tok * nc` floats.
+            unsafe { self.launch_shared("ssm_conv", blocks, 256, 0, &args)? };
+        }
         Ok(())
     }
 
@@ -853,30 +979,41 @@ impl Cuda {
         let dt = self.resident(d.dt_bias)?;
         let od = self.mirror_out(out)?;
 
-        let args = [
-            KArg::I32(d.head_k_dim as i32),
-            KArg::I32(d.head_v_dim as i32),
-            KArg::I32(d.n_k_heads as i32),
-            KArg::F32(d.scale()),
-            KArg::Ptr(q),
-            KArg::Ptr(k),
-            KArg::Ptr(v),
-            KArg::Ptr(alpha),
-            KArg::Ptr(beta),
-            KArg::Ptr(ssm_a),
-            KArg::Ptr(dt),
-            KArg::Ptr(sd),
-            KArg::Ptr(od),
-        ];
         // q and k for the head are staged in shared memory: every thread in the
         // block reads all of both.
         let shared = (2 * d.head_k_dim * 4) as u32;
         let threads = d.head_v_dim.min(256) as u32;
-        // SAFETY: parameters match `delta_rule` in kernels.cu; one block per
-        // value head, and `shared` is the two staged vectors.
-        unsafe {
-            self.launch_shared("delta_rule", d.n_v_heads as u32, threads, shared, &args)?
-        };
+
+        // **The one op with no batched form.** Token `t`'s rank-1 correction is
+        // token `t+1`'s stored state, so these launches are ordered and cannot
+        // be collapsed into a grid. Offsets go on the device pointers for the
+        // same reason as in `ssm_conv_impl`.
+        let kper = d.n_k_heads * d.head_k_dim;
+        let vper = d.n_v_heads * d.head_v_dim;
+        let heads = d.n_v_heads;
+        for t in 0..d.n_tokens() {
+            let args = [
+                KArg::I32(d.head_k_dim as i32),
+                KArg::I32(d.head_v_dim as i32),
+                KArg::I32(d.n_k_heads as i32),
+                KArg::F32(d.scale()),
+                KArg::Ptr(q + (t * kper * 4) as u64),
+                KArg::Ptr(k + (t * kper * 4) as u64),
+                KArg::Ptr(v + (t * vper * 4) as u64),
+                KArg::Ptr(alpha + (t * heads * 4) as u64),
+                KArg::Ptr(beta + (t * heads * 4) as u64),
+                KArg::Ptr(ssm_a),
+                KArg::Ptr(dt),
+                KArg::Ptr(sd),
+                KArg::Ptr(od + (t * vper * 4) as u64),
+            ];
+            // SAFETY: parameters match `delta_rule` in kernels.cu; one block
+            // per value head, `shared` is the two staged vectors, and every
+            // offset stays inside a buffer the model sized for `n_tokens`.
+            unsafe {
+                self.launch_shared("delta_rule", d.n_v_heads as u32, threads, shared, &args)?
+            };
+        }
         Ok(())
     }
 

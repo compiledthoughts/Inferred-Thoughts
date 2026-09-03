@@ -20,6 +20,8 @@
 //! The LM head is tied when the file has no `output.weight`, which is how
 //! llama.cpp's loader behaves and is the case for Qwen3-0.6B.
 
+use std::cell::RefCell;
+
 use crate::cache::KvCache;
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
@@ -134,6 +136,78 @@ pub struct Qwen3<'a> {
     /// The LM head. Points at `tok_embd` when the file has no `output.weight`.
     output: Weights<'a>,
     layers: Vec<Layer<'a>>,
+    /// Activation buffers, owned so their **addresses never change**.
+    scratch: RefCell<Scratch>,
+}
+
+/// The per-pass activation buffers, allocated once and grown, never per pass.
+///
+/// **This exists for a memory reason, not a speed one.** A device backend keys
+/// its activation mirrors on the host address of a slice and never frees them
+/// (`Mirror::invalidate` says why: releasing ~280 buffers per token cost more
+/// than it saved). While these were `vec![...]` inside `forward`, every pass
+/// allocated at a fresh address and left a whole new set of device buffers
+/// behind — measured at **64 mirrors holding 84 MiB** for a single 1471-token
+/// prompt on the 0.6B, and it climbs for as long as a session runs.
+///
+/// Owning them fixes the addresses, so there is exactly one mirror per buffer
+/// for the life of the model and device memory is `max_batch` times the
+/// per-token footprint, flat.
+///
+/// Buffers are sized for the largest batch seen and handed out as prefixes, so
+/// a shorter pass reuses the same allocation *starting at the same address* —
+/// which is what lets the mirror be reused rather than replaced.
+#[derive(Default)]
+struct Scratch {
+    x: Vec<f32>,
+    normed: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    kqv: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn_out: Vec<f32>,
+    /// The last row, lifted out of `x` through the seam.
+    last: Vec<f32>,
+    final_norm: Vec<f32>,
+    /// Held rather than allocated per pass for the same reason as the rest; the
+    /// caller gets a copy. On the 9B this vector is 970 KiB, so a fresh one per
+    /// token would be a fresh mirror per token.
+    logits: Vec<f32>,
+}
+
+impl Scratch {
+    /// Grow to fit `n` tokens. **Never shrinks**: the point is a stable address,
+    /// and every buffer is handed to the ops as a `[..n * dim]` prefix, so the
+    /// extra capacity is invisible to them while the pointer stays put.
+    ///
+    /// `qwen35::Scratch` reaches the same guarantee the other way, resizing
+    /// exactly and passing whole buffers — `Vec::resize` also keeps the pointer
+    /// while capacity holds. Either is fine; what matters is that the address
+    /// never moves, because a device mirror is keyed on it.
+    fn fit(&mut self, c: &Config, n: usize) {
+        let g = |b: &mut Vec<f32>, len: usize| {
+            if b.len() < len {
+                b.resize(len, 0.0);
+            }
+        };
+        let (nd, qd, kd, nf) = (c.n_embd, c.q_dim(), c.kv_dim(), c.n_ff);
+        g(&mut self.x, n * nd);
+        g(&mut self.normed, n * nd);
+        g(&mut self.q, n * qd);
+        g(&mut self.k, n * kd);
+        g(&mut self.v, n * kd);
+        g(&mut self.attn, n * qd);
+        g(&mut self.kqv, n * nd);
+        g(&mut self.gate, n * nf);
+        g(&mut self.up, n * nf);
+        g(&mut self.ffn_out, n * nd);
+        g(&mut self.last, nd);
+        g(&mut self.final_norm, nd);
+        g(&mut self.logits, c.n_vocab);
+    }
 }
 
 impl<'a> Qwen3<'a> {
@@ -174,6 +248,7 @@ impl<'a> Qwen3<'a> {
             output_norm: vector(f, "output_norm.weight", n_embd)?,
             output,
             layers,
+            scratch: RefCell::new(Scratch::default()),
         })
     }
 
@@ -275,204 +350,141 @@ impl<'a> Qwen3<'a> {
         // not be trusted. No-op on the CPU backends.
         ops.begin_pass(n);
 
+        // Buffers are owned by the model and handed out as prefixes, so their
+        // addresses are the same every pass. See `Scratch`: while they were
+        // allocated per pass, a device backend accumulated a fresh set of
+        // mirrors each time and never released them.
+        let (nd, qd, kd, nf) = (c.n_embd, c.q_dim(), c.kv_dim(), c.n_ff);
+        let sc = &mut *self.scratch.borrow_mut();
+        sc.fit(c, n);
+        let x = &mut sc.x[..n * nd];
+        let normed = &mut sc.normed[..n * nd];
+        let q = &mut sc.q[..n * qd];
+        let k = &mut sc.k[..n * kd];
+        let v = &mut sc.v[..n * kd];
+        let attn = &mut sc.attn[..n * qd];
+        let kqv = &mut sc.kqv[..n * nd];
+        let gate = &mut sc.gate[..n * nf];
+        let up = &mut sc.up[..n * nf];
+        let ffn_out = &mut sc.ffn_out[..n * nd];
+
         // Residual stream, one row of n_embd per token in this batch.
-        let mut x = vec![0.0f32; n * c.n_embd];
         for (t, &id) in tokens.iter().enumerate() {
-            self.embed(id, &mut x[t * c.n_embd..(t + 1) * c.n_embd])?;
+            self.embed(id, &mut x[t * nd..(t + 1) * nd])?;
         }
         // Written here rather than by an op, so a device copy would be stale.
-        // Per row, because that is the granularity the ops below work at and
-        // therefore the granularity a device backend keys its copies on.
-        for t in 0..n {
-            ops.host_wrote(&x[t * c.n_embd..(t + 1) * c.n_embd]);
-        }
-        ctx.trace("inp_embd", 0, &x);
-
-        // Batch-local buffers: one slot per token being processed now, which in
-        // decode is exactly one. Sized for the whole batch rather than reused
-        // per token so each trace call hands out a whole tensor, matching what
-        // `llama-eval-callback` prints at the same point.
-        let (nd, qd, kd, nf) = (c.n_embd, c.q_dim(), c.kv_dim(), c.n_ff);
-        let mut normed = vec![0.0f32; n * nd];
-        let mut q = vec![0.0f32; n * qd];
-        let mut k = vec![0.0f32; n * kd];
-        let mut v = vec![0.0f32; n * kd];
-        let mut attn = vec![0.0f32; n * qd];
-        let mut kqv = vec![0.0f32; n * nd];
-        let mut gate = vec![0.0f32; n * nf];
-        let mut up = vec![0.0f32; n * nf];
-        let mut ffn_out = vec![0.0f32; n * nd];
+        // Once for the whole batch, because that is now the granularity the ops
+        // below work at and therefore the granularity a device backend keys its
+        // copies on. It used to be per row, when they did.
+        ops.host_wrote(x);
+        ctx.trace("inp_embd", 0, x);
 
         for (il, layer) in self.layers.iter().enumerate() {
             let t_attn = ctx.prof.layer_begin();
 
-            for t in 0..n {
-                ops.rms_norm(
-                    &x[t * nd..(t + 1) * nd],
-                    &layer.attn_norm,
-                    c.rms_eps,
-                    &mut normed[t * nd..(t + 1) * nd],
-                );
-            }
-            ctx.trace("attn_norm", il, &normed);
+            // Every call below takes the whole batch. In decode `n == 1` and
+            // this is the same sequence of ops it always was; in prefill each
+            // weight is read once for `n` tokens instead of once per token,
+            // which is the entire point. Nothing here reorders an accumulation,
+            // so the logits stay bit-identical either way.
+            ops.rms_norm(x, &layer.attn_norm, c.rms_eps, normed);
+            ctx.trace("attn_norm", il, normed);
 
-            for t in 0..n {
-                let inp = &normed[t * nd..(t + 1) * nd];
-                ops.matmul(&layer.wq, inp, &mut q[t * qd..(t + 1) * qd]);
-                ops.matmul(&layer.wk, inp, &mut k[t * kd..(t + 1) * kd]);
-                ops.matmul(&layer.wv, inp, &mut v[t * kd..(t + 1) * kd]);
-            }
-            ctx.trace("Vcur", il, &v);
+            ops.matmul(&layer.wq, normed, q);
+            ops.matmul(&layer.wk, normed, k);
+            ops.matmul(&layer.wv, normed, v);
+            ctx.trace("Vcur", il, v);
 
-            // QK-norm strictly before RoPE, per head over head_dim.
-            for t in 0..n {
-                ops.rms_norm_heads(
-                    &mut q[t * qd..(t + 1) * qd],
-                    &layer.q_norm,
-                    c.head_dim,
-                    c.rms_eps,
-                );
-            }
-            ctx.trace("Qcur_normed", il, &q);
-            for t in 0..n {
-                ops.rms_norm_heads(
-                    &mut k[t * kd..(t + 1) * kd],
-                    &layer.k_norm,
-                    c.head_dim,
-                    c.rms_eps,
-                );
-            }
-            ctx.trace("Kcur_normed", il, &k);
+            // QK-norm strictly before RoPE, per head over head_dim. Already
+            // correct for a batch: a longer buffer is simply more heads.
+            ops.rms_norm_heads(q, &layer.q_norm, c.head_dim, c.rms_eps);
+            ctx.trace("Qcur_normed", il, q);
+            ops.rms_norm_heads(k, &layer.k_norm, c.head_dim, c.rms_eps);
+            ctx.trace("Kcur_normed", il, k);
 
-            // RoPE at the ABSOLUTE position. Using the batch index `t` here is
-            // the classic KV cache bug: it is invisible during prefill, where
-            // the two are equal, and wrong for every token decoded after.
-            for t in 0..n {
-                ops.rope_neox(
-                    &mut q[t * qd..(t + 1) * qd],
-                    start_pos + t,
-                    c.head_dim,
-                    c.head_dim,
-                    c.n_head,
-                    c.rope_theta,
-                );
-            }
-            ctx.trace("Qcur", il, &q);
-            for t in 0..n {
-                ops.rope_neox(
-                    &mut k[t * kd..(t + 1) * kd],
-                    start_pos + t,
-                    c.head_dim,
-                    c.head_dim,
-                    c.n_head_kv,
-                    c.rope_theta,
-                );
-            }
-            ctx.trace("Kcur", il, &k);
+            // RoPE from the ABSOLUTE position of row 0; the op advances one
+            // position per row. Using the batch index here is the classic KV
+            // cache bug: invisible during prefill, where the two are equal, and
+            // wrong for every token decoded after.
+            ops.rope_neox(
+                q,
+                start_pos,
+                c.head_dim,
+                c.head_dim,
+                c.n_head,
+                c.rope_theta,
+            );
+            ctx.trace("Qcur", il, q);
+            ops.rope_neox(
+                k,
+                start_pos,
+                c.head_dim,
+                c.head_dim,
+                c.n_head_kv,
+                c.rope_theta,
+            );
+            ctx.trace("Kcur", il, k);
 
             // Publish the whole batch before attending: within a prefill, token
             // t attends to tokens start_pos..=start_pos+t, which includes rows
             // written by this same call. The cache rounds to f16 on the way in
-            // — that is where llama.cpp's f16 KV semantics now live, replacing
+            // -- that is where llama.cpp's f16 KV semantics now live, replacing
             // the explicit round-trip Stage 4 did here.
             // Publishing goes through the seam, so a device backend can
             // convert and store without the keys and values ever coming home.
-            // On the CPU backends this is the same f16 rounding `KvCache::store`
-            // did, in the same place.
-            if start_pos + n > cache.n_ctx() {
-                return Err(Error::ContextOverflow {
-                    pos: start_pos + n - 1,
-                    n_ctx: cache.n_ctx(),
-                });
-            }
-            for t in 0..n {
-                let at = (start_pos + t) * kd;
-                ops.kv_write(cache.k_layer_mut(il), at, &k[t * kd..(t + 1) * kd]);
-                ops.kv_write(cache.v_layer_mut(il), at, &v[t * kd..(t + 1) * kd]);
-            }
+            // One call, not `n`: the cache is position-major and the batch
+            // occupies consecutive positions, so it is one contiguous run.
+            ops.kv_write(cache.k_layer_mut(il), start_pos * kd, k);
+            ops.kv_write(cache.v_layer_mut(il), start_pos * kd, v);
 
             let scale = 1.0 / (c.head_dim as f32).sqrt();
 
-            // Attention now goes through the ops seam rather than a loop here,
-            // so a backend can thread over heads. Model code stays unaware of
-            // which backend it is talking to, per CLAUDE.md.
-            for t in 0..n {
-                let pos = start_pos + t;
-                let a = Attn {
-                    q: &q[t * qd..(t + 1) * qd],
-                    k: cache.k_layer(il),
-                    v: cache.v_layer(il),
-                    kv_dim: kd,
-                    // Inclusive of this token, which is what masks the future.
-                    n_pos: pos + 1,
-                    head_dim: c.head_dim,
-                    n_head: c.n_head,
-                    n_head_kv: c.n_head_kv,
-                    scale,
-                };
-                ops.attend(&a, &mut attn[t * qd..(t + 1) * qd]);
-            }
+            // Attention goes through the ops seam rather than a loop here, so a
+            // backend can thread over heads -- and now over query rows too.
+            // `n_pos` is the *last* row's window; earlier rows are masked to
+            // proportionally fewer by `Attn::n_pos_of`, which is what keeps a
+            // batched prefill causal.
+            let a = Attn {
+                q,
+                k: cache.k_layer(il),
+                v: cache.v_layer(il),
+                kv_dim: kd,
+                n_pos: start_pos + n,
+                head_dim: c.head_dim,
+                n_head: c.n_head,
+                n_head_kv: c.n_head_kv,
+                scale,
+            };
+            ops.attend(&a, attn);
 
             // The reference names the concatenated head output "kqv_out",
             // before the output projection -- its dims are {q_dim, n_tokens}.
             // For token 0 this equals V[0], since it can only attend to itself.
-            ctx.trace("kqv_out", il, &attn);
+            ctx.trace("kqv_out", il, attn);
 
-            for t in 0..n {
-                ops.matmul(
-                    &layer.wo,
-                    &attn[t * qd..(t + 1) * qd],
-                    &mut kqv[t * nd..(t + 1) * nd],
-                );
-            }
-
-            for t in 0..n {
-                let (row, add) = (&mut x[t * nd..(t + 1) * nd], &kqv[t * nd..(t + 1) * nd]);
-                ops.add_assign(row, add);
-            }
-            ctx.trace("ffn_inp", il, &x);
+            ops.matmul(&layer.wo, attn, kqv);
+            ops.add_assign(x, kqv);
+            ctx.trace("ffn_inp", il, x);
             ctx.prof.layer_end(t_attn, step, il, Part::Attn);
 
             let t_ffn = ctx.prof.layer_begin();
 
-            for t in 0..n {
-                ops.rms_norm(
-                    &x[t * nd..(t + 1) * nd],
-                    &layer.ffn_norm,
-                    c.rms_eps,
-                    &mut normed[t * nd..(t + 1) * nd],
-                );
-            }
-            ctx.trace("ffn_norm", il, &normed);
+            ops.rms_norm(x, &layer.ffn_norm, c.rms_eps, normed);
+            ctx.trace("ffn_norm", il, normed);
 
-            for t in 0..n {
-                let inp = &normed[t * nd..(t + 1) * nd];
-                ops.matmul(&layer.ffn_gate, inp, &mut gate[t * nf..(t + 1) * nf]);
-                ops.matmul(&layer.ffn_up, inp, &mut up[t * nf..(t + 1) * nf]);
-            }
-            ctx.trace("ffn_gate", il, &gate);
-            ctx.trace("ffn_up", il, &up);
+            ops.matmul(&layer.ffn_gate, normed, gate);
+            ops.matmul(&layer.ffn_up, normed, up);
+            ctx.trace("ffn_gate", il, gate);
+            ctx.trace("ffn_up", il, up);
 
-            for t in 0..n {
-                let (g, u) = (&mut gate[t * nf..(t + 1) * nf], &up[t * nf..(t + 1) * nf]);
-                ops.silu_mul(g, u);
-            }
-            ctx.trace("ffn_swiglu", il, &gate);
+            ops.silu_mul(gate, up);
+            ctx.trace("ffn_swiglu", il, gate);
 
-            for t in 0..n {
-                ops.matmul(
-                    &layer.ffn_down,
-                    &gate[t * nf..(t + 1) * nf],
-                    &mut ffn_out[t * nd..(t + 1) * nd],
-                );
-            }
-            ctx.trace("ffn_out", il, &ffn_out);
+            ops.matmul(&layer.ffn_down, gate, ffn_out);
+            ctx.trace("ffn_out", il, ffn_out);
 
-            for t in 0..n {
-                let (row, add) = (&mut x[t * nd..(t + 1) * nd], &ffn_out[t * nd..(t + 1) * nd]);
-                ops.add_assign(row, add);
-            }
-            ctx.trace("l_out", il, &x);
+            ops.add_assign(x, ffn_out);
+            ctx.trace("l_out", il, x);
             ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
         }
 
@@ -492,21 +504,30 @@ impl<'a> Qwen3<'a> {
             .sum::<u64>();
 
         // Only the final position's logits are needed.
-        let last = &x[(n - 1) * nd..];
-        let mut final_norm = vec![0.0f32; nd];
-        ops.rms_norm(last, &self.output_norm, c.rms_eps, &mut final_norm);
-        ctx.trace("result_norm", 0, &final_norm);
-        let normed = final_norm;
+        //
+        // **Taken through the seam, not by sub-slicing `x`.** A device backend
+        // keys its mirrors on the host address of a slice, so `&x[(n-1)*nd..]`
+        // is an address it has never seen and would be uploaded from the host
+        // copy -- which is stale, because the device wrote `x`. In decode the
+        // two addresses coincide and the bug is invisible; in a batched prefill
+        // every token but the first is wrong. That is the same hazard
+        // `Ops::rope_neox` carries a note about, and it has now bitten three
+        // times. `gather_chunks` exists for exactly this: one chunk of `nd`,
+        // starting at the last row.
+        ops.gather_chunks(x, nd, nd, (n - 1) * nd, &mut sc.last);
+        ops.rms_norm(&sc.last, &self.output_norm, c.rms_eps, &mut sc.final_norm);
+        ctx.trace("result_norm", 0, &sc.final_norm);
 
-        let mut logits = vec![0.0f32; c.n_vocab];
-        ops.matmul(&self.output, &normed, &mut logits);
+        ops.matmul(&self.output, &sc.final_norm, &mut sc.logits);
         // Everything above may only have been *queued*; this is where a
         // batched backend runs it, and it must happen before the read below.
         ops.end_pass();
-        ops.host_needs(&mut logits);
-        ctx.trace("result_output", 0, &logits);
+        ops.host_needs(&mut sc.logits);
+        ctx.trace("result_output", 0, &sc.logits);
 
-        Ok(logits)
+        // Copied out rather than moved: the buffer has to keep its address, or
+        // the next pass allocates a new one and leaves a device mirror behind.
+        Ok(sc.logits.clone())
     }
 
     /// Greedy pick from a logit vector.

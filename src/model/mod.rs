@@ -16,12 +16,13 @@ use crate::quant::dequantize;
 /// The architectures this engine runs, chosen at load time from the file.
 ///
 /// **An enum rather than a trait, deliberately.** `CLAUDE.md` scopes the
-/// project to a handful of architectures on purpose, and the two here do not
-/// have the same shape: `qwen3` runs a whole batch in one pass, `qwen35` is a
-/// sequential scan that runs one token at a time, and only one of them needs
-/// recurrent state. A trait would have to either take the union of those
-/// signatures — which is this enum with extra indirection — or grow associated
-/// cache types that every caller then has to name.
+/// project to a handful of architectures on purpose, and only one of the two
+/// here needs recurrent state. A trait would have to either take the union of
+/// those signatures — which is this enum with extra indirection — or grow
+/// associated cache types that every caller then has to name.
+///
+/// The shapes have since converged: both now take a batch and a start position,
+/// which is what batched prefill bought. The remaining asymmetry is the state.
 ///
 /// The other reason is what comes next. Layer placement makes the engine ask
 /// "where does layer `il` run", which is a question about the *schedule*, not
@@ -112,12 +113,10 @@ impl<'a> Model<'a> {
     /// Run `tokens` from absolute position `start_pos` and return logits for
     /// the last one.
     ///
-    /// The two architectures differ in a way the caller does not have to care
-    /// about: `qwen3` takes the whole batch, and `qwen35` is fed one token at a
-    /// time because the delta rule is a sequential scan — token `t`'s state
-    /// update is token `t+1`'s input, so there is no batched form of it short
-    /// of llama.cpp's separate chunked algorithm. Prefill on `qwen35` is
-    /// therefore correct and slow, which is the right order to get them in.
+    /// Both architectures now take the whole batch. `qwen35`'s two sequential
+    /// scans — the delta rule and the causal convolution — iterate over it
+    /// behind the seam rather than forcing the whole layer to run a token at a
+    /// time, so its matmuls still read each weight once per batch.
     pub fn forward<O: Ops>(
         &self,
         ops: &O,
@@ -134,11 +133,7 @@ impl<'a> Model<'a> {
                     what: "recurrent state",
                     detail: "qwen35 needs recurrent state and none was supplied".to_string(),
                 })?;
-                let mut logits = Vec::new();
-                for (i, &token) in tokens.iter().enumerate() {
-                    logits = m.forward(ops, token, start_pos + i, kv, rs, ctx)?;
-                }
-                Ok(logits)
+                m.forward(ops, tokens, start_pos, kv, rs, ctx)
             }
         }
     }

@@ -20,7 +20,7 @@
 //! # The session, and the constraint GatedDeltaNet imposes
 //!
 //! A chat client re-sends the whole conversation every turn. Re-prefilling all
-//! of it each time is O(n^2), and on `qwen35` prefill runs one token at a time,
+//! of it each time is O(n^2), and prefill used to run one token at a time,
 //! so a long chat would become unusable. Instead the engine keeps its state and
 //! only the *new* tokens are prefilled.
 //!
@@ -223,12 +223,12 @@ impl<O: Ops> Session<'_, O> {
             });
         }
 
-        // Checked before a single token runs, because prefill is one forward
-        // pass per token and finding out the hard way costs minutes. A VS Code
-        // Copilot request carries a ~78,000-character system prompt -- tool
-        // definitions, the workspace file tree, terminal state -- which is
-        // ~20,000 tokens before the user has typed anything, and the failure
-        // used to arrive three minutes in.
+        // Checked before a single token runs. A VS Code Copilot request carries
+        // a ~78,000-character system prompt -- tool definitions, the workspace
+        // file tree, terminal state -- which is ~20,000 tokens before the user
+        // has typed anything. When prefill was one forward pass per token that
+        // failure arrived three minutes in; batching made it fast rather than
+        // free, so checking up front still earns its place.
         let need = self.consumed + tokens.len();
         if need > self.engine.n_ctx() {
             return Err(Error::InconsistentArchitecture {

@@ -73,6 +73,71 @@ fn decoding_advances_the_cache_position() {
     assert_eq!(engine.pos(), 0, "reset returns to the start");
 }
 
+/// **Batched prefill must evolve the recurrent state exactly as one token at a
+/// time does.** The acceptance criterion for batching `qwen35`.
+///
+/// `qwen3`'s equivalent lives in `tests/kv_cache.rs`, and for that architecture
+/// a batch only had to get the KV cache and the causal mask right. Here there
+/// is a second, harder thing to get right: 24 of the 32 layers are
+/// GatedDeltaNet, and their state is a running matrix that token `t` updates
+/// for token `t+1`. Batching those layers means iterating the scan *inside* the
+/// seam instead of outside it, and an off-by-one in that loop -- a token's
+/// alpha read from the wrong row, a state advanced twice, a conv window taken
+/// before rather than after the update -- would still produce fluent-looking
+/// text. This is what makes such a slip a failure instead of a mystery.
+///
+/// Bit-identical, not a tolerance: the batched path runs the same arithmetic in
+/// the same order on the same values, so anything else is a bug rather than
+/// drift.
+#[test]
+#[ignore = "loads the real 9B; run with --release -- --ignored"]
+fn batched_prefill_equals_token_by_token() {
+    use inferred_thoughts::{Engine, Model, Naive, Tokenizer};
+
+    let Some(path) = common::find_model_named("Qwen3.5-9B-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.5-9B-Q8_0.gguf found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is Paris, and the capital of", true, true);
+    assert!(tokens.len() >= 6, "prompt too short to exercise the scan");
+    let n_ctx = tokens.len() + 4;
+
+    // The whole prompt in one pass.
+    let batched = {
+        let m = Model::load(&f).expect("load model");
+        let mut e = Engine::new(m, Naive, n_ctx, false);
+        e.prefill(&tokens).expect("prefill")
+    };
+
+    // The same prompt one token at a time. A recurrent architecture cannot
+    // rewind, so this needs its own engine rather than a reset mid-run.
+    let stepwise = {
+        let m = Model::load(&f).expect("load model");
+        let mut e = Engine::new(m, Naive, n_ctx, false);
+        let mut logits = e.prefill(&tokens[..1]).expect("prefill first token");
+        for (i, &tok) in tokens.iter().enumerate().skip(1) {
+            logits = e.decode(tok).expect("decode");
+            assert_eq!(e.pos(), i + 1, "cache length tracks absolute position");
+        }
+        logits
+    };
+
+    assert_eq!(batched.len(), stepwise.len(), "same vocabulary");
+    let differing = batched
+        .iter()
+        .zip(&stepwise)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} of {} logits differ between a batched prefill and the same \
+         tokens one at a time; the batch is not reproducing the scan",
+        batched.len()
+    );
+}
+
 #[test]
 #[ignore = "loads the real 9B; run with --release -- --ignored"]
 fn config_matches_the_9b_tensor_shapes() {

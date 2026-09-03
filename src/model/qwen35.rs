@@ -177,6 +177,8 @@
 //! kernel. This was flagged unverified precisely because getting it wrong would
 //! look like a numerics bug rather than a structural one.
 
+use std::cell::RefCell;
+
 use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
 use crate::gguf::GgufFile;
@@ -479,7 +481,15 @@ struct Layer<'a> {
 ///
 /// Sized for the widest layer of each kind, so an attention block and a
 /// recurrent block share the same allocations.
+#[derive(Default)]
 struct Scratch {
+    /// The residual stream, here with the rest so it too keeps one address.
+    x: Vec<f32>,
+    /// The last row lifted out of `x`, its norm, and the logits. Not batched —
+    /// only the final position produces output — but owned for the same reason.
+    last: Vec<f32>,
+    final_norm: Vec<f32>,
+    logits: Vec<f32>,
     normed: Vec<f32>,
     mixed: Vec<f32>,
     gate: Vec<f32>,
@@ -505,30 +515,54 @@ struct Scratch {
 }
 
 impl Scratch {
-    fn new(c: &Config) -> Self {
-        let z = |n: usize| vec![0.0f32; n];
-        Self {
-            normed: z(c.n_embd),
-            mixed: z(c.n_embd),
-            gate: z(c.n_ff),
-            up: z(c.n_ff),
-            ffn_out: z(c.n_embd),
-            qg: z(c.q_gate_dim()),
-            q: z(c.head_dim * c.n_head),
-            g: z(c.head_dim * c.n_head),
-            k: z(c.kv_dim()),
-            v: z(c.kv_dim()),
-            attn: z(c.head_dim * c.n_head),
-            qkv: z(c.conv_dim()),
-            z: z(c.value_dim()),
-            alpha: z(c.n_v_heads()),
-            beta: z(c.n_v_heads()),
-            conv: z(c.conv_dim()),
-            q_part: z(c.key_dim()),
-            k_part: z(c.key_dim()),
-            v_part: z(c.value_dim()),
-            core: z(c.value_dim()),
-        }
+    /// Size every buffer for a batch of `n` tokens, token-major, **without
+    /// moving it**.
+    ///
+    /// Every buffer is `n` copies of the single-token shape, which is what lets
+    /// [`Qwen35::attention`] and [`Qwen35::gated_delta`] batch with almost no
+    /// change: they were already written as whole-buffer calls through the
+    /// seam, so a longer buffer is simply a bigger call.
+    ///
+    /// **Resized rather than reallocated, and owned by the model rather than
+    /// built per pass.** `Vec::resize` moves nothing while capacity holds, so
+    /// capacity settles at the largest batch ever seen and the addresses then
+    /// never change again.
+    ///
+    /// That matters because a device backend keys its activation mirrors on
+    /// host addresses and never frees them — `Mirror::invalidate` records why.
+    /// Allocating these per pass left a whole new set of device buffers behind
+    /// every time: measured at **64 mirrors holding 84 MiB** after one prompt
+    /// on the 0.6B, climbing for as long as a session ran. It cost throughput
+    /// too, because a mirror at a new address is not device-current and every
+    /// buffer was re-uploaded — 261 -> 656 tok/s of prefill on that same run.
+    fn fit(&mut self, c: &Config, n: usize) {
+        let z = |b: &mut Vec<f32>, k: usize| b.resize(n * k, 0.0);
+        z(&mut self.x, c.n_embd);
+        z(&mut self.normed, c.n_embd);
+        z(&mut self.mixed, c.n_embd);
+        z(&mut self.gate, c.n_ff);
+        z(&mut self.up, c.n_ff);
+        z(&mut self.ffn_out, c.n_embd);
+        z(&mut self.qg, c.q_gate_dim());
+        z(&mut self.q, c.head_dim * c.n_head);
+        z(&mut self.g, c.head_dim * c.n_head);
+        z(&mut self.k, c.kv_dim());
+        z(&mut self.v, c.kv_dim());
+        z(&mut self.attn, c.head_dim * c.n_head);
+        z(&mut self.qkv, c.conv_dim());
+        z(&mut self.z, c.value_dim());
+        z(&mut self.alpha, c.n_v_heads());
+        z(&mut self.beta, c.n_v_heads());
+        z(&mut self.conv, c.conv_dim());
+        z(&mut self.q_part, c.key_dim());
+        z(&mut self.k_part, c.key_dim());
+        z(&mut self.v_part, c.value_dim());
+        z(&mut self.core, c.value_dim());
+
+        // One row of output per pass, whatever the batch.
+        self.last.resize(c.n_embd, 0.0);
+        self.final_norm.resize(c.n_embd, 0.0);
+        self.logits.resize(c.n_vocab, 0.0);
     }
 }
 
@@ -548,6 +582,9 @@ pub struct Qwen35<'a> {
     /// megabytes, and one numbering is worth more than the memory.
     kv_slot: Vec<usize>,
     n_kv_layer: usize,
+    /// Activation buffers, owned so their **addresses never change**. See
+    /// [`Scratch`].
+    scratch: RefCell<Scratch>,
 }
 
 impl<'a> Qwen35<'a> {
@@ -627,6 +664,7 @@ impl<'a> Qwen35<'a> {
             layers,
             kv_slot,
             n_kv_layer: next,
+            scratch: RefCell::new(Scratch::default()),
         })
     }
 
@@ -673,29 +711,39 @@ impl<'a> Qwen35<'a> {
         per_layer + w(&self.output)
     }
 
-    /// One token against the recurrent state and the KV cache.
+    /// Run `tokens` from absolute position `start_pos` against the recurrent
+    /// state and the KV cache, and return logits for the last one.
     ///
-    /// **Single token only, deliberately, for now.** The delta rule is a
-    /// sequential scan — token `t`'s state update feeds token `t+1` — so a
-    /// batched prefill is a different algorithm (llama.cpp has a whole chunked
-    /// path for it), not a loop tightening. Prefill therefore runs this once
-    /// per prompt token, which is correct and slow, and the chunked form is a
-    /// later optimization rather than a correctness question.
+    /// **One function serves both phases**, as in [`super::Qwen3::forward`]:
+    /// prefill is the prompt at `start_pos = 0`, decode is one token at
+    /// `start_pos = kv.len()`.
     ///
-    /// That is a real departure from [`super::Qwen3::forward`], where one
-    /// function serving both phases is what makes the cache acceptance test
-    /// exact. Here the equivalent property comes for free: there is only one
-    /// path, so prefill and decode cannot disagree.
+    /// The delta rule and the causal convolution are sequential scans — token
+    /// `t`'s state update feeds `t+1` — so they cannot be parallelized over the
+    /// batch. That does **not** make them a reason to run the whole layer one
+    /// token at a time, which is what this used to do. Everything carrying real
+    /// bytes here is a matmul: the fused `attn_qkv`, `attn_gate`, `ssm_out`,
+    /// the attention projections and the whole FFN. Those batch, and a batch
+    /// reads each weight once instead of once per token. The two scans iterate
+    /// *behind the seam*, so llama.cpp's chunked algorithm can arrive later as a
+    /// backend change with no edit here.
     pub fn forward<O: Ops>(
         &self,
         ops: &O,
-        token: u32,
-        pos: usize,
+        tokens: &[u32],
+        start_pos: usize,
         kv: &mut KvCache,
         rs: &mut RecurrentState,
         ctx: &mut Ctx<'_>,
     ) -> Result<Vec<f32>> {
         let c = &self.cfg;
+        let n = tokens.len();
+        if n == 0 {
+            return Err(Error::InconsistentArchitecture {
+                what: "forward",
+                detail: "no tokens supplied".to_string(),
+            });
+        }
         rs.check(c.n_main_layer(), c.conv_state_len(), c.ssm_state_len())?;
         if kv.kv_dim() != c.kv_dim() {
             return Err(Error::InconsistentArchitecture {
@@ -707,48 +755,51 @@ impl<'a> Qwen35<'a> {
                 ),
             });
         }
-        if pos >= kv.n_ctx() {
+        // Checked up front so neither cache is left half-written.
+        if start_pos + n > kv.n_ctx() {
             return Err(Error::ContextOverflow {
-                pos,
+                pos: start_pos + n - 1,
                 n_ctx: kv.n_ctx(),
             });
         }
 
         let step = ctx.prof.begin_step();
-        ops.begin_pass(1);
+        ops.begin_pass(n);
 
         let nd = c.n_embd;
-        let mut x = vec![0.0f32; nd];
-        self.embed(token, &mut x)?;
-        ops.host_wrote(&x);
-        ctx.trace("inp_embd", 0, &x);
-
-        // One allocation per pass, not per layer. See `Scratch`.
-        let mut s = Scratch::new(c);
+        // Owned by the model and resized in place, so every buffer keeps the
+        // address it had last pass. See `Scratch`.
+        let s = &mut *self.scratch.borrow_mut();
+        s.fit(c, n);
+        for (t, &token) in tokens.iter().enumerate() {
+            self.embed(token, &mut s.x[t * nd..(t + 1) * nd])?;
+        }
+        ops.host_wrote(&s.x);
+        ctx.trace("inp_embd", 0, &s.x);
 
         for il in 0..c.n_main_layer() {
             let layer = &self.layers[il];
             let t_mix = ctx.prof.layer_begin();
 
-            ops.rms_norm(&x, &layer.attn_norm, c.rms_eps, &mut s.normed);
+            ops.rms_norm(&s.x, &layer.attn_norm, c.rms_eps, &mut s.normed);
             ctx.trace("attn_norm", il, &s.normed);
 
             match &layer.mixer {
-                Mixer::Attn { .. } => self.attention(ops, layer, il, pos, kv, &mut s, ctx)?,
-                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, &mut s, ctx)?,
+                Mixer::Attn { .. } => self.attention(ops, layer, il, start_pos, n, kv, s, ctx)?,
+                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, s, ctx)?,
             }
-            ops.add_assign(&mut x, &s.mixed);
-            ctx.trace("attn_residual", il, &x);
+            ops.add_assign(&mut s.x, &s.mixed);
+            ctx.trace("attn_residual", il, &s.x);
             ctx.prof.layer_end(t_mix, step, il, Part::Attn);
 
             let t_ffn = ctx.prof.layer_begin();
-            ops.rms_norm(&x, &layer.ffn_norm, c.rms_eps, &mut s.normed);
+            ops.rms_norm(&s.x, &layer.ffn_norm, c.rms_eps, &mut s.normed);
             ops.matmul(&layer.ffn_gate, &s.normed, &mut s.gate);
             ops.matmul(&layer.ffn_up, &s.normed, &mut s.up);
             ops.silu_mul(&mut s.gate, &s.up);
             ops.matmul(&layer.ffn_down, &s.gate, &mut s.ffn_out);
-            ops.add_assign(&mut x, &s.ffn_out);
-            ctx.trace("post_ffn", il, &x);
+            ops.add_assign(&mut s.x, &s.ffn_out);
+            ctx.trace("post_ffn", il, &s.x);
             ctx.prof.layer_end(t_ffn, step, il, Part::Ffn);
         }
 
@@ -763,17 +814,24 @@ impl<'a> Qwen35<'a> {
         // does not care about `pos`, so the model still emits plausible text
         // for a few tokens before collapsing. That is what made it look like
         // numerical drift.
-        kv.commit(pos + 1);
+        kv.commit(start_pos + n);
 
-        ops.rms_norm(&x, &self.output_norm, c.rms_eps, &mut s.normed);
-        ctx.trace("result_norm", 0, &s.normed);
+        // Only the final position's logits are needed, and the last row is
+        // taken through the seam rather than by sub-slicing `x`: a device
+        // backend keys its mirrors on host addresses, so `&x[(n-1)*nd..]` would
+        // be an unseen address uploaded from a host copy the device never
+        // wrote. See the same note in `qwen3::forward`.
+        ops.gather_chunks(&s.x, nd, nd, (n - 1) * nd, &mut s.last);
+        ops.rms_norm(&s.last, &self.output_norm, c.rms_eps, &mut s.final_norm);
+        ctx.trace("result_norm", 0, &s.final_norm);
 
-        let mut logits = vec![0.0f32; c.n_vocab];
-        ops.matmul(&self.output, &s.normed, &mut logits);
+        ops.matmul(&self.output, &s.final_norm, &mut s.logits);
         ops.end_pass();
-        ops.host_needs(&mut logits);
-        ctx.trace("result_output", 0, &logits);
-        Ok(logits)
+        ops.host_needs(&mut s.logits);
+        ctx.trace("result_output", 0, &s.logits);
+        // Copied out rather than moved: the buffer keeps its address, or the
+        // next pass allocates a new one and strands a device mirror.
+        Ok(s.logits.clone())
     }
 
     /// A full-attention block.
@@ -790,7 +848,8 @@ impl<'a> Qwen35<'a> {
         ops: &O,
         layer: &Layer<'_>,
         il: usize,
-        pos: usize,
+        start_pos: usize,
+        n: usize,
         kv: &mut KvCache,
         s: &mut Scratch,
         ctx: &mut Ctx<'_>,
@@ -812,7 +871,6 @@ impl<'a> Qwen35<'a> {
         };
 
         let (hd, kd) = (c.head_dim, c.kv_dim());
-        let qd = hd * c.n_head;
 
         ops.matmul(wq, &s.normed, &mut s.qg);
         ctx.trace("Qcur_full", il, &s.qg);
@@ -834,21 +892,27 @@ impl<'a> Qwen35<'a> {
         ops.rms_norm_heads(&mut s.k, k_norm, hd, c.rms_eps);
         ctx.trace("Kcur_normed", il, &s.k);
 
-        ops.rope_neox(&mut s.q, pos, hd, c.n_rot, c.n_head, c.rope_theta);
+        // From row 0's absolute position; the op advances one per row.
+        ops.rope_neox(&mut s.q, start_pos, hd, c.n_rot, c.n_head, c.rope_theta);
         ctx.trace("Qcur", il, &s.q);
-        ops.rope_neox(&mut s.k, pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
+        ops.rope_neox(&mut s.k, start_pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
         ctx.trace("Kcur", il, &s.k);
 
+        // The whole batch is published before attending, because row `t`
+        // attends to rows this same call wrote. One contiguous run: the cache
+        // is position-major and the batch occupies consecutive positions.
         let slot = self.kv_slot[il];
-        ops.kv_write(kv.k_layer_mut(slot), pos * kd, &s.k);
-        ops.kv_write(kv.v_layer_mut(slot), pos * kd, &s.v);
+        ops.kv_write(kv.k_layer_mut(slot), start_pos * kd, &s.k);
+        ops.kv_write(kv.v_layer_mut(slot), start_pos * kd, &s.v);
 
         let a = Attn {
             q: &s.q,
             k: kv.k_layer(slot),
             v: kv.v_layer(slot),
             kv_dim: kd,
-            n_pos: pos + 1,
+            // The *last* row's window; earlier rows are masked to fewer by
+            // `Attn::n_pos_of`, which is what keeps a batched prefill causal.
+            n_pos: start_pos + n,
             head_dim: hd,
             n_head: c.n_head,
             n_head_kv: c.n_head_kv,

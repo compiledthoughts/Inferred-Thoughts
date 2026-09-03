@@ -28,30 +28,14 @@ pub struct Naive;
 /// Elements per Q8_0 block (`QK8_0` in ggml-common.h).
 pub(crate) const QK8_0: usize = 32;
 
-impl Ops for Naive {
-    fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
-        debug_assert_eq!(x.len(), weight.len());
-        debug_assert_eq!(x.len(), out.len());
-
-        let scale = rms_scale(x, eps);
-        for i in 0..x.len() {
-            out[i] = x[i] * scale * weight[i];
-        }
-    }
-
-    fn rms_norm_heads(&self, x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
-        debug_assert_eq!(weight.len(), head_dim);
-        debug_assert_eq!(x.len() % head_dim, 0);
-
-        for head in x.chunks_exact_mut(head_dim) {
-            let scale = rms_scale(head, eps);
-            for i in 0..head_dim {
-                head[i] = head[i] * scale * weight[i];
-            }
-        }
-    }
-
-    fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
+impl Naive {
+    /// One token against every weight row — the body the batched
+    /// [`Ops::matmul`] loops over.
+    ///
+    /// Split out rather than inlined so the batch loop reads as "do the
+    /// single-token thing `n` times", which is exactly the claim the
+    /// differential tests check.
+    fn matmul_row(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
         debug_assert_eq!(x.len(), w.n_in);
         debug_assert_eq!(out.len(), w.n_out);
 
@@ -63,7 +47,7 @@ impl Ops for Naive {
             // matching it is what makes this a usable oracle. It is also what
             // a SIMD backend will do, so this stays a faithful scalar model.
             GgmlType::Q8_0 => {
-                // Quantized once per matmul and shared across all rows, as in
+                // Quantized once per token and shared across all rows, as in
                 // ggml_compute_forward_mul_mat.
                 let qx = QuantizedRow::from_f32(x);
                 for j in 0..w.n_out {
@@ -77,144 +61,9 @@ impl Ops for Naive {
             }
         }
     }
-
-    fn rope_neox(
-        &self,
-        x: &mut [f32],
-        pos: usize,
-        head_dim: usize,
-        n_rot: usize,
-        n_heads: usize,
-        theta_base: f32,
-    ) {
-        debug_assert_eq!(x.len(), head_dim * n_heads);
-        debug_assert_eq!(n_rot % 2, 0);
-        debug_assert!(n_rot <= head_dim);
-
-        // Only the first `n_rot` of each head rotate; the rest pass through.
-        // The frequency divides by `n_rot`, not `head_dim` -- ggml's rope_yarn
-        // takes `theta_scale = powf(freq_base, -2/n_dims)` with n_dims = n_rot.
-        let half = n_rot / 2;
-        for head in x.chunks_exact_mut(head_dim) {
-            for i in 0..half {
-                let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
-                let theta = pos as f64 * freq;
-                let (sin, cos) = theta.sin_cos();
-                let (sin, cos) = (sin as f32, cos as f32);
-
-                // NEOX pairs i with i + head_dim/2.
-                let x0 = head[i];
-                let x1 = head[i + half];
-                head[i] = x0 * cos - x1 * sin;
-                head[i + half] = x0 * sin + x1 * cos;
-            }
-        }
-    }
-
-    fn softmax(&self, x: &mut [f32]) {
-        softmax_in_place(x)
-    }
-
-    fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
-        debug_assert_eq!(out.len(), a.n_head * a.head_dim);
-        let per_kv = a.group() * a.head_dim;
-        // One scratch for the whole call, not one per head.
-        let mut sc = Scratch::for_attn(a);
-        for (h_kv, chunk) in out.chunks_mut(per_kv).enumerate() {
-            attend_kv_head(a, h_kv, chunk, &mut sc);
-        }
-    }
-
-    fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
-        debug_assert_eq!(gate.len(), up.len());
-        for i in 0..gate.len() {
-            let g = gate[i];
-            gate[i] = g / (1.0 + (-g).exp()) * up[i];
-        }
-    }
-
-    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
-        debug_assert_eq!(x.len() % head_dim, 0);
-
-        for head in x.chunks_exact_mut(head_dim) {
-            // Transcribed from ggml_compute_forward_l2_norm_f32. Two details
-            // that a glance at RMSNorm would get wrong: the sum is not divided
-            // by n, and eps clamps the norm from below instead of being added
-            // under the root. The f64 accumulator is the reference's
-            // `ggml_float`, and `sqrtf` takes a float, so the narrowing before
-            // the root is the reference's too and not an accident here.
-            let mut sum = 0.0f64;
-            for &v in head.iter() {
-                sum += f64::from(v * v);
-            }
-            let scale = 1.0f32 / (sum as f32).sqrt().max(eps);
-            for v in head.iter_mut() {
-                *v *= scale;
-            }
-        }
-    }
-
-    fn ssm_conv(
-        &self,
-        state: &mut [f32],
-        x: &[f32],
-        weight: &[f32],
-        kernel: usize,
-        out: &mut [f32],
-    ) {
-        let keep = kernel - 1;
-        debug_assert_eq!(state.len(), out.len() * keep);
-        debug_assert_eq!(x.len(), out.len());
-        debug_assert_eq!(weight.len(), out.len() * kernel);
-
-        for (c, o) in out.iter_mut().enumerate() {
-            let past = &mut state[c * keep..(c + 1) * keep];
-
-            // f32, not f64. ggml_compute_forward_ssm_conv_f32 says outright
-            // that it avoids ggml_vec_dot_f32 "because its sum is in double
-            // precision", so accumulating wider here would make the oracle
-            // disagree with the reference it exists to reproduce.
-            //
-            // The window is the stored samples oldest-first, then this token,
-            // so tap `keep` is always the newest sample and never comes from
-            // the state.
-            let mut sum = 0.0f32;
-            for t in 0..keep {
-                sum += past[t] * weight[c * kernel + t];
-            }
-            sum += x[c] * weight[c * kernel + keep];
-            *o = sum / (1.0 + (-sum).exp()); // silu, fused in as the reference does
-
-            // Advance: drop the oldest, append this token.
-            past.rotate_left(1);
-            past[keep - 1] = x[c];
-        }
-    }
-
-    fn gather_chunks(
-        &self,
-        src: &[f32],
-        chunk: usize,
-        stride: usize,
-        offset: usize,
-        out: &mut [f32],
-    ) {
-        debug_assert_eq!(out.len() % chunk, 0);
-        for (c, dst) in out.chunks_exact_mut(chunk).enumerate() {
-            let at = c * stride + offset;
-            dst.copy_from_slice(&src[at..at + chunk]);
-        }
-    }
-
-    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
-        debug_assert_eq!(x.len(), g.len());
-        for i in 0..x.len() {
-            x[i] *= 1.0 / (1.0 + (-g[i]).exp());
-        }
-    }
-
-    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
-        debug_assert_eq!(state.len(), d.n_v_heads * d.state_per_head());
+    /// One token's delta-rule update — the body the batched [`Ops::delta_rule`]
+    /// applies in order.
+    fn delta_rule_row(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
         debug_assert_eq!(out.len(), d.n_v_heads * d.head_v_dim);
         debug_assert_eq!(d.v.len(), d.n_v_heads * d.head_v_dim);
         debug_assert_eq!(d.q.len(), d.n_k_heads * d.head_k_dim);
@@ -261,6 +110,217 @@ impl Ops for Naive {
                 }
                 out[h * sv + j] = o;
             }
+        }
+    
+    }
+}
+
+impl Ops for Naive {
+    fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
+        let nd = weight.len();
+        debug_assert_eq!(x.len() % nd, 0);
+        debug_assert_eq!(x.len(), out.len());
+
+        // Each row normalizes against its own mean. Batching cannot change a
+        // bit: no accumulation crosses a row boundary.
+        for (row, o) in x.chunks_exact(nd).zip(out.chunks_exact_mut(nd)) {
+            let scale = rms_scale(row, eps);
+            for i in 0..nd {
+                o[i] = row[i] * scale * weight[i];
+            }
+        }
+    }
+
+    fn rms_norm_heads(&self, x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
+        debug_assert_eq!(weight.len(), head_dim);
+        debug_assert_eq!(x.len() % head_dim, 0);
+
+        for head in x.chunks_exact_mut(head_dim) {
+            let scale = rms_scale(head, eps);
+            for i in 0..head_dim {
+                head[i] = head[i] * scale * weight[i];
+            }
+        }
+    }
+
+    fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(x.len() % w.n_in, 0);
+        debug_assert_eq!(out.len(), (x.len() / w.n_in) * w.n_out);
+
+        // The oracle walks the batch token by token, so every dot product is
+        // the one the single-token path computed, in the same order. A backend
+        // that instead reads each weight row once for all tokens is still
+        // bit-identical -- it reorders which outputs are computed together, not
+        // how any one of them accumulates.
+        for (xt, ot) in x.chunks_exact(w.n_in).zip(out.chunks_exact_mut(w.n_out)) {
+            self.matmul_row(w, xt, ot);
+        }
+    }
+
+    fn rope_neox(
+        &self,
+        x: &mut [f32],
+        pos: usize,
+        head_dim: usize,
+        n_rot: usize,
+        n_heads: usize,
+        theta_base: f32,
+    ) {
+        let per_row = head_dim * n_heads;
+        debug_assert_eq!(x.len() % per_row, 0);
+        debug_assert_eq!(n_rot % 2, 0);
+        debug_assert!(n_rot <= head_dim);
+
+        // Only the first `n_rot` of each head rotate; the rest pass through.
+        // The frequency divides by `n_rot`, not `head_dim` -- ggml's rope_yarn
+        // takes `theta_scale = powf(freq_base, -2/n_dims)` with n_dims = n_rot.
+        let half = n_rot / 2;
+        // `pos` is row 0's absolute position; rows are consecutive. Rotating
+        // every row at `pos` would be the classic KV cache bug, invisible in a
+        // prefill from zero and wrong for everything decoded after.
+        for (t, row) in x.chunks_exact_mut(per_row).enumerate() {
+            let pos = pos + t;
+            for head in row.chunks_exact_mut(head_dim) {
+            for i in 0..half {
+                let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
+                let theta = pos as f64 * freq;
+                let (sin, cos) = theta.sin_cos();
+                let (sin, cos) = (sin as f32, cos as f32);
+
+                // NEOX pairs i with i + head_dim/2.
+                let x0 = head[i];
+                let x1 = head[i + half];
+                head[i] = x0 * cos - x1 * sin;
+                head[i + half] = x0 * sin + x1 * cos;
+            }
+            }
+        }
+    }
+
+    fn softmax(&self, x: &mut [f32]) {
+        softmax_in_place(x)
+    }
+
+    fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), a.n_q() * a.n_head * a.head_dim);
+        let per_kv = a.group() * a.head_dim;
+        // One scratch for the whole call, not one per head or per row.
+        let mut sc = Scratch::for_attn(a);
+        // Query rows are independent given the cache — the batch is published
+        // before any of this runs — so `(t, h_kv)` is a grid of independent
+        // outputs. A threaded backend gets a wider one during prefill than it
+        // ever has in decode.
+        for t in 0..a.n_q() {
+            let row = &mut out[t * a.n_head * a.head_dim..][..a.n_head * a.head_dim];
+            for (h_kv, chunk) in row.chunks_mut(per_kv).enumerate() {
+                attend_kv_head(a, t, h_kv, chunk, &mut sc);
+            }
+        }
+    }
+
+    fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
+        debug_assert_eq!(gate.len(), up.len());
+        for i in 0..gate.len() {
+            let g = gate[i];
+            gate[i] = g / (1.0 + (-g).exp()) * up[i];
+        }
+    }
+
+    fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+        debug_assert_eq!(x.len() % head_dim, 0);
+
+        for head in x.chunks_exact_mut(head_dim) {
+            // Transcribed from ggml_compute_forward_l2_norm_f32. Two details
+            // that a glance at RMSNorm would get wrong: the sum is not divided
+            // by n, and eps clamps the norm from below instead of being added
+            // under the root. The f64 accumulator is the reference's
+            // `ggml_float`, and `sqrtf` takes a float, so the narrowing before
+            // the root is the reference's too and not an accident here.
+            let mut sum = 0.0f64;
+            for &v in head.iter() {
+                sum += f64::from(v * v);
+            }
+            let scale = 1.0f32 / (sum as f32).sqrt().max(eps);
+            for v in head.iter_mut() {
+                *v *= scale;
+            }
+        }
+    }
+
+    fn ssm_conv(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        out: &mut [f32],
+    ) {
+        let keep = kernel - 1;
+        let nc = weight.len() / kernel;
+        debug_assert_eq!(state.len(), nc * keep);
+        debug_assert_eq!(x.len(), out.len());
+        debug_assert_eq!(x.len() % nc, 0);
+
+        // Sequential in the batch: token `t` convolves over the window token
+        // `t-1` advanced, so the tokens cannot be reordered.
+        for (xt, ot) in x.chunks_exact(nc).zip(out.chunks_exact_mut(nc)) {
+        for (c, o) in ot.iter_mut().enumerate() {
+            let past = &mut state[c * keep..(c + 1) * keep];
+
+            // f32, not f64. ggml_compute_forward_ssm_conv_f32 says outright
+            // that it avoids ggml_vec_dot_f32 "because its sum is in double
+            // precision", so accumulating wider here would make the oracle
+            // disagree with the reference it exists to reproduce.
+            //
+            // The window is the stored samples oldest-first, then this token,
+            // so tap `keep` is always the newest sample and never comes from
+            // the state.
+            let mut sum = 0.0f32;
+            for t in 0..keep {
+                sum += past[t] * weight[c * kernel + t];
+            }
+            sum += xt[c] * weight[c * kernel + keep];
+            *o = sum / (1.0 + (-sum).exp()); // silu, fused in as the reference does
+
+            // Advance: drop the oldest, append this token.
+            past.rotate_left(1);
+            past[keep - 1] = xt[c];
+        }
+        }
+    }
+
+    fn gather_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        out: &mut [f32],
+    ) {
+        debug_assert_eq!(out.len() % chunk, 0);
+        for (c, dst) in out.chunks_exact_mut(chunk).enumerate() {
+            let at = c * stride + offset;
+            dst.copy_from_slice(&src[at..at + chunk]);
+        }
+    }
+
+    fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+        debug_assert_eq!(x.len(), g.len());
+        for i in 0..x.len() {
+            x[i] *= 1.0 / (1.0 + (-g[i]).exp());
+        }
+    }
+
+    fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+        debug_assert_eq!(state.len(), d.n_v_heads * d.state_per_head());
+        debug_assert_eq!(out.len(), d.n_tokens() * d.n_v_heads * d.head_v_dim);
+
+        // The one op with no batched form: token `t`'s rank-1 correction is
+        // token `t+1`'s stored state. `Delta::row` is shared with every other
+        // backend so the striding cannot drift from the oracle's.
+        let per_token = d.n_v_heads * d.head_v_dim;
+        for t in 0..d.n_tokens() {
+            self.delta_rule_row(&d.row(t), state, &mut out[t * per_token..(t + 1) * per_token]);
         }
     }
 
@@ -332,10 +392,19 @@ impl Scratch {
 /// is what keeps `par` bit-identical to this. Breaking the accumulator
 /// dependency chain *would* change the order, and is deliberately not done
 /// here.
-pub(crate) fn attend_kv_head(a: &Attn<'_>, h_kv: usize, out: &mut [f32], sc: &mut Scratch) {
+pub(crate) fn attend_kv_head(
+    a: &Attn<'_>,
+    t: usize,
+    h_kv: usize,
+    out: &mut [f32],
+    sc: &mut Scratch,
+) {
     sc.fit(a);
-    let (hd, group, n_pos) = (a.head_dim, a.group(), a.n_pos);
+    // Query row `t` sees only its own history: the causal mask *is* this
+    // number. In decode `n_q == 1` and it is `a.n_pos`, unchanged.
+    let (hd, group, n_pos) = (a.head_dim, a.group(), a.n_pos_of(t));
     let off = h_kv * hd;
+    let q_row = t * a.n_head * hd;
     debug_assert_eq!(out.len(), group * hd);
 
     // Pass 1: scores. Convert each position's key once, score it against every
@@ -346,7 +415,7 @@ pub(crate) fn attend_kv_head(a: &Attn<'_>, h_kv: usize, out: &mut [f32], sc: &mu
             *dst = f16_to_f32(bits);
         }
         for g in 0..group {
-            let q = &a.q[(h_kv * group + g) * hd..][..hd];
+            let q = &a.q[q_row + (h_kv * group + g) * hd..][..hd];
             let dot: f32 = q.iter().zip(&sc.conv).map(|(x, y)| x * y).sum();
             sc.scores[g * n_pos + s] = dot * a.scale;
         }

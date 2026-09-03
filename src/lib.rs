@@ -21,6 +21,6 @@ pub use gguf::GgufFile;
 pub use model::{Model, Qwen3, Qwen35};
 pub use ops::{Ops, naive::Naive, par::Par, spin::Spin};
 #[cfg(feature = "cuda")]
-pub use ops::cuda::{Cuda, DeviceBench, DeviceStats};
+pub use ops::cuda::{Cuda, DeviceBench, DeviceStats, Resident};
 pub use profile::{Ctx, Profile};
 pub use tok::Tokenizer;

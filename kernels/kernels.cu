@@ -123,6 +123,12 @@ __global__ void rms_norm(int n, const float *__restrict__ x,
     extern __shared__ float sq[];
     __shared__ float scale;
 
+    // One block per row of the batch. Each row normalizes against its own mean,
+    // so nothing accumulates across the block boundary and a batch is
+    // bit-identical to the same rows done one at a time.
+    x += (size_t)blockIdx.x * n;
+    out += (size_t)blockIdx.x * n;
+
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float v = x[i];
         sq[i] = v * v;
@@ -210,6 +216,9 @@ __global__ void rms_norm_heads(int head_dim, const float *__restrict__ w,
 __global__ void rms_norm_tree(int n, const float *__restrict__ x,
                               const float *__restrict__ w, float eps,
                               float *__restrict__ out) {
+    // One block per row of the batch, as in `rms_norm` above.
+    x += (size_t)blockIdx.x * n;
+    out += (size_t)blockIdx.x * n;
     __shared__ double p[256];
     __shared__ float scale;
 
@@ -272,19 +281,27 @@ __global__ void rms_norm_heads_tree(int head_dim, const float *__restrict__ w,
 // and CUDA's double-precision pow and sincos are not obliged to return the same
 // bits. Computing the table once on the CPU costs head_dim/2 transcendentals
 // per call and makes this kernel exactly the oracle's arithmetic.
-__global__ void rope_neox(int head_dim, int n_rot, int n_heads,
+__global__ void rope_neox(int head_dim, int n_rot, int n_heads, int n_tok,
                           const float *__restrict__ cosv,
                           const float *__restrict__ sinv, float *__restrict__ x) {
     // Partial RoPE: only the first `n_rot` of each head rotate and the rest
     // pass through, so the pair stride is n_rot/2 and the head stride stays
     // head_dim. qwen35 rotates 64 of 256; qwen3 passes n_rot == head_dim.
     const int half = n_rot / 2;
+    const int per_row = n_heads * half;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_heads * half) return;
+    if (idx >= n_tok * per_row) return;
 
-    float *head = x + (size_t)(idx / half) * head_dim;
-    const int i = idx % half;
-    const float c = cosv[i], s = sinv[i];
+    // Consecutive rows are consecutive absolute positions, so the caller sends
+    // `n_tok` stacked cos/sin tables and each row reads its own. Rotating every
+    // row at row 0's position is the classic KV cache bug -- invisible in a
+    // prefill from zero, wrong for everything decoded after.
+    const int t = idx / per_row;
+    const int within = idx % per_row;
+
+    float *head = x + (size_t)t * n_heads * head_dim + (size_t)(within / half) * head_dim;
+    const int i = within % half;
+    const float c = cosv[(size_t)t * half + i], s = sinv[(size_t)t * half + i];
 
     // NEOX pairs i with i + head_dim/2, not with i + 1.
     const float x0 = head[i];
@@ -566,6 +583,86 @@ __global__ void matmul_q8_0_warp(int n_in, int n_out,
         float sumf = 0.0f;
         for (int b = 0; b < n_blocks; ++b) sumf += mine[b];
         out[j] = sumf;
+    }
+}
+
+// The same dot product as `matmul_q8_0_warp`, with the batch in registers.
+//
+// **This is the kernel batched prefill exists for.** The single-token version
+// reads the whole weight from VRAM for every token, which is why prefill cost
+// what generating the prompt would: at 20k prompt tokens the 9B's weights would
+// cross the bus 20,000 times. Here a warp loads its slice of a weight row once
+// and dots it against `MM_TOK` tokens held in registers, so weight traffic --
+// the dominant term, and the one the card is actually limited by after the
+// repack took it to 85-89% of peak -- falls by that factor.
+//
+// Bit-exactness is untouched, and for the reason recorded above: the block sum
+// is integer and order-free, and each token's cross-block sum is still walked
+// serially in ascending `b`. Adding a token axis changes which outputs share a
+// weight load, never how one output accumulates. So the batched and unbatched
+// kernels agree exactly, which `tests/cuda_ops.rs` asserts rather than assumes.
+//
+// Shared memory is `warps_per_block * MM_TOK * n_blocks` floats. That is what
+// caps MM_TOK at 4: the 9B's `ffn_down` has n_in 12288, so n_blocks is 384 and
+// four warps need 24.5 KB, already half the 48 KB a block may ask for.
+#define MM_TOK 4
+__global__ void matmul_q8_0_batch(int n_in, int n_out, int n_tok,
+                                  const unsigned short *__restrict__ w_scales,
+                                  const signed char *__restrict__ w_quants,
+                                  const float *__restrict__ x_scales,
+                                  const signed char *__restrict__ x_quants,
+                                  float *__restrict__ out) {
+    extern __shared__ float partial[];
+
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int t0 = blockIdx.y * MM_TOK;
+    if (j >= n_out) return;
+
+    // The tail block of the batch carries fewer than MM_TOK tokens.
+    int nt = n_tok - t0;
+    if (nt > MM_TOK) nt = MM_TOK;
+
+    float *mine = partial + (size_t)warp * MM_TOK * n_blocks;
+
+    for (int b = lane; b < n_blocks; b += 32) {
+        // Loaded once, used `nt` times. This is the whole point of the kernel.
+        const float dw = __half2float(__ushort_as_half(w_scales[(size_t)j * n_blocks + b]));
+        const int4 *wq = (const int4 *)(w_quants + (size_t)j * n_in + (size_t)b * 32);
+        const int4 w0 = wq[0], w1 = wq[1];
+
+        for (int u = 0; u < nt; ++u) {
+            const int t = t0 + u;
+            const int4 *xq =
+                (const int4 *)(x_quants + (size_t)t * n_in + (size_t)b * 32);
+            const int4 a0 = xq[0], a1 = xq[1];
+
+            int sumi = 0;
+            sumi = __dp4a(w0.x, a0.x, sumi);
+            sumi = __dp4a(w0.y, a0.y, sumi);
+            sumi = __dp4a(w0.z, a0.z, sumi);
+            sumi = __dp4a(w0.w, a0.w, sumi);
+            sumi = __dp4a(w1.x, a1.x, sumi);
+            sumi = __dp4a(w1.y, a1.y, sumi);
+            sumi = __dp4a(w1.z, a1.z, sumi);
+            sumi = __dp4a(w1.w, a1.w, sumi);
+
+            mine[(size_t)u * n_blocks + b] =
+                (float)sumi * (dw * x_scales[(size_t)t * n_blocks + b]);
+        }
+    }
+    __syncwarp();
+
+    // One ordered accumulation per token, each kept serial and ascending.
+    if (lane == 0) {
+        for (int u = 0; u < nt; ++u) {
+            const float *p = mine + (size_t)u * n_blocks;
+            float sumf = 0.0f;
+            for (int b = 0; b < n_blocks; ++b) sumf += p[b];
+            out[(size_t)(t0 + u) * n_out + j] = sumf;
+        }
     }
 }
 

@@ -47,6 +47,14 @@ enum Command {
         /// this trades memory for the longest usable context.
         #[arg(short = 'c', long, default_value_t = 4096)]
         ctx: usize,
+        /// Prompt tokens per forward pass during prefill.
+        ///
+        /// A **memory** bound, not a speed knob: a device backend mirrors every
+        /// activation buffer and those are sized by the batch — ~405 KiB per
+        /// token on the 9B — and are not freed between passes. Raising this
+        /// costs VRAM that the model and KV cache would otherwise have.
+        #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
+        batch: usize,
         /// Print the profile summary: phase timings, byte traffic, and the
         /// top-2 logit margins.
         #[arg(long)]
@@ -127,6 +135,14 @@ enum Command {
         /// Context length. The KV cache is allocated for this up front.
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
+        /// Prompt tokens per forward pass during prefill.
+        ///
+        /// A **memory** bound, not a speed knob: a device backend mirrors every
+        /// activation buffer and those are sized by the batch — ~405 KiB per
+        /// token on the 9B — and are not freed between passes. Raising this
+        /// costs VRAM that the model and KV cache would otherwise have.
+        #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
+        batch: usize,
         /// Default generation budget when the request does not set one.
         #[arg(short = 'n', long, default_value_t = 512)]
         max_tokens: usize,
@@ -160,6 +176,7 @@ fn main() -> ExitCode {
             max_tokens,
             ignore_eos,
             ctx,
+            batch,
             profile,
             profile_detail,
             profile_json,
@@ -177,6 +194,7 @@ fn main() -> ExitCode {
                 max_tokens,
                 ignore_eos,
                 n_ctx: ctx,
+                max_batch: batch,
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
@@ -194,6 +212,7 @@ fn main() -> ExitCode {
             model,
             port,
             ctx,
+            batch,
             max_tokens,
             threads,
             backend,
@@ -203,6 +222,7 @@ fn main() -> ExitCode {
             model,
             port,
             ctx,
+            max_batch: batch,
             max_tokens,
             threads,
             backend,
@@ -245,6 +265,9 @@ struct GenOpts {
     max_tokens: usize,
     ignore_eos: bool,
     n_ctx: usize,
+    /// Prompt tokens per forward pass. See the CLI doc on `--batch`: this
+    /// bounds activation VRAM, which a batch sizes.
+    max_batch: usize,
     report: bool,
     detail: bool,
     json: Option<String>,
@@ -415,6 +438,34 @@ device   {} kernel launches", s.launches);
         s.d2h_bytes as f64 / 1048576.0,
     );
 
+    // Resident bytes, always printed. What the device *holds* is a different
+    // question from what crosses the bus, and only the first one explains why a
+    // long session ends up near the card's limit.
+    let r = cuda.resident_bytes();
+    let mib = |b: u64| b as f64 / 1048576.0;
+    eprintln!(
+        "
+resident {:.0} MiB total on the device",
+        mib(r.total())
+    );
+    eprintln!(
+        "         {:.0} MiB weights ({} tensors) | {:.0} MiB kv ({} slabs) | {:.0} MiB pool",
+        mib(r.weight_bytes),
+        r.weight_tensors,
+        mib(r.kv_bytes),
+        r.kv_slabs,
+        mib(r.pool_bytes),
+    );
+    // Mirrors are the term that can climb: they are keyed on host address and
+    // never freed, so a buffer allocated at a fresh address adds to this rather
+    // than reusing. Printed with the count so a climb is attributable.
+    eprintln!(
+        "         {:.0} MiB activations in {} mirrors (+{:.0} MiB quantized)",
+        mib(r.mirror_bytes),
+        r.mirrors,
+        mib(r.quant_bytes),
+    );
+
     if !o.device {
         eprintln!("         --profile-device times what one crossing costs");
         return Ok(());
@@ -449,6 +500,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
     use std::io::Write;
 
     let mut engine = Engine::new(model, ops, o.n_ctx, o.detail);
+    engine.set_max_batch(o.max_batch);
     let rs_bytes = engine.recurrent_capacity_bytes();
     eprintln!(
         "kv cache {:.0} MiB resident{}",
@@ -535,11 +587,27 @@ struct ServeArgs {
     model: String,
     port: u16,
     ctx: usize,
+    /// Prompt tokens per forward pass; bounds activation VRAM. See `--batch`.
+    max_batch: usize,
     max_tokens: usize,
     threads: usize,
     backend: String,
     rms_serial: bool,
     verbose: bool,
+}
+
+/// Apply the prefill batch cap to a freshly built engine.
+///
+/// A free function because `serve` builds an engine in four branches with four
+/// different backend types, and the cap must not be something one of them can
+/// forget: it bounds activation VRAM, which on the 9B is ~405 KiB per batch
+/// token. See `engine::DEFAULT_MAX_BATCH`.
+fn with_batch<'a, O: inferred_thoughts::Ops>(
+    mut e: inferred_thoughts::Engine<'a, O>,
+    n: usize,
+) -> inferred_thoughts::Engine<'a, O> {
+    e.set_max_batch(n);
+    e
 }
 
 fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
@@ -585,7 +653,7 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
             free as f64 / 1073741824.0,
             total as f64 / 1073741824.0,
         );
-        let engine = Engine::new(m, &cuda, a.ctx, false);
+        let engine = with_batch(Engine::new(m, &cuda, a.ctx, false), a.max_batch);
         let r = run_server(engine, tk, chat, opts);
         if let Some(e) = cuda.take_error() {
             return Err(e);
@@ -599,13 +667,28 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         a.threads
     };
     if n_threads <= 1 {
-        return run_server(Engine::new(m, Naive, a.ctx, false), tk, chat, opts);
+        return run_server(
+            with_batch(Engine::new(m, Naive, a.ctx, false), a.max_batch),
+            tk,
+            chat,
+            opts,
+        );
     }
     match a.backend.as_str() {
-        "spin" => run_server(Engine::new(m, Spin::new(n_threads), a.ctx, false), tk, chat, opts),
+        "spin" => run_server(
+            with_batch(Engine::new(m, Spin::new(n_threads), a.ctx, false), a.max_batch),
+            tk,
+            chat,
+            opts,
+        ),
         "par" => {
             Par::init(n_threads);
-            run_server(Engine::new(m, Par, a.ctx, false), tk, chat, opts)
+            run_server(
+                with_batch(Engine::new(m, Par, a.ctx, false), a.max_batch),
+                tk,
+                chat,
+                opts,
+            )
         }
         other => Err(inferred_thoughts::Error::InconsistentArchitecture {
             what: "--backend",

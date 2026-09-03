@@ -42,12 +42,17 @@ impl<'a> Weights<'a> {
     }
 }
 
-/// One token's attention inputs.
+/// The attention inputs for a batch of queries against one layer's history.
 ///
 /// A struct rather than ten positional arguments, which is how a `head_dim` and
 /// an `n_head` end up swapped.
+///
+/// **`q` may hold several consecutive query rows**, which is what makes prefill
+/// one call instead of one per token. The count is derived from `q.len()` (see
+/// [`Attn::n_q`]) rather than passed, so it cannot disagree with the buffer.
 pub struct Attn<'a> {
-    /// This token's queries, post-RoPE: `n_head * head_dim`.
+    /// Queries, post-RoPE: [`Attn::n_q`] consecutive rows of `n_head *
+    /// head_dim`, row `t` belonging to absolute position `n_pos - n_q + 1 + t`.
     pub q: &'a [f32],
     /// The layer's whole key slab as f16 bits, position-major with stride
     /// `kv_dim`. Only `0..n_pos` is read.
@@ -56,8 +61,12 @@ pub struct Attn<'a> {
     pub v: &'a [u16],
     /// Distance in elements between consecutive positions.
     pub kv_dim: usize,
-    /// Positions to attend over: `0..n_pos`, inclusive of this token, which is
-    /// what applies the causal mask.
+    /// Positions the **last** query row attends over: `0..n_pos`, inclusive of
+    /// itself. Earlier rows in the batch see proportionally fewer, which is
+    /// what applies the causal mask — see [`Attn::n_pos_of`].
+    ///
+    /// Defined against the last row rather than the first so that decode, where
+    /// `n_q == 1`, reads exactly as it always did: `n_pos = pos + 1`.
     pub n_pos: usize,
     pub head_dim: usize,
     pub n_head: usize,
@@ -70,6 +79,24 @@ impl Attn<'_> {
     /// Query heads served by one key/value head.
     pub fn group(&self) -> usize {
         self.n_head / self.n_head_kv
+    }
+
+    /// Query rows in this call. Derived from the buffer, never passed.
+    ///
+    /// One in decode; the whole prompt in a batched prefill. Deriving it means
+    /// a shape error is a failed division rather than a silently wrong mask.
+    pub fn n_q(&self) -> usize {
+        debug_assert_eq!(self.q.len() % (self.n_head * self.head_dim), 0);
+        self.q.len() / (self.n_head * self.head_dim)
+    }
+
+    /// Positions query row `t` attends over — **the causal mask**.
+    ///
+    /// Row `t` is at absolute position `n_pos - n_q + t`, and attends to
+    /// everything up to and including itself. At `n_q == 1` this is `n_pos`,
+    /// so decode is unchanged.
+    pub fn n_pos_of(&self, t: usize) -> usize {
+        self.n_pos - self.n_q() + 1 + t
     }
 }
 
@@ -128,14 +155,77 @@ impl Delta<'_> {
     pub fn state_per_head(&self) -> usize {
         self.head_k_dim * self.head_v_dim
     }
+
+    /// Tokens in this call. Derived from the buffers, like [`Attn::n_q`].
+    pub fn n_tokens(&self) -> usize {
+        let per = self.n_v_heads * self.head_v_dim;
+        debug_assert_eq!(self.v.len() % per, 0);
+        self.v.len() / per
+    }
+
+    /// Token `t` of the batch as a single-token [`Delta`].
+    ///
+    /// The scan has to be applied in order, so every implementation walks the
+    /// batch this way. Sharing one view function means a backend cannot get the
+    /// per-token striding subtly different from the oracle's.
+    pub fn row(&self, t: usize) -> Delta<'_> {
+        let (kper, vper) = (self.n_k_heads * self.head_k_dim, self.n_v_heads * self.head_v_dim);
+        let h = self.n_v_heads;
+        Delta {
+            q: &self.q[t * kper..(t + 1) * kper],
+            k: &self.k[t * kper..(t + 1) * kper],
+            v: &self.v[t * vper..(t + 1) * vper],
+            alpha: &self.alpha[t * h..(t + 1) * h],
+            beta: &self.beta[t * h..(t + 1) * h],
+            // Per-head constants, shared by every token in the batch.
+            ssm_a: self.ssm_a,
+            dt_bias: self.dt_bias,
+            head_k_dim: self.head_k_dim,
+            head_v_dim: self.head_v_dim,
+            n_k_heads: self.n_k_heads,
+            n_v_heads: self.n_v_heads,
+        }
+    }
 }
 
 /// Every primitive the qwen3 forward pass needs.
 ///
 /// Methods write into caller-provided buffers so a backend never allocates on
 /// the forward path.
+///
+/// # The batch convention
+///
+/// **Every method takes a batch of consecutive tokens, and `n` is derived from
+/// the buffers rather than passed.** Decode is `n == 1` of the same call, so
+/// there is one code path, not two — the same property that makes
+/// [`crate::model::Qwen3::forward`] serve prefill and decode and lets the cache
+/// acceptance test demand bit-identical logits.
+///
+/// A batched buffer is **token-major**: `n` consecutive rows, each the shape
+/// that single call used to take. The count comes from a division that the
+/// implementation asserts is exact, so a shape error fails loudly at the seam
+/// instead of becoming a silently wrong batch count.
+///
+/// Ops fall into three kinds, and the distinction is the whole reason this
+/// works without the seam growing a parallel set of methods:
+///
+/// | | ops | under a batch |
+/// |---|---|---|
+/// | elementwise, or per fixed-size slice | [`Ops::rms_norm_heads`], [`Ops::silu_mul`], [`Ops::l2_norm_heads`], [`Ops::sigmoid_mul`], [`Ops::add_assign`], [`Ops::gather_chunks`] | **already correct.** A longer buffer is more slices; nothing to change |
+/// | parallel over the batch | [`Ops::rms_norm`], [`Ops::matmul`], [`Ops::rope_neox`], [`Ops::attend`], [`Ops::kv_write`] | the win. `matmul` reads each weight row once for all `n` tokens instead of once per token |
+/// | **sequential in the batch** | [`Ops::ssm_conv`], [`Ops::delta_rule`] | token `t`'s state feeds `t+1`, so these iterate. They still take the batch, so a backend may loop inside one launch, or implement a chunked parallel form, without model code changing |
+///
+/// A backend that simply loops over the batch is *bit-identical* to one that
+/// does not, because batching changes which outputs are computed together and
+/// never the order of any accumulation. That is the exactness rule in
+/// `ARCHITECTURE.md` applied to a new axis, and it is why this whole change
+/// needs no tolerance.
 pub trait Ops {
-    /// `out = x / sqrt(mean(x^2) + eps) * weight`
+    /// `out = x / sqrt(mean(x^2) + eps) * weight`, for each of `n` rows.
+    ///
+    /// `n` is `x.len() / weight.len()`: the row length *is* the weight length,
+    /// so a batch is self-describing. Each row is normalized independently —
+    /// the mean is per row, never across the batch.
     ///
     /// No `+1` on the weight — that is Gemma's variant, not Qwen's.
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]);
@@ -145,7 +235,22 @@ pub trait Ops {
     /// shared across heads.
     fn rms_norm_heads(&self, x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32);
 
-    /// `out[j] = dot(w.row(j), x)` for every row, dequantizing as it goes.
+    /// `out[t][j] = dot(w.row(j), x[t])` for every weight row and every token,
+    /// dequantizing as it goes.
+    ///
+    /// **This is where batching pays.** `n` is `x.len() / w.n_in`, and the
+    /// weight is read once for the whole batch instead of once per token: a
+    /// 512-token prefill moves the model's bytes once, not 512 times. That is
+    /// the difference between prefill costing what a GEMM costs and costing
+    /// what generating the prompt would.
+    ///
+    /// Bit-exactness is free here and worth saying why: each `(t, j)` output is
+    /// a complete dot product of the same weight row in the same order. Batching
+    /// changes which outputs are computed together, never how any one of them
+    /// accumulates. For Q8_0 the activation row is quantized once per token and
+    /// shared across all weight rows, exactly as `ggml_compute_forward_mul_mat`
+    /// does — so a batched call quantizes `n` rows and reuses each across the
+    /// weight, which is the same arithmetic the per-token loop performed.
     fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]);
 
     /// NEOX-style rotary embedding, in place, over `n_heads` heads of
@@ -162,6 +267,15 @@ pub trait Ops {
     /// mirrors on the host address of a slice — so every head after the first
     /// looked like an unmirrored buffer and was uploaded from a stale host
     /// copy. It also cost 160 launches a token where one will do.
+    ///
+    /// **`pos` is the position of row 0**, and rows are consecutive: row `t`
+    /// rotates at `pos + t`. `n` is `x.len() / (head_dim * n_heads)`. Positions
+    /// in a batch are always consecutive in both phases — prefill is the prompt
+    /// from `start_pos`, decode is one row — so this needs no position array.
+    ///
+    /// Using the batch index instead of the absolute position is the classic KV
+    /// cache bug: invisible during a prefill from zero, where the two agree, and
+    /// wrong for every token decoded after.
     fn rope_neox(
         &self,
         x: &mut [f32],
@@ -176,8 +290,8 @@ pub trait Ops {
     /// implementations, and by the MoE router when Stage 7 lands.
     fn softmax(&self, x: &mut [f32]);
 
-    /// Scaled dot-product attention for one token against the cached history,
-    /// all heads at once.
+    /// Scaled dot-product attention for a batch of queries against the cached
+    /// history, all heads and all rows at once.
     ///
     /// **This is a whole-token op, not a per-head one, and that is the point.**
     /// Attention scoring is the only part of decode whose work grows with
@@ -190,6 +304,12 @@ pub trait Ops {
     /// K and V arrive as **raw f16 bits**, deliberately: the seam must not
     /// depend on `KvCache`, or the ops layer would be coupled to the very type
     /// the project exists to iterate on.
+    ///
+    /// A batch carries its own causal mask: row `t` attends over
+    /// [`Attn::n_pos_of`] positions, so early rows of a prefill do strictly
+    /// less work than late ones. The rows a prefill batch attends to include
+    /// rows this same call wrote, which is why model code publishes the whole
+    /// batch to the cache before attending.
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]);
 
     /// `gate = silu(gate) * up`, in place — the SwiGLU nonlinearity.
@@ -205,7 +325,14 @@ pub trait Ops {
     fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32);
 
     /// Depthwise causal conv1d over this layer's conv state and `x`, then
-    /// `silu`, advancing the state.
+    /// `silu`, advancing the state — for each of `n` tokens in turn.
+    ///
+    /// **Sequential in the batch.** Token `t` convolves over a window that
+    /// token `t-1` just advanced, so this iterates where [`Ops::matmul`]
+    /// parallelizes. It still takes the whole batch rather than being called
+    /// per token, so a backend can run the scan inside a single launch instead
+    /// of paying launch overhead `n` times. `n` is `x.len() / n_channels`,
+    /// where `n_channels` is `weight.len() / kernel`.
     ///
     /// **The seam takes the state slab, not an assembled window**, for the same
     /// reason [`Ops::kv_write`] does: a layer's history belongs wherever that
@@ -259,8 +386,21 @@ pub trait Ops {
     /// [`Ops::silu_mul`], and inexact for the same reason: `expf`.
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]);
 
-    /// The gated delta rule for one token, every value head, state updated in
-    /// place.
+    /// The gated delta rule for a batch of tokens, every value head, state
+    /// updated in place.
+    ///
+    /// **Sequential in the batch, and the one op with no batched form.** Token
+    /// `t`'s rank-1 correction is token `t+1`'s stored state, so the tokens
+    /// must be applied in order. llama.cpp has a separate chunked algorithm
+    /// that recovers parallelism; this signature is what lets that arrive as a
+    /// backend change rather than a model rewrite, because the seam already
+    /// hands over the whole batch. `n` is `d.v.len() / (n_v_heads *
+    /// head_v_dim)`.
+    ///
+    /// The cost of iterating here is small in the place it matters: within a
+    /// GatedDeltaNet layer everything carrying real bytes — the fused `attn_qkv`
+    /// and `attn_gate`, `ssm_out`, and the whole FFN — is a matmul and batches.
+    /// This scan touches only the state.
     ///
     /// Per value head `h`, with state `S` indexed `[value][key]` — key
     /// contiguous, matching ggml's `[S_v, S_v, H_v]` where `ne[0]` is the
@@ -325,6 +465,11 @@ pub trait Ops {
     fn end_pass(&self) {}
 
     /// Round `src` to f16 and write it into `slab` at `offset` elements in.
+    ///
+    /// Already batched, and needed no change to become so: the cache is
+    /// position-major and a batch occupies consecutive positions, so `n` rows
+    /// are one contiguous run of `n * kv_dim` elements at `start_pos * kv_dim`.
+    /// A prefill therefore publishes its whole batch in one call per layer.
     ///
     /// This is how K and V enter the cache. It goes through the seam rather
     /// than being done by the model because *where* the cache lives follows

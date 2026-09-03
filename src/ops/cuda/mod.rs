@@ -147,7 +147,10 @@ pub struct Cuda {
     /// Every layer rotates at the same position within one token, so the table
     /// is identical across all 28 of them — it was being rebuilt and re-sent 56
     /// times per token for no reason.
-    rope_pos: Cell<Option<(usize, usize, u32)>>,
+    /// `(pos of row 0, n_rot, theta bits, rows)`. `rows` is part of the key
+    /// because a batch's table is `rows` stacked tables, so its *length* varies
+    /// -- a decode step after a prefill must not reuse the prefill's.
+    rope_pos: Cell<Option<(usize, usize, u32, usize)>>,
 }
 
 /// A device copy of one host activation buffer.
@@ -183,6 +186,42 @@ impl Mirror {
 /// backend crosses the bus is a property of the backend, not of the model, and
 /// it is exactly the quantity the `Ops` seam determines — so it has to be
 /// observed. Two increments per op, off any inner loop.
+/// What this backend is holding on the device, by category.
+///
+/// **Built because a prediction was wrong.** Capping the prefill batch was
+/// expected to bring a long 9B session from 14.8 GiB to ~10.5 GiB; it brought
+/// it to 12.4. The existing counters cannot see the gap: they count crossings
+/// and launches, which are properties of the *traffic*, and this is a property
+/// of what was never released. The rule in `ARCHITECTURE.md` is the same one --
+/// how a backend uses the device is a fact about the backend, so it is observed
+/// rather than derived.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Resident {
+    /// Repacked Q8_0 weights: scales plus quants. Uploaded once, keyed on the
+    /// mmap pointer, genuinely permanent.
+    pub weight_bytes: u64,
+    pub weight_tensors: u64,
+    /// KV slabs, one per attending layer, allocated at full context up front.
+    pub kv_bytes: u64,
+    pub kv_slabs: u64,
+    /// Activation mirrors, keyed on **host address** and never freed. This is
+    /// the one that can climb across a session: a fresh `Vec` at an address not
+    /// seen before inserts a new entry instead of reusing an old one.
+    pub mirror_bytes: u64,
+    pub mirrors: u64,
+    /// The Q8_0 copies hanging off those mirrors.
+    pub quant_bytes: u64,
+    /// Scratch slots (RoPE tables, attention partials), indexed rather than
+    /// keyed, so bounded by construction.
+    pub pool_bytes: u64,
+}
+
+impl Resident {
+    pub fn total(&self) -> u64 {
+        self.weight_bytes + self.kv_bytes + self.mirror_bytes + self.quant_bytes + self.pool_bytes
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeviceStats {
     pub launches: u64,
@@ -684,6 +723,34 @@ impl Cuda {
     }
 
     /// Driver traffic so far.
+    /// Every device allocation this backend is holding, by category.
+    ///
+    /// Walks the four stores rather than maintaining a running total: it is
+    /// called once at the end of a run, and a counter incremented on every
+    /// allocation would be one more thing to keep honest.
+    pub fn resident_bytes(&self) -> Resident {
+        let mut r = Resident::default();
+        for (sc, q) in self.q8.borrow().values() {
+            r.weight_bytes += (sc.len_bytes() + q.len_bytes()) as u64;
+            r.weight_tensors += 1;
+        }
+        for m in self.kv.borrow().values() {
+            r.kv_bytes += m.buf.len_bytes() as u64;
+            r.kv_slabs += 1;
+        }
+        for m in self.mirrors.borrow().values() {
+            r.mirror_bytes += m.buf.len_bytes() as u64;
+            r.mirrors += 1;
+            if let Some((sc, q)) = &m.quant {
+                r.quant_bytes += (sc.len_bytes() + q.len_bytes()) as u64;
+            }
+        }
+        for b in self.pool.borrow().iter() {
+            r.pool_bytes += b.len_bytes() as u64;
+        }
+        r
+    }
+
     pub fn stats(&self) -> DeviceStats {
         self.stats.get()
     }

@@ -50,8 +50,41 @@ pub struct Engine<'a, O: Ops> {
     /// needs state and does not get it fails loudly instead of scanning an
     /// empty slice.
     recurrent: Option<RecurrentState>,
+    /// Largest number of prompt tokens handed to one forward pass.
+    ///
+    /// See [`Engine::set_max_batch`]. This exists because a batch's cost is not
+    /// only time.
+    max_batch: usize,
     pub prof: Profile,
 }
+
+/// Prompt tokens per forward pass, unless the caller says otherwise.
+///
+/// **This is a VRAM bound, not a speed knob**, and it was added after a batched
+/// prefill quietly cost 4.5 GiB on a long session. A device backend keeps a
+/// mirror of every activation buffer, and those buffers are sized by the batch:
+/// on the 9B they come to **405 KiB per token** — 376 of `Scratch`, of which
+/// the `n_ff` gate/up pair alone is 96, plus 29 of Q8_0 activation mirrors.
+/// The mirrors are deliberately *not* freed between passes (`Ops::begin_pass`
+/// invalidates in place, because freeing ~280 buffers per token was measured to
+/// cost more than it saved), so a single 10,000-token prefill sizes them at
+/// ~4 GiB and holds it for the life of the process.
+///
+/// That reasoning was sound while a buffer was one token wide. Batching made a
+/// buffer up to `n` tokens wide without revisiting it, and on the 35B — where
+/// VRAM is the entire constraint and 4.5 GiB is about ten layers of residency —
+/// the trade runs backwards.
+///
+/// 512 rather than the whole prompt because the speedup saturates far below it:
+/// the GPU's reuse is per-warp over `MM_TOK` = 4 tokens, and the rest is L2
+/// hits, neither of which needs thousands of rows. It caps activations at
+/// ~0.20 GiB on the 9B. llama.cpp draws the same line for the same reason
+/// (`n_batch` 2048, `n_ubatch` 512).
+///
+/// Chunking is safe to the bit: `split_prefill_equals_single_prefill` asserts a
+/// prefill split in two produces logits identical to one pass, which holds
+/// because a chunk is just a prefill at a later `start_pos`.
+pub const DEFAULT_MAX_BATCH: usize = 512;
 
 impl<'a, O: Ops> Engine<'a, O> {
     pub fn new(model: impl Into<Model<'a>>, ops: O, n_ctx: usize, detail: bool) -> Self {
@@ -69,8 +102,21 @@ impl<'a, O: Ops> Engine<'a, O> {
             ops,
             cache,
             recurrent,
+            max_batch: DEFAULT_MAX_BATCH,
             prof,
         }
+    }
+
+    /// Cap the prompt tokens handed to one forward pass. See
+    /// [`DEFAULT_MAX_BATCH`] for why this is a memory bound rather than a
+    /// tuning knob. Zero is rejected by clamping, so a caller cannot stall the
+    /// engine with it.
+    pub fn set_max_batch(&mut self, n: usize) {
+        self.max_batch = n.max(1);
+    }
+
+    pub fn max_batch(&self) -> usize {
+        self.max_batch
     }
 
     /// Absolute position the next token will occupy.
@@ -145,11 +191,30 @@ impl<'a, O: Ops> Engine<'a, O> {
         Ok((logits, t0.elapsed()))
     }
 
-    /// Process a whole prompt in one pass. Returns logits for its last token.
+    /// Process a whole prompt, in chunks of at most [`Engine::max_batch`].
+    /// Returns logits for its last token.
+    ///
+    /// Chunking is a **memory** decision, not a speed one — see
+    /// [`DEFAULT_MAX_BATCH`]. It costs nothing numerically: each chunk is an
+    /// ordinary prefill at a later `start_pos`, which is the property
+    /// `split_prefill_equals_single_prefill` pins down.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let (logits, dt) = self.run(tokens)?;
+        let (logits, dt) = self.prefill_chunked(tokens)?;
         self.prof.add_prefill(tokens.len(), dt);
         Ok(logits)
+    }
+
+    /// The chunk loop, shared by [`Engine::prefill`] and [`Engine::generate`]
+    /// so neither can acquire its own batching policy.
+    fn prefill_chunked(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Duration)> {
+        let mut logits = Vec::new();
+        let mut total = Duration::ZERO;
+        for chunk in tokens.chunks(self.max_batch) {
+            let (l, dt) = self.run(chunk)?;
+            logits = l;
+            total += dt;
+        }
+        Ok((logits, total))
     }
 
     /// Process one token against the cached history.
@@ -174,7 +239,7 @@ impl<'a, O: Ops> Engine<'a, O> {
     ) -> Result<(Vec<u32>, StopReason)> {
         self.prof.reserve(self.model.n_layer(), max_new);
 
-        let (mut logits, dt) = self.run(prompt)?;
+        let (mut logits, dt) = self.prefill_chunked(prompt)?;
         self.prof.add_prefill(prompt.len(), dt);
         let mut elapsed = dt;
 
