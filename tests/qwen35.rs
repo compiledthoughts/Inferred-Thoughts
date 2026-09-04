@@ -275,3 +275,43 @@ fn the_35b_loads_and_experts_address_contiguously() {
     );
     println!("  35B reads {per_pass:.2} GiB per token");
 }
+
+/// The 35B produces coherent text — the acceptance test for the MoE path.
+///
+/// **Deliberately a text assertion rather than a numeric one.** The routing
+/// rule has four places where a plausible misreading still yields fluent
+/// output: a softmax of the top 8 instead of the top 8 of the softmax, an
+/// unnormalized weight vector, a missing shared expert, or the shared expert
+/// added without its sigmoid gate. Each of those degrades the model rather than
+/// breaking it, so "it ran" proves nothing and only the content does.
+///
+/// `llama-eval-callback` remains the sharp instrument for localizing a numeric
+/// bug; this is the cheap standing check that the whole path is assembled.
+#[test]
+#[ignore = "loads the real 35B; run with --release -- --ignored"]
+fn the_35b_generates_coherent_text() {
+    use inferred_thoughts::{Engine, Model, Spin, Tokenizer};
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let m = Model::load(&f).expect("load the 35B");
+    let mut e = Engine::new(m, Spin::new(8), 128, false);
+
+    let prompt = tk.encode("The capital of France is", true, true);
+    let (out, _) = e.generate(&prompt, 6, None, |_| {}).expect("generate");
+    let text = tk.decode(&out, false).expect("decode");
+    println!("  35B says: {text:?}");
+
+    // Routing that is wrong but self-consistent still produces English, so the
+    // check is for the fact the model actually knows.
+    assert!(
+        text.to_lowercase().contains("paris"),
+        "the 35B answered {text:?}; a routing error degrades fluency last and \
+         factual recall first, so suspect the top-k, the weight normalization, \
+         or the shared expert's gate"
+    );
+}

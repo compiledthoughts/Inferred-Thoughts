@@ -578,6 +578,17 @@ enum Ffn<'a> {
 struct Scratch {
     /// The residual stream, here with the rest so it too keeps one address.
     x: Vec<f32>,
+    /// Router logits then probabilities, `n_expert` wide. **Not batched**: the
+    /// MoE FFN is a per-token loop, because each token routes to its own eight
+    /// experts and there is nothing to share across a batch until the tokens
+    /// are grouped by expert, which is what llama.cpp's `mul_mat_id` does.
+    router: Vec<f32>,
+    /// One expert's intermediates, `expert_ff` wide, reused across all eight.
+    e_gate: Vec<f32>,
+    e_up: Vec<f32>,
+    /// One expert's output and the running weighted sum, `n_embd` wide.
+    e_out: Vec<f32>,
+    moe_acc: Vec<f32>,
     /// The last row lifted out of `x`, its norm, and the logits. Not batched —
     /// only the final position produces output — but owned for the same reason.
     last: Vec<f32>,
@@ -651,6 +662,16 @@ impl Scratch {
         z(&mut self.k_part, c.key_dim());
         z(&mut self.v_part, c.value_dim());
         z(&mut self.core, c.value_dim());
+
+        // The MoE buffers are single-token: routing differs per token, so that
+        // FFN runs as a loop and shares one set of scratch across the batch.
+        if let Some(m) = &c.moe {
+            self.router.resize(m.n_expert, 0.0);
+            self.e_gate.resize(m.expert_ff.max(m.shared_ff), 0.0);
+            self.e_up.resize(m.expert_ff.max(m.shared_ff), 0.0);
+            self.e_out.resize(c.n_embd, 0.0);
+            self.moe_acc.resize(c.n_embd, 0.0);
+        }
 
         // One row of output per pass, whatever the batch.
         self.last.resize(c.n_embd, 0.0);
@@ -932,14 +953,45 @@ impl<'a> Qwen35<'a> {
                 //    and how the shared expert's sigmoid gate composes. Those
                 //    are constants to be read out of the llama.cpp source, not
                 //    guessed, per `CLAUDE.md`.
-                Ffn::Moe { .. } => {
-                    return Err(Error::InconsistentArchitecture {
-                        what: "qwen35moe forward",
-                        detail: "the MoE FFN loads but does not run yet: Ops::matmul has no \
-                                 IQ4_XS/Q5_K/Q6_K path (ggml pairs them with Q8_K activations) \
-                                 and the routing rule is not yet transcribed"
-                            .to_string(),
-                    });
+                Ffn::Moe {
+                    gate_inp,
+                    gate,
+                    up,
+                    down,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                    shared_gate_inp,
+                } => {
+                    let m = match &c.moe {
+                        Some(m) => *m,
+                        None => {
+                            return Err(Error::InconsistentArchitecture {
+                                what: "moe config",
+                                detail: "a routed FFN without expert counts".to_string(),
+                            });
+                        }
+                    };
+                    for t in 0..n {
+                        let at = t * nd;
+                        moe_token(
+                            ops,
+                            &m,
+                            MoeWeights {
+                                gate_inp,
+                                gate,
+                                up,
+                                down,
+                                shared_gate,
+                                shared_up,
+                                shared_down,
+                                shared_gate_inp,
+                            },
+                            at,
+                            s,
+                        );
+                    }
+                    ctx.trace("ffn_moe_out", il, &s.ffn_out);
                 }
             }
             ops.add_assign(&mut s.x, &s.ffn_out);
@@ -1308,4 +1360,113 @@ mod tests {
         assert_eq!(c.ssm_state_len(), 524_288); // 2 MiB of f32 per layer
         assert_eq!(c.conv_state_len(), 3 * 8192);
     }
+}
+
+/// The weights one routed FFN needs, grouped so `moe_token` takes four
+/// arguments instead of eleven.
+struct MoeWeights<'a, 'b> {
+    gate_inp: &'b Weights<'a>,
+    gate: &'b Experts<'a>,
+    up: &'b Experts<'a>,
+    down: &'b Experts<'a>,
+    shared_gate: &'b Weights<'a>,
+    shared_up: &'b Weights<'a>,
+    shared_down: &'b Weights<'a>,
+    shared_gate_inp: &'b [f32],
+}
+
+/// One token through the mixture of experts, writing into `s.ffn_out` at `at`.
+///
+/// Transcribed from `llm_graph_context::build_moe_ffn` and
+/// `llama_model_qwen35moe::graph::build_layer_ffn`. The rule, with the two
+/// arguments qwen35moe passes:
+///
+/// ```text
+/// probs = softmax(ffn_gate_inp . x)             over all 256, before top-k
+/// sel   = the 8 largest                          LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX
+/// w     = probs[sel] / max(sum, 6.103515625e-5)  norm_w = true
+/// out   = sum_i w_i * down_i(silu(gate_i . x) * up_i . x)
+///       + sigmoid(ffn_gate_inp_shexp . x) * down_sh(silu(gate_sh . x) * up_sh . x)
+/// ```
+///
+/// Three details that are easy to get wrong and produce plausible text anyway:
+///
+/// - **The softmax is over all 256 experts, before selection**, so the weights
+///   are the full distribution's probabilities and not a softmax of the top 8.
+///   `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT` is the variant that does the
+///   latter, and qwen35moe does not use it.
+/// - **`expert_weights_scale` is not applied.** It defaults to 0.0, the file
+///   carries no such key, and llama.cpp skips the scale when it is 0.0 or 1.0 —
+///   so a naive reading that multiplies by it would zero the whole FFN.
+/// - **The clamp is `6.103515625e-5`**, f16's smallest normal, guarding the
+///   division rather than the weights.
+///
+/// The experts are summed in top-k order, serially, as the reference does.
+fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut Scratch) {
+    let nd = s.e_out.len();
+    let x = &s.normed[at..at + nd];
+
+    // The router is F32, so this matmul is exact and the expert choice can be
+    // compared against llama.cpp directly.
+    ops.matmul(w.gate_inp, x, &mut s.router);
+    ops.softmax(&mut s.router);
+    // Selection is a host decision, so the probabilities have to come home. On
+    // a device backend that is one crossing per layer per token and is the
+    // first thing to remove when the MoE moves to the GPU.
+    ops.host_needs(&mut s.router);
+
+    // Top-k by probability, ties broken by the lower expert id — `argsort` in
+    // the reference is descending and stable, and exact ties in a softmax over
+    // 256 logits are vanishingly rare either way.
+    let mut pick: Vec<(usize, f32)> = Vec::with_capacity(m.n_expert_used);
+    for _ in 0..m.n_expert_used {
+        let mut best = usize::MAX;
+        for e in 0..m.n_expert {
+            if pick.iter().any(|(p, _)| *p == e) {
+                continue;
+            }
+            if best == usize::MAX || s.router[e] > s.router[best] {
+                best = e;
+            }
+        }
+        pick.push((best, s.router[best]));
+    }
+
+    let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
+    let denom = sum.max(6.103_515_625e-5);
+
+    s.moe_acc[..nd].fill(0.0);
+    ops.host_wrote(&s.moe_acc[..nd]);
+
+    for (e, p) in &pick {
+        let weight = p / denom;
+        ops.matmul(&w.gate.expert(*e), x, &mut s.e_gate[..m.expert_ff]);
+        ops.matmul(&w.up.expert(*e), x, &mut s.e_up[..m.expert_ff]);
+        let (g, u) = (&mut s.e_gate[..m.expert_ff], &s.e_up[..m.expert_ff]);
+        ops.silu_mul(g, u);
+        ops.matmul(&w.down.expert(*e), &s.e_gate[..m.expert_ff], &mut s.e_out);
+        let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
+        ops.add_scaled(acc, out, weight);
+    }
+
+    // The shared expert: always run, gated by a sigmoid of a single logit.
+    ops.matmul(w.shared_gate, x, &mut s.e_gate[..m.shared_ff]);
+    ops.matmul(w.shared_up, x, &mut s.e_up[..m.shared_ff]);
+    let (g, u) = (&mut s.e_gate[..m.shared_ff], &s.e_up[..m.shared_ff]);
+    ops.silu_mul(g, u);
+    ops.matmul(w.shared_down, &s.e_gate[..m.shared_ff], &mut s.e_out);
+
+    // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
+    let logit: f32 = w
+        .shared_gate_inp
+        .iter()
+        .zip(x)
+        .map(|(a, b)| a * b)
+        .sum();
+    let sg = 1.0 / (1.0 + (-logit).exp());
+    let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
+    ops.add_scaled(acc, out, sg);
+
+    s.ffn_out[at..at + nd].copy_from_slice(&s.moe_acc[..nd]);
+    ops.host_wrote(&s.ffn_out[at..at + nd]);
 }

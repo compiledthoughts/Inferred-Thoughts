@@ -127,7 +127,11 @@ impl Ops for Par {
         // batch goes to the oracle, which is bit-identical and keeps this
         // backend's one interesting property -- its decode behaviour -- exactly
         // as it was measured.
-        if w.n_out < PARALLEL_THRESHOLD || x.len() != w.n_in {
+        // The k-quants go to the oracle too: `par` is the superseded control and
+        // exists to demonstrate rayon's dispatch cost, not to grow a second
+        // Q8_K path that could drift from `spin`'s.
+        let kquant = matches!(w.ty, GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs);
+        if w.n_out < PARALLEL_THRESHOLD || x.len() != w.n_in || kquant {
             return Naive.matmul(w, x, out);
         }
 

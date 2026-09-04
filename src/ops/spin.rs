@@ -19,6 +19,7 @@
 //! how that gap closes — not wider instructions.
 
 use super::naive::{self, Naive};
+use crate::quant::{Q8KRow, kquant};
 use super::pool::{Pool, Rows};
 use super::{Attn, Delta, Ops, Weights};
 use crate::gguf::GgmlType;
@@ -72,6 +73,37 @@ const MIN_POS: usize = 32;
 /// automatically transfer to prefill, which is a different regime.
 const TOKEN_TILE: usize = 8;
 
+/// The activation, in whichever form the weight's `vec_dot_type` calls for.
+///
+/// ggml pairs Q8_0 weights with a Q8_0 activation and the k-quants with Q8_K,
+/// and quantizing is a function of the activation alone — so it happens once
+/// per matmul and every worker shares it read-only, exactly as the single-token
+/// path has always shared its Q8_0 row.
+enum Act {
+    Q80(naive::QuantizedRow),
+    Q8k(Q8KRow),
+    /// F32 and F16 weights, which dot against the activation directly.
+    Raw,
+}
+
+impl Act {
+    fn of(ty: GgmlType, x: &[f32]) -> Self {
+        match ty {
+            GgmlType::Q8_0 => Act::Q80(naive::QuantizedRow::from_f32(x)),
+            GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => Act::Q8k(Q8KRow::from_f32(x)),
+            _ => Act::Raw,
+        }
+    }
+
+    fn dot(&self, ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
+        match self {
+            Act::Q80(q) => naive::dot_q8_0_q8_0(row, q),
+            Act::Q8k(q) => kquant::dot_row_q8_k(ty, row, q),
+            Act::Raw => naive::dot_row(ty, row, x),
+        }
+    }
+}
+
 pub struct Spin {
     pool: Pool,
 }
@@ -88,10 +120,7 @@ impl Spin {
         // Quantized once and shared read-only across every worker, exactly as
         // the serial path shares it across every row. Doing it per worker would
         // be both slower and a different function.
-        let qx = match w.ty {
-            GgmlType::Q8_0 => Some(naive::QuantizedRow::from_f32(x)),
-            _ => None,
-        };
+        let qx = Act::of(w.ty, x);
 
         let rows = Rows::new(out);
         self.pool.run(|index, n| {
@@ -104,17 +133,8 @@ impl Spin {
             // `out` outlives this `run` call, which does not return until every
             // worker has finished.
             let mine = unsafe { rows.slice(start, end) };
-            match &qx {
-                Some(qx) => {
-                    for (i, o) in mine.iter_mut().enumerate() {
-                        *o = naive::dot_q8_0_q8_0(w.row(start + i), qx);
-                    }
-                }
-                None => {
-                    for (i, o) in mine.iter_mut().enumerate() {
-                        *o = naive::dot_row(w.ty, w.row(start + i), x);
-                    }
-                }
+            for (i, o) in mine.iter_mut().enumerate() {
+                *o = qx.dot(w.ty, w.row(start + i), x);
             }
         });
     }
@@ -147,13 +167,7 @@ impl Ops for Spin {
         // Quantized once per token and shared read-only across every worker,
         // exactly as the serial path shares one row across every weight row.
         // Doing it per worker would be both slower and a different function.
-        let qx: Vec<naive::QuantizedRow> = match w.ty {
-            GgmlType::Q8_0 => x
-                .chunks_exact(w.n_in)
-                .map(naive::QuantizedRow::from_f32)
-                .collect(),
-            _ => Vec::new(),
-        };
+        let qx: Vec<Act> = x.chunks_exact(w.n_in).map(|r| Act::of(w.ty, r)).collect();
 
         // **The weight row is the outer loop and the token the inner one.**
         // That is the whole reason a batch is faster on a DDR5-bound CPU: a row
@@ -173,10 +187,7 @@ impl Ops for Spin {
                 for j in start..end {
                     let row = w.row(j);
                     for t in lo..hi {
-                        let v = match w.ty {
-                            GgmlType::Q8_0 => naive::dot_q8_0_q8_0(row, &qx[t]),
-                            _ => naive::dot_row(w.ty, row, &x[t * w.n_in..(t + 1) * w.n_in]),
-                        };
+                        let v = qx[t].dot(w.ty, row, &x[t * w.n_in..(t + 1) * w.n_in]);
                         // SAFETY: workers own disjoint weight-row bands, from
                         // `Rows::range` over `n_out` at a fixed `nw`, so for
                         // every `t` the element `t * n_out + j` belongs to

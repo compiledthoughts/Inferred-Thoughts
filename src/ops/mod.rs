@@ -474,6 +474,23 @@ pub trait Ops {
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);
 
+    /// `a += b * scale`, in place — the MoE expert accumulation.
+    ///
+    /// Separate from [`Ops::add_assign`] because a routed expert's output is
+    /// weighted by its router probability before it joins the sum, and doing
+    /// the scale as its own pass would read and write `b` an extra time for
+    /// every one of the 8 experts a token visits.
+    ///
+    /// The default is the scalar loop, which is correct for every CPU backend.
+    /// **A device backend must override it**, or it will read a host buffer the
+    /// device owns.
+    fn add_scaled(&self, a: &mut [f32], b: &[f32], scale: f32) {
+        debug_assert_eq!(a.len(), b.len());
+        for i in 0..a.len() {
+            a[i] += b[i] * scale;
+        }
+    }
+
     // ------------------------------------------------------- residency hints
     //
     // Three no-ops that exist for backends whose memory is not the caller's.
