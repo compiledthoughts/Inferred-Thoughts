@@ -879,6 +879,7 @@ mod tests {
             ty: GgmlType::F32,
             n_in: 3,
             n_out: 2,
+            pooled: false,
         };
         let mut out = [0.0f32; 2];
         Naive.matmul(&w, &[1.0, 1.0, 1.0], &mut out);
@@ -898,6 +899,7 @@ mod tests {
             ty: GgmlType::Q8_0,
             n_in: 64,
             n_out: 1,
+            pooled: false,
         };
         let mut out = [0.0f32];
         Naive.matmul(&w, &x, &mut out);
@@ -946,6 +948,7 @@ mod tests {
             ty: GgmlType::Q8_0,
             n_in: 64,
             n_out: 1,
+            pooled: false,
         };
         let mut out = [0.0f32];
         Naive.matmul(&w, &x, &mut out);
@@ -971,6 +974,7 @@ mod tests {
             ty: GgmlType::F32,
             n_in: 32,
             n_out: 3,
+            pooled: false,
         };
         let mut x = vec![0.0f32; 32];
         x[5] = 2.0;

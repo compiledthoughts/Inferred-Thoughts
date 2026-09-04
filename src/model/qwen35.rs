@@ -589,6 +589,7 @@ struct Scratch {
     /// One expert's output and the running weighted sum, `n_embd` wide.
     e_out: Vec<f32>,
     moe_acc: Vec<f32>,
+    e_in: Vec<f32>,
     /// The last row lifted out of `x`, its norm, and the logits. Not batched —
     /// only the final position produces output — but owned for the same reason.
     last: Vec<f32>,
@@ -671,6 +672,9 @@ impl Scratch {
             self.e_up.resize(m.expert_ff.max(m.shared_ff), 0.0);
             self.e_out.resize(c.n_embd, 0.0);
             self.moe_acc.resize(c.n_embd, 0.0);
+            // One token's input row, gathered out of the batch. Owned rather
+            // than sub-sliced from `normed`; see `moe_token`.
+            self.e_in.resize(c.n_embd, 0.0);
         }
 
         // One row of output per pass, whatever the batch.
@@ -1404,7 +1408,28 @@ struct MoeWeights<'a, 'b> {
 /// The experts are summed in top-k order, serially, as the reference does.
 fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut Scratch) {
     let nd = s.e_out.len();
-    let x = &s.normed[at..at + nd];
+
+    // This token's row, lifted through the seam rather than as `&s.normed[at..]`.
+    //
+    // **`CLAUDE.md`'s sub-slice rule, and this was the fourth place it applied.**
+    // A device backend keys its mirrors on the host address of a slice, so
+    // `&s.normed[at..]` for `at > 0` is an address it has never seen and would
+    // be uploaded from a host copy the device never wrote. It is invisible in
+    // decode, where `at` is always zero, and wrong for every batched pass —
+    // which is exactly how the previous three hid.
+    ops.gather_chunks(&s.normed, nd, nd, at, &mut s.e_in);
+    // The shared expert's gate is a dot of `x` with a length-`n_embd` vector,
+    // computed on the host below — so on a device backend `x` has to be
+    // readable there. Asked for here, beside the router's crossing, so the two
+    // land on one stall instead of two.
+    //
+    // **Both crossings go away together.** They are `HANDOFF.md`'s fourth
+    // blocker: top-k is a host decision, so a device backend syncs once per
+    // layer per token, in a path that took 1329 crossings down to 5. Moving
+    // selection onto the device is what removes them, and it is the same change
+    // that makes the MoE decode step graphable.
+    ops.host_needs(&mut s.e_in);
+    let x = &s.e_in[..];
 
     // The router is F32, so this matmul is exact and the expert choice can be
     // compared against llama.cpp directly.
@@ -1467,6 +1492,9 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
     ops.add_scaled(acc, out, sg);
 
-    s.ffn_out[at..at + nd].copy_from_slice(&s.moe_acc[..nd]);
-    ops.host_wrote(&s.ffn_out[at..at + nd]);
+    // Written back through the seam, for the mirror-image reason `x` is read
+    // through it: a host `copy_from_slice` here would read `moe_acc` -- which
+    // the device just wrote -- from a stale host buffer, and store it at a host
+    // address the device has never mirrored. Two halves of the same rule.
+    ops.scatter_chunks(&s.moe_acc[..nd], nd, nd, at, &mut s.ffn_out);
 }

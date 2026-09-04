@@ -369,6 +369,7 @@ mod tests {
             ty,
             n_in,
             n_out,
+            pooled: false,
         };
         let mut serial = vec![0.0f32; n_out];
         let mut threaded = vec![0.0f32; n_out];
@@ -466,6 +467,7 @@ mod tests {
             ty: GgmlType::Q8_0,
             n_in: 128,
             n_out: 1024,
+            pooled: false,
         };
         let ops = Spin::new(4);
         let mut first = vec![0.0f32; 1024];

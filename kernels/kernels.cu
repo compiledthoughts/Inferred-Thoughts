@@ -777,6 +777,431 @@ __global__ void kv_write_f16(int n, const float *__restrict__ src,
     if (i < n) dst[i] = __half_as_ushort(__float2half(src[i]));
 }
 
+
+// ================================================================ the k-quants
+//
+// The 35B needs three matmuls the earlier two models did not: IQ4_XS on every
+// routed expert, `token_embd` and the GDN projections; Q5_K on `attn_output`;
+// Q6_K on `attn_q` and the LM head. ggml pairs all three with a **Q8_K**
+// activation rather than Q8_0, which is why `quantize_q8_k` lives beside
+// `quantize_q8_0` instead of replacing it -- one layer of the 35B feeds the
+// same normed activation to a Q6_K matmul (`attn_q`) and two Q8_0 ones
+// (`attn_k`, `attn_v`), so both quantizations are live at once.
+//
+// **All three are bit-identical to `ops::naive`.** The handoff for this work
+// expected a derived tolerance; it is not needed, and the escape is the one
+// `matmul_q8_0_warp` found, which generalizes further than it looked:
+//
+//     every k-quant dot is an INTEGER inner sum inside an f32 outer chain.
+//
+// The integer part cannot round, so its order is free and it can have the whole
+// warp. The f32 chain is walked serially and ascending, exactly as the oracle
+// walks it. Only the *shape* of that split differs per format:
+//
+//   Q6_K     8 f32 lanes x nb super-blocks, then an 8-way fold
+//   Q5_K     the same, plus a separate `dmin` chain joined before the lanes
+//   IQ4_XS   one chain of nb*8 terms -- the same length as Q8_0's at n_in 2048
+//
+// The integer sums provably cannot overflow i32, which is what makes them
+// order-free rather than merely usually-order-free:
+//
+//   Q6_K    |scale| <= 127, |aux16| <= 32767, 32 terms  ->  1.3e8
+//   Q5_K     scale <=  63, |aux16| <= 32767, 32 terms  ->  6.6e7
+//   IQ4_XS  |q8| <= 127, |kvalue| <= 127, 32 terms     ->  5.2e5
+//
+// Two things had to be reproduced deliberately rather than falling out:
+//
+//  - **FMA is chosen per format, not per file.** `--fmad=false` turns nvcc's
+//    contraction off globally, so fusion is opted back in by hand with
+//    `__fmaf_rn` in exactly the two places the reference build fused: Q5_K's
+//    `sums[l]` and `sumf` updates. Q6_K's `sums[l] +=` and IQ4_XS's `sumf +=`
+//    look identical on the page and must NOT be fused. `src/quant/kquant.rs`
+//    records the same asymmetry on the CPU side; it is a property of the
+//    reference's compiler, not of the format.
+//  - **The Q8_K scale's argmax breaks ties toward the lower index**, because
+//    the reference scans linearly with a strict `>` and keeps the first winner.
+//    A plain tree max is free to return either, and would move a whole block's
+//    quants when it disagreed.
+
+#define QK_K 256
+// block_q6_K:   { uint8 ql[128]; uint8 qh[64]; int8 scales[16]; f16 d; }
+#define Q6K_BYTES 210
+// block_q5_K:   { f16 d; f16 dmin; uint8 scales[12]; uint8 qh[32]; uint8 qs[128] }
+#define Q5K_BYTES 176
+// block_iq4_xs: { f16 d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128] }
+#define IQ4XS_BYTES 136
+
+// `kvalues_iq4nl` from ggml/src/ggml-common.h. A non-uniform grid -- the "IQ"
+// in IQ4_XS -- so a linear dequantization would be a different format.
+__constant__ signed char kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// Round to nearest, ties to even -- `nearest_int` in ggml/src/ggml-quants.c.
+//
+// Adding 1.5 * 2^23 forces the fractional bits out of an f32 mantissa and IEEE
+// addition resolves the tie to even while doing it. **This add must not be
+// contracted with the multiply that feeds it**; `--fmad=false` guarantees that
+// globally, and the caller uses `__fmul_rn` so the guarantee is local too.
+__device__ __forceinline__ int nearest_int_dev(float fval) {
+    float val = fval + 12582912.0f;
+    return (__float_as_int(val) & 0x007fffff) - 0x00400000;
+}
+
+// Quantize an activation to Q8_K: one 256-thread block per super-block.
+//
+// Mirrors `quant::kquant::Q8KRow::from_f32`, which mirrors
+// `quantize_row_q8_K_ref`. Four details are silent if wrong, and the module
+// docs in kquant.rs carry them; the two that constrain *this* kernel are the
+// argmax tie-break above and `bsums`, which only Q5_K reads -- so omitting them
+// leaves two formats right and one subtly wrong.
+__global__ void quantize_q8_k(int n_super, const float *__restrict__ x,
+                              float *__restrict__ scales,
+                              signed char *__restrict__ quants,
+                              short *__restrict__ bsums) {
+    __shared__ float s_av[QK_K];
+    __shared__ int   s_ai[QK_K];
+    __shared__ int   s_q[QK_K];
+
+    const int sb = blockIdx.x;
+    if (sb >= n_super) return;
+    const int t = threadIdx.x;
+
+    const float v  = x[(size_t)sb * QK_K + t];
+    s_av[t] = fabsf(v);
+    s_ai[t] = t;
+    __syncthreads();
+
+    // Tree argmax. Taking the right half only on a *strict* win keeps the
+    // leftmost index at every level, so the winner is the lowest index holding
+    // the maximum -- which is what the reference's linear `if (ax > amax)`
+    // scan returns.
+    for (int stride = QK_K / 2; stride > 0; stride >>= 1) {
+        if (t < stride && s_av[t + stride] > s_av[t]) {
+            s_av[t] = s_av[t + stride];
+            s_ai[t] = s_ai[t + stride];
+        }
+        __syncthreads();
+    }
+
+    const float amax = s_av[0];
+    if (amax == 0.0f) {
+        quants[(size_t)sb * QK_K + t] = 0;
+        if (t < QK_K / 16) bsums[(size_t)sb * (QK_K / 16) + t] = 0;
+        if (t == 0) scales[sb] = 0.0f;
+        return;
+    }
+
+    // The **signed** value at the largest magnitude, not the magnitude: the
+    // reference divides -127 by it, so `iscale` is negative for a positive
+    // extreme and the extreme element quantizes to exactly -127.
+    const float mx = x[(size_t)sb * QK_K + s_ai[0]];
+    const float iscale = -127.0f / mx;
+
+    const int q = min(127, nearest_int_dev(__fmul_rn(iscale, v)));
+    quants[(size_t)sb * QK_K + t] = (signed char)q;
+    s_q[t] = q;
+    __syncthreads();
+
+    // Sums of 16 consecutive quants, accumulated in int and narrowed after --
+    // the reference's `sum` is an int and only the store is int16.
+    if (t < QK_K / 16) {
+        int sum = 0;
+        for (int k = 0; k < 16; ++k) sum += s_q[t * 16 + k];
+        bsums[(size_t)sb * (QK_K / 16) + t] = (short)sum;
+    }
+    if (t == 0) scales[sb] = 1.0f / iscale;
+}
+
+// Q6_K x Q8_K, one warp per output row.
+//
+// Six bits per weight, split across a low nibble in `ql` and a high pair in
+// `qh`, biased by -32. The 16 sub-block scales are plain int8.
+//
+// Lane layout is `lane = g*8 + l`. `l` is the oracle's f32 lane -- the fixed
+// position within a 16-element sub-block that owns one of the eight `sums[]`
+// accumulators -- and `g` splits the 16 sub-blocks four ways. The g-split is
+// integer-only and therefore free; the l-split is the oracle's own.
+//
+// `blockIdx.y` is the batch token. Decode is `gridDim.y == 1` of the same
+// kernel rather than a separate one, so prefill and decode cannot disagree.
+__global__ void matmul_q6_k_q8_k(int n_in, int n_out,
+                                 const unsigned char *__restrict__ w,
+                                 const float *__restrict__ x_scales,
+                                 const signed char *__restrict__ x_quants,
+                                 float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    // Warp-uniform: every lane of a warp shares `j`, so the shuffles below
+    // keep a full mask.
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int l = lane & 7;
+    const int g = lane >> 3;
+
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * Q6K_BYTES;
+
+    float sum_l = 0.0f;   // this lane's sums[l], serial and ascending in i
+
+    for (int i = 0; i < nb; ++i) {
+        const unsigned char *blk = row + (size_t)i * Q6K_BYTES;
+        const unsigned char *ql = blk;
+        const unsigned char *qh = blk + QK_K / 2;
+        const signed char   *sc = (const signed char *)(blk + QK_K / 2 + QK_K / 4);
+        const unsigned short d16 =
+            (unsigned short)blk[Q6K_BYTES - 2] | ((unsigned short)blk[Q6K_BYTES - 1] << 8);
+        const signed char *q8 = xq + (size_t)i * QK_K;
+
+        int aux = 0;
+        for (int jj = g * 4; jj < g * 4 + 4; ++jj) {
+            const int scale = (int)sc[jj];
+            for (int half = 0; half < 2; ++half) {
+                const int idx = jj * 16 + half * 8 + l;
+
+                // The reference unpacks all 256 weights up front in two
+                // 128-element halves; this is that mapping inverted, so a lane
+                // materializes only the eight it needs.
+                const int j2  = idx >> 7;
+                const int r   = idx & 127;
+                const int sub = r >> 5;
+                const int l2  = r & 31;
+                const unsigned char h = qh[j2 * 32 + l2];
+                int base, hb;
+                if (sub == 0)      { base = ql[j2 * 64 + l2]      & 0xF; hb = (h >> 0) & 3; }
+                else if (sub == 1) { base = ql[j2 * 64 + l2 + 32] & 0xF; hb = (h >> 2) & 3; }
+                else if (sub == 2) { base = ql[j2 * 64 + l2]      >> 4;  hb = (h >> 4) & 3; }
+                else               { base = ql[j2 * 64 + l2 + 32] >> 4;  hb = (h >> 6) & 3; }
+                const int av = (base | (hb << 4)) - 32;
+
+                // int16 in the reference. The product of an int8 quant and a
+                // -32..31 weight cannot leave that range, so the narrowing is
+                // faithful rather than lossy.
+                const short aux16 = (short)((int)q8[idx] * av);
+                aux += scale * (int)aux16;
+            }
+        }
+        // Fold the four g-groups. Integer, so exact and order-free.
+        aux += __shfl_down_sync(0xffffffff, aux, 16);
+        aux += __shfl_down_sync(0xffffffff, aux, 8);
+
+        if (lane < 8) {
+            const float d = h2f(d16) * xs[i];
+            // NOT fused. The reference's compiler contracts Q5_K's identical
+            // line and not this one.
+            sum_l += d * (float)aux;
+        }
+    }
+
+    // The 8-way fold, serial and ascending -- the oracle's last loop. The
+    // shuffle is outside the branch because every lane must reach it.
+    float sumf = 0.0f;
+    for (int k = 0; k < 8; ++k) {
+        const float v = __shfl_sync(0xffffffff, sum_l, k);
+        if (lane == 0) sumf += v;
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// Q5_K x Q8_K, one warp per output row.
+//
+// Five bits per weight: four in a nibble of `qs`, the fifth as a bit-plane in
+// `qh`, giving an **unsigned** 0..31 with no bias -- unlike Q6_K's -32. The
+// offset lives instead in a per-sub-block `min`, subtracted through the
+// activation's `bsums`, which is the only reason Q8_K carries them.
+//
+// Same `lane = g*8 + l` layout as Q6_K, with `g` splitting eight sub-blocks
+// two apiece. The extra structure is the `dmin` chain: it accumulates into
+// `sumf` inside the super-block loop, ahead of the lane fold, and both of its
+// updates are fused where Q6_K's are not.
+__global__ void matmul_q5_k_q8_k(int n_in, int n_out,
+                                 const unsigned char *__restrict__ w,
+                                 const float *__restrict__ x_scales,
+                                 const signed char *__restrict__ x_quants,
+                                 const short *__restrict__ x_bsums,
+                                 float *__restrict__ out) {
+    const unsigned int KMASK1 = 0x3f3f3f3fu;
+    const unsigned int KMASK2 = 0x0f0f0f0fu;
+    const unsigned int KMASK3 = 0x03030303u;
+
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int l = lane & 7;
+    const int g = lane >> 3;
+
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const short *xb = x_bsums + (size_t)tok * nb * (QK_K / 16);
+    const unsigned char *row = w + (size_t)j * nb * Q5K_BYTES;
+
+    float sum_l = 0.0f;   // sums[l]
+    float sumf  = 0.0f;   // the dmin chain, lane 0's
+
+    for (int i = 0; i < nb; ++i) {
+        const unsigned char *blk = row + (size_t)i * Q5K_BYTES;
+        const unsigned short d16    = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        const unsigned short dmin16 = (unsigned short)blk[2] | ((unsigned short)blk[3] << 8);
+        const unsigned char *qh = blk + 16;
+        const unsigned char *qs = blk + 16 + QK_K / 8;
+
+        // 12 bytes -> 8 six-bit scales and 8 six-bit mins, through a fixed
+        // shuffle that is easier to transcribe than to re-derive. Recomputed
+        // per lane rather than staged in shared memory: a dozen integer ops
+        // against a barrier. The block base is 16-byte aligned and these sit
+        // at +4, +8, +12, so the 32-bit loads are legal.
+        unsigned int u0 = *(const unsigned int *)(blk + 4);
+        unsigned int u1 = *(const unsigned int *)(blk + 8);
+        unsigned int u2 = *(const unsigned int *)(blk + 12);
+        const unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+        const unsigned int uaux = u1 & KMASK1;
+        u1 = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+        u2 = uaux;
+        u0 &= KMASK1;
+        // scales = bytes of (u0, u1); mins = bytes of (u2, u3).
+
+        const signed char *q8 = xq + (size_t)i * QK_K;
+
+        int aux = 0;
+        for (int jj = g * 2; jj < g * 2 + 2; ++jj) {
+            const unsigned int su = (jj < 4) ? u0 : u1;
+            const int scale = (int)((su >> ((jj & 3) * 8)) & 0xff);
+            for (int q = 0; q < 4; ++q) {
+                const int idx = jj * 32 + q * 8 + l;
+
+                const int jj4  = idx >> 6;
+                const int r    = idx & 63;
+                const int half = r >> 5;
+                const int l2   = r & 31;
+                const unsigned char q4 = qs[jj4 * 32 + l2];
+                const int base = (half == 0) ? (q4 & 0xF) : (q4 >> 4);
+                // `m` marches one bit per 32-element run: 1 << (j*2 + half).
+                const int av = base + (((qh[l2] >> (jj4 * 2 + half)) & 1) ? 16 : 0);
+
+                const short aux16 = (short)((int)q8[idx] * av);
+                aux += scale * (int)aux16;
+            }
+        }
+        aux += __shfl_down_sync(0xffffffff, aux, 16);
+        aux += __shfl_down_sync(0xffffffff, aux, 8);
+
+        if (lane < 8) {
+            const float d = h2f(d16) * xs[i];
+            // FUSED. `fma(d, aux32[l], sums[l])` in the compiled reference.
+            sum_l = __fmaf_rn(d, (float)aux, sum_l);
+        }
+        if (lane == 0) {
+            const short *bs = xb + (size_t)i * (QK_K / 16);
+            int sumi = 0;
+            for (int k = 0; k < QK_K / 16; ++k) {
+                const int mk = k >> 1;
+                const unsigned int mu = (mk < 4) ? u2 : u3;
+                sumi += (int)bs[k] * (int)((mu >> ((mk & 3) * 8)) & 0xff);
+            }
+            const float dmin = h2f(dmin16) * xs[i];
+            // FUSED, and inside the loop, before the lanes are folded in:
+            // `fma(-dmin, sumi, sumf)`, not a multiply followed by a subtract.
+            sumf = __fmaf_rn(-dmin, (float)sumi, sumf);
+        }
+    }
+
+    for (int k = 0; k < 8; ++k) {
+        const float v = __shfl_sync(0xffffffff, sum_l, k);
+        if (lane == 0) sumf += v;
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// IQ4_XS x Q8_K, one warp per output row.
+//
+// The odd one of the three. Its accumulation is a **single** `sumf`, not eight
+// lanes -- each 32-element sub-block contributes `d * (sumi1 + sumi2)` straight
+// into it -- so its rounding differs from Q5_K's and Q6_K's by construction.
+// That single chain is `nb * 8` long, which at n_in 2048 is 64: exactly the
+// length `matmul_q8_0_warp` keeps serial for 2-7%.
+//
+// Lane layout is `lane = t*4 + p`. `t` picks one of the eight sub-blocks the
+// oracle folds in order, and `p` splits that sub-block's integer sum four ways.
+// Each sub-block's 6-bit scale is split across `scales_l` and two bits marching
+// through `scales_h`, and biased by -32.
+__global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
+                                   const unsigned char *__restrict__ w,
+                                   const float *__restrict__ x_scales,
+                                   const signed char *__restrict__ x_quants,
+                                   float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int t = lane >> 2;   // which of the eight sub-blocks
+    const int p = lane & 3;    // which quarter of its integer sum
+
+    // `t` is (ib, half) flattened, and the reference walks ib = 0,2,4,6 with
+    // half = 0 then 1 -- so ascending `t` is the oracle's own order.
+    const int ib   = (t >> 1) * 2;
+    const int half = t & 1;
+
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    float sumf = 0.0f;
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned int sh = (unsigned int)blk[2] | ((unsigned int)blk[3] << 8);
+        const unsigned char *scales_l = blk + 4;
+        const unsigned char *qs = blk + 4 + QK_K / 64;
+        const float d4d8 = d * xs[ibl];
+        const signed char *q8 = xq + (size_t)ibl * QK_K;
+
+        // The reference shifts `h` right by 4 once per ib-pair, so at pair
+        // ib/2 it has been shifted by 2*ib.
+        const unsigned int h  = sh >> (ib * 2);
+        const unsigned int lo = scales_l[ib >> 1];
+        const int ls = (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                                   : (int)((lo >> 4)  | ((h << 2) & 0x30));
+        const float dh = d4d8 * (float)(ls - 32);
+
+        const int qo = ib * 16 + half * 16;
+        const int ao = ib * 32 + half * 32;
+
+        // s1 and s2 in the reference, summed together here: both are integer,
+        // so joining them cannot round.
+        int s = 0;
+        for (int k = p * 4; k < p * 4 + 4; ++k) {
+            const unsigned char b = qs[qo + k];
+            s += (int)q8[ao + k]      * (int)kvalues_iq4nl[b & 0xf];
+            s += (int)q8[ao + 16 + k] * (int)kvalues_iq4nl[b >> 4];
+        }
+        s += __shfl_down_sync(0xffffffff, s, 2);
+        s += __shfl_down_sync(0xffffffff, s, 1);
+        // Lane t*4 now holds sumi1 + sumi2 for sub-block t.
+
+        // The one serial chain. NOT fused -- unlike Q5_K and Q6_K, the
+        // reference's compiler leaves this one as a multiply and an add.
+        const float term = dh * (float)s;
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, term, k * 4);
+            if (lane == 0) sumf += v;
+        }
+    }
+
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
 // ------------------------------------------------------------- diagnostics
 //
 // Not used by the forward pass. These exist to answer one question: why does a
@@ -1053,6 +1478,70 @@ extern "C" __global__ void gather_chunks(int n_out, int chunk, int stride,
     int c = i / chunk;
     int j = i - c * chunk;
     out[i] = src[c * stride + offset + j];
+}
+
+// F32 matrix-vector, one thread per output row.
+//
+// **The MoE router, and nothing else.** `ffn_gate_inp` is F32 in the 35B --
+// llama.cpp keeps the routing logits unquantized because they decide *which*
+// experts run, and a quant flip there changes the answer categorically rather
+// than by an ulp. `CLAUDE.md` leans on that: the router being exact is what
+// lets an expert choice be compared against llama.cpp directly.
+//
+// So this kernel is deliberately the slow shape -- one thread walking a whole
+// row in ascending order, which is `ops::naive::dot_row` statement for
+// statement. It is bit-identical for the same reason the very first Q8_0
+// kernel was. That costs nothing worth measuring here: the router is
+// 2048 x 256, about 2 MB against the ~630 MB of experts the same token reads.
+// If an F32 matmul ever lands somewhere that matters, it needs the warp
+// treatment and a decision about its serial chain -- this one does not.
+extern "C" __global__ void matmul_f32(int n_in, int n_out,
+                                      const float *__restrict__ w,
+                                      const float *__restrict__ x,
+                                      float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const float *row = w + (size_t)j * n_in;
+    const float *xt = x + (size_t)tok * n_in;
+
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += row[k] * xt[k];
+    out[(size_t)tok * n_out + j] = sum;
+}
+
+// a += b * scale, elementwise.
+//
+// The MoE expert accumulation: a routed expert's output is weighted by its
+// router probability before it joins the sum. Separate from `add_assign`
+// because doing the scale as its own pass would read and write `b` an extra
+// time for each of the eight experts a token visits.
+//
+// A multiply and an add, not an FMA -- `--fmad=false` keeps it that way, which
+// is what `ops::naive`'s `a[i] += b[i] * scale` compiles to.
+extern "C" __global__ void add_scaled(int n, float scale,
+                                      float *__restrict__ a,
+                                      const float *__restrict__ b) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) a[i] += b[i] * scale;
+}
+
+// The dual of gather_chunks: contiguous `src` written back into `dst` every
+// `stride`, starting at `offset`.
+//
+// One thread per *source* element, because src is the shorter buffer and every
+// one of its elements lands exactly once -- so this cannot race, and nothing
+// outside the written windows is touched.
+extern "C" __global__ void scatter_chunks(int n_src, int chunk, int stride,
+                                          int offset,
+                                          const float *__restrict__ src,
+                                          float *__restrict__ dst) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_src) return;
+    int c = i / chunk;
+    int j = i - c * chunk;
+    dst[c * stride + offset + j] = src[i];
 }
 
 // x *= sigmoid(g), elementwise. The sibling of silu_mul, and inexact for the

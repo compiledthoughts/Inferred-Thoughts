@@ -31,6 +31,20 @@ pub struct Weights<'a> {
     pub n_in: usize,
     /// Number of rows (`ne1`): the output width.
     pub n_out: usize,
+    /// This tensor is one of many interchangeable ones drawn from a pool too
+    /// large to keep resident — an MoE expert.
+    ///
+    /// **A fact about the tensor, not a policy.** It says only "there are
+    /// thousands of these and they will not all fit", which is what lets a
+    /// device backend put it in a bounded cache instead of the
+    /// upload-once-keep-forever mirror. *Which* of them are resident, and when
+    /// they move, stays above this type — that is the distinction the project
+    /// exists to make.
+    ///
+    /// Set only by [`Experts::expert`]. Everything else is `false`, including
+    /// the shared expert, which is one tensor per layer and belongs in the
+    /// permanent mirror like any other weight.
+    pub pooled: bool,
 }
 
 impl<'a> Weights<'a> {
@@ -84,6 +98,7 @@ impl<'a> Experts<'a> {
             ty: self.ty,
             n_in: self.n_in,
             n_out: self.n_out,
+            pooled: true,
         }
     }
 }
@@ -427,6 +442,33 @@ pub trait Ops {
         offset: usize,
         out: &mut [f32],
     );
+
+    /// The exact dual of [`Ops::gather_chunks`]: write contiguous `src` back
+    /// into `dst` at `offset`, every `stride`.
+    ///
+    /// Exists because the MoE FFN is a **per-token loop inside a batched
+    /// pass** — routing differs per token, so its scratch is single-token and
+    /// each token's result has to land in row `t` of the layer's output. The
+    /// obvious `dst[at..at + nd].copy_from_slice(&acc)` is wrong in two ways at
+    /// once on a device backend: it reads a host buffer the device wrote, and
+    /// it writes a host address the device has never mirrored. That is
+    /// `CLAUDE.md`'s sub-slice rule, and this is the fourth place it applies.
+    ///
+    /// The default is the host copy, which is correct for every CPU backend.
+    /// **A device backend must override it.**
+    fn scatter_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        dst: &mut [f32],
+    ) {
+        for (i, block) in src.chunks_exact(chunk).enumerate() {
+            let at = offset + i * stride;
+            dst[at..at + chunk].copy_from_slice(block);
+        }
+    }
 
     /// `x *= sigmoid(g)`, elementwise and in place. The sibling of
     /// [`Ops::silu_mul`], and inexact for the same reason: `expf`.

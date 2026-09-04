@@ -211,6 +211,7 @@ fn every_op_agrees_with_the_oracle() {
             ty: inferred_thoughts::gguf::GgmlType::Q8_0,
             n_in,
             n_out,
+            pooled: false,
         };
         let x = noise(n_in, 6);
         let (mut a, mut b) = (vec![0.0; n_out], vec![0.0; n_out]);

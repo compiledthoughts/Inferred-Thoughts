@@ -55,6 +55,15 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
+        ///
+        /// The expert pool does not fit in VRAM, so it lives in a bounded slab
+        /// with an eviction policy. Larger is not automatically better: the
+        /// slab is allocated up front, so an over-large one leaves the driver
+        /// short and it begins paging VRAM to host — which costs far more than
+        /// the misses it avoids.
+        #[arg(long, default_value_t = 0.0)]
+        expert_cache: f64,
         /// Print the profile summary: phase timings, byte traffic, and the
         /// top-2 logit margins.
         #[arg(long)]
@@ -143,6 +152,15 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
+        ///
+        /// The expert pool does not fit in VRAM, so it lives in a bounded slab
+        /// with an eviction policy. Larger is not automatically better: the
+        /// slab is allocated up front, so an over-large one leaves the driver
+        /// short and it begins paging VRAM to host — which costs far more than
+        /// the misses it avoids.
+        #[arg(long, default_value_t = 0.0)]
+        expert_cache: f64,
         /// Default generation budget when the request does not set one.
         #[arg(short = 'n', long, default_value_t = 512)]
         max_tokens: usize,
@@ -177,6 +195,7 @@ fn main() -> ExitCode {
             ignore_eos,
             ctx,
             batch,
+            expert_cache,
             profile,
             profile_detail,
             profile_json,
@@ -195,6 +214,7 @@ fn main() -> ExitCode {
                 ignore_eos,
                 n_ctx: ctx,
                 max_batch: batch,
+                expert_cache,
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
@@ -213,6 +233,7 @@ fn main() -> ExitCode {
             port,
             ctx,
             batch,
+            expert_cache,
             max_tokens,
             threads,
             backend,
@@ -223,6 +244,7 @@ fn main() -> ExitCode {
             port,
             ctx,
             max_batch: batch,
+            expert_cache,
             max_tokens,
             threads,
             backend,
@@ -268,6 +290,8 @@ struct GenOpts {
     /// Prompt tokens per forward pass. See the CLI doc on `--batch`: this
     /// bounds activation VRAM, which a batch sizes.
     max_batch: usize,
+    /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
+    expert_cache: f64,
     report: bool,
     detail: bool,
     json: Option<String>,
@@ -328,6 +352,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         let cuda = inferred_thoughts::Cuda::new(0)?;
         cuda.time_kernels(o.kernels);
         cuda.rms_serial(o.rms_serial);
+        cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(
@@ -344,7 +369,13 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
             return Err(e);
         }
         if o.report || o.device || o.kernels {
-            report_device(&cuda, &o, tokens.len(), run.as_ref().ok().copied())?;
+            let r = run.as_ref().ok().copied();
+            report_device(
+                &cuda,
+                &o,
+                r.map(|r| r.tokens).unwrap_or((tokens.len() + o.max_tokens) as u64),
+                r.map(|r| r.ms_per_token),
+            )?;
         }
         return run.map(|_| ());
     }
@@ -385,11 +416,10 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
 fn report_device(
     cuda: &inferred_thoughts::Cuda,
     o: &GenOpts,
-    prompt_len: usize,
+    tokens: u64,
     ms_per_token: Option<f64>,
 ) -> inferred_thoughts::Result<()> {
     let s = cuda.stats();
-    let tokens = (prompt_len + o.max_tokens) as u64;
     let per = |ns: u64| ns as f64 / tokens.max(1) as f64 / 1e6;
 
     if o.kernels {
@@ -437,6 +467,86 @@ device   {} kernel launches", s.launches);
         s.h2d_bytes as f64 / 1048576.0,
         s.d2h_bytes as f64 / 1048576.0,
     );
+    if cuda.graphs_off_for_mid_pass_read() {
+        eprintln!(
+            "         CUDA graphs OFF: the model reads a device result mid-pass, so a
+         graph would hand it the previous pass's contents. MoE top-k is a host
+         decision; this goes away when expert selection moves onto the device."
+        );
+    }
+
+    // The self-configuring microbenchmark. Behind `--profile-device` because it
+    // runs real work on the device after the model has finished, which is not
+    // something a plain `--profile` should do.
+    if o.device {
+        let group = 8; // experts per token, so the grouped column prices the routed FFN
+        match cuda.bench_shapes(group, tokens, 300) {
+            Ok(b) if !b.is_empty() => {
+                eprintln!(
+                    "
+shapes   measured on the live device, queue full, no per-launch sync"
+                );
+                eprintln!(
+                    "         {:<20} {:>12} {:>7} {:>8} {:>9} {:>9} {:>9}",
+                    "kernel", "shape", "calls/t", "gpu us", "issue us", "gpu ms/t", "grp ms/t",
+                );
+                let (mut gpu, mut issue, mut grouped) = (0.0, 0.0, 0.0);
+                for r in &b {
+                    if r.gpu_us.is_nan() {
+                        continue;
+                    }
+                    gpu += r.gpu_ms_per_token(tokens);
+                    issue += r.issue_ms_per_token(tokens);
+                    grouped += r.grouped_ms_per_token(tokens);
+                    eprintln!(
+                        "         {:<20} {:>5}x{:<6} {:>7.1} {:>8.1} {:>9.1} {:>9.2} {:>9.2}",
+                        r.kernel,
+                        r.n_in,
+                        r.n_out,
+                        r.calls as f64 / tokens.max(1) as f64,
+                        r.gpu_us,
+                        r.issue_us,
+                        r.gpu_ms_per_token(tokens),
+                        r.grouped_ms_per_token(tokens),
+                    );
+                }
+                eprintln!(
+                    "         {:<20} {:>12} {:>7} {:>8} {:>9} {:>9.2} {:>9.2}",
+                    "total", "", "", "", "", gpu, grouped,
+                );
+                eprintln!(
+                    "         matmuls alone: {gpu:.1} ms/token on the device, {issue:.1} ms to issue.
+         Whichever is larger is what binds; `grp` is the same arithmetic
+         in one launch per {group} instead of {group}."
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("         shape bench unavailable: {e}"),
+        }
+    }
+
+    if let Some(e) = cuda.expert_stats() {
+        let gib = |b: u64| b as f64 / 1073741824.0;
+        eprintln!(
+            "
+experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
+            e.slots,
+            e.slot_bytes as f64 / 1048576.0,
+            gib(e.capacity_bytes()),
+        );
+        eprintln!(
+            "         {:.1}% hit over {} lookups   {} misses, {} evictions",
+            100.0 * e.hit_rate(),
+            e.lookups(),
+            e.misses,
+            e.evictions,
+        );
+        eprintln!(
+            "         {:.2} GiB filled, {:.1} MiB/token of PCIe",
+            gib(e.filled_bytes),
+            e.filled_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
+        );
+    }
 
     // Resident bytes, always printed. What the device *holds* is a different
     // question from what crosses the bus, and only the first one explains why a
@@ -495,7 +605,7 @@ fn run_generation<O: inferred_thoughts::Ops>(
     tokens: &[u32],
     prompt_text: &str,
     o: &GenOpts,
-) -> inferred_thoughts::Result<f64> {
+) -> inferred_thoughts::Result<Run> {
     use inferred_thoughts::Engine;
     use std::io::Write;
 
@@ -578,7 +688,23 @@ fn run_generation<O: inferred_thoughts::Ops>(
         })?;
         eprintln!("profile written to {path}");
     }
-    Ok(ms_per_token)
+    Ok(Run {
+        ms_per_token,
+        tokens: total_tokens,
+    })
+}
+
+/// What a generation actually did, as opposed to what was asked for.
+///
+/// **`tokens` is the count produced, not `max_tokens`.** The device report
+/// divides every counter by it, and a run that stops early — context full, or
+/// an EOS — would otherwise have every per-token figure understated by the
+/// ratio. That happened: a 1000-token request that stopped at 504 reported
+/// 1621 launches and 50% GPU occupancy where the truth was 3195 and ~98%.
+#[derive(Clone, Copy)]
+struct Run {
+    ms_per_token: f64,
+    tokens: u64,
 }
 
 // ----------------------------------------------------------------------- serve
@@ -589,6 +715,8 @@ struct ServeArgs {
     ctx: usize,
     /// Prompt tokens per forward pass; bounds activation VRAM. See `--batch`.
     max_batch: usize,
+    /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
+    expert_cache: f64,
     max_tokens: usize,
     threads: usize,
     backend: String,
@@ -646,6 +774,7 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
     if a.backend == "cuda" {
         let cuda = inferred_thoughts::Cuda::new(0)?;
         cuda.rms_serial(a.rms_serial);
+        cuda.set_expert_budget((a.expert_cache * 1073741824.0) as usize);
         let (free, total) = cuda.mem_info()?;
         eprintln!(
             "device {} | {:.2} of {:.2} GiB free",

@@ -18,6 +18,7 @@
 //! Everything is behind the `cuda` feature so a machine without a toolkit still
 //! builds and tests the rest of the crate.
 
+pub mod experts;
 pub mod ffi;
 mod ops;
 
@@ -97,6 +98,22 @@ pub struct Cuda {
     pass_graph: Cell<bool>,
     /// Master switch. Off for callers that drive ops one at a time.
     graphs_enabled: Cell<bool>,
+    /// Bounded VRAM residency for the MoE expert pool. See [`experts`].
+    ///
+    /// Separate from `weights`, which is upload-once-keep-forever and right for
+    /// anything that fits. The expert pool does not fit — 15.94 GiB against
+    /// 14.80 free on the 35B — so it gets a slab with an eviction policy
+    /// instead. Built lazily on the first pooled tensor, because its size is
+    /// taken from free VRAM at a point when the permanent weights are mostly up.
+    experts: RefCell<Option<experts::ExpertCache>>,
+
+    /// VRAM to leave free when sizing the expert slab, in bytes.
+    ///
+    /// Covers what is not yet allocated when the slab is built: the rest of the
+    /// permanent weights, the KV cache at full context, activation mirrors at
+    /// the configured batch, and the driver's own working set.
+    expert_reserve: Cell<usize>,
+
     /// Q8_0 weights, repacked at upload into an aligned scale array and an
     /// aligned quant array. Keyed on the mmap address of the tensor.
     ///
@@ -133,6 +150,32 @@ pub struct Cuda {
     /// Whether a pass is open, i.e. whether the event pair holds a live pair of
     /// timestamps still to be read.
     pass_open: Cell<bool>,
+
+    /// True between `begin_pass` and `end_pass`. Distinct from `pass_open`,
+    /// which means "the event pair still holds unread timestamps".
+    in_pass: Cell<bool>,
+
+    /// The model read a device result **in the middle of a pass**, which
+    /// `ARCHITECTURE.md` says it must not do.
+    ///
+    /// **This is a correctness guard, not a diagnostic.** A graph defers every
+    /// kernel to `end_pass`, so a mid-pass `host_needs` downloads a buffer
+    /// nothing has written this pass — the *previous* pass's contents. The
+    /// graph's own safety check cannot see it: that check compares the kernel
+    /// *sequence*, and the sequence is identical. The result is plausible
+    /// garbage, which is the failure mode the graph machinery spends code to
+    /// avoid everywhere else.
+    ///
+    /// `qwen35moe` does exactly this: top-k over the router's probabilities is
+    /// a host decision, so it reads them per layer, per token. It cost a
+    /// session's worth of confusion — the first four tokens were right, because
+    /// three warm-up passes run eagerly before the graph records.
+    ///
+    /// So the read is the declaration: a model that needs one is telling the
+    /// backend its pass cannot be a graph, and graphs turn off for the rest of
+    /// the run. That is a real throughput loss and it is reported rather than
+    /// hidden. It goes away when expert selection moves onto the device.
+    mid_pass_read: Cell<bool>,
     /// When the host started issuing the current pass.
     issue_start: Cell<Option<std::time::Instant>>,
 
@@ -141,6 +184,20 @@ pub struct Cuda {
 
     /// Whether to synchronize after each launch and attribute the time.
     time_kernels: Cell<bool>,
+
+    /// Every `(kernel, n_in, n_out)` this run actually launched, and how often.
+    ///
+    /// **So the microbenchmark configures itself.** A hand-written bench picks
+    /// shapes someone thought were representative; this one replays the shapes
+    /// the model really used, in the proportions it used them, which is the
+    /// difference between a number and an answer. It is also the only way to
+    /// attribute cost per launch without `--profile-kernels`, whose per-launch
+    /// synchronize inflates every share in proportion to call count.
+    ///
+    /// Two `usize` and a `&'static str` per distinct shape, of which a model
+    /// has a few dozen. Off any inner loop: one hash per matmul, against a
+    /// kernel that runs for microseconds.
+    shapes: RefCell<HashMap<(&'static str, usize, usize), u64>>,
 
     /// The position the RoPE sin/cos table on the device was built for.
     ///
@@ -166,6 +223,16 @@ struct Mirror {
     /// layer.
     quant: Option<(DeviceBuffer, DeviceBuffer)>,
     quant_valid: bool,
+    /// The same buffer quantized to **Q8_K**: scales, quants, and the per-16
+    /// sums Q5_K needs. Held *beside* the Q8_0 copy rather than replacing it.
+    ///
+    /// Both are live at once on the 35B: one attention layer feeds its normed
+    /// activation to `attn_q` (Q6_K, so Q8_K) and to `attn_k` and `attn_v`
+    /// (Q8_0, so Q8_0). ggml's `type_traits_cpu[T].vec_dot_type` is a property
+    /// of the *weight* format, so a single activation genuinely needs two
+    /// quantizations, and a single slot would thrash between them every layer.
+    quant_k: Option<(DeviceBuffer, DeviceBuffer, DeviceBuffer)>,
+    quant_k_valid: bool,
 }
 
 impl Mirror {
@@ -175,6 +242,7 @@ impl Mirror {
     fn invalidate(&mut self) {
         self.device_current = false;
         self.quant_valid = false;
+        self.quant_k_valid = false;
     }
 }
 
@@ -214,11 +282,20 @@ pub struct Resident {
     /// Scratch slots (RoPE tables, attention partials), indexed rather than
     /// keyed, so bounded by construction.
     pub pool_bytes: u64,
+    /// The expert slab: **bounded by policy, not by what was touched.** This is
+    /// the one category that does not grow with the length of a run, which is
+    /// the whole reason it exists.
+    pub expert_slab_bytes: u64,
 }
 
 impl Resident {
     pub fn total(&self) -> u64 {
-        self.weight_bytes + self.kv_bytes + self.mirror_bytes + self.quant_bytes + self.pool_bytes
+        self.weight_bytes
+            + self.kv_bytes
+            + self.mirror_bytes
+            + self.quant_bytes
+            + self.pool_bytes
+            + self.expert_slab_bytes
     }
 }
 
@@ -504,9 +581,14 @@ impl Cuda {
                 rms_serial: Cell::new(false),
                 states: RefCell::new(HashMap::new()),
                 q8: RefCell::new(HashMap::new()),
+                experts: RefCell::new(None),
+                shapes: RefCell::new(HashMap::new()),
+                expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),
+                in_pass: Cell::new(false),
+                mid_pass_read: Cell::new(false),
                 issue_start: Cell::new(None),
                 kernel_ms: RefCell::new(HashMap::new()),
                 time_kernels: Cell::new(false),
@@ -734,6 +816,21 @@ impl Cuda {
             r.weight_bytes += (sc.len_bytes() + q.len_bytes()) as u64;
             r.weight_tensors += 1;
         }
+        // **This map was missing here until the 35B arrived**, and the omission
+        // was invisible for exactly as long as every weight was Q8_0: `q8`
+        // above held all of them, and `weights` held only norm vectors. The
+        // 35B puts every k-quant tensor — which is every routed expert, 15.94
+        // GiB of them — through `resident` instead, so leaving it out
+        // under-reported residency by nearly the whole model. The counter
+        // exists because a memory prediction was once wrong by 1.9 GiB; it can
+        // only do that job if it counts every map that allocates.
+        for b in self.weights.borrow().values() {
+            r.weight_bytes += b.len_bytes() as u64;
+            r.weight_tensors += 1;
+        }
+        if let Some(c) = self.experts.borrow().as_ref() {
+            r.expert_slab_bytes = c.resident_bytes();
+        }
         for m in self.kv.borrow().values() {
             r.kv_bytes += m.buf.len_bytes() as u64;
             r.kv_slabs += 1;
@@ -743,6 +840,9 @@ impl Cuda {
             r.mirrors += 1;
             if let Some((sc, q)) = &m.quant {
                 r.quant_bytes += (sc.len_bytes() + q.len_bytes()) as u64;
+            }
+            if let Some((sc, q, bs)) = &m.quant_k {
+                r.quant_bytes += (sc.len_bytes() + q.len_bytes() + bs.len_bytes()) as u64;
             }
         }
         for b in self.pool.borrow().iter() {
@@ -1577,7 +1677,8 @@ mod tests {
             let x: Vec<f32> = (0..n_in).map(|i| val(i + 9871)).collect();
 
             // CPU reference, through the ops seam.
-            let w = Weights { data: &packed, ty: GgmlType::Q8_0, n_in, n_out };
+            let w = Weights { data: &packed, ty: GgmlType::Q8_0, n_in, n_out,
+     pooled: false, };
             let mut expect = vec![0.0f32; n_out];
             Naive.matmul(&w, &x, &mut expect);
 

@@ -192,6 +192,7 @@ pub(crate) fn matrix<'a>(
         ty: info.ty,
         n_in,
         n_out,
+        pooled: false,
     })
 }
 

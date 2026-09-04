@@ -328,6 +328,7 @@ mod tests {
             ty,
             n_in,
             n_out,
+            pooled: false,
         };
         let mut serial = vec![0.0f32; n_out];
         let mut parallel = vec![0.0f32; n_out];
@@ -395,6 +396,7 @@ mod tests {
             ty: GgmlType::Q8_0,
             n_in: 128,
             n_out: WIDE,
+            pooled: false,
         };
         let mut first = vec![0.0f32; WIDE];
         Par.matmul(&w, &x, &mut first);

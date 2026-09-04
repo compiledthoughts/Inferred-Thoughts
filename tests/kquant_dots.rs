@@ -306,3 +306,230 @@ fn the_dots_agree_with_the_proven_dequantizer_to_the_quantization_floor() {
         );
     }
 }
+
+// ------------------------------------------------------------------- on CUDA
+//
+// The same fixtures, against the GPU kernels. These are in this file rather
+// than `tests/cuda_ops.rs` because the fixture loader and the real 35B weight
+// rows are here, and a k-quant kernel checked against synthetic weights is a
+// much weaker test: the bit-packings are what break, and real weights exercise
+// every nibble, high bit and scale the format has.
+
+/// The device Q8_K quantizer, against the host one.
+///
+/// **Checked before the dots, and separately from them, for one reason.** All
+/// three formats share this input, so a wrong `d` or a wrong rounding rule
+/// fails three kernels at once and looks like three bugs. Worse, `bsums` is
+/// read only by Q5_K, so a defect confined to it presents as *one* broken
+/// matmul beside two healthy ones — which reads like a Q5_K transcription slip
+/// and sends you to the wrong file. The handoff for this work named that exact
+/// failure shape; this test is the answer to it.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_device_q8_k_quantizer_matches_the_host_one() {
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let fx = fixtures();
+    assert!(!fx.is_empty(), "no .itdp fixtures; run scripts/dump_kquant_dots.py");
+
+    for f in &fx {
+        let host = inferred_thoughts::quant::Q8KRow::from_f32(&f.activation);
+        let (scales, quants, bsums) = gpu
+            .quantize_q8_k_readback(&f.activation)
+            .expect("quantize_q8_k");
+
+        // Bit-for-bit on the scale, not approximately: `d` is 1/iscale and
+        // iscale is -127 divided by the signed extreme, so a tie broken the
+        // other way in the argmax moves the whole block's quants.
+        for (b, (a, e)) in scales.iter().zip(host.scales()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                e.to_bits(),
+                "{}: super-block {b} scale differs, device {a:e} vs host {e:e}. \
+                 The argmax that picks the extreme must break ties toward the \
+                 LOWER index, as the reference's linear scan does.",
+                f.name
+            );
+        }
+        assert_eq!(quants, host.quants(), "{}: Q8_K quants differ", f.name);
+        assert_eq!(
+            bsums,
+            host.bsums(),
+            "{}: Q8_K bsums differ. Only Q5_K reads these, so this would have \
+             surfaced as a lone Q5_K failure.",
+            f.name
+        );
+        println!(
+            "  {:<52} {} super-blocks identical (scales, quants, bsums)",
+            f.name,
+            scales.len()
+        );
+    }
+}
+
+/// Every k-quant matmul on the GPU, **bit-identical to the CPU oracle**.
+///
+/// The handoff for this work expected a derived tolerance here, on the grounds
+/// that the CPU dots are exact only because they mirror one build's per-function
+/// FMA contraction. That turned out to be recoverable rather than lost: nvcc's
+/// contraction is off globally (`--fmad=false` in build.rs) and re-enabled by
+/// hand with `__fmaf_rn` in exactly the two places the reference fused, so the
+/// GPU can mirror the same asymmetry deliberately.
+///
+/// What makes the *parallel* kernel exact is the argument `matmul_q8_0_warp`
+/// found, which generalizes: every k-quant dot is an integer inner sum inside
+/// an f32 outer chain. The integer part cannot round, so the warp may split it
+/// however it likes; the f32 chain is walked serially and ascending, exactly as
+/// the oracle walks it. See `kernels/kernels.cu`.
+///
+/// Per `CLAUDE.md`, the fix if this ever fails is never to loosen it.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_k_quant_matmuls_are_bit_identical_on_the_gpu() {
+    use inferred_thoughts::ops::{Ops, Weights};
+
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    // One op at a time, read straight back: a graph defers the whole pass to
+    // `end_pass`, so it cannot serve this shape.
+    gpu.use_graphs(false);
+    println!(
+        "device {} sm_{}{}",
+        gpu.name(),
+        gpu.capability().0,
+        gpu.capability().1
+    );
+
+    let fx = fixtures();
+    assert!(!fx.is_empty(), "no .itdp fixtures; run scripts/dump_kquant_dots.py");
+
+    for f in &fx {
+        // The fixture's rows are contiguous and each is a whole number of
+        // super-blocks, which is exactly a `Weights` of `rows` outputs.
+        let w = Weights {
+            data: &f.weights,
+            ty: f.ty,
+            n_in: f.n,
+            n_out: f.rows,
+            pooled: false,
+        };
+
+        let mut cpu = vec![0.0f32; f.rows];
+        inferred_thoughts::Naive.matmul(&w, &f.activation, &mut cpu);
+
+        let mut dev = vec![0.0f32; f.rows];
+        gpu.begin_pass(1);
+        gpu.matmul(&w, &f.activation, &mut dev);
+        gpu.host_needs(&mut dev);
+        if let Some(e) = gpu.take_error() {
+            panic!("{}: driver error: {e}", f.name);
+        }
+
+        // The CPU side is already pinned to ggml's portable kernel by
+        // `every_k_quant_dot_reproduces_ggml`, so agreeing with it bit-for-bit
+        // chains the GPU to ggml's definition too.
+        let differing = cpu
+            .iter()
+            .zip(&dev)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        if differing != 0 {
+            let at = cpu
+                .iter()
+                .zip(&dev)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .unwrap_or(0);
+            panic!(
+                "{} ({:?}, n_in {}, {} rows): {differing} rows differ from the oracle.\n  \
+                 first at row {at}: naive {:e} vs cuda {:e}\n  \
+                 The integer part of this dot is order-free and the f32 chain is \
+                 meant to be serial and ascending -- a difference is a defect in \
+                 one of those two claims, not rounding. Check the FMA choices \
+                 first: Q5_K fuses, Q6_K and IQ4_XS must not.",
+                f.name, f.ty, f.n, f.rows, cpu[at], dev[at],
+            );
+        }
+        println!(
+            "  {:<52} {} rows bit-identical to naive",
+            f.name, f.rows
+        );
+    }
+}
+
+/// The batch axis changes which outputs share a launch, never how one
+/// accumulates.
+///
+/// Q8_0 gets this property from two separate kernels that must be kept in
+/// agreement; the k-quants get it from one kernel with the batch on
+/// `blockIdx.y`, so decode is `gridDim.y == 1` of the same code. This asserts
+/// that rather than assuming it — and it is the test that would catch a
+/// per-token pointer offset computed from the wrong stride, which is the one
+/// thing the single-token path cannot see.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn a_batched_k_quant_matmul_agrees_with_its_own_single_token_path() {
+    use inferred_thoughts::ops::{Ops, Weights};
+
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    for f in fixtures() {
+        let w = Weights {
+            data: &f.weights,
+            ty: f.ty,
+            n_in: f.n,
+            n_out: f.rows,
+            pooled: false,
+        };
+
+        // Four tokens: the fixture's activation, then three cheap variations
+        // of it, so a stride bug cannot hide behind identical rows.
+        let n_tok = 4usize;
+        let mut batch = Vec::with_capacity(n_tok * f.n);
+        for t in 0..n_tok {
+            let k = 1.0 + t as f32 * 0.37;
+            batch.extend(f.activation.iter().map(|v| v * k));
+        }
+
+        let mut want = vec![0.0f32; n_tok * f.rows];
+        for t in 0..n_tok {
+            let x = &batch[t * f.n..(t + 1) * f.n];
+            let mut row = vec![0.0f32; f.rows];
+            gpu.begin_pass(1);
+            gpu.matmul(&w, x, &mut row);
+            gpu.host_needs(&mut row);
+            want[t * f.rows..(t + 1) * f.rows].copy_from_slice(&row);
+        }
+
+        let mut got = vec![0.0f32; n_tok * f.rows];
+        gpu.begin_pass(n_tok);
+        gpu.matmul(&w, &batch, &mut got);
+        gpu.host_needs(&mut got);
+        if let Some(e) = gpu.take_error() {
+            panic!("{}: driver error: {e}", f.name);
+        }
+
+        let differing = want
+            .iter()
+            .zip(&got)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing,
+            0,
+            "{} ({:?}): {differing} of {} batched outputs differ from the same \
+             kernel run one token at a time. Batching is meant to be exact by \
+             construction, so suspect a per-token stride.",
+            f.name,
+            f.ty,
+            want.len()
+        );
+        println!(
+            "  {:<52} {n_tok} tokens x {} rows match the single-token path",
+            f.name, f.rows
+        );
+    }
+}

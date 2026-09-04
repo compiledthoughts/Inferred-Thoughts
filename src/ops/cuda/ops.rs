@@ -31,7 +31,7 @@
 
 use std::ffi::c_void;
 
-use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, ffi};
+use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, experts, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
 /// Tokens one warp of `matmul_q8_0_batch` holds in registers while it loads a
@@ -80,6 +80,48 @@ mod slot {
     pub const Q: usize = 8;
 }
 
+/// One matmul shape, measured on the live device with the launch queue kept
+/// full — the thing `--profile-kernels` cannot report, because synchronizing
+/// per launch is exactly what changes the answer.
+///
+/// `gpu` and `issue` are the same launches timed two ways, so the larger of
+/// them is what binds for this shape. `grouped` is the same arithmetic in one
+/// launch instead of `group`, which prices fusing the routed FFN.
+#[derive(Debug, Clone, Copy)]
+pub struct ShapeBench {
+    pub kernel: &'static str,
+    pub n_in: usize,
+    pub n_out: usize,
+    /// Launches of this shape observed during the run being profiled.
+    pub calls: u64,
+    /// Device microseconds per launch.
+    pub gpu_us: f64,
+    /// Host microseconds per launch, i.e. what it costs to describe the work.
+    pub issue_us: f64,
+    /// Device microseconds for one launch covering `group` shapes' rows.
+    pub grouped_us: f64,
+    pub group: usize,
+}
+
+impl ShapeBench {
+    /// Device milliseconds this shape costs per token, at the observed rate.
+    pub fn gpu_ms_per_token(&self, tokens: u64) -> f64 {
+        self.calls as f64 / tokens.max(1) as f64 * self.gpu_us / 1000.0
+    }
+
+    /// Host milliseconds per token, same basis.
+    pub fn issue_ms_per_token(&self, tokens: u64) -> f64 {
+        self.calls as f64 / tokens.max(1) as f64 * self.issue_us / 1000.0
+    }
+
+    /// What fusing `group` launches into one would leave, per token, on the
+    /// device. Compare against [`ShapeBench::gpu_ms_per_token`].
+    pub fn grouped_ms_per_token(&self, tokens: u64) -> f64 {
+        let launches = self.calls as f64 / self.group.max(1) as f64;
+        launches / tokens.max(1) as f64 * self.grouped_us / 1000.0
+    }
+}
+
 impl Cuda {
     /// The device copy of a model-owned activation, brought up to date.
     ///
@@ -116,8 +158,12 @@ impl Cuda {
         if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
             m.device_current = true;
             // The contents are about to change, so a quantization of them is
-            // stale — but the buffer holding it is kept.
+            // stale — but the buffer holding it is kept. **Both** forms: a
+            // 35B attention layer keeps a Q8_0 and a Q8_K copy of the same
+            // activation live at once, and invalidating one would leave the
+            // other serving the previous token's values.
             m.quant_valid = false;
+            m.quant_k_valid = false;
         }
         Ok(ptr)
     }
@@ -138,6 +184,8 @@ impl Cuda {
                     device_current: false,
                     quant: None,
                     quant_valid: false,
+                    quant_k: None,
+                    quant_k_valid: false,
                 },
             );
         }
@@ -148,6 +196,73 @@ impl Cuda {
                 detail: "mirror vanished between insert and lookup".to_string(),
             }),
         }
+    }
+
+    /// This activation quantized to **Q8_K** on the device, computed once.
+    ///
+    /// Returns `(scales, quants, bsums)`. The same caching argument as
+    /// [`Cuda::quantized`], on a separate slot: the k-quants pair with Q8_K
+    /// where Q8_0 weights pair with Q8_0, so a 35B attention layer needs both
+    /// forms of the same normed activation and one slot would thrash.
+    ///
+    /// `bsums` is carried even though only Q5_K reads it. Sizing the buffer on
+    /// demand would make its presence depend on which weight arrived first,
+    /// which is exactly the kind of ordering dependence that leaves two formats
+    /// right and one wrong.
+    fn quantized_k(
+        &self,
+        x: &[f32],
+        n_super: usize,
+    ) -> Result<(ffi::CUdeviceptr, ffi::CUdeviceptr, ffi::CUdeviceptr)> {
+        const QK_K: usize = 256;
+        let key = x.as_ptr() as usize;
+        let xd = self.mirror_in(x)?;
+
+        let existing = match self.mirrors.borrow().get(&key) {
+            Some(m) => match &m.quant_k {
+                Some((s, q, b)) if s.len_bytes() >= n_super * 4 => {
+                    if m.quant_k_valid {
+                        return Ok((s.ptr, q.ptr, b.ptr));
+                    }
+                    Some((s.ptr, q.ptr, b.ptr))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let (sd, qd, bd, fresh_bufs) = match existing {
+            Some((s, q, b)) => (s, q, b, None),
+            None => {
+                let scales = DeviceBuffer::new(n_super * 4)?;
+                let quants = DeviceBuffer::new(n_super * QK_K)?;
+                let bsums = DeviceBuffer::new(n_super * (QK_K / 16) * 2)?;
+                let (s, q, b) = (scales.ptr, quants.ptr, bsums.ptr);
+                (s, q, b, Some((scales, quants, bsums)))
+            }
+        };
+        {
+            let args = [
+                KArg::I32(n_super as i32),
+                KArg::Ptr(xd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(bd),
+            ];
+            // One block of 256 threads per super-block: the argmax that sets
+            // the scale is a whole-super-block reduction, so the block is the
+            // super-block rather than a tunable.
+            // SAFETY: parameters match `quantize_q8_k`; the grid covers exactly
+            // `n_super` super-blocks and all three outputs are sized for them.
+            unsafe { self.launch("quantize_q8_k", n_super as u32, QK_K as u32, &args)? };
+        }
+        if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
+            if let Some(bufs) = fresh_bufs {
+                m.quant_k = Some(bufs);
+            }
+            m.quant_k_valid = true;
+        }
+        Ok((sd, qd, bd))
     }
 
     /// This activation quantized to Q8_0 on the device, computed once.
@@ -274,6 +389,19 @@ impl Cuda {
             return Ok(b.ptr);
         }
         let buf = DeviceBuffer::from_slice(data)?;
+        // Counted, because on the 35B this is no longer a start-up cost.
+        //
+        // `DeviceBuffer::from_slice` copies through the driver directly rather
+        // than through `Cuda::h2d`, so these uploads were invisible to the
+        // crossing counters. That was harmless while `resident` held only norm
+        // vectors uploaded once; it is not harmless now, when it is the path
+        // every routed expert takes and the traffic it hides is the quantity
+        // this project exists to measure. The first 35B run reported "2.0 MiB
+        // up" against ~300 MB per token of actual expert streaming.
+        self.bump(|s| {
+            s.h2d_calls += 1;
+            s.h2d_bytes += std::mem::size_of_val(data) as u64;
+        });
         let ptr = buf.ptr;
         map.insert(key, buf);
         Ok(ptr)
@@ -353,6 +481,33 @@ impl Cuda {
     /// error is kept and the caller checks it once the run is over. Output
     /// after a failure is meaningless, which is why the CLI treats a present
     /// error as fatal rather than as a warning.
+    /// What the expert cache did. `None` if the model has no pooled weights.
+    ///
+    /// **The measurement the whole design is waiting on.** `HANDOFF.md` §9
+    /// item 2 proposed getting the hit rate from an offline replay of a routing
+    /// trace; this is better, because it is the policy actually running against
+    /// the traffic actually generated.
+    pub fn expert_stats(&self) -> Option<experts::ExpertStats> {
+        self.experts.borrow().as_ref().map(|c| c.stats())
+    }
+
+    /// Cap the expert slab, in bytes. Zero restores the automatic budget.
+    pub fn set_expert_budget(&self, bytes: usize) {
+        // Expressed as a reserve because that is what the sizing code has to
+        // work with: total free VRAM minus what everything else will need.
+        let (free, _) = self.mem_info().unwrap_or((0, 0));
+        self.expert_reserve
+            .set(if bytes == 0 { experts::DEFAULT_RESERVE } else { free.saturating_sub(bytes) });
+    }
+
+    /// Whether graphs were turned off because the model read a device result
+    /// mid-pass. See [`Cuda::mid_pass_read`]; reported by `--profile-device`
+    /// so the throughput loss is visible rather than inferred from a launch
+    /// count.
+    pub fn graphs_off_for_mid_pass_read(&self) -> bool {
+        self.mid_pass_read.get()
+    }
+
     pub fn take_error(&self) -> Option<Error> {
         self.error.borrow_mut().take()
     }
@@ -412,16 +567,183 @@ impl Cuda {
         self.mirror_out(x).map(|_| ())
     }
 
-    fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
-        if w.ty != GgmlType::Q8_0 {
-            return Err(Error::Cuda {
-                what: "matmul",
-                detail: format!(
-                    "{:?} has no CUDA kernel; this backend implements Q8_0, which is \
-                     every matmul in the models it targets",
-                    w.ty
-                ),
+    /// The k-quant matmuls: Q6_K, Q5_K and IQ4_XS, all against a Q8_K
+    /// activation.
+    ///
+    /// **One kernel serves decode and prefill**, with the batch on `blockIdx.y`
+    /// rather than in a second kernel. That is deliberately unlike the Q8_0
+    /// pair, where `matmul_q8_0_batch` exists to amortize a weight load across
+    /// `MM_TOK` tokens: here a warp still re-reads its weight row per token, so
+    /// prefill weight traffic scales with the batch. Correct first, and the
+    /// reuse variant arrives as a measured change against this baseline —
+    /// which is also what keeps decode and prefill unable to disagree while the
+    /// exactness claim is being established.
+    fn matmul_kquant(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        const QK_K: usize = 256;
+        let n_tok = x.len() / w.n_in;
+        let n_super = w.n_in / QK_K;
+
+        // The weight goes up in the file's own layout, unrepacked. The Q8_0
+        // path repacks for 16-byte alignment; that was tried there *and*
+        // reverted once for being 20% slower, so the same bet is not made
+        // twice untested. Whether these three want a repack is a measurement,
+        // not an assumption.
+        let wd = self.expert_or_resident(w)?;
+        let (sd, qd, bd) = self.quantized_k(x, n_tok * n_super)?;
+        let od = self.mirror_out(out)?;
+
+        // 128 threads is four warps, so four output rows per block.
+        let block = 128u32;
+        let rows_per_block = (block / 32) as usize;
+        let grid_rows = w.n_out.div_ceil(rows_per_block) as u32;
+
+        let (name, args): (&'static str, Vec<KArg>) = match w.ty {
+            GgmlType::Q6K => (
+                "matmul_q6_k_q8_k",
+                vec![
+                    KArg::I32(w.n_in as i32),
+                    KArg::I32(w.n_out as i32),
+                    KArg::Ptr(wd),
+                    KArg::Ptr(sd),
+                    KArg::Ptr(qd),
+                    KArg::Ptr(od),
+                ],
+            ),
+            GgmlType::Q5K => (
+                "matmul_q5_k_q8_k",
+                vec![
+                    KArg::I32(w.n_in as i32),
+                    KArg::I32(w.n_out as i32),
+                    KArg::Ptr(wd),
+                    KArg::Ptr(sd),
+                    KArg::Ptr(qd),
+                    // Only Q5_K reads the per-16 sums, and omitting them here
+                    // would leave the other two correct.
+                    KArg::Ptr(bd),
+                    KArg::Ptr(od),
+                ],
+            ),
+            _ => (
+                "matmul_iq4_xs_q8_k",
+                vec![
+                    KArg::I32(w.n_in as i32),
+                    KArg::I32(w.n_out as i32),
+                    KArg::Ptr(wd),
+                    KArg::Ptr(sd),
+                    KArg::Ptr(qd),
+                    KArg::Ptr(od),
+                ],
+            ),
+        };
+
+        self.note_shape(name, w.n_in, w.n_out);
+        // SAFETY: parameters match the named kernel; the grid covers exactly
+        // `n_out` rows by `n_tok` tokens, and the kernels use no dynamic
+        // shared memory.
+        unsafe { self.launch_grid2(name, grid_rows, n_tok as u32, block, 0, &args) }
+    }
+
+    /// The device address of a weight, from whichever residency it belongs to.
+    ///
+    /// **The one branch that decides whether this engine can serve a model
+    /// larger than VRAM.** Anything that fits goes in the permanent mirror, as
+    /// it always has. A tensor marked `pooled` — an MoE expert, and only an MoE
+    /// expert — goes in the bounded slab, where it may be evicted.
+    ///
+    /// The distinction is a fact about the tensor, carried on `Weights::pooled`,
+    /// not a policy. The policy is [`experts::ExpertCache`]'s.
+    fn expert_or_resident(&self, w: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
+        if !w.pooled {
+            return self.resident(w.data);
+        }
+        let mut slot = self.experts.borrow_mut();
+        if slot.is_none() {
+            // Sized here rather than at construction, because "free VRAM" only
+            // means something once the permanent weights are on their way up.
+            // Nothing before the first expert of layer 0 is large.
+            let (free, _) = self.mem_info()?;
+            let reserve = self.expert_reserve.get();
+            let budget = free.saturating_sub(reserve);
+            let slots = budget / w.data.len().max(1);
+            *slot = Some(experts::ExpertCache::new(w.data.len(), slots)?);
+        }
+        let cache = match slot.as_mut() {
+            Some(c) => c,
+            None => {
+                return Err(Error::Cuda {
+                    what: "expert cache",
+                    detail: "cache vanished between build and use".to_string(),
+                });
+            }
+        };
+        let before = cache.stats().filled_bytes;
+        let ptr = cache.get_or_fill(w.data.as_ptr() as usize, w.data)?;
+        let filled = cache.stats().filled_bytes - before;
+        drop(slot);
+        // A miss is a bus crossing and is counted as one; a hit moves nothing.
+        // Counted rather than derived for the reason `DeviceBuffer::from_slice`
+        // taught this session — an upload the counters cannot see reads as
+        // "3.9 MiB up" against an actual 3111, and this is the exact traffic
+        // the whole design is drawn against.
+        if filled > 0 {
+            self.bump(|st| {
+                st.h2d_calls += 1;
+                st.h2d_bytes += filled;
             });
+        }
+        Ok(ptr)
+    }
+
+    /// The F32 matmul, which on the 35B is the MoE router and nothing else.
+    ///
+    /// Kept as the slow one-thread-per-row shape on purpose; see `matmul_f32`
+    /// in kernels.cu for why exactness is worth more than speed here.
+    fn matmul_f32(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let n_tok = x.len() / w.n_in;
+        self.note_shape("matmul_f32", w.n_in, w.n_out);
+        // The mmap holds the rows as little-endian f32 already, so the device
+        // copy is the file's bytes reinterpreted rather than converted.
+        let wd = self.resident(w.data)?;
+        let xd = self.mirror_in(x)?;
+        let od = self.mirror_out(out)?;
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(xd),
+            KArg::Ptr(od),
+        ];
+        let block = 128u32;
+        // SAFETY: parameters match `matmul_f32`; the grid covers exactly
+        // `n_out` rows by `n_tok` tokens.
+        unsafe {
+            self.launch_grid2(
+                "matmul_f32",
+                w.n_out.div_ceil(block as usize) as u32,
+                n_tok as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
+    fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        match w.ty {
+            GgmlType::Q8_0 => {}
+            GgmlType::Q6K | GgmlType::Q5K | GgmlType::Iq4Xs => {
+                return self.matmul_kquant(w, x, out);
+            }
+            GgmlType::F32 => return self.matmul_f32(w, x, out),
+            other => {
+                return Err(Error::Cuda {
+                    what: "matmul",
+                    detail: format!(
+                        "{other:?} has no CUDA kernel; this backend implements Q8_0 and the \
+                         three k-quants the 35B uses (Q5_K, Q6_K, IQ4_XS)"
+                    ),
+                });
+            }
         }
 
         // Quantized on the device. It began on the host, because the scale
@@ -728,6 +1050,247 @@ impl Cuda {
         Ok(ptrs)
     }
 
+    /// Run `quantize_q8_k` on the device and read all three outputs back.
+    ///
+    /// **For tests, and it earns its place.** A wrong Q8_K quantization shows
+    /// up in every k-quant dot at once, so without this a single defect looks
+    /// like three broken matmuls — and a defect in `bsums` alone looks like one
+    /// broken matmul (Q5_K) with two healthy ones, which is worse. This makes
+    /// the quantizer directly comparable to `quant::kquant::Q8KRow::from_f32`.
+    pub fn quantize_q8_k_readback(&self, x: &[f32]) -> Result<(Vec<f32>, Vec<i8>, Vec<i16>)> {
+        const QK_K: usize = 256;
+        if x.len() % QK_K != 0 {
+            return Err(Error::Cuda {
+                what: "quantize_q8_k_readback",
+                detail: format!("{} values is not a whole number of super-blocks", x.len()),
+            });
+        }
+        let n_super = x.len() / QK_K;
+        self.begin_pass(1);
+        self.host_wrote(x);
+        let (sd, qd, bd) = self.quantized_k(x, n_super)?;
+        self.sync()?;
+
+        let mut scales = vec![0.0f32; n_super];
+        let mut quants = vec![0i8; n_super * QK_K];
+        let mut bsums = vec![0i16; n_super * (QK_K / 16)];
+        self.d2h(&mut scales, sd)?;
+        self.d2h(&mut quants, qd)?;
+        self.d2h(&mut bsums, bd)?;
+        Ok((scales, quants, bsums))
+    }
+
+
+    /// Record a matmul's shape, so the microbenchmark can replay it later.
+    fn note_shape(&self, kernel: &'static str, n_in: usize, n_out: usize) {
+        *self
+            .shapes
+            .borrow_mut()
+            .entry((kernel, n_in, n_out))
+            .or_insert(0) += 1;
+    }
+
+    /// Time the shapes this run actually launched — **with no per-launch
+    /// synchronize**, which is what `--profile-kernels` cannot do.
+    ///
+    /// # Why this exists
+    ///
+    /// `gpu` and `issue` in the pass timings came out at 74.95 and 71.75
+    /// ms/token on the 35B, which is ambiguous in the worst way: it is
+    /// consistent both with a device saturated by real work and with a device
+    /// starved by a host that cannot describe work fast enough. Those call for
+    /// opposite fixes — better kernels versus fewer launches — so guessing is
+    /// expensive.
+    ///
+    /// So each shape is measured twice over the same launches:
+    ///
+    /// * **gpu** — CUDA events either side of the whole batch. Time the device
+    ///   spent, per launch, with the queue kept full.
+    /// * **issue** — host wall time for the launch loop, which returns as soon
+    ///   as the driver accepts each launch. Host cost, per launch.
+    ///
+    /// Whichever is larger is the one that binds, per shape, and the ratio says
+    /// by how much.
+    ///
+    /// # The grouped column
+    ///
+    /// Each shape is also run **once** with `group` times the rows, which is
+    /// the same arithmetic in one launch instead of `group`. For the routed
+    /// FFN that is exactly the change worth costing: 8 experts of `{2048, 512}`
+    /// become one `{2048, 4096}`. The difference between `group * gpu` and
+    /// `grouped` is what fusing them would return, measured rather than argued.
+    ///
+    /// Weights are synthetic. These kernels are bandwidth and instruction
+    /// bound and do not branch on values — but the f16 scale bytes are set to a
+    /// real value anyway, because a NaN scale is the kind of thing that turns
+    /// out to matter on some future architecture.
+    pub fn bench_shapes(&self, group: usize, tokens: u64, reps: u32) -> Result<Vec<ShapeBench>> {
+        let mut want: Vec<((&'static str, usize, usize), u64)> =
+            self.shapes.borrow().iter().map(|(k, v)| (*k, *v)).collect();
+        // Most-launched first: that is the order in which they matter.
+        want.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+
+        let mut out = Vec::with_capacity(want.len());
+        for ((kernel, n_in, n_out), calls) in want {
+            let one = self.time_shape(kernel, n_in, n_out, reps)?;
+            // The grouped form is the same kernel over `group` times the rows.
+            // Skipped when it would not fit or would not mean anything.
+            // Only meaningful where the shape is launched at least `group`
+            // times **per token**, which is what "fuse the experts a token
+            // visits" means. Gating on the raw count instead priced fusing
+            // eight LM heads — a 2048 x 1,986,560 matmul nobody would build —
+            // and that one row put 82 ms into a 7 ms total.
+            let per_token = calls as f64 / tokens.max(1) as f64;
+            let groupable = group > 1 && per_token >= group as f64;
+            let grouped = if groupable {
+                self.time_shape(kernel, n_in, n_out * group, reps.max(1) / 4 + 1)?.0
+            } else {
+                one.0
+            };
+            out.push(ShapeBench {
+                kernel,
+                n_in,
+                n_out,
+                calls,
+                gpu_us: one.0,
+                issue_us: one.1,
+                grouped_us: grouped,
+                group: if groupable { group } else { 1 },
+            });
+        }
+        Ok(out)
+    }
+
+    /// One shape, `reps` launches, one synchronize. Returns `(gpu, issue)` in
+    /// microseconds per launch.
+    fn time_shape(
+        &self,
+        kernel: &'static str,
+        n_in: usize,
+        n_out: usize,
+        reps: u32,
+    ) -> Result<(f64, f64)> {
+        const QK_K: usize = 256;
+        // Bytes one row of this format occupies, and the f16 scale's offset
+        // within a block. `None` where the format has no f16 to protect.
+        let (block_bytes, block_elems, scale_at) = match kernel {
+            "matmul_iq4_xs_q8_k" => (136usize, QK_K, Some(0usize)),
+            "matmul_q5_k_q8_k" => (176, QK_K, Some(0)),
+            "matmul_q6_k_q8_k" => (210, QK_K, Some(208)),
+            "matmul_f32" => (4, 1, None),
+            // Q8_0 has its own benches, and anything else is not a matmul.
+            _ => return Ok((f64::NAN, f64::NAN)),
+        };
+        let n_super = n_in / block_elems;
+        let row_bytes = n_super * block_bytes;
+
+        let mut w = vec![0x11u8; n_out * row_bytes];
+        if let Some(off) = scale_at {
+            // 0x3800 is f16 0.5: a real number, so the arithmetic is finite.
+            for r in 0..n_out {
+                for b in 0..n_super {
+                    let at = r * row_bytes + b * block_bytes + off;
+                    w[at] = 0x00;
+                    w[at + 1] = 0x38;
+                }
+            }
+        } else {
+            for c in w.chunks_exact_mut(4) {
+                c.copy_from_slice(&0.01f32.to_le_bytes());
+            }
+        }
+
+        let wd = DeviceBuffer::from_slice(&w)?;
+        let od = DeviceBuffer::new(n_out * 4)?;
+
+        // The activation, in whichever form this kernel dots against.
+        let (xs, xq, xb, xf) = if kernel == "matmul_f32" {
+            let x: Vec<f32> = (0..n_in).map(|i| (i % 17) as f32 * 0.01).collect();
+            (None, None, None, Some(DeviceBuffer::from_slice(&x)?))
+        } else {
+            let scales: Vec<f32> = (0..n_super).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
+            let quants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+            let bsums: Vec<i16> = (0..n_super * (QK_K / 16)).map(|i| (i % 97) as i16).collect();
+            (
+                Some(DeviceBuffer::from_slice(&scales)?),
+                Some(DeviceBuffer::from_slice(&quants)?),
+                Some(DeviceBuffer::from_slice(&bsums)?),
+                None,
+            )
+        };
+
+        let mut args = vec![KArg::I32(n_in as i32), KArg::I32(n_out as i32), KArg::Ptr(wd.ptr)];
+        match (&xf, &xs, &xq, &xb) {
+            (Some(x), ..) => args.push(KArg::Ptr(x.ptr)),
+            (None, Some(s), Some(q), Some(b)) => {
+                args.push(KArg::Ptr(s.ptr));
+                args.push(KArg::Ptr(q.ptr));
+                if kernel == "matmul_q5_k_q8_k" {
+                    args.push(KArg::Ptr(b.ptr));
+                }
+            }
+            _ => {}
+        }
+        args.push(KArg::Ptr(od.ptr));
+
+        let block = 128u32;
+        let grid = if kernel == "matmul_f32" {
+            n_out.div_ceil(block as usize) as u32
+        } else {
+            n_out.div_ceil((block / 32) as usize) as u32
+        };
+
+        // A bench is never part of a graph, and never times its own launches.
+        let was_graph = self.pass_graph.replace(false);
+        let was_timed = self.time_kernels.replace(false);
+
+        let (mut a, mut b): (ffi::CUevent, ffi::CUevent) =
+            (std::ptr::null_mut(), std::ptr::null_mut());
+        // SAFETY: valid out-pointers; flag 0 is the timing-enabled default.
+        unsafe {
+            check(ffi::cuEventCreate(&mut a, 0), "cuEventCreate")?;
+            check(ffi::cuEventCreate(&mut b, 0), "cuEventCreate")?;
+        }
+
+        let mut run = |n: u32| -> Result<(f64, f64)> {
+            // SAFETY: `a`/`b` are ours; the null stream is the one everything
+            // uses, so the events bracket exactly these launches.
+            unsafe { check(ffi::cuEventRecord(a, std::ptr::null_mut()), "cuEventRecord")? };
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                // SAFETY: the argument list is built above to match `kernel`,
+                // and every buffer is sized for the shape it describes.
+                unsafe { self.launch_grid2(kernel, grid, 1, block, 0, &args)? };
+            }
+            // Host time first: the launch loop returns once the driver has
+            // accepted the work, so this is issue cost and not device time.
+            let issue = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            // SAFETY: as above.
+            unsafe {
+                check(ffi::cuEventRecord(b, std::ptr::null_mut()), "cuEventRecord")?;
+                check(ffi::cuEventSynchronize(b), "cuEventSynchronize")?;
+            }
+            let mut ms = 0.0f32;
+            // SAFETY: both events have completed.
+            unsafe {
+                check(ffi::cuEventElapsedTime(&mut ms, a, b), "cuEventElapsedTime")?;
+            }
+            Ok((f64::from(ms) * 1000.0 / f64::from(n), issue))
+        };
+
+        run(8)?; // warm the module, the caches and the clocks
+        let measured = run(reps.max(1));
+
+        // SAFETY: both events are ours and are no longer in flight.
+        unsafe {
+            check(ffi::cuEventDestroy_v2(a), "cuEventDestroy")?;
+            check(ffi::cuEventDestroy_v2(b), "cuEventDestroy")?;
+        }
+        self.pass_graph.set(was_graph);
+        self.time_kernels.set(was_timed);
+        measured
+    }
+
     /// Time a matmul variant at a real weight shape.
     ///
     /// Weights are synthetic -- the kernels are bandwidth and instruction bound
@@ -897,6 +1460,49 @@ impl Cuda {
         // per output element, guarded against the tail.
         unsafe { self.launch_shared("gather_chunks", blocks, 256, 0, &args)? };
         Ok(())
+    }
+
+    fn scatter_chunks_impl(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        dst: &mut [f32],
+    ) -> Result<()> {
+        let sd = self.mirror_in(src)?;
+        // `mirror_in`, not `mirror_out`: this writes only the windows it is
+        // given, so the rest of `dst` must already be on the device. The MoE
+        // fills row `t` of an output whose other rows earlier tokens wrote.
+        let dd = self.mirror_in(dst)?;
+        let args = [
+            KArg::I32(src.len() as i32),
+            KArg::I32(chunk as i32),
+            KArg::I32(stride as i32),
+            KArg::I32(offset as i32),
+            KArg::Ptr(sd),
+            KArg::Ptr(dd),
+        ];
+        let blocks = src.len().div_ceil(256) as u32;
+        // SAFETY: parameters match `scatter_chunks` in kernels.cu; one thread
+        // per *source* element, guarded against the tail.
+        unsafe { self.launch_shared("scatter_chunks", blocks, 256, 0, &args)? };
+        self.mirror_out(dst).map(|_| ())
+    }
+
+    fn add_scaled_impl(&self, a: &mut [f32], b: &[f32], scale: f32) -> Result<()> {
+        let bd = self.mirror_in(b)?;
+        let ad = self.mirror_in(a)?;
+        let args = [
+            KArg::I32(a.len() as i32),
+            KArg::F32(scale),
+            KArg::Ptr(ad),
+            KArg::Ptr(bd),
+        ];
+        let blocks = a.len().div_ceil(256) as u32;
+        // SAFETY: parameters match `add_scaled` in kernels.cu.
+        unsafe { self.launch_shared("add_scaled", blocks, 256, 0, &args)? };
+        self.mirror_out(a).map(|_| ())
     }
 
     fn sigmoid_mul_impl(&self, x: &mut [f32], g: &[f32]) -> Result<()> {
@@ -1198,6 +1804,24 @@ impl Ops for Cuda {
         self.note(self.gather_chunks_impl(src, chunk, stride, offset, out));
     }
 
+    fn scatter_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        dst: &mut [f32],
+    ) {
+        self.note(self.scatter_chunks_impl(src, chunk, stride, offset, dst));
+    }
+
+    /// **A device backend must override this**, or the trait default's host
+    /// scalar loop reads a buffer the device owns. It is the MoE expert
+    /// accumulation, so it runs eight times a layer.
+    fn add_scaled(&self, a: &mut [f32], b: &[f32], scale: f32) {
+        self.note(self.add_scaled_impl(a, b, scale));
+    }
+
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
         self.note(self.sigmoid_mul_impl(x, g));
     }
@@ -1217,6 +1841,16 @@ impl Ops for Cuda {
     }
 
     fn host_needs(&self, buf: &mut [f32]) {
+        // A read *inside* a pass is the model telling us this pass cannot be a
+        // CUDA graph: a graph defers every kernel to `end_pass`, so the
+        // download below would return the previous pass's contents. See
+        // `Cuda::mid_pass_read`. Latched on the first occurrence, which always
+        // happens during the eager warm-up passes, so no graph is ever recorded
+        // for such a model rather than one being recorded and silently lying.
+        if self.in_pass.get() && !self.mid_pass_read.get() {
+            self.mid_pass_read.set(true);
+            self.graphs_enabled.set(false);
+        }
         let key = buf.as_ptr() as usize;
         let ptr = match self.mirrors.borrow().get(&key) {
             Some(m) if m.device_current => m.buf.ptr,
@@ -1230,11 +1864,13 @@ impl Ops for Cuda {
     }
 
     fn end_pass(&self) {
+        self.in_pass.set(false);
         self.note(self.graph_end());
         self.note(self.timing_end());
     }
 
     fn begin_pass(&self, n_tokens: usize) {
+        self.in_pass.set(true);
         self.note(self.timing_begin());
         self.note(self.graph_begin(n_tokens));
         // Activation buffers are allocated per pass, so an address from the
@@ -1316,6 +1952,21 @@ impl Ops for &Cuda {
         out: &mut [f32],
     ) {
         (*self).gather_chunks(src, chunk, stride, offset, out)
+    }
+
+    fn scatter_chunks(
+        &self,
+        src: &[f32],
+        chunk: usize,
+        stride: usize,
+        offset: usize,
+        dst: &mut [f32],
+    ) {
+        (*self).scatter_chunks(src, chunk, stride, offset, dst)
+    }
+
+    fn add_scaled(&self, a: &mut [f32], b: &[f32], scale: f32) {
+        (*self).add_scaled(a, b, scale)
     }
 
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
