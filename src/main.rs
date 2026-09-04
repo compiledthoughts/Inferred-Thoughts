@@ -499,7 +499,7 @@ shapes   measured on the live device, queue full, no per-launch sync"
                     issue += r.issue_ms_per_token(tokens);
                     grouped += r.grouped_ms_per_token(tokens);
                     eprintln!(
-                        "         {:<20} {:>5}x{:<6} {:>7.1} {:>8.1} {:>9.1} {:>9.2} {:>9.2}",
+                        "         {:<20} {:>5}x{:<6} {:>7.1} {:>8.1} {:>9.1} {:>9.2} {:>9.2} {}",
                         r.kernel,
                         r.n_in,
                         r.n_out,
@@ -508,6 +508,7 @@ shapes   measured on the live device, queue full, no per-launch sync"
                         r.issue_us,
                         r.gpu_ms_per_token(tokens),
                         r.grouped_ms_per_token(tokens),
+                        if r.host_limited() { "?" } else { "" },
                     );
                 }
                 eprintln!(
@@ -517,7 +518,9 @@ shapes   measured on the live device, queue full, no per-launch sync"
                 eprintln!(
                     "         matmuls alone: {gpu:.1} ms/token on the device, {issue:.1} ms to issue.
          Whichever is larger is what binds; `grp` is the same arithmetic
-         in one launch per {group} instead of {group}."
+         in one launch per {group} instead of {group}.
+         `?` marks a row the host could not keep fed, so its gpu figure is an
+         upper bound rather than a measurement."
                 );
             }
             Ok(_) => {}

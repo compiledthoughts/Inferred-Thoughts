@@ -104,6 +104,18 @@ pub struct ShapeBench {
 }
 
 impl ShapeBench {
+    /// Whether the host, not the device, limited this measurement.
+    ///
+    /// The event pair brackets the launch loop, so if the host cannot keep the
+    /// queue full it times the stall and `gpu` collapses onto `issue`. Taking
+    /// the best of several runs removes most of it; what survives is reported
+    /// rather than trusted, because the alternative is reading a 2 KiB
+    /// elementwise kernel as costing 22 us of device time.
+    pub fn host_limited(&self) -> bool {
+        self.gpu_us > 0.0 && self.issue_us / self.gpu_us > 0.7
+    }
+
+
     /// Device milliseconds this shape costs per token, at the observed rate.
     pub fn gpu_ms_per_token(&self, tokens: u64) -> f64 {
         self.calls as f64 / tokens.max(1) as f64 * self.gpu_us / 1000.0
@@ -254,6 +266,7 @@ impl Cuda {
             // super-block rather than a tunable.
             // SAFETY: parameters match `quantize_q8_k`; the grid covers exactly
             // `n_super` super-blocks and all three outputs are sized for them.
+            self.note_shape("quantize_q8_k", n_super * QK_K, 0);
             unsafe { self.launch("quantize_q8_k", n_super as u32, QK_K as u32, &args)? };
         }
         if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
@@ -1161,6 +1174,114 @@ impl Cuda {
         Ok(out)
     }
 
+    /// Build the argument list and launch geometry for one shape.
+    ///
+    /// **Per kernel, by hand, because there is no honest shortcut.** Every
+    /// kernel's parameter list is its own, so a generic replay would have to
+    /// guess — and a bench that guesses wrong measures a kernel reading
+    /// garbage sizes, which is fast and meaningless. The shapes come from the
+    /// run; only the plumbing is written down here.
+    ///
+    /// `n_out == 0` marks an elementwise kernel, for which `n_in` is the
+    /// buffer length. Returns `None` for anything not benched, which the
+    /// caller reports as `--` rather than as a zero.
+    fn shape_args(
+        &self,
+        kernel: &'static str,
+        n_in: usize,
+        n_out: usize,
+        keep: &mut Vec<DeviceBuffer>,
+    ) -> Result<Option<(Vec<KArg>, u32, u32, u32)>> {
+        const QK_K: usize = 256;
+        // Two f32 buffers of `n` and a couple of quantized outputs cover every
+        // elementwise kernel here; they are allocated once and shared.
+        let mut fbuf = |n: usize| -> Result<ffi::CUdeviceptr> {
+            let v: Vec<f32> = (0..n.max(1)).map(|i| 0.01 + (i % 31) as f32 * 1e-3).collect();
+            let b = DeviceBuffer::from_slice(&v)?;
+            let p = b.ptr;
+            keep.push(b);
+            Ok(p)
+        };
+
+        let out = match kernel {
+            "silu_mul" | "add_assign" | "sigmoid_mul" => {
+                let (a, b) = (fbuf(n_in)?, fbuf(n_in)?);
+                let args = vec![KArg::I32(n_in as i32), KArg::Ptr(a), KArg::Ptr(b)];
+                (args, n_in.div_ceil(256) as u32, 256u32, 0u32)
+            }
+            "add_scaled" => {
+                let (a, b) = (fbuf(n_in)?, fbuf(n_in)?);
+                let args = vec![
+                    KArg::I32(n_in as i32),
+                    KArg::F32(0.125),
+                    KArg::Ptr(a),
+                    KArg::Ptr(b),
+                ];
+                (args, n_in.div_ceil(256) as u32, 256, 0)
+            }
+            "gather_chunks" | "scatter_chunks" => {
+                let (src, dst) = (fbuf(n_in * 2)?, fbuf(n_in * 2)?);
+                let args = vec![
+                    KArg::I32(n_in as i32),
+                    KArg::I32(n_in as i32),
+                    KArg::I32(n_in as i32),
+                    KArg::I32(0),
+                    KArg::Ptr(src),
+                    KArg::Ptr(dst),
+                ];
+                (args, n_in.div_ceil(256) as u32, 256, 0)
+            }
+            "quantize_q8_k" => {
+                let n_super = n_in / QK_K;
+                let x = fbuf(n_in)?;
+                let s = DeviceBuffer::new(n_super * 4)?;
+                let q = DeviceBuffer::new(n_super * QK_K)?;
+                let b = DeviceBuffer::new(n_super * (QK_K / 16) * 2)?;
+                let args = vec![
+                    KArg::I32(n_super as i32),
+                    KArg::Ptr(x),
+                    KArg::Ptr(s.ptr),
+                    KArg::Ptr(q.ptr),
+                    KArg::Ptr(b.ptr),
+                ];
+                keep.push(s);
+                keep.push(q);
+                keep.push(b);
+                (args, n_super as u32, QK_K as u32, 0)
+            }
+            "quantize_q8_0" => {
+                let n_blocks = n_in / 32;
+                let x = fbuf(n_in)?;
+                let s = DeviceBuffer::new(n_blocks * 4)?;
+                let q = DeviceBuffer::new(n_blocks * 32)?;
+                let args = vec![
+                    KArg::I32(n_blocks as i32),
+                    KArg::Ptr(x),
+                    KArg::Ptr(s.ptr),
+                    KArg::Ptr(q.ptr),
+                ];
+                keep.push(s);
+                keep.push(q);
+                (args, n_blocks.div_ceil(64) as u32, 64, 0)
+            }
+            "rms_norm_tree" => {
+                let (x, w, o) = (fbuf(n_in)?, fbuf(n_in)?, fbuf(n_in)?);
+                let args = vec![
+                    KArg::I32(n_in as i32),
+                    KArg::Ptr(x),
+                    KArg::Ptr(w),
+                    KArg::F32(1e-6),
+                    KArg::Ptr(o),
+                ];
+                // One block per row; the recorded shape is a single row.
+                (args, 1, 256, 0)
+            }
+            _ => return Ok(None),
+        };
+        let _ = n_out;
+        Ok(Some(out))
+    }
+
     /// One shape, `reps` launches, one synchronize. Returns `(gpu, issue)` in
     /// microseconds per launch.
     fn time_shape(
@@ -1171,6 +1292,16 @@ impl Cuda {
         reps: u32,
     ) -> Result<(f64, f64)> {
         const QK_K: usize = 256;
+        // Everything that is not a matmul goes through `shape_args`.
+        let mut keep: Vec<DeviceBuffer> = Vec::new();
+        if !kernel.starts_with("matmul_") {
+            let built = self.shape_args(kernel, n_in, n_out, &mut keep)?;
+            let (args, grid, block, shared) = match built {
+                Some(b) => b,
+                None => return Ok((f64::NAN, f64::NAN)),
+            };
+            return self.time_launches(kernel, grid, block, shared, &args, reps);
+        }
         // Bytes one row of this format occupies, and the f16 scale's offset
         // within a block. `None` where the format has no f16 to protect.
         let (block_bytes, block_elems, scale_at) = match kernel {
@@ -1240,6 +1371,31 @@ impl Cuda {
             n_out.div_ceil((block / 32) as usize) as u32
         };
 
+        keep.push(wd);
+        keep.push(od);
+        if let Some(b) = xs { keep.push(b); }
+        if let Some(b) = xq { keep.push(b); }
+        if let Some(b) = xb { keep.push(b); }
+        if let Some(b) = xf { keep.push(b); }
+        self.time_launches(kernel, grid, block, 0, &args, reps)
+    }
+
+    /// `reps` launches of one configured kernel, timed two ways: CUDA events
+    /// for device microseconds, host wall clock for issue microseconds.
+    ///
+    /// **One synchronize, at the end.** That is the whole point — a per-launch
+    /// sync measures latency where throughput is what matters, and inflates
+    /// every kernel in proportion to how often it is called, which is what
+    /// makes `--profile-kernels` shares unusable for ranking work.
+    fn time_launches(
+        &self,
+        kernel: &'static str,
+        grid: u32,
+        block: u32,
+        shared: u32,
+        args: &[KArg],
+        reps: u32,
+    ) -> Result<(f64, f64)> {
         // A bench is never part of a graph, and never times its own launches.
         let was_graph = self.pass_graph.replace(false);
         let was_timed = self.time_kernels.replace(false);
@@ -1252,15 +1408,16 @@ impl Cuda {
             check(ffi::cuEventCreate(&mut b, 0), "cuEventCreate")?;
         }
 
-        let mut run = |n: u32| -> Result<(f64, f64)> {
+        let run = |n: u32| -> Result<(f64, f64)> {
             // SAFETY: `a`/`b` are ours; the null stream is the one everything
             // uses, so the events bracket exactly these launches.
             unsafe { check(ffi::cuEventRecord(a, std::ptr::null_mut()), "cuEventRecord")? };
             let t = std::time::Instant::now();
             for _ in 0..n {
-                // SAFETY: the argument list is built above to match `kernel`,
-                // and every buffer is sized for the shape it describes.
-                unsafe { self.launch_grid2(kernel, grid, 1, block, 0, &args)? };
+                // SAFETY: the caller built `args`, `grid`, `block` and
+                // `shared` to match `kernel`, and sized every buffer for the
+                // shape it describes.
+                unsafe { self.launch_shared(kernel, grid, block, shared, args)? };
             }
             // Host time first: the launch loop returns once the driver has
             // accepted the work, so this is issue cost and not device time.
@@ -1279,7 +1436,26 @@ impl Cuda {
         };
 
         run(8)?; // warm the module, the caches and the clocks
-        let measured = run(reps.max(1));
+
+        // **Best of several, not the average.** Every error source here only
+        // adds time: a stall in the host launch loop, a clock that has not
+        // ramped, contention from anything else on the device. WSL's CUDA
+        // virtualization makes per-launch host cost spiky in particular, and
+        // when the host cannot keep the queue full the event pair measures the
+        // stall rather than the kernel — visible as `gpu` collapsing onto
+        // `issue`. That was caught by running the same bench twice and finding
+        // the affected rows had moved: a 512-element `silu_mul` read 22.4 us
+        // once and 13.0 the next time, neither of them credible for 2 KiB.
+        //
+        // The minimum is the only statistic that is not a function of how busy
+        // the machine was, so it is the one reported.
+        let mut measured = run(reps.max(1))?;
+        for _ in 0..3 {
+            let (g, i) = run(reps.max(1))?;
+            measured.0 = measured.0.min(g);
+            measured.1 = measured.1.min(i);
+        }
+        let measured = Ok(measured);
 
         // SAFETY: both events are ours and are no longer in flight.
         unsafe {
@@ -1456,6 +1632,7 @@ impl Cuda {
             KArg::Ptr(od),
         ];
         let blocks = out.len().div_ceil(256) as u32;
+        self.note_shape("gather_chunks", out.len(), 0);
         // SAFETY: parameters match `gather_chunks` in kernels.cu; one thread
         // per output element, guarded against the tail.
         unsafe { self.launch_shared("gather_chunks", blocks, 256, 0, &args)? };
@@ -1484,6 +1661,7 @@ impl Cuda {
             KArg::Ptr(dd),
         ];
         let blocks = src.len().div_ceil(256) as u32;
+        self.note_shape("scatter_chunks", src.len(), 0);
         // SAFETY: parameters match `scatter_chunks` in kernels.cu; one thread
         // per *source* element, guarded against the tail.
         unsafe { self.launch_shared("scatter_chunks", blocks, 256, 0, &args)? };
@@ -1500,6 +1678,7 @@ impl Cuda {
             KArg::Ptr(bd),
         ];
         let blocks = a.len().div_ceil(256) as u32;
+        self.note_shape("add_scaled", a.len(), 0);
         // SAFETY: parameters match `add_scaled` in kernels.cu.
         unsafe { self.launch_shared("add_scaled", blocks, 256, 0, &args)? };
         self.mirror_out(a).map(|_| ())
@@ -1510,6 +1689,7 @@ impl Cuda {
         let xd = self.mirror_in(x)?;
         let args = [KArg::I32(x.len() as i32), KArg::Ptr(xd), KArg::Ptr(gd)];
         let blocks = x.len().div_ceil(256) as u32;
+        self.note_shape("sigmoid_mul", x.len(), 0);
         // SAFETY: parameters match `sigmoid_mul` in kernels.cu.
         unsafe { self.launch_shared("sigmoid_mul", blocks, 256, 0, &args)? };
         self.mirror_out(x).map(|_| ())
@@ -1682,6 +1862,7 @@ impl Cuda {
 
         let args = [KArg::I32(gate.len() as i32), KArg::Ptr(gd), KArg::Ptr(ud)];
         let block = 256u32;
+        self.note_shape("silu_mul", gate.len(), 0);
         // SAFETY: parameters match `silu_mul`; both buffers hold `n` floats.
         unsafe {
             self.launch(
@@ -1700,6 +1881,7 @@ impl Cuda {
 
         let args = [KArg::I32(a.len() as i32), KArg::Ptr(ad), KArg::Ptr(bd)];
         let block = 256u32;
+        self.note_shape("add_assign", a.len(), 0);
         // SAFETY: parameters match `add_assign`; both buffers hold `n` floats.
         unsafe {
             self.launch(
