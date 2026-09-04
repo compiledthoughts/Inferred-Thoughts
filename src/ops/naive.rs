@@ -54,6 +54,17 @@ impl Naive {
                     out[j] = dot_q8_0_q8_0(w.row(j), &qx);
                 }
             }
+            // The k-quants, which the 35B needs everywhere: IQ4_XS on every
+            // routed expert, Q5_K on `attn_output`, Q6_K on `attn_q` and the LM
+            // head. ggml pairs all three with a **Q8_K** activation rather than
+            // f32, so the row is quantized once and shared across every weight
+            // row, exactly as the Q8_0 arm above does with its own format.
+            GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => {
+                let qx = crate::quant::Q8KRow::from_f32(x);
+                for j in 0..w.n_out {
+                    out[j] = crate::quant::kquant::dot_row_q8_k(w.ty, w.row(j), &qx);
+                }
+            }
             _ => {
                 for j in 0..w.n_out {
                     out[j] = dot_row(w.ty, w.row(j), x);

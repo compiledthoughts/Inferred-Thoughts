@@ -14,6 +14,9 @@
 //! `GGML_FP16_TO_FP32(x[i].d)`.
 
 pub mod half;
+pub mod kquant;
+
+pub use kquant::{Q8KRow, q8_k_blocks, vec_dot_q8_k};
 
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
