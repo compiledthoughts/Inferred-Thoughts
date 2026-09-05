@@ -1476,17 +1476,14 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     let weights: Vec<f32> = pick.iter().map(|(_, p)| p / denom).collect();
     let ff = m.n_expert_used * m.expert_ff;
 
-    ops.matmul_experts(w.gate, &ids, x, &mut s.g_all[..ff]);
-    ops.matmul_experts(w.up, &ids, x, &mut s.u_all[..ff]);
-    let (g, u) = (&mut s.g_all[..ff], &s.u_all[..ff]);
-    ops.silu_mul(g, u);
+    // Gate, up and the SiLU gating in one call. Three launches became one, and
+    // the pair never round-trips through device memory.
+    let (g, u) = (&mut s.g_all[..ff], &mut s.u_all[..ff]);
+    ops.moe_glu(w.gate, w.up, &ids, x, g, u);
     // `x` here is one row per expert rather than one shared row, which
     // `matmul_experts` reads off the buffer length.
     ops.matmul_experts(w.down, &ids, &s.g_all[..ff], &mut s.o_all[..m.n_expert_used * nd]);
-    // Writes `moe_acc` rather than accumulating into it: the zero-fill this
-    // replaces was the first term of the same sum.
-    let (acc, rows) = (&mut s.moe_acc[..nd], &s.o_all[..m.n_expert_used * nd]);
-    ops.add_scaled_rows(acc, rows, &weights);
+
 
     // The shared expert: always run, gated by a sigmoid of a single logit.
     ops.matmul(w.shared_gate, x, &mut s.e_gate[..m.shared_ff]);
@@ -1497,15 +1494,22 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
 
     // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
     // Through the seam rather than as a host dot product, so the logit — which
-    // is a matmul result — never has to be read back. That read was the second
-    // of two device syncs per layer; only the router's remains.
+    // is a matmul result — never has to be read back.
     ops.matmul(w.shared_gate_inp, x, &mut s.shexp_logit);
-    let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
-    ops.add_scaled_sigmoid(acc, out, &s.shexp_logit);
 
-    // Written back through the seam, for the mirror-image reason `x` is read
-    // through it: a host `copy_from_slice` here would read `moe_acc` -- which
-    // the device just wrote -- from a stale host buffer, and store it at a host
-    // address the device has never mirrored. Two halves of the same rule.
-    ops.scatter_chunks(&s.moe_acc[..nd], nd, nd, at, &mut s.ffn_out);
+    // The whole tail in one call: weighted expert sum, the shared expert's
+    // sigmoid gate, and the write into row `at`. That was three launches
+    // (`add_scaled_rows`, `add_scaled_sigmoid`, `scatter_chunks`) plus a
+    // staging buffer, to produce one vector.
+    let rows = &s.o_all[..m.n_expert_used * nd];
+    ops.moe_finish(
+        &mut s.ffn_out,
+        at,
+        nd,
+        rows,
+        &weights,
+        &s.e_out[..nd],
+        &s.shexp_logit,
+        0,
+    );
 }

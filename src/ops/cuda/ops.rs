@@ -857,6 +857,123 @@ impl Cuda {
         }
     }
 
+    fn moe_glu_impl(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        picks: &[usize],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        const QK_K: usize = 256;
+        const MAX: usize = 8;
+        if gate.ty != GgmlType::Iq4Xs || up.ty != GgmlType::Iq4Xs {
+            return Err(Error::Cuda {
+                what: "moe_glu",
+                detail: format!("{:?}/{:?} experts have no fused CUDA kernel", gate.ty, up.ty),
+            });
+        }
+        let n_used = picks.len();
+        if n_used == 0 || n_used > MAX || gate.n_in != up.n_in || gate.n_out != up.n_out {
+            return Err(Error::Cuda {
+                what: "moe_glu",
+                detail: format!("{n_used} experts, gate {:?} vs up {:?}",
+                    (gate.n_in, gate.n_out), (up.n_in, up.n_out)),
+            });
+        }
+
+        let n_super = gate.n_in / QK_K;
+        let (sd, qd, _) = self.quantized_k(x, n_super)?;
+
+        let mut gp = [0 as ffi::CUdeviceptr; MAX];
+        let mut upp = [0 as ffi::CUdeviceptr; MAX];
+        for (i, &e) in picks.iter().enumerate() {
+            gp[i] = self.expert_or_resident(&gate.expert(e))?;
+            upp[i] = self.expert_or_resident(&up.expert(e))?;
+        }
+        let od = self.mirror_out(out)?;
+        self.note_shape("matmul_iq4_xs_q8_k_moe_glu", gate.n_in, gate.n_out);
+
+        let block = 128u32;
+        let rows_per_block = (block / 32) as usize;
+        let mut args = vec![
+            KArg::I32(gate.n_in as i32),
+            KArg::I32(gate.n_out as i32),
+            KArg::I32(n_used as i32),
+        ];
+        for p in gp {
+            args.push(KArg::Ptr(p));
+        }
+        for p in upp {
+            args.push(KArg::Ptr(p));
+        }
+        args.push(KArg::Ptr(sd));
+        args.push(KArg::Ptr(qd));
+        args.push(KArg::Ptr(od));
+
+        // SAFETY: parameters match `matmul_iq4_xs_q8_k_moe_glu`; the grid covers
+        // `n_out` rows by `n_used` experts, unused pointer slots are never
+        // dereferenced because the kernel returns on `e >= n_used`, and no
+        // dynamic shared memory is used.
+        unsafe {
+            self.launch_grid2(
+                "matmul_iq4_xs_q8_k_moe_glu",
+                gate.n_out.div_ceil(rows_per_block) as u32,
+                n_used as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_finish_impl(
+        &self,
+        out: &mut [f32],
+        at: usize,
+        n: usize,
+        rows: &[f32],
+        scales: &[f32],
+        shared: &[f32],
+        logit: &[f32],
+        logit_at: usize,
+    ) -> Result<()> {
+        const MAX: usize = 8;
+        if scales.is_empty() || scales.len() > MAX {
+            return Err(Error::Cuda {
+                what: "moe_finish",
+                detail: format!("{} rows; the kernel carries at most {MAX}", scales.len()),
+            });
+        }
+        let rd = self.mirror_in(rows)?;
+        let shd = self.mirror_in(shared)?;
+        let ld = self.mirror_in(logit)?;
+        // `mirror_in`: only row `at` is written, so the rest of `out` must
+        // already be on the device.
+        let od = self.mirror_in(out)?;
+        let mut s = [0.0f32; MAX];
+        s[..scales.len()].copy_from_slice(scales);
+        let args = [
+            KArg::I32(n as i32),
+            KArg::I32(scales.len() as i32),
+            KArg::I32(at as i32),
+            KArg::F32(s[0]), KArg::F32(s[1]), KArg::F32(s[2]), KArg::F32(s[3]),
+            KArg::F32(s[4]), KArg::F32(s[5]), KArg::F32(s[6]), KArg::F32(s[7]),
+            KArg::Ptr(rd),
+            KArg::Ptr(shd),
+            KArg::Ptr(ld),
+            KArg::I32(logit_at as i32),
+            KArg::Ptr(od),
+        ];
+        self.note_shape("moe_finish", n, 0);
+        // SAFETY: parameters match `moe_finish`; `rows` holds `scales.len() * n`
+        // floats, `shared` holds `n`, and one thread covers each element of the
+        // output row at `at`.
+        unsafe { self.launch_shared("moe_finish", n.div_ceil(256) as u32, 256, 0, &args)? };
+        self.mirror_out(out).map(|_| ())
+    }
+
     fn add_scaled_rows_impl(
         &self,
         acc: &mut [f32],
@@ -2269,6 +2386,33 @@ impl Ops for Cuda {
         self.note(self.add_scaled_rows_impl(acc, rows, scales));
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn moe_finish(
+        &self,
+        out: &mut [f32],
+        at: usize,
+        n: usize,
+        rows: &[f32],
+        scales: &[f32],
+        shared: &[f32],
+        logit: &[f32],
+        logit_at: usize,
+    ) {
+        self.note(self.moe_finish_impl(out, at, n, rows, scales, shared, logit, logit_at));
+    }
+
+    fn moe_glu(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        picks: &[usize],
+        x: &[f32],
+        out: &mut [f32],
+        _scratch: &mut [f32],
+    ) {
+        self.note(self.moe_glu_impl(gate, up, picks, x, out));
+    }
+
     fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {
         self.note(self.add_scaled_sigmoid_impl(acc, b, logit));
     }
@@ -2426,6 +2570,33 @@ impl Ops for &Cuda {
 
     fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
         (*self).add_scaled_rows(acc, rows, scales)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_finish(
+        &self,
+        out: &mut [f32],
+        at: usize,
+        n: usize,
+        rows: &[f32],
+        scales: &[f32],
+        shared: &[f32],
+        logit: &[f32],
+        logit_at: usize,
+    ) {
+        (*self).moe_finish(out, at, n, rows, scales, shared, logit, logit_at)
+    }
+
+    fn moe_glu(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        picks: &[usize],
+        x: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        (*self).moe_glu(gate, up, picks, x, out, scratch)
     }
 
     fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {

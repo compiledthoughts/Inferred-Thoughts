@@ -1277,6 +1277,97 @@ __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
     if (lane == 0) out[(size_t)e * n_out + j] = sumf;
 }
 
+// The routed FFN's gate, up and SiLU-gating in **one launch**.
+//
+// Three kernels became one: `matmul_experts(gate)`, `matmul_experts(up)` and
+// `silu_mul` over the pair. Measured at 3.0 + 2.7 launches per layer out of 38,
+// so this is 80 of a token's 1522 -- and on this platform the unit of cost is
+// the launch, because WDDM serializes submissions and the CUDA driver batches
+// them by heuristic. llama.cpp reaches 40 tok/s here with graphs *disabled*
+// (split buffers, see ggml_cuda_graph_check_compability), so fewer and larger
+// launches is a proven route rather than a guess.
+//
+// It also removes a round trip through VRAM: the old form wrote `n_used * n_ff`
+// floats twice and read them back to combine. Here `gate` and `up` for the same
+// output element are both in registers, so only the result is stored.
+//
+// Bit-exactness is unchanged. Each dot is `dot_iq4_xs_warp` over the same bytes
+// in the same order, and `silu` was already outside the exact set for the usual
+// reason -- `expf` -- with its order untouched.
+__global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
+                                           const unsigned char *__restrict__ g0,
+                                           const unsigned char *__restrict__ g1,
+                                           const unsigned char *__restrict__ g2,
+                                           const unsigned char *__restrict__ g3,
+                                           const unsigned char *__restrict__ g4,
+                                           const unsigned char *__restrict__ g5,
+                                           const unsigned char *__restrict__ g6,
+                                           const unsigned char *__restrict__ g7,
+                                           const unsigned char *__restrict__ u0,
+                                           const unsigned char *__restrict__ u1,
+                                           const unsigned char *__restrict__ u2,
+                                           const unsigned char *__restrict__ u3,
+                                           const unsigned char *__restrict__ u4,
+                                           const unsigned char *__restrict__ u5,
+                                           const unsigned char *__restrict__ u6,
+                                           const unsigned char *__restrict__ u7,
+                                           const float *__restrict__ x_scales,
+                                           const signed char *__restrict__ x_quants,
+                                           float *__restrict__ out) {
+    const int e = blockIdx.y;
+    if (e >= n_used) return;
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_ff) return;
+
+    const unsigned char *gs[8] = {g0, g1, g2, g3, g4, g5, g6, g7};
+    const unsigned char *us[8] = {u0, u1, u2, u3, u4, u5, u6, u7};
+    const size_t off = (size_t)j * nb * IQ4XS_BYTES;
+
+    // Every expert reads the same activation here -- this is the gate/up half
+    // of the FFN, before any per-expert intermediate exists.
+    const float g = dot_iq4_xs_warp(nb, gs[e] + off, x_scales, x_quants, lane);
+    const float u = dot_iq4_xs_warp(nb, us[e] + off, x_scales, x_quants, lane);
+
+    if (lane == 0) {
+        // silu(g) * u, exactly as `silu_mul` computes it.
+        out[(size_t)e * n_ff + j] = g / (1.0f + expf(-g)) * u;
+    }
+}
+
+// The whole tail of a routed FFN in one launch: weighted sum of the experts,
+// the shared expert's sigmoid gate, and the write back into the layer's output
+// row.
+//
+// Replaces `add_scaled_rows` + `add_scaled_sigmoid` + `scatter_chunks`, which
+// were three launches per layer -- 120 of a token's 1455 -- to produce one
+// vector. Per-launch cost on this platform is **20.7 us, measured**, so three
+// kernels that each read and write the same 8 KB are worth removing on launch
+// count alone, before the memory traffic they also save.
+//
+// Order is the oracle's: the experts summed in ascending pick order from zero,
+// then the shared expert added last. `expf` is the only inexactness and it was
+// already there.
+extern "C" __global__ void moe_finish(int n, int n_rows, int at,
+                                      float s0, float s1, float s2, float s3,
+                                      float s4, float s5, float s6, float s7,
+                                      const float *__restrict__ rows,
+                                      const float *__restrict__ shared,
+                                      const float *__restrict__ logit,
+                                      int logit_at,
+                                      float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const float sc[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    float v = 0.0f;
+    for (int e = 0; e < n_rows; ++e) v += sc[e] * rows[(size_t)e * n + j];
+    const float g = 1.0f / (1.0f + expf(-logit[logit_at]));
+    v += shared[j] * g;
+    out[(size_t)at + j] = v;
+}
+
 // Weighted sum of `n_rows` rows into one, in ascending row order.
 //
 // The MoE accumulation: `acc[j] = sum_e scale[e] * rows[e * n + j]`, replacing

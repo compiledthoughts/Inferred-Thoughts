@@ -549,6 +549,72 @@ pub trait Ops {
         }
     }
 
+    /// The routed FFN's gated half: `out[e] = silu(gate[e] . x) * (up[e] . x)`,
+    /// for every pick, in one call.
+    ///
+    /// Three seam calls collapsed into one — two [`Ops::matmul_experts`] and a
+    /// [`Ops::silu_mul`] — because on this platform the unit of cost is the
+    /// launch, not the arithmetic. Measured at 5.7 of a layer's 38 launches.
+    /// It also saves a round trip through device memory: `gate` and `up` for
+    /// the same output element can be combined while both are still in
+    /// registers, so only the result is stored.
+    ///
+    /// `out` is `picks.len()` rows of `gate.n_out`; `x` is the one activation
+    /// every expert reads.
+    ///
+    /// The default is the three calls it replaces, so no CPU backend changes by
+    /// a bit and the oracle is untouched.
+    fn moe_glu(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        picks: &[usize],
+        x: &[f32],
+        out: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        self.matmul_experts(gate, picks, x, out);
+        self.matmul_experts(up, picks, x, scratch);
+        self.silu_mul(out, scratch);
+    }
+
+    /// The routed FFN's whole tail: weighted expert sum, the shared expert's
+    /// sigmoid gate, and the write back into row `at` of the layer's output.
+    ///
+    /// Replaces [`Ops::add_scaled_rows`], [`Ops::add_scaled_sigmoid`] and
+    /// [`Ops::scatter_chunks`] — three launches per layer to produce one
+    /// vector, when the per-launch cost on the target platform is **20.7 us,
+    /// measured**. It also drops the `moe_acc` staging buffer entirely.
+    ///
+    /// `logit` is a whole buffer with an index rather than a one-element slice,
+    /// because a sub-slice is a host address a device backend has never
+    /// mirrored — `CLAUDE.md`'s rule, which has now caused four bugs.
+    ///
+    /// Order is the oracle's: experts summed ascending from zero, shared expert
+    /// added last.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_finish(
+        &self,
+        out: &mut [f32],
+        at: usize,
+        n: usize,
+        rows: &[f32],
+        scales: &[f32],
+        shared: &[f32],
+        logit: &[f32],
+        logit_at: usize,
+    ) {
+        let g = 1.0 / (1.0 + (-logit[logit_at]).exp());
+        for j in 0..n {
+            let mut v = 0.0f32;
+            for (e, &s) in scales.iter().enumerate() {
+                v += s * rows[e * n + j];
+            }
+            v += shared[j] * g;
+            out[at + j] = v;
+        }
+    }
+
     /// `acc[j] = sum over e of `scales[e] * rows[e * acc.len() + j]`, summed in
     /// ascending `e`.
     ///
