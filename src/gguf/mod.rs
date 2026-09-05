@@ -81,7 +81,66 @@ pub struct GgufFile {
     pub tensors: Vec<TensorInfo>,
     /// File offset at which the tensor data blob begins.
     pub data_offset: u64,
-    mmap: Mmap,
+    /// Wrapped so `Drop` can release the mapping *before* evicting the file
+    /// from the page cache — pages a live mapping holds cannot be evicted, so
+    /// the order is the whole point. See the `Drop` impl.
+    mmap: std::mem::ManuallyDrop<Mmap>,
+}
+
+impl Drop for GgufFile {
+    /// Hand the model file back to the system.
+    ///
+    /// **Because the page cache is the larger half of this program's host
+    /// footprint, and nothing else was going to.** Loading the 35B reads
+    /// 18.8 GB through the mapping; the pages stay cached after the process
+    /// exits, and WSL does not return them to Windows. Observed repeatedly at
+    /// 15-16 GB of cache with no process running, on a 32 GB machine.
+    ///
+    /// The expert cache already evicts each tensor as it places it, but that
+    /// covers only pooled weights on the CUDA path with a model path supplied.
+    /// It missed the non-expert weights, every model without experts, and every
+    /// test — which construct `Cuda` directly and never set a path. Here it is
+    /// unconditional: whoever opened the file, on whatever backend, gets the
+    /// cache dropped when they are done with it.
+    ///
+    /// `madvise` is not a substitute: on a private file mapping it unmaps the
+    /// pages from this process while the kernel keeps them, which is why an
+    /// earlier attempt reported 757 MB of process against 16.7 GB of cache.
+    ///
+    /// Best-effort. A failure leaves the cache, which is the behaviour before
+    /// this existed.
+    fn drop(&mut self) {
+        // SAFETY: `mmap` is dropped exactly once, here, and nothing reads it
+        // afterwards — `self` is being destroyed.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.mmap) };
+        drop_page_cache(&self.path);
+    }
+}
+
+/// `POSIX_FADV_DONTNEED`, from `fcntl.h`.
+const POSIX_FADV_DONTNEED: std::ffi::c_int = 4;
+
+unsafe extern "C" {
+    fn posix_fadvise(
+        fd: std::ffi::c_int,
+        offset: i64,
+        len: i64,
+        advice: std::ffi::c_int,
+    ) -> std::ffi::c_int;
+}
+
+/// Evict a whole file from the page cache.
+///
+/// Addresses the file rather than a descriptor, so a fresh `open` reaches the
+/// same pages the mapping used.
+fn drop_page_cache(path: &Path) {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::File::open(path) else { return };
+    // SAFETY: `f` owns a valid descriptor for the call; `(0, 0)` names the
+    // whole file, and the advice is purely a hint to the kernel.
+    unsafe {
+        let _ = posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED);
+    }
 }
 
 impl GgufFile {
@@ -249,7 +308,7 @@ impl GgufFile {
             metadata,
             tensors,
             data_offset,
-            mmap,
+            mmap: std::mem::ManuallyDrop::new(mmap),
         })
     }
 
