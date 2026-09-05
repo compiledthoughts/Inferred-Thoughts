@@ -953,3 +953,130 @@ fn why_is_the_rms_reduction_slow() {
 
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 }
+
+/// The host expert selection, transcribed from `qwen35::moe_token`.
+///
+/// Kept here rather than exported so the test compares against the rule as
+/// *written in the model*, and a change to one without the other shows up as a
+/// failure rather than as both agreeing on something new.
+fn host_topk(probs: &[f32], n_used: usize) -> (Vec<i32>, Vec<f32>) {
+    let mut pick: Vec<(usize, f32)> = Vec::with_capacity(n_used);
+    for _ in 0..n_used {
+        let mut best = usize::MAX;
+        for e in 0..probs.len() {
+            if pick.iter().any(|(p, _)| *p == e) {
+                continue;
+            }
+            if best == usize::MAX || probs[e] > probs[best] {
+                best = e;
+            }
+        }
+        pick.push((best, probs[best]));
+    }
+    let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
+    let denom = sum.max(6.103_515_625e-5);
+    (
+        pick.iter().map(|(e, _)| *e as i32).collect(),
+        pick.iter().map(|(_, p)| p / denom).collect(),
+    )
+}
+
+/// `moe_topk` on the device reproduces the host selection exactly, including
+/// the tie rule and the weight normalization.
+///
+/// **This is the kernel that decides which weights are read, not what is
+/// computed from them.** A wrong pick does not degrade the output the way a
+/// numeric bug does — it produces fluent text from the wrong experts, at full
+/// confidence, and no tolerance-based check anywhere else in this file would
+/// notice. So the assertion is equality of ids and *bit* equality of weights.
+///
+/// The tie cases are the point. Selection scans ascending and takes a new best
+/// only on a strict `>`, so equal probabilities must resolve to the lower
+/// index; a device reduction that used `>=`, or that combined halves in the
+/// wrong order, would differ only when two experts happen to tie — which on
+/// real softmax output is rare enough to hide for a very long time.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn device_topk_reproduces_the_host_selection() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let mut cases: Vec<(&str, Vec<f32>)> = Vec::new();
+
+    // Ordinary router output: softmax over noise, which is what the real thing
+    // produces and where ties essentially never happen.
+    for seed in [1u64, 2, 3, 4, 5] {
+        let mut p = noise(256, seed);
+        let max = p.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for v in p.iter_mut() {
+            *v = (*v - max).exp();
+            sum += *v;
+        }
+        for v in p.iter_mut() {
+            *v /= sum;
+        }
+        cases.push(("softmax of noise", p));
+    }
+
+    // Every expert identical: the whole selection is decided by the tie rule,
+    // so the answer must be exactly 0..n_used.
+    cases.push(("all equal", vec![1.0 / 256.0; 256]));
+
+    // Ties among the leaders only, planted away from index 0 so an
+    // implementation that silently prefers low indices for the wrong reason
+    // still has to get the *set* right.
+    let mut tied = vec![0.001f32; 256];
+    for e in [200usize, 7, 91, 199, 12, 250, 3, 44, 45, 46] {
+        tied[e] = 0.05;
+    }
+    cases.push(("ten-way tie for eight places", tied));
+
+    // A single dominant expert and a flat tail, which stresses the clamp:
+    // seven of the eight picks contribute almost nothing to the sum.
+    let mut spiked = vec![1e-12f32; 256];
+    spiked[137] = 1.0;
+    cases.push(("one spike, denormal tail", spiked));
+
+    // Everything below the 6.103515625e-5 clamp, so `denom` is the clamp rather
+    // than the sum and the weights do not sum to one. Getting this wrong scales
+    // the whole FFN and still produces text.
+    cases.push(("entirely below the clamp", vec![1e-9f32; 256]));
+
+    // Descending, so the correct answer is 0..8 by value and by index at once,
+    // and ascending, where it is the last eight in reverse.
+    cases.push(("descending", (0..256).map(|i| (256 - i) as f32 / 32896.0).collect()));
+    cases.push(("ascending", (0..256).map(|i| (i + 1) as f32 / 32896.0).collect()));
+
+    for (label, probs) in &cases {
+        let (want_ids, want_w) = host_topk(probs, 8);
+        let (got_ids, got_w) = gpu.moe_topk_readback(probs, 8).expect("moe_topk");
+        assert_eq!(got_ids, want_ids, "{label}: expert ids differ");
+        for (i, (g, w)) in got_w.iter().zip(want_w.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "{label}: weight {i} is {g:e} against {w:e}; selection is exact by \
+                 construction and the sum is serial, so any difference is a bug"
+            );
+        }
+    }
+
+    // n_used other than 8, since the kernel loops over it and the shared
+    // `picked` array is sized for the maximum.
+    for n_used in [1usize, 2, 4, 8] {
+        let probs = {
+            let mut p = noise(256, 99);
+            for v in p.iter_mut() {
+                *v = v.abs() / 256.0;
+            }
+            p
+        };
+        let (want_ids, want_w) = host_topk(&probs, n_used);
+        let (got_ids, got_w) = gpu.moe_topk_readback(&probs, n_used).expect("moe_topk");
+        assert_eq!(got_ids, want_ids, "n_used {n_used}: ids differ");
+        for (g, w) in got_w.iter().zip(want_w.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "n_used {n_used}: weights differ");
+        }
+    }
+}

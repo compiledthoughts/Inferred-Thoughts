@@ -1442,6 +1442,52 @@ impl Cuda {
     }
 
 
+    /// Run `moe_topk` on the device and bring its answer home.
+    ///
+    /// **For tests, and it earns its place the same way
+    /// [`Cuda::quantize_q8_k_readback`] does.** Expert selection is the one
+    /// decision in the pass that changes *which* weights are read rather than
+    /// what is computed from them, so getting it wrong does not degrade the
+    /// output — it produces fluent text from the wrong experts, which no
+    /// tolerance-based check would catch. This makes the kernel directly
+    /// comparable to the host loop in `qwen35::moe_token`.
+    ///
+    /// `probs` is the router's softmax output, already over all `n_expert`.
+    pub fn moe_topk_readback(&self, probs: &[f32], n_used: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+        const MAX: usize = 8;
+        if n_used == 0 || n_used > MAX || n_used > probs.len() {
+            return Err(Error::Cuda {
+                what: "moe_topk",
+                detail: format!("{n_used} of {} experts; the kernel carries at most {MAX}", probs.len()),
+            });
+        }
+        let pd = DeviceBuffer::from_slice(probs)?;
+        let idb = DeviceBuffer::new(n_used * 4)?;
+        let wb = DeviceBuffer::new(n_used * 4)?;
+        // One block: the reduction is over the whole expert axis, so it cannot
+        // be split across blocks without a second pass, and 256 experts is one
+        // block's work. `blockDim` need not divide `n_expert` -- the per-thread
+        // loop is strided -- but it must be a power of two for the tree.
+        let block = 256u32;
+        let shared = block * 8;
+        let args = [
+            KArg::I32(probs.len() as i32),
+            KArg::I32(n_used as i32),
+            KArg::Ptr(pd.ptr),
+            KArg::Ptr(idb.ptr),
+            KArg::Ptr(wb.ptr),
+        ];
+        // SAFETY: parameters match `moe_topk`; the two outputs are sized
+        // `n_used` and the kernel writes exactly that many.
+        unsafe { self.launch_shared("moe_topk", 1, block, shared, &args)? };
+        self.sync()?;
+        let mut ids = vec![0i32; n_used];
+        let mut weights = vec![0.0f32; n_used];
+        self.d2h(&mut ids, idb.ptr)?;
+        self.d2h(&mut weights, wb.ptr)?;
+        Ok((ids, weights))
+    }
+
     /// Record a matmul's shape, so the microbenchmark can replay it later.
     fn note_shape(&self, kernel: &'static str, n_in: usize, n_out: usize) {
         *self

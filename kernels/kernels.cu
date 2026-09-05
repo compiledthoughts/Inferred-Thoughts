@@ -1357,6 +1357,105 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
 }
 
 // The whole tail of a routed FFN in one launch: weighted sum of the experts,
+// Top-k expert selection, on the device.
+//
+// **The one host decision left in a decode pass, and therefore the reason CUDA
+// graphs are off for this model.** `moe_token` downloads the router's 256
+// probabilities once per layer to choose eight experts on the CPU -- 40 syncs a
+// token, in a backend that took bus crossings from 1329 to 5. A graph defers
+// every kernel to `end_pass`, so that mid-pass read would return the *previous*
+// token's probabilities and the model would route to the wrong experts:
+// fluent-looking nonsense. Moving the decision here is what removes it.
+//
+// # It must reproduce the host selection exactly, and does
+//
+// `moe_token` runs `n_used` rounds, each scanning `e` ascending and taking a
+// new best only on a *strict* `>`, so the lowest index survives a tie. Then it
+// sums the chosen probabilities **in selection order** and divides each by
+// `max(sum, 6.103515625e-5)`.
+//
+// Selection is exact under any decomposition: (value, index) with "higher value
+// wins, tie to lower index" is a total order, and a max never rounds. So the
+// tree reduction below is free of the usual reordering worry -- the same
+// argument that made the Q8_0 warp matmul bit-identical, applied to a
+// comparison rather than to an integer sum.
+//
+// The sum is *not* order-free, so thread 0 walks the eight picks serially in
+// pick order, exactly as the host does. Eight additions on one thread is not
+// worth splitting.
+extern "C" __global__ void moe_topk(int n_expert, int n_used,
+                                    const float *__restrict__ probs,
+                                    int *__restrict__ ids,
+                                    float *__restrict__ weights) {
+    extern __shared__ unsigned char moe_topk_smem[];
+    float *sv = (float *)moe_topk_smem;
+    int *si = (int *)(sv + blockDim.x);
+    // `MAX` in `Cuda::moe_glu` and friends: the routed count this model uses is
+    // 8, and every kernel downstream carries no more.
+    __shared__ int picked[8];
+
+    const int t = threadIdx.x;
+
+    for (int r = 0; r < n_used; ++r) {
+        // This thread's best over the experts it owns, skipping ones already
+        // taken. Strided, so `n_expert` may exceed the block.
+        float bv = 0.0f;
+        int bi = -1;
+        for (int e = t; e < n_expert; e += blockDim.x) {
+            bool taken = false;
+            for (int k = 0; k < r; ++k) {
+                if (picked[k] == e) taken = true;
+            }
+            if (taken) continue;
+            const float v = probs[e];
+            // Strictly greater, so the lowest index survives a tie -- the rule
+            // `moe_token` gets from scanning ascending.
+            if (bi < 0 || v > bv) {
+                bv = v;
+                bi = e;
+            }
+        }
+        sv[t] = bv;
+        si[t] = bi;
+        __syncthreads();
+
+        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+            if (t < s) {
+                // Take the other half only if it is a real candidate and either
+                // strictly larger, or an equal value at a lower index.
+                const bool other_ok = si[t + s] >= 0;
+                const bool mine_bad = si[t] < 0;
+                const bool better =
+                    other_ok && (mine_bad || sv[t + s] > sv[t] ||
+                                 (sv[t + s] == sv[t] && si[t + s] < si[t]));
+                if (better) {
+                    sv[t] = sv[t + s];
+                    si[t] = si[t + s];
+                }
+            }
+            __syncthreads();
+        }
+        if (t == 0) picked[r] = si[0];
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        // Serial, in pick order, from zero -- `Iterator::sum` on the host folds
+        // left the same way, and this is the one part that would round
+        // differently if it were split.
+        float sum = 0.0f;
+        for (int r = 0; r < n_used; ++r) sum += probs[picked[r]];
+        // f16's smallest normal, guarding the division rather than the weights.
+        // A ternary rather than `fmaxf` so a NaN sum yields the clamp, which is
+        // what Rust's `f32::max` does.
+        const float denom = sum > 6.103515625e-5f ? sum : 6.103515625e-5f;
+        for (int r = 0; r < n_used; ++r) {
+            ids[r] = picked[r];
+            weights[r] = probs[picked[r]] / denom;
+        }
+    }
+}
+
 // the shared expert's sigmoid gate, and the write back into the layer's output
 // row.
 //
