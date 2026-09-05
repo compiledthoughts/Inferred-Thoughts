@@ -208,8 +208,13 @@ impl Ops for Naive {
         }
     }
 
-    fn softmax(&self, x: &mut [f32]) {
-        softmax_in_place(x)
+    fn softmax(&self, x: &mut [f32], row: usize) {
+        if row == 0 {
+            return;
+        }
+        for r in x.chunks_mut(row) {
+            softmax_in_place(r);
+        }
     }
 
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
@@ -666,13 +671,15 @@ mod tests {
     #[test]
     fn softmax_sums_to_one_and_survives_large_inputs() {
         let mut x = [1.0f32, 2.0, 3.0];
-        Naive.softmax(&mut x);
+        let n = x.len();
+        Naive.softmax(&mut x, n);
         assert!((x.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!(x[2] > x[1] && x[1] > x[0]);
 
         // Without the max subtraction this overflows to NaN.
         let mut big = [1000.0f32, 1001.0];
-        Naive.softmax(&mut big);
+        let n = big.len();
+        Naive.softmax(&mut big, n);
         assert!(big.iter().all(|v| v.is_finite()), "{big:?}");
         assert!((big.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     }

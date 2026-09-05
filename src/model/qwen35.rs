@@ -1440,7 +1440,9 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     // The router is F32, so this matmul is exact and the expert choice can be
     // compared against llama.cpp directly.
     ops.matmul(w.gate_inp, x, &mut s.router);
-    ops.softmax(&mut s.router);
+    // A row per token: `s.router` is `n_expert` wide and holds one row for
+    // every token in the batch.
+    ops.softmax(&mut s.router, m.n_expert);
 
     // **Selection through the seam, so the model has one path.** The rule —
     // top-k descending, ties to the lower id, weights normalized by
@@ -1449,7 +1451,7 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     // tested against. A backend that can choose on the card returns
     // `Route::Device` and the probabilities never come home; nothing here
     // changes either way, which is the point. `Route`'s doc has the contract.
-    let route = ops.route(&mut s.router, m.n_expert_used);
+    let route = ops.route(&mut s.router, m.n_expert, m.n_expert_used);
 
     // **The whole routed stage, one launch per step.** This was a loop over the
     // eight picks doing five ops each; on the GPU that cost 18.03 ms/token

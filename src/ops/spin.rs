@@ -268,8 +268,8 @@ impl Ops for Spin {
         Naive.rope_neox(x, pos, head_dim, n_rot, n_heads, theta)
     }
 
-    fn softmax(&self, x: &mut [f32]) {
-        Naive.softmax(x)
+    fn softmax(&self, x: &mut [f32], row: usize) {
+        Naive.softmax(x, row)
     }
 
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {

@@ -1393,15 +1393,18 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
 // buffer is read when it is replayed. Moving the expert pointers from the
 // former to the latter is the whole difference between a graph that routes to
 // last token's experts and one that routes to this token's.
-extern "C" __global__ void moe_gather_ptrs(int n_used, int base,
+extern "C" __global__ void moe_gather_ptrs(int n_used, int base, int n_tok,
                                            const unsigned long long *__restrict__ table,
                                            const int *__restrict__ ids,
                                            const int *__restrict__ vram,
                                            unsigned int *__restrict__ counts,
                                            unsigned long long *__restrict__ tally,
                                            unsigned long long *__restrict__ out) {
-    const int e = threadIdx.x;
-    if (e >= n_used) return;
+    // `n_tok * n_used` addresses, one per (token, pick), laid out token-major
+    // so an expert matmul can index `wptrs[tok * n_used + e]`.
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tok * n_used) return;
+    const int e = i;
     const int id = ids[e];
     out[e] = table[id];
 
@@ -1445,12 +1448,20 @@ extern "C" __global__ void moe_gather_ptrs(int n_used, int base,
 // pick order, exactly as the host does. Eight additions on one thread is not
 // worth splitting.
 extern "C" __global__ void moe_topk(int n_expert, int n_used,
-                                    const float *__restrict__ probs,
-                                    int *__restrict__ ids,
-                                    float *__restrict__ weights) {
+                                    const float *__restrict__ all_probs,
+                                    int *__restrict__ all_ids,
+                                    float *__restrict__ all_weights) {
     extern __shared__ unsigned char moe_topk_smem[];
     float *sv = (float *)moe_topk_smem;
     int *si = (int *)(sv + blockDim.x);
+
+    // One block per token. Selection is independent per row -- a token's
+    // experts depend only on its own probabilities -- so a prefill batch is
+    // just a wider grid, and decode is `gridDim.x == 1` of the same kernel.
+    const int tok = blockIdx.x;
+    const float *probs = all_probs + (size_t)tok * n_expert;
+    int *ids = all_ids + (size_t)tok * n_used;
+    float *weights = all_weights + (size_t)tok * n_used;
     // `MAX` in `Cuda::moe_glu` and friends: the routed count this model uses is
     // 8, and every kernel downstream carries no more.
     __shared__ int picked[8];

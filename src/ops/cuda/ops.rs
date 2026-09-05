@@ -1110,7 +1110,7 @@ impl Cuda {
         // Nothing here reads the router's output, which is what lets this
         // launch live in a graph.
         let table = self.expert_table(w)?;
-        let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, slot::PTR_DOWN)?;
+        let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, route.n_tok(), slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
         self.note_shape("matmul_iq4_xs_q8_k_moe", w.n_in, w.n_out);
 
@@ -1175,8 +1175,8 @@ impl Cuda {
         // need not share a residency tier.
         let gtab = self.expert_table(gate)?;
         let utab = self.expert_table(up)?;
-        let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, slot::PTR_GATE)?;
-        let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, slot::PTR_UP)?;
+        let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, route.n_tok(), slot::PTR_GATE)?;
+        let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, route.n_tok(), slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
         self.note_shape("matmul_iq4_xs_q8_k_moe_glu", gate.n_in, gate.n_out);
 
@@ -1458,12 +1458,20 @@ impl Cuda {
         self.mirror_out(x).map(|_| ())
     }
 
-    fn softmax_impl(&self, x: &mut [f32]) -> Result<()> {
+    fn softmax_impl(&self, x: &mut [f32], row: usize) -> Result<()> {
+        if row == 0 {
+            return Ok(());
+        }
+        let n_rows = x.len() / row;
         let xd = self.mirror_in(x)?;
 
-        let args = [KArg::I32(x.len() as i32), KArg::I32(1), KArg::Ptr(xd)];
-        // SAFETY: parameters match `softmax_rows`; one row, so one thread.
-        unsafe { self.launch("softmax_rows", 1, 1, &args)? };
+        let args = [KArg::I32(row as i32), KArg::I32(n_rows as i32), KArg::Ptr(xd)];
+        let block = 64u32;
+        // SAFETY: parameters match `softmax_rows`; one thread per row, and the
+        // kernel returns on `r >= n_rows`.
+        unsafe {
+            self.launch("softmax_rows", (n_rows as u32).div_ceil(block), block, &args)?
+        };
         self.mirror_out(x).map(|_| ())
     }
 
@@ -1674,17 +1682,23 @@ impl Cuda {
     /// comparable to the host loop in `qwen35::moe_token`.
     ///
     /// `probs` is the router's softmax output, already over all `n_expert`.
-    pub fn moe_topk_readback(&self, probs: &[f32], n_used: usize) -> Result<(Vec<i32>, Vec<f32>)> {
+    pub fn moe_topk_readback(
+        &self,
+        probs: &[f32],
+        n_expert: usize,
+        n_used: usize,
+    ) -> Result<(Vec<i32>, Vec<f32>)> {
         const MAX: usize = 8;
-        if n_used == 0 || n_used > MAX || n_used > probs.len() {
+        if n_used == 0 || n_used > MAX || n_used > n_expert || n_expert == 0 {
             return Err(Error::Cuda {
                 what: "moe_topk",
-                detail: format!("{n_used} of {} experts; the kernel carries at most {MAX}", probs.len()),
+                detail: format!("{n_used} of {n_expert} experts; the kernel carries at most {MAX}"),
             });
         }
+        let n_tok = probs.len() / n_expert;
         let pd = DeviceBuffer::from_slice(probs)?;
-        let idb = DeviceBuffer::new(n_used * 4)?;
-        let wb = DeviceBuffer::new(n_used * 4)?;
+        let idb = DeviceBuffer::new(n_tok * n_used * 4)?;
+        let wb = DeviceBuffer::new(n_tok * n_used * 4)?;
         // One block: the reduction is over the whole expert axis, so it cannot
         // be split across blocks without a second pass, and 256 experts is one
         // block's work. `blockDim` need not divide `n_expert` -- the per-thread
@@ -1692,18 +1706,18 @@ impl Cuda {
         let block = 256u32;
         let shared = block * 8;
         let args = [
-            KArg::I32(probs.len() as i32),
+            KArg::I32(n_expert as i32),
             KArg::I32(n_used as i32),
             KArg::Ptr(pd.ptr),
             KArg::Ptr(idb.ptr),
             KArg::Ptr(wb.ptr),
         ];
-        // SAFETY: parameters match `moe_topk`; the two outputs are sized
-        // `n_used` and the kernel writes exactly that many.
-        unsafe { self.launch_shared("moe_topk", 1, block, shared, &args)? };
+        // SAFETY: parameters match `moe_topk`; one block per token, each
+        // writing its own `n_used` ids and weights.
+        unsafe { self.launch_shared("moe_topk", n_tok as u32, block, shared, &args)? };
         self.sync()?;
-        let mut ids = vec![0i32; n_used];
-        let mut weights = vec![0.0f32; n_used];
+        let mut ids = vec![0i32; n_tok * n_used];
+        let mut weights = vec![0.0f32; n_tok * n_used];
         self.d2h(&mut ids, idb.ptr)?;
         self.d2h(&mut weights, wb.ptr)?;
         Ok((ids, weights))
@@ -1759,22 +1773,23 @@ impl Cuda {
     /// the host read they replace is the reason CUDA graphs are off for this
     /// model. `moe_topk` reproduces [`Ops::route`]'s default exactly — see
     /// `device_topk_reproduces_the_host_selection`.
-    fn route_impl(&self, probs: &[f32], n_used: usize) -> Result<()> {
+    fn route_impl(&self, probs: &[f32], n_expert: usize, n_used: usize) -> Result<()> {
+        let n_tok = probs.len() / n_expert.max(1);
         let pd = self.mirror_in(probs)?;
-        let idd = self.pooled(slot::ROUTE_IDS, n_used * 4)?;
-        let wd = self.pooled(slot::ROUTE_W, n_used * 4)?;
+        let idd = self.pooled(slot::ROUTE_IDS, n_tok * n_used * 4)?;
+        let wd = self.pooled(slot::ROUTE_W, n_tok * n_used * 4)?;
         let block = 256u32;
         let args = [
-            KArg::I32(probs.len() as i32),
+            KArg::I32(n_expert as i32),
             KArg::I32(n_used as i32),
             KArg::Ptr(pd),
             KArg::Ptr(idd),
             KArg::Ptr(wd),
         ];
-        // SAFETY: parameters match `moe_topk`; both outputs are `n_used` wide
-        // and the kernel writes exactly that. Shared memory is one float and
-        // one int per thread, which is what the kernel declares.
-        unsafe { self.launch_shared("moe_topk", 1, block, block * 8, &args) }
+        // SAFETY: parameters match `moe_topk`; one block per token, each
+        // writing its own `n_used` ids and weights. Shared memory is one float
+        // and one int per thread, which is what the kernel declares.
+        unsafe { self.launch_shared("moe_topk", n_tok as u32, block, block * 8, &args) }
     }
 
     /// Resolve `n_used` chosen experts to addresses, from `table`.
@@ -1787,10 +1802,11 @@ impl Cuda {
         key: usize,
         table: ffi::CUdeviceptr,
         n_used: usize,
+        n_tok: usize,
         into: usize,
     ) -> Result<ffi::CUdeviceptr> {
-        let idd = self.pooled(slot::ROUTE_IDS, n_used * 4)?;
-        let out = self.pooled(into, n_used * 8)?;
+        let idd = self.pooled(slot::ROUTE_IDS, n_tok * n_used * 4)?;
+        let out = self.pooled(into, n_tok * n_used * 8)?;
         let (vram, counts, tally, base) = match self.experts.borrow().as_ref().and_then(|c| c.counters(key)) {
             Some(x) => x,
             None => {
@@ -1805,6 +1821,7 @@ impl Cuda {
         let args = [
             KArg::I32(n_used as i32),
             KArg::I32(base as i32),
+            KArg::I32(n_tok as i32),
             KArg::Ptr(table),
             KArg::Ptr(idd),
             KArg::Ptr(vram),
@@ -1812,10 +1829,19 @@ impl Cuda {
             KArg::Ptr(tally),
             KArg::Ptr(out),
         ];
-        // SAFETY: parameters match `moe_gather_ptrs`; one thread per pick, and
-        // the kernel returns on `e >= n_used`. `base + id` is inside the
-        // counter arrays because `table` refused a base that would not fit.
-        unsafe { self.launch("moe_gather_ptrs", 1, 32, &args)? };
+        let block = 128u32;
+        // SAFETY: parameters match `moe_gather_ptrs`; one thread per
+        // (token, pick), and the kernel returns past `n_tok * n_used`.
+        // `base + id` is inside the counter arrays because `table` refused a
+        // base that would not fit.
+        unsafe {
+            self.launch(
+                "moe_gather_ptrs",
+                ((n_tok * n_used) as u32).div_ceil(block),
+                block,
+                &args,
+            )?
+        };
         Ok(out)
     }
 
@@ -2952,8 +2978,8 @@ impl Ops for Cuda {
         self.note(self.rope_impl(x, pos, head_dim, n_rot, n_heads, theta));
     }
 
-    fn softmax(&self, x: &mut [f32]) {
-        self.note(self.softmax_impl(x));
+    fn softmax(&self, x: &mut [f32], row: usize) {
+        self.note(self.softmax_impl(x, row));
     }
 
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
@@ -3030,9 +3056,9 @@ impl Ops for Cuda {
     /// `experts::ExpertCache::table`), so there is no state in which the host
     /// still has to resolve a pick — which is what keeps this backend on one
     /// path rather than two that can disagree.
-    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
-        self.note(self.route_impl(probs, n_used));
-        Route::Device { n_used }
+    fn route(&self, probs: &mut [f32], n_expert: usize, n_used: usize) -> Route {
+        self.note(self.route_impl(probs, n_expert, n_used));
+        Route::Device { n_used, n_tok: probs.len() / n_expert.max(1) }
     }
 
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
@@ -3209,8 +3235,8 @@ impl Ops for &Cuda {
         (*self).rope_neox(x, pos, head_dim, n_rot, n_heads, theta)
     }
 
-    fn softmax(&self, x: &mut [f32]) {
-        (*self).softmax(x)
+    fn softmax(&self, x: &mut [f32], row: usize) {
+        (*self).softmax(x, row)
     }
 
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
@@ -3266,8 +3292,8 @@ impl Ops for &Cuda {
         (*self).add_scaled(a, b, scale)
     }
 
-    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
-        (*self).route(probs, n_used)
+    fn route(&self, probs: &mut [f32], n_expert: usize, n_used: usize) -> Route {
+        (*self).route(probs, n_expert, n_used)
     }
 
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {

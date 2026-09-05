@@ -250,9 +250,11 @@ fn every_op_agrees_with_the_oracle() {
     {
         let mut a = noise(384, 10);
         let mut b = a.clone();
-        Naive.softmax(&mut a);
+        let n = a.len();
+        Naive.softmax(&mut a, n);
         gpu.begin_pass(1);
-        gpu.softmax(&mut b);
+        let n = b.len();
+        gpu.softmax(&mut b, n);
         gpu.host_needs(&mut b);
         close("softmax", &a, &b, 1e-7);
     }
@@ -474,8 +476,8 @@ fn only_the_expf_ops_diverge() {
             self.0.host_needs(a);
         }
 
-        fn softmax(&self, x: &mut [f32]) {
-            Naive.softmax(x);
+        fn softmax(&self, x: &mut [f32], row: usize) {
+            Naive.softmax(x, row);
             self.0.host_wrote(x);
         }
         fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
@@ -959,26 +961,29 @@ fn why_is_the_rms_reduction_slow() {
 /// Kept here rather than exported so the test compares against the rule as
 /// *written in the model*, and a change to one without the other shows up as a
 /// failure rather than as both agreeing on something new.
-fn host_topk(probs: &[f32], n_used: usize) -> (Vec<i32>, Vec<f32>) {
-    let mut pick: Vec<(usize, f32)> = Vec::with_capacity(n_used);
-    for _ in 0..n_used {
-        let mut best = usize::MAX;
-        for e in 0..probs.len() {
-            if pick.iter().any(|(p, _)| *p == e) {
-                continue;
+fn host_topk(all: &[f32], n_expert: usize, n_used: usize) -> (Vec<i32>, Vec<f32>) {
+    let mut ids = Vec::new();
+    let mut weights = Vec::new();
+    for probs in all.chunks(n_expert) {
+        let mut pick: Vec<(usize, f32)> = Vec::with_capacity(n_used);
+        for _ in 0..n_used {
+            let mut best = usize::MAX;
+            for e in 0..probs.len() {
+                if pick.iter().any(|(p, _)| *p == e) {
+                    continue;
+                }
+                if best == usize::MAX || probs[e] > probs[best] {
+                    best = e;
+                }
             }
-            if best == usize::MAX || probs[e] > probs[best] {
-                best = e;
-            }
+            pick.push((best, probs[best]));
         }
-        pick.push((best, probs[best]));
+        let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
+        let denom = sum.max(6.103_515_625e-5);
+        ids.extend(pick.iter().map(|(e, _)| *e as i32));
+        weights.extend(pick.iter().map(|(_, p)| p / denom));
     }
-    let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
-    let denom = sum.max(6.103_515_625e-5);
-    (
-        pick.iter().map(|(e, _)| *e as i32).collect(),
-        pick.iter().map(|(_, p)| p / denom).collect(),
-    )
+    (ids, weights)
 }
 
 /// `moe_topk` on the device reproduces the host selection exactly, including
@@ -1048,9 +1053,20 @@ fn device_topk_reproduces_the_host_selection() {
     cases.push(("descending", (0..256).map(|i| (256 - i) as f32 / 32896.0).collect()));
     cases.push(("ascending", (0..256).map(|i| (i + 1) as f32 / 32896.0).collect()));
 
+    // **Batched too.** A prefill routes every token in the batch at once, and
+    // the kernel went from one block to one block per token; a decode-shaped
+    // test would never see a token read another's probabilities.
+    let batched: Vec<f32> = cases.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+    let (want_ids, want_w) = host_topk(&batched, 256, 8);
+    let (got_ids, got_w) = gpu.moe_topk_readback(&batched, 256, 8).expect("moe_topk batch");
+    assert_eq!(got_ids, want_ids, "batched over {} tokens: ids differ", cases.len());
+    for (i, (g, w)) in got_w.iter().zip(want_w.iter()).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "batched weight {i}");
+    }
+
     for (label, probs) in &cases {
-        let (want_ids, want_w) = host_topk(probs, 8);
-        let (got_ids, got_w) = gpu.moe_topk_readback(probs, 8).expect("moe_topk");
+        let (want_ids, want_w) = host_topk(probs, 256, 8);
+        let (got_ids, got_w) = gpu.moe_topk_readback(probs, 256, 8).expect("moe_topk");
         assert_eq!(got_ids, want_ids, "{label}: expert ids differ");
         for (i, (g, w)) in got_w.iter().zip(want_w.iter()).enumerate() {
             assert_eq!(
@@ -1072,8 +1088,8 @@ fn device_topk_reproduces_the_host_selection() {
             }
             p
         };
-        let (want_ids, want_w) = host_topk(&probs, n_used);
-        let (got_ids, got_w) = gpu.moe_topk_readback(&probs, n_used).expect("moe_topk");
+        let (want_ids, want_w) = host_topk(&probs, 256, n_used);
+        let (got_ids, got_w) = gpu.moe_topk_readback(&probs, 256, n_used).expect("moe_topk");
         assert_eq!(got_ids, want_ids, "n_used {n_used}: ids differ");
         for (g, w) in got_w.iter().zip(want_w.iter()) {
             assert_eq!(g.to_bits(), w.to_bits(), "n_used {n_used}: weights differ");

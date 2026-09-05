@@ -185,8 +185,8 @@ impl Ops for Par {
         Naive.rope_neox(x, pos, head_dim, n_rot, n_heads, theta)
     }
 
-    fn softmax(&self, x: &mut [f32]) {
-        Naive.softmax(x)
+    fn softmax(&self, x: &mut [f32], row: usize) {
+        Naive.softmax(x, row)
     }
 
     /// Threaded over key/value heads.

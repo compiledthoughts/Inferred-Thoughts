@@ -126,20 +126,29 @@ impl<'a> Experts<'a> {
 /// whole-model differential test is what enforces it.
 #[derive(Debug, Clone)]
 pub enum Route {
-    /// Chosen on the host: expert ids in descending probability, and their
-    /// normalized weights in the same order.
-    Host { ids: Vec<usize>, weights: Vec<f32> },
+    /// Chosen on the host: `n_tok * n_used` expert ids, token-major, each
+    /// token's in descending probability, and their normalized weights in the
+    /// same order.
+    Host { ids: Vec<usize>, weights: Vec<f32>, n_used: usize },
     /// Chosen on the device. The backend knows where the ids and weights are;
     /// nothing above the seam does.
-    Device { n_used: usize },
+    Device { n_used: usize, n_tok: usize },
 }
 
 impl Route {
-    /// How many experts this token visits, whichever side chose them.
+    /// How many experts each token visits, whichever side chose them.
     pub fn n_used(&self) -> usize {
         match self {
-            Route::Host { ids, .. } => ids.len(),
-            Route::Device { n_used } => *n_used,
+            Route::Host { n_used, .. } => *n_used,
+            Route::Device { n_used, .. } => *n_used,
+        }
+    }
+
+    /// Tokens this route covers. One in decode; the whole batch in prefill.
+    pub fn n_tok(&self) -> usize {
+        match self {
+            Route::Host { ids, n_used, .. } => ids.len() / (*n_used).max(1),
+            Route::Device { n_tok, .. } => *n_tok,
         }
     }
 
@@ -406,7 +415,17 @@ pub trait Ops {
 
     /// Numerically stable softmax, in place. Used by [`Ops::attend`]'s
     /// implementations, and by the MoE router when Stage 7 lands.
-    fn softmax(&self, x: &mut [f32]);
+    /// Softmax over each row of `x`, where a row is `row` elements.
+    ///
+    /// **`row` is passed rather than derived, and it is the one place the batch
+    /// convention cannot reach.** Every other op recovers its count from a
+    /// second buffer — `matmul` from `x.len() / w.n_in`, `rms_norm` from
+    /// `x.len() / weight.len()` — but softmax has a single buffer, so nothing
+    /// in the arguments distinguishes one row of `n` from `n` rows of one. The
+    /// caller knows: for the MoE router it is `n_expert`.
+    ///
+    /// Decode is `row == x.len()`, one row, exactly as before.
+    fn softmax(&self, x: &mut [f32], row: usize);
 
     /// Scaled dot-product attention for a batch of queries against the cached
     /// history, all heads and all rows at once.
@@ -702,25 +721,31 @@ pub trait Ops {
     /// what every CPU backend wants and what the CUDA backend does until its
     /// expert pointer table is complete. A device backend overrides it to keep
     /// the decision on the card, which is what lets the pass be a CUDA graph.
-    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
+    fn route(&self, probs: &mut [f32], n_expert: usize, n_used: usize) -> Route {
         self.host_needs(probs);
-        let mut ids: Vec<usize> = Vec::with_capacity(n_used);
-        for _ in 0..n_used {
-            let mut best = usize::MAX;
-            for e in 0..probs.len() {
-                if ids.contains(&e) {
-                    continue;
+        let n_tok = probs.len() / n_expert.max(1);
+        let mut ids: Vec<usize> = Vec::with_capacity(n_tok * n_used);
+        let mut weights: Vec<f32> = Vec::with_capacity(n_tok * n_used);
+        for t in 0..n_tok {
+            let p = &probs[t * n_expert..(t + 1) * n_expert];
+            let base = ids.len();
+            for _ in 0..n_used {
+                let mut best = usize::MAX;
+                for e in 0..n_expert {
+                    if ids[base..].contains(&e) {
+                        continue;
+                    }
+                    if best == usize::MAX || p[e] > p[best] {
+                        best = e;
+                    }
                 }
-                if best == usize::MAX || probs[e] > probs[best] {
-                    best = e;
-                }
+                ids.push(best);
             }
-            ids.push(best);
+            let sum: f32 = ids[base..].iter().map(|&e| p[e]).sum();
+            let denom = sum.max(6.103_515_625e-5);
+            weights.extend(ids[base..].iter().map(|&e| p[e] / denom));
         }
-        let sum: f32 = ids.iter().map(|&e| probs[e]).sum();
-        let denom = sum.max(6.103_515_625e-5);
-        let weights = ids.iter().map(|&e| probs[e] / denom).collect();
-        Route::Host { ids, weights }
+        Route::Host { ids, weights, n_used }
     }
 
     /// `acc[j] = sum over e of `scales[e] * rows[e * acc.len() + j]`, summed in
