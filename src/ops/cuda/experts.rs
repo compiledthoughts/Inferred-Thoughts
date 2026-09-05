@@ -138,6 +138,16 @@ pub struct ExpertStats {
     /// slots. The pool is no longer wholly addressable and a graph would be
     /// unsound.
     pub degraded: bool,
+    /// Microseconds spent placing experts, split by where the time went.
+    ///
+    /// **Because a whole-prefill number cannot say which part is expensive.**
+    /// Eager placement reads 16.3 GB of mmap, page-locks ~4.5 GiB and issues
+    /// ~22,400 host-to-device copies, and the first attempt to explain a 46 s
+    /// prefill from arithmetic over those three was wrong by 40 s. These are
+    /// observed at the point each happens.
+    pub place_h2d_us: u64,
+    pub place_pin_us: u64,
+    pub place_copy_us: u64,
 }
 
 impl ExpertStats {
@@ -419,7 +429,9 @@ impl ExpertCache {
         if self.next_slot < self.owner.len() {
             let slot = self.next_slot as u32;
             self.next_slot += 1;
+            let t = std::time::Instant::now();
             self.slab.write_at(slot as usize * self.stride, src)?;
+            self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
             self.stats.filled_bytes += src.len() as u64;
             self.owner[slot as usize] = Some(key);
             self.referenced[slot as usize] = true;
@@ -577,6 +589,7 @@ impl ExpertCache {
             }
             let mut host: *mut c_void = std::ptr::null_mut();
             let mut dev: ffi::CUdeviceptr = 0;
+            let t = std::time::Instant::now();
             // SAFETY: both are out-parameters the driver fills, and both are
             // checked by `check` before anything dereferences them. The block
             // owns the allocation until `HostBlock::drop` returns it.
@@ -590,6 +603,7 @@ impl ExpertCache {
                     "cuMemHostGetDevicePointer",
                 )?;
             }
+            self.stats.place_pin_us += t.elapsed().as_micros() as u64;
             self.stats.host_bytes += bytes as u64;
             self.blocks.push(HostBlock { host, dev, used: 0, capacity: per_block });
         }
@@ -603,10 +617,13 @@ impl ExpertCache {
         // `used` is below `capacity` and every slot is `stride` bytes, which
         // `src.len()` was checked to equal. The regions cannot overlap: `src`
         // is in the model's mmap and `host` is a fresh pinned allocation.
+        let t = std::time::Instant::now();
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), (b.host as *mut u8).add(off), src.len());
         }
+        let us = t.elapsed().as_micros() as u64;
         b.used += 1;
+        self.stats.place_copy_us += us;
         Ok(Some(b.dev + off as ffi::CUdeviceptr))
     }
 

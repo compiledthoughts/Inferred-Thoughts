@@ -693,9 +693,12 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             e.evictions,
         );
         eprintln!(
-            "         {:.2} GiB placed at load ({} tensors)",
+            "         {:.2} GiB placed at load ({} tensors): {:.1}s h2d + {:.1}s pin + {:.1}s memcpy",
             gib(e.filled_bytes),
             e.distinct,
+            e.place_h2d_us as f64 / 1e6,
+            e.place_pin_us as f64 / 1e6,
+            e.place_copy_us as f64 / 1e6,
         );
         // The host tier is the point of the two-tier design, so it is reported
         // whether or not it was used: "0 tensors" is a result, not an absence.
