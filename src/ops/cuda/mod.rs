@@ -139,6 +139,10 @@ pub struct Cuda {
     /// **Off by default, on a measured regression.** See `Cuda::matmul_f32`.
     f32_staged: Cell<bool>,
 
+    /// Force the warp-per-position score phase on or off. `None` picks by
+    /// context depth; see `Cuda::attend_impl`.
+    attn_warp: Cell<Option<bool>>,
+
     /// Q8_0 weights, repacked at upload into an aligned scale array and an
     /// aligned quant array. Keyed on the mmap address of the tensor.
     ///
@@ -686,6 +690,7 @@ impl Cuda {
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
+                attn_warp: Cell::new(None),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),

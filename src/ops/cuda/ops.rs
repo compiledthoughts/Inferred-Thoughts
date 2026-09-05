@@ -624,6 +624,12 @@ impl Cuda {
         self.experts.borrow().as_ref().map(|c| c.coverage())
     }
 
+    /// Force the warp-per-position flash-decoding kernel on or off; `None`
+    /// restores the depth-based choice. Benchmarks only — see `attend_impl`.
+    pub fn attn_warp(&self, force: Option<bool>) {
+        self.attn_warp.set(force);
+    }
+
     /// Use the staged F32 matmul. Off by default; see `matmul_f32`.
     pub fn f32_staged(&self, on: bool) {
         self.f32_staged.set(on);
@@ -848,6 +854,39 @@ impl Cuda {
     /// slower.
     fn n_out_fits_impl(n_out: usize, block: u32) -> bool {
         n_out > 0 && n_out <= block as usize
+    }
+
+    /// Positions below which the thread-per-position score phase still wins.
+    ///
+    /// **Measured, not chosen.** `attn_flash_warp` fixes an uncoalesced read —
+    /// one thread per position means adjacent threads are `kv_dim` apart — and
+    /// is ~3x faster from d2048 up, taking KV reads from ~43 GB/s to ~133. But
+    /// it is *slower* shallow, because it gives each warp 32 positions to walk
+    /// serially where the thread version had 128 running at once, and at short
+    /// context the kernel is latency-bound rather than bandwidth-bound:
+    ///
+    /// | n_pos | thread us | warp us | speedup |
+    /// |---|---|---|---|
+    /// | 256 | 41.3 | 49.1 | 0.84 |
+    /// | 512 | 50.2 | 56.0 | 0.90 |
+    /// | 768 | 59.7 | 47.3 | **1.26** |
+    /// | 1536 | 98.6 | 37.8 | 2.61 |
+    /// | 19942 | 974.7 | 307.0 | 3.18 |
+    ///
+    /// So the crossover is near 600 and this is the first measured depth above
+    /// it. `what_attention_costs_as_context_grows` regenerates the table.
+    ///
+    /// A shape-dependent dispatch rather than a replacement, because the
+    /// alternative — measuring one shape and generalising — is what made
+    /// `f32_staged` a 1.65x regression.
+    const ATTN_WARP_MIN_POS: usize = 768;
+
+    /// Whether this call uses the warp-per-position score phase.
+    fn warp_scores(&self, n_pos: usize) -> bool {
+        match self.attn_warp.get() {
+            Some(force) => force,
+            None => n_pos >= Self::ATTN_WARP_MIN_POS,
+        }
     }
 
     /// The F32 weight transposed into column-major, uploaded once.
@@ -1428,15 +1467,15 @@ impl Cuda {
             // SAFETY: parameters match `attn_flash`; the grid is one block per
             // (query head, chunk) so no block sees an empty range, and `shared`
             // is head_dim + 2 * FD_CHUNK floats, which is what it indexes.
+            // `attn_flash` reads K transposed -- one thread per position, so
+            // adjacent threads are `kv_dim` apart and a warp's load touches 32
+            // cache lines. `attn_flash_warp` gives a whole warp to each position
+            // so lanes read consecutive keys. Same grid, same shared memory;
+            // only the score phase differs. Behind a flag until measured across
+            // depth, which is the lesson `f32_staged` cost.
+            let name = if self.warp_scores(a.n_pos) { "attn_flash_warp" } else { "attn_flash" };
             unsafe {
-                self.launch_grid2(
-                    "attn_flash",
-                    a.n_head as u32,
-                    n_split as u32,
-                    chunk as u32,
-                    shared,
-                    &args,
-                )?
+                self.launch_grid2(name, a.n_head as u32, n_split as u32, chunk as u32, shared, &args)?
             };
         }
 

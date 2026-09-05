@@ -1111,7 +1111,7 @@ fn what_attention_costs_as_context_grows() {
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
 
-    let depths = [512usize, 2048, 4096, 8192, 16384, 19942, 32768];
+    let depths = [256usize, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384, 19942, 32768];
     let max = depths.iter().copied().max().unwrap_or(0);
 
     // f16 bits, as the cache stores them. 32768 x 512 x 2 bytes = 32 MiB each.
@@ -1121,7 +1121,10 @@ fn what_attention_costs_as_context_grows() {
     let mut out = vec![0.0f32; N_HEAD * HEAD_DIM];
 
     println!("\nattn_flash, one query row, {N_HEAD}q/{N_HEAD_KV}kv x {HEAD_DIM}");
-    println!("  {:>7}  {:>9}  {:>10}  {:>9}  {:>12}", "n_pos", "us/call", "MiB read", "GB/s", "ms/token");
+    println!(
+        "  {:>7}  {:>9}  {:>9}  {:>7}  {:>9}  {:>9}  {:>11}",
+        "n_pos", "thread", "warp", "speedup", "GB/s thr", "GB/s warp", "ms/tok warp"
+    );
     for d in depths {
         let a = Attn {
             q: &q,
@@ -1143,24 +1146,41 @@ fn what_attention_costs_as_context_grows() {
             gpu.end_pass();
         }
         const REPS: u32 = 50;
-        let t0 = std::time::Instant::now();
-        gpu.begin_pass(1);
-        for _ in 0..REPS {
-            gpu.attend(&a, &mut out);
-        }
-        gpu.end_pass();
-        gpu.host_needs(&mut out);
-        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(REPS);
+        // Both kernels, same shape, same sitting, warm-up discarded each time.
+        // A/B rather than before/after, because `f32_staged` shipped a 1.65x
+        // regression off a measurement of one shape taken at a different moment.
+        let mut timed = |warp: bool| {
+            gpu.attn_warp(Some(warp));
+            for _ in 0..2 {
+                gpu.begin_pass(1);
+                gpu.attend(&a, &mut out);
+                gpu.host_needs(&mut out);
+                gpu.end_pass();
+            }
+            let t0 = std::time::Instant::now();
+            gpu.begin_pass(1);
+            for _ in 0..REPS {
+                gpu.attend(&a, &mut out);
+            }
+            gpu.end_pass();
+            gpu.host_needs(&mut out);
+            t0.elapsed().as_secs_f64() * 1e6 / f64::from(REPS)
+        };
+        let us = timed(false);
+        let warp_us = timed(true);
+        gpu.attn_warp(None);
 
         // K and V, both f16, over the live window.
         let bytes = (d * KV_DIM * 2 * 2) as f64;
         println!(
-            "  {:>7}  {:>9.1}  {:>10.1}  {:>9.1}  {:>12.2}",
+            "  {:>7}  {:>9.1}  {:>9.1}  {:>7.2}  {:>9.1}  {:>9.1}  {:>11.2}",
             d,
             us,
-            bytes / 1048576.0,
+            warp_us,
+            us / warp_us,
             bytes / (us * 1e3),
-            us * LAYERS as f64 / 1000.0,
+            bytes / (warp_us * 1e3),
+            warp_us * LAYERS as f64 / 1000.0,
         );
     }
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
@@ -1218,6 +1238,71 @@ fn the_staged_f32_matmul_is_bit_identical() {
             }
         }
     }
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error: {e}");
+    }
+}
+
+/// The warp-per-position score phase agrees with the oracle at the depths it
+/// actually runs at.
+///
+/// **`every_op_agrees_with_the_oracle` cannot cover this.** It attends over 96
+/// positions, and the dispatch only reaches for `attn_flash_warp` at 768 and
+/// above — so the kernel that serves every long session was untested by the
+/// test whose whole job is to catch a wrong kernel.
+///
+/// The score phase changes the dot product's summation order: serial over
+/// `head_dim` becomes eight serial terms per lane plus a five-level shuffle
+/// tree. `attn_flash` was already outside the bit-exact set for `expf` and for
+/// flash-decoding's per-chunk rescaling, and its tolerance is *derived* from
+/// that decomposition. A tree over 32 accumulates error as O(log n) where a
+/// serial walk of 256 is O(n), so this is **more** accurate, not less — which
+/// is why the same `attend_tolerance` is used rather than a looser one. If that
+/// reasoning is wrong this test says so.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_warp_attention_agrees_with_the_oracle() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // The 35B's shape, and depths either side of the dispatch threshold.
+    let (head_dim, n_head, n_head_kv) = (256usize, 16usize, 2usize);
+    let kv_dim = n_head_kv * head_dim;
+
+    for n_pos in [768usize, 1024, 2048, 5000] {
+        let q = noise(n_head * head_dim, 21);
+        let kf = noise(n_pos * kv_dim, 22);
+        let vf = noise(n_pos * kv_dim, 23);
+        let k: Vec<u16> = kf.iter().map(|&v| f32_to_f16(v)).collect();
+        let v: Vec<u16> = vf.iter().map(|&v| f32_to_f16(v)).collect();
+        let attn = Attn {
+            q: &q,
+            k: &k,
+            v: &v,
+            kv_dim,
+            n_pos,
+            head_dim,
+            n_head,
+            n_head_kv,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+        };
+
+        let mut want = vec![0.0; n_head * head_dim];
+        Naive.attend(&attn, &mut want);
+        let tol = attend_tolerance(n_pos, &want);
+
+        for force in [Some(false), Some(true)] {
+            gpu.attn_warp(force);
+            let mut got = vec![0.0; n_head * head_dim];
+            gpu.begin_pass(1);
+            gpu.attend(&attn, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            let label = if force == Some(true) { "warp" } else { "thread" };
+            close(&format!("attend {label} d{n_pos}"), &want, &got, tol);
+        }
+    }
+    gpu.attn_warp(None);
     if let Some(e) = gpu.take_error() {
         panic!("cuda error: {e}");
     }
