@@ -63,7 +63,7 @@ const MM_TOK: usize = 8;
 /// `kernels/kernels.cu`.** It fixes the shared-memory request independently of
 /// `n_in`, which is what uncapped `MM_TOK`.
 const MM_SEG: usize = 64;
-use crate::ops::{Attn, Delta, Ops, Weights};
+use crate::ops::{Attn, Delta, Experts, Ops, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
 mod slot {
@@ -741,6 +741,132 @@ impl Cuda {
         }
     }
 
+    /// The routed FFN's matmuls, every expert in one launch.
+    ///
+    /// IQ4_XS only, which is every `ffn_*_exps` tensor the 35B has. A different
+    /// expert format would need its own grouped kernel; failing loudly is
+    /// better than falling back to the trait default, whose sub-slicing of
+    /// `out` would hand this backend addresses it has never mirrored.
+    fn matmul_experts_impl(
+        &self,
+        w: &Experts<'_>,
+        picks: &[usize],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        const QK_K: usize = 256;
+        const MAX: usize = 8;
+        if w.ty != GgmlType::Iq4Xs {
+            return Err(Error::Cuda {
+                what: "matmul_experts",
+                detail: format!(
+                    "{:?} experts have no grouped CUDA kernel; every ffn_*_exps in the \
+                     models this targets is IQ4_XS",
+                    w.ty
+                ),
+            });
+        }
+        let n_used = picks.len();
+        if n_used == 0 || n_used > MAX {
+            return Err(Error::Cuda {
+                what: "matmul_experts",
+                detail: format!("{n_used} experts per token; the kernel carries at most {MAX}"),
+            });
+        }
+
+        let n_super = w.n_in / QK_K;
+        // One row shared by every expert, or one row each. Derived from the
+        // buffer, as the seam's batch count is.
+        let rows = x.len() / w.n_in;
+        let x_stride_super = if rows == n_used { n_super } else { 0 };
+        let (sd, qd, _) = self.quantized_k(x, rows * n_super)?;
+
+        // Each pick's bytes, from whichever residency holds them. A miss fills
+        // a cache slot here, which is the one place the policy touches the
+        // forward pass.
+        let mut ptrs = [0 as ffi::CUdeviceptr; MAX];
+        for (i, &e) in picks.iter().enumerate() {
+            ptrs[i] = self.expert_or_resident(&w.expert(e))?;
+        }
+        let od = self.mirror_out(out)?;
+        self.note_shape("matmul_iq4_xs_q8_k_moe", w.n_in, w.n_out);
+
+        let block = 128u32;
+        let rows_per_block = (block / 32) as usize;
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::I32(x_stride_super as i32),
+            KArg::I32(n_used as i32),
+            KArg::Ptr(ptrs[0]),
+            KArg::Ptr(ptrs[1]),
+            KArg::Ptr(ptrs[2]),
+            KArg::Ptr(ptrs[3]),
+            KArg::Ptr(ptrs[4]),
+            KArg::Ptr(ptrs[5]),
+            KArg::Ptr(ptrs[6]),
+            KArg::Ptr(ptrs[7]),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        // SAFETY: parameters match `matmul_iq4_xs_q8_k_moe`; the grid covers
+        // exactly `n_out` rows by `n_used` experts, unused pointer slots are
+        // never dereferenced because the kernel returns on `e >= n_used`, and
+        // the kernel uses no dynamic shared memory.
+        unsafe {
+            self.launch_grid2(
+                "matmul_iq4_xs_q8_k_moe",
+                w.n_out.div_ceil(rows_per_block) as u32,
+                n_used as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
+    fn add_scaled_rows_impl(
+        &self,
+        acc: &mut [f32],
+        rows: &[f32],
+        scales: &[f32],
+    ) -> Result<()> {
+        const MAX: usize = 8;
+        if scales.is_empty() || scales.len() > MAX {
+            return Err(Error::Cuda {
+                what: "add_scaled_rows",
+                detail: format!("{} rows; the kernel carries at most {MAX}", scales.len()),
+            });
+        }
+        let n = acc.len();
+        let rd = self.mirror_in(rows)?;
+        // `mirror_out`, not `mirror_in`: every element of `acc` is written, so
+        // whatever the host or a previous token left there is irrelevant.
+        let ad = self.mirror_out(acc)?;
+        let mut s = [0.0f32; MAX];
+        s[..scales.len()].copy_from_slice(scales);
+        let args = [
+            KArg::I32(n as i32),
+            KArg::I32(scales.len() as i32),
+            KArg::F32(s[0]),
+            KArg::F32(s[1]),
+            KArg::F32(s[2]),
+            KArg::F32(s[3]),
+            KArg::F32(s[4]),
+            KArg::F32(s[5]),
+            KArg::F32(s[6]),
+            KArg::F32(s[7]),
+            KArg::Ptr(rd),
+            KArg::Ptr(ad),
+        ];
+        self.note_shape("add_scaled_rows", n, 0);
+        // SAFETY: parameters match `add_scaled_rows`; `rows` holds
+        // `scales.len() * n` floats and one thread covers each output element.
+        unsafe { self.launch("add_scaled_rows", n.div_ceil(256) as u32, 256, &args)? };
+        Ok(())
+    }
+
     fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
         match w.ty {
             GgmlType::Q8_0 => {}
@@ -1154,7 +1280,8 @@ impl Cuda {
             // eight LM heads — a 2048 x 1,986,560 matmul nobody would build —
             // and that one row put 82 ms into a 7 ms total.
             let per_token = calls as f64 / tokens.max(1) as f64;
-            let groupable = group > 1 && per_token >= group as f64;
+            let groupable =
+                group > 1 && per_token >= group as f64 && !kernel.ends_with("_moe");
             let grouped = if groupable {
                 self.time_shape(kernel, n_in, n_out * group, reps.max(1) / 4 + 1)?.0
             } else {
@@ -1276,6 +1403,48 @@ impl Cuda {
                 // One block per row; the recorded shape is a single row.
                 (args, 1, 256, 0)
             }
+            "matmul_iq4_xs_q8_k_moe" => {
+                // Eight experts against one shared activation, which is the
+                // gate/up shape. All eight pointers reference the same weight:
+                // the kernel is bandwidth and instruction bound and does not
+                // branch on values, and eight copies would only measure the
+                // cache differently than the real thing does.
+                let n_super = n_in / QK_K;
+                let row_bytes = n_super * 136;
+                let mut w = vec![0x11u8; n_out * row_bytes];
+                for r in 0..n_out {
+                    for b in 0..n_super {
+                        let at = r * row_bytes + b * 136;
+                        w[at] = 0x00;
+                        w[at + 1] = 0x38;
+                    }
+                }
+                let wd = DeviceBuffer::from_slice(&w)?;
+                let scales: Vec<f32> =
+                    (0..n_super).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
+                let quants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+                let sd = DeviceBuffer::from_slice(&scales)?;
+                let qd = DeviceBuffer::from_slice(&quants)?;
+                let od = DeviceBuffer::new(8 * n_out * 4)?;
+                let mut args = vec![
+                    KArg::I32(n_in as i32),
+                    KArg::I32(n_out as i32),
+                    KArg::I32(0),
+                    KArg::I32(8),
+                ];
+                for _ in 0..8 {
+                    args.push(KArg::Ptr(wd.ptr));
+                }
+                args.push(KArg::Ptr(sd.ptr));
+                args.push(KArg::Ptr(qd.ptr));
+                args.push(KArg::Ptr(od.ptr));
+                let grid = n_out.div_ceil(4) as u32;
+                keep.push(wd);
+                keep.push(sd);
+                keep.push(qd);
+                keep.push(od);
+                (args, grid, 128, 0)
+            }
             _ => return Ok(None),
         };
         let _ = n_out;
@@ -1292,9 +1461,13 @@ impl Cuda {
         reps: u32,
     ) -> Result<(f64, f64)> {
         const QK_K: usize = 256;
-        // Everything that is not a matmul goes through `shape_args`.
+        // Everything that is not a plain matmul goes through `shape_args`.
+        // The grouped MoE matmul is a matmul by name and not by signature, and
+        // leaving it out meant the table silently omitted the single largest
+        // kernel in the routed FFN — the same shape of gap that made
+        // `resident_bytes` under-report by an order of magnitude.
         let mut keep: Vec<DeviceBuffer> = Vec::new();
-        if !kernel.starts_with("matmul_") {
+        if !kernel.starts_with("matmul_") || kernel.ends_with("_moe") {
             let built = self.shape_args(kernel, n_in, n_out, &mut keep)?;
             let (args, grid, block, shared) = match built {
                 Some(b) => b,
@@ -1417,7 +1590,11 @@ impl Cuda {
                 // SAFETY: the caller built `args`, `grid`, `block` and
                 // `shared` to match `kernel`, and sized every buffer for the
                 // shape it describes.
-                unsafe { self.launch_shared(kernel, grid, block, shared, args)? };
+                // The grouped MoE matmul puts the expert on `blockIdx.y`; every
+                // other kernel here is one-dimensional.
+                let gy = if kernel.ends_with("_moe") { 8 } else { 1 };
+                // SAFETY: as above.
+                unsafe { self.launch_grid2(kernel, grid, gy, block, shared, args)? };
             }
             // Host time first: the launch loop returns once the driver has
             // accepted the work, so this is issue cost and not device time.
@@ -2004,6 +2181,14 @@ impl Ops for Cuda {
         self.note(self.add_scaled_impl(a, b, scale));
     }
 
+    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
+        self.note(self.matmul_experts_impl(w, picks, x, out));
+    }
+
+    fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
+        self.note(self.add_scaled_rows_impl(acc, rows, scales));
+    }
+
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
         self.note(self.sigmoid_mul_impl(x, g));
     }
@@ -2149,6 +2334,14 @@ impl Ops for &Cuda {
 
     fn add_scaled(&self, a: &mut [f32], b: &[f32], scale: f32) {
         (*self).add_scaled(a, b, scale)
+    }
+
+    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
+        (*self).matmul_experts(w, picks, x, out)
+    }
+
+    fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
+        (*self).add_scaled_rows(acc, rows, scales)
     }
 
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {

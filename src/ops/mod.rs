@@ -516,6 +516,61 @@ pub trait Ops {
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);
 
+    /// One matmul per routed expert, **issued together**.
+    ///
+    /// `out` is `picks.len()` consecutive rows of `w.n_out`. `x` is either one
+    /// row of `w.n_in`, shared by every expert — the gate and up projections —
+    /// or `picks.len()` rows, one each — the down projection. Which it is is
+    /// derived from `x.len()`, the same convention the batch axis uses, so the
+    /// count cannot disagree with the buffer.
+    ///
+    /// **This reverses a documented decision.** [`Experts`] says the seam does
+    /// not grow a MoE matmul, because each pick is an ordinary matmul over a
+    /// borrowed sub-range. That was right about the arithmetic and wrong about
+    /// the machine: measured on the 35B, issuing the eight experts separately
+    /// costs **18.03 ms/token** across the whole expert stage against **4.46**
+    /// grouped — and not from launch overhead, which is ~2 us against ~9 us of
+    /// device time, but from occupancy. A `{2048, 512}` matmul cannot fill 36
+    /// SMs. The seam had no way to say "these eight go together", so a backend
+    /// had no way to fix it.
+    ///
+    /// *Which* experts, and where their bytes live, still lives above this —
+    /// `picks` arrives already chosen.
+    ///
+    /// The default is the loop it replaces. **It sub-slices `out`**, which is
+    /// safe only for a backend that addresses memory by value; a device backend
+    /// must override it, and every device backend must anyway or it gains
+    /// nothing.
+    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
+        let per_expert = x.len() == picks.len() * w.n_in;
+        for (i, &e) in picks.iter().enumerate() {
+            let xi = if per_expert { &x[i * w.n_in..(i + 1) * w.n_in] } else { x };
+            self.matmul(&w.expert(e), xi, &mut out[i * w.n_out..(i + 1) * w.n_out]);
+        }
+    }
+
+    /// `acc[j] = sum over e of `scales[e] * rows[e * acc.len() + j]`, summed in
+    /// ascending `e`.
+    ///
+    /// The MoE accumulation, replacing one [`Ops::add_scaled`] per expert over
+    /// an accumulator that started at zero. **Bit-identical to that loop**: the
+    /// sum is parallel over `j`, which the oracle already treats as
+    /// independent, and serial and ascending over `e`, which it does not.
+    ///
+    /// `acc` is written, not accumulated into — the zero-fill it replaces is
+    /// the first term of the same sum.
+    fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
+        let n = acc.len();
+        debug_assert_eq!(rows.len(), scales.len() * n);
+        for (j, a) in acc.iter_mut().enumerate() {
+            let mut v = 0.0f32;
+            for (e, &s) in scales.iter().enumerate() {
+                v += s * rows[e * n + j];
+            }
+            *a = v;
+        }
+    }
+
     /// `a += b * scale`, in place — the MoE expert accumulation.
     ///
     /// Separate from [`Ops::add_assign`] because a routed expert's output is

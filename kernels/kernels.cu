@@ -1132,18 +1132,20 @@ __global__ void matmul_q5_k_q8_k(int n_in, int n_out,
 // oracle folds in order, and `p` splits that sub-block's integer sum four ways.
 // Each sub-block's 6-bit scale is split across `scales_l` and two bits marching
 // through `scales_h`, and biased by -32.
-__global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
-                                   const unsigned char *__restrict__ w,
-                                   const float *__restrict__ x_scales,
-                                   const signed char *__restrict__ x_quants,
-                                   float *__restrict__ out) {
-    const int nb   = n_in / QK_K;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (j >= n_out) return;
-    const int tok = blockIdx.y;
-
+// The IQ4_XS dot product, one warp cooperating on one output row.
+//
+// Factored out so the plain and the grouped matmul below share **one**
+// implementation. Two copies of an accumulation this order-sensitive would
+// drift, and the drift would be a handful of ulps in a kernel whose whole claim
+// is bit-equality with the oracle.
+//
+// Returns the result on lane 0; other lanes' values are partial.
+__device__ __forceinline__ float dot_iq4_xs_warp(
+        int nb,
+        const unsigned char *__restrict__ row,
+        const float *__restrict__ xs,
+        const signed char *__restrict__ xq,
+        int lane) {
     const int t = lane >> 2;   // which of the eight sub-blocks
     const int p = lane & 3;    // which quarter of its integer sum
 
@@ -1151,10 +1153,6 @@ __global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
     // half = 0 then 1 -- so ascending `t` is the oracle's own order.
     const int ib   = (t >> 1) * 2;
     const int half = t & 1;
-
-    const float *xs = x_scales + (size_t)tok * nb;
-    const signed char *xq = x_quants + (size_t)tok * n_in;
-    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
 
     float sumf = 0.0f;
 
@@ -1198,8 +1196,106 @@ __global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
             if (lane == 0) sumf += v;
         }
     }
+    return sumf;
+}
 
+__global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
+                                   const unsigned char *__restrict__ w,
+                                   const float *__restrict__ x_scales,
+                                   const signed char *__restrict__ x_quants,
+                                   float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const float sumf = dot_iq4_xs_warp(
+        nb,
+        w + (size_t)j * nb * IQ4XS_BYTES,
+        x_scales + (size_t)tok * nb,
+        x_quants + (size_t)tok * n_in,
+        lane);
     if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// The routed FFN's matmul: **every expert a token visits, in one launch.**
+//
+// Measured, and the reason this exists: issuing the eight experts one at a time
+// costs 18.03 ms/token across the whole expert stage, against 4.46 for the
+// grouped form. The saving is **not** launch overhead -- host issue is only
+// ~2 us against ~9 us of device time per launch. It is occupancy. A
+// `{2048, 512}` matmul is 128 blocks of 128 threads on a 36-SM card and
+// finishes before the machine is full; eight of them stacked on `blockIdx.y`
+// have eight times the parallelism for the same bytes.
+//
+// `x_stride_super` is what lets one kernel serve both halves of the FFN:
+//
+//   gate and up   every expert reads the same activation, so 0
+//   down          every expert reads its own 512-element intermediate, so nb
+//
+// which is the seam's "derive the count from the buffer" convention applied to
+// the expert axis rather than the token axis.
+//
+// Bit-exact by construction, for the same reason batching was: this changes
+// which outputs share a launch, never how one accumulates. Each output row is
+// `dot_iq4_xs_warp` over the same bytes in the same order.
+__global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
+                                       int n_used,
+                                       const unsigned char *__restrict__ w0,
+                                       const unsigned char *__restrict__ w1,
+                                       const unsigned char *__restrict__ w2,
+                                       const unsigned char *__restrict__ w3,
+                                       const unsigned char *__restrict__ w4,
+                                       const unsigned char *__restrict__ w5,
+                                       const unsigned char *__restrict__ w6,
+                                       const unsigned char *__restrict__ w7,
+                                       const float *__restrict__ x_scales,
+                                       const signed char *__restrict__ x_quants,
+                                       float *__restrict__ out) {
+    const int e = blockIdx.y;
+    if (e >= n_used) return;
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    // Eight pointers as kernel arguments rather than a device array: an array
+    // would need an upload per launch, 120 a token, to save nothing. When
+    // expert selection moves onto the device this becomes a slot-table lookup
+    // and the whole signature changes anyway.
+    const unsigned char *ws[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+
+    const float sumf = dot_iq4_xs_warp(
+        nb,
+        ws[e] + (size_t)j * nb * IQ4XS_BYTES,
+        x_scales + (size_t)e * x_stride_super,
+        x_quants + (size_t)e * x_stride_super * QK_K,
+        lane);
+    if (lane == 0) out[(size_t)e * n_out + j] = sumf;
+}
+
+// Weighted sum of `n_rows` rows into one, in ascending row order.
+//
+// The MoE accumulation: `acc[j] = sum_e scale[e] * rows[e * n + j]`, replacing
+// `n_rows` separate `add_scaled` launches over an accumulator that starts at
+// zero. **Bit-identical to that loop**: the sum is walked serially and
+// ascending exactly as the oracle walks its picks -- parallel over `j`, which
+// the oracle already treats as independent, and serial over `e`, which it does
+// not.
+extern "C" __global__ void add_scaled_rows(int n, int n_rows, float s0, float s1,
+                                           float s2, float s3, float s4, float s5,
+                                           float s6, float s7,
+                                           const float *__restrict__ rows,
+                                           float *__restrict__ acc) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const float sc[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    float a = 0.0f;
+    for (int e = 0; e < n_rows; ++e) a += sc[e] * rows[(size_t)e * n + j];
+    acc[j] = a;
 }
 
 // ------------------------------------------------------------- diagnostics

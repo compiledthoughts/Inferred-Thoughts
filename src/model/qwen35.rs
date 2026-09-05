@@ -590,6 +590,13 @@ struct Scratch {
     e_out: Vec<f32>,
     moe_acc: Vec<f32>,
     e_in: Vec<f32>,
+    /// The routed experts' intermediates, all of them at once: `n_expert_used`
+    /// consecutive rows. Separate from `e_gate`/`e_up`/`e_out`, which stay
+    /// single-row for the shared expert — sharing one buffer at two lengths
+    /// would resize a device mirror mid-layer for 64 KiB of saving.
+    g_all: Vec<f32>,
+    u_all: Vec<f32>,
+    o_all: Vec<f32>,
     /// The last row lifted out of `x`, its norm, and the logits. Not batched —
     /// only the final position produces output — but owned for the same reason.
     last: Vec<f32>,
@@ -675,6 +682,11 @@ impl Scratch {
             // One token's input row, gathered out of the batch. Owned rather
             // than sub-sliced from `normed`; see `moe_token`.
             self.e_in.resize(c.n_embd, 0.0);
+            // Every routed expert's intermediates, side by side, so the whole
+            // stage is one launch per step instead of one per expert.
+            self.g_all.resize(m.n_expert_used * m.expert_ff, 0.0);
+            self.u_all.resize(m.n_expert_used * m.expert_ff, 0.0);
+            self.o_all.resize(m.n_expert_used * c.n_embd, 0.0);
         }
 
         // One row of output per pass, whatever the batch.
@@ -1460,26 +1472,34 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
     let denom = sum.max(6.103_515_625e-5);
 
-    s.moe_acc[..nd].fill(0.0);
-    ops.host_wrote(&s.moe_acc[..nd]);
+    // **The whole routed stage, one launch per step.** This was a loop over the
+    // eight picks doing five ops each; on the GPU that cost 18.03 ms/token
+    // against 4.46 grouped, because a `{2048, 512}` matmul cannot fill 36 SMs.
+    // The arithmetic is untouched — each output is the same dot product of the
+    // same bytes in the same order — so this is bit-exact by construction, the
+    // same argument that made batching free.
+    let ids: Vec<usize> = pick.iter().map(|(e, _)| *e).collect();
+    let weights: Vec<f32> = pick.iter().map(|(_, p)| p / denom).collect();
+    let ff = m.n_expert_used * m.expert_ff;
 
-    for (e, p) in &pick {
-        let weight = p / denom;
-        ops.matmul(&w.gate.expert(*e), x, &mut s.e_gate[..m.expert_ff]);
-        ops.matmul(&w.up.expert(*e), x, &mut s.e_up[..m.expert_ff]);
-        let (g, u) = (&mut s.e_gate[..m.expert_ff], &s.e_up[..m.expert_ff]);
-        ops.silu_mul(g, u);
-        ops.matmul(&w.down.expert(*e), &s.e_gate[..m.expert_ff], &mut s.e_out);
-        let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
-        ops.add_scaled(acc, out, weight);
-    }
+    ops.matmul_experts(w.gate, &ids, x, &mut s.g_all[..ff]);
+    ops.matmul_experts(w.up, &ids, x, &mut s.u_all[..ff]);
+    let (g, u) = (&mut s.g_all[..ff], &s.u_all[..ff]);
+    ops.silu_mul(g, u);
+    // `x` here is one row per expert rather than one shared row, which
+    // `matmul_experts` reads off the buffer length.
+    ops.matmul_experts(w.down, &ids, &s.g_all[..ff], &mut s.o_all[..m.n_expert_used * nd]);
+    // Writes `moe_acc` rather than accumulating into it: the zero-fill this
+    // replaces was the first term of the same sum.
+    let (acc, rows) = (&mut s.moe_acc[..nd], &s.o_all[..m.n_expert_used * nd]);
+    ops.add_scaled_rows(acc, rows, &weights);
 
     // The shared expert: always run, gated by a sigmoid of a single logit.
     ops.matmul(w.shared_gate, x, &mut s.e_gate[..m.shared_ff]);
     ops.matmul(w.shared_up, x, &mut s.e_up[..m.shared_ff]);
     let (g, u) = (&mut s.e_gate[..m.shared_ff], &s.e_up[..m.shared_ff]);
     ops.silu_mul(g, u);
-    ops.matmul(w.shared_down, &s.e_gate[..m.shared_ff], &mut s.e_out);
+    ops.matmul(w.shared_down, &s.e_gate[..m.shared_ff], &mut s.e_out[..nd]);
 
     // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
     let logit: f32 = w
