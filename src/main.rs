@@ -490,7 +490,7 @@ host     {per:.2} ms/token on-CPU, {:.0}% of the {:.2} ms wall{}",
                     if o.cuda_blocking { "" } else { " (driver spins; see --cuda-blocking)" },
                 );
             }
-            report_device(&cuda, &o, n, r.map(|r| r.ms_per_token))?;
+            report_device(&cuda, &o, n, tokens.len() as u64, r.map(|r| r.ms_per_token))?;
         }
         return run.map(|_| ());
     }
@@ -532,6 +532,7 @@ fn report_device(
     cuda: &inferred_thoughts::Cuda,
     o: &GenOpts,
     tokens: u64,
+    prefill_tokens: u64,
     ms_per_token: Option<f64>,
 ) -> inferred_thoughts::Result<()> {
     let s = cuda.stats();
@@ -600,12 +601,24 @@ device   {} kernel launches", s.launches);
 launches replayed from the run itself (after generation, so writes are moot)"
                 );
                 eprintln!(
+                    "         per token over {} prefill + {tokens} decode",
+                    prefill_tokens,
+                );
+                eprintln!(
                     "         {:<28}{:>10}{:>9}{:>9}{:>10}{:>9}",
                     "kernel", "grid", "calls/t", "gpu us", "ms/token", "share",
                 );
-                let total: f64 = b.iter().map(|r| r.gpu_ms_per_token(tokens)).sum();
+                // **Every token the launches were issued for, not just the
+                // decoded ones.** The recorder runs from the first pass, so a
+                // run with a long prompt has most of its launches in prefill;
+                // dividing those by the decode count reported a 19,890 ms
+                // "token" and a kernel share of 0%. The shares were still
+                // right, which is exactly what makes a wrong denominator hard
+                // to notice.
+                let norm = tokens + prefill_tokens;
+                let total: f64 = b.iter().map(|r| r.gpu_ms_per_token(norm)).sum();
                 for r in b.iter().take(28) {
-                    let ms = r.gpu_ms_per_token(tokens);
+                    let ms = r.gpu_ms_per_token(norm);
                     if ms < 0.005 {
                         continue;
                     }
@@ -613,7 +626,7 @@ launches replayed from the run itself (after generation, so writes are moot)"
                         "         {:<28}{:>10}{:>9.1}{:>9.1}{:>10.2}{:>8.1}% {}",
                         r.kernel,
                         format!("{}x{}", r.grid.0, r.grid.1),
-                        r.calls_per_token(tokens),
+                        r.calls_per_token(norm),
                         r.gpu_us,
                         ms,
                         100.0 * ms / total.max(1e-9),
@@ -622,15 +635,32 @@ launches replayed from the run itself (after generation, so writes are moot)"
                 }
                 eprintln!("         {:<28}{:>38.2} ms/token, {} distinct launches",
                     "TOTAL", total, b.len());
-                if let Some(ms) = ms_per_token {
-                    eprintln!(
+                // Only comparable when the run is mostly decode: `ms` is the
+                // decode token's wall clock while `total` is now normalised
+                // over prefill too, so on a long prompt these measure different
+                // things and subtracting them is meaningless.
+                match ms_per_token {
+                    Some(ms) if prefill_tokens <= tokens => eprintln!(
                         "         against a {ms:.1} ms token: kernels {:.0}%, everything else {:.1} ms.
          Compare `--null-kernels`, which measures that remainder directly.",
                         100.0 * total / ms, ms - total,
-                    );
+                    ),
+                    Some(_) => eprintln!(
+                        "         no decode comparison: {prefill_tokens} prefill against {tokens} decode tokens,
+         so a decode ms/token and this prefill-weighted total are not the same quantity."
+                    ),
+                    None => {}
                 }
             }
-            Ok(_) => {}
+            // **Say so.** An empty replay printed nothing at all, which reads
+            // as "this run had no launches" rather than "the recorder was
+            // never armed" — and cost a three-minute run to notice. Ninth
+            // instrument in this repo to default to silence.
+            Ok(_) => eprintln!(
+                "         launch replay recorded nothing. `--profile-device` arms the recorder,
+         but `launch_grid2` returns through `graph_launch` before reaching it, so a
+         graphed run records none. Add `--no-graphs`."
+            ),
             Err(e) => eprintln!("         launch replay unavailable: {e}"),
         }
     }
