@@ -519,6 +519,14 @@ impl Cuda {
             .set(if bytes == 0 { experts::DEFAULT_RESERVE } else { free.saturating_sub(bytes) });
     }
 
+    /// Replace every kernel with a no-op, keeping the launch pattern exactly.
+    ///
+    /// The output is meaningless; the *time* is the point. See `noop` in
+    /// kernels.cu.
+    pub fn null_kernels(&self, on: bool) {
+        self.null_kernels.set(on);
+    }
+
     /// Whether graphs were turned off because the model read a device result
     /// mid-pass. See [`Cuda::mid_pass_read`]; reported by `--profile-device`
     /// so the throughput loss is visible rather than inferred from a launch

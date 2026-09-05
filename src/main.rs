@@ -55,6 +55,14 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Replace every CUDA kernel with a no-op, keeping the launch pattern.
+        ///
+        /// **A stopwatch, not a mode.** The output is garbage. What it measures
+        /// is what a token costs when the work costs nothing — the only direct
+        /// way to size the gap between a 53.6 ms token and the 18.05 ms of
+        /// kernel time the shape bench accounts for.
+        #[arg(long)]
+        null_kernels: bool,
         /// Ask the CUDA driver to sleep rather than spin while synchronizing.
         ///
         /// A **measurement** switch, not a speed one. The default context
@@ -160,6 +168,14 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Replace every CUDA kernel with a no-op, keeping the launch pattern.
+        ///
+        /// **A stopwatch, not a mode.** The output is garbage. What it measures
+        /// is what a token costs when the work costs nothing — the only direct
+        /// way to size the gap between a 53.6 ms token and the 18.05 ms of
+        /// kernel time the shape bench accounts for.
+        #[arg(long)]
+        null_kernels: bool,
         /// Ask the CUDA driver to sleep rather than spin while synchronizing.
         ///
         /// A **measurement** switch, not a speed one. The default context
@@ -212,6 +228,7 @@ fn main() -> ExitCode {
             ctx,
             batch,
             cuda_blocking,
+            null_kernels,
             expert_cache,
             profile,
             profile_detail,
@@ -233,6 +250,7 @@ fn main() -> ExitCode {
                 max_batch: batch,
                 expert_cache,
                 cuda_blocking,
+                null_kernels,
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
@@ -252,6 +270,7 @@ fn main() -> ExitCode {
             ctx,
             batch,
             cuda_blocking: _,
+            null_kernels: _,
             expert_cache,
             max_tokens,
             threads,
@@ -313,6 +332,8 @@ struct GenOpts {
     expert_cache: f64,
     /// Ask the driver to block rather than spin on sync. Measurement only.
     cuda_blocking: bool,
+    /// Replace every kernel with a no-op. Measurement only; output is garbage.
+    null_kernels: bool,
     report: bool,
     detail: bool,
     json: Option<String>,
@@ -374,6 +395,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.time_kernels(o.kernels);
         cuda.rms_serial(o.rms_serial);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
+        cuda.null_kernels(o.null_kernels);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(

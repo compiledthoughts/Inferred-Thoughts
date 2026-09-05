@@ -142,6 +142,10 @@ pub struct Cuda {
     /// Cleared by `forget_state` when the engine resets a sequence.
     states: RefCell<HashMap<usize, DeviceBuffer>>,
 
+    /// Replace every kernel with `noop`, keeping the launch pattern. See the
+    /// kernel's comment; the output is garbage and the point is the clock.
+    null_kernels: Cell<bool>,
+
     /// Reduce RMSNorm's sum of squares serially rather than as a tree.
     ///
     /// The tree is the default and is ~4x faster, but f64 addition rounds and
@@ -602,6 +606,7 @@ impl Cuda {
                 pass_graph: Cell::new(false),
                 graphs_enabled: Cell::new(true),
                 rms_serial: Cell::new(false),
+                null_kernels: Cell::new(false),
                 states: RefCell::new(HashMap::new()),
                 q8: RefCell::new(HashMap::new()),
                 f32t: RefCell::new(HashMap::new()),
@@ -703,8 +708,12 @@ impl Cuda {
         if self.pass_graph.get() {
             return self.graph_launch(name, grid_x, grid_y, block, shared_bytes, args);
         }
-        let f = self.cached_function(name)?;
-        let mut pack = ArgPack::new(args);
+        // Every launch funnels through here, which is what makes the
+        // substitution total: same count, same order, same geometry.
+        let nulled = self.null_kernels.get();
+        let f = self.cached_function(if nulled { "noop" } else { name })?;
+        let empty: [KArg; 0] = [];
+        let mut pack = ArgPack::new(if nulled { &empty } else { args });
         let mut params = pack.ptrs();
         let started = std::time::Instant::now();
         // SAFETY: the caller's contract, documented above.
@@ -718,7 +727,7 @@ impl Cuda {
                     block,
                     1,
                     1,
-                    shared_bytes,
+                    if nulled { 0 } else { shared_bytes },
                     std::ptr::null_mut(),
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
@@ -754,8 +763,12 @@ impl Cuda {
         if self.pass_graph.get() {
             return self.graph_launch(name, grid, 1, block, shared_bytes, args);
         }
-        let f = self.cached_function(name)?;
-        let mut pack = ArgPack::new(args);
+        // Every launch funnels through here, which is what makes the
+        // substitution total: same count, same order, same geometry.
+        let nulled = self.null_kernels.get();
+        let f = self.cached_function(if nulled { "noop" } else { name })?;
+        let empty: [KArg; 0] = [];
+        let mut pack = ArgPack::new(if nulled { &empty } else { args });
         let mut params = pack.ptrs();
         let started = std::time::Instant::now();
         // SAFETY: the caller's contract, documented above.
@@ -769,7 +782,7 @@ impl Cuda {
                     block,
                     1,
                     1,
-                    shared_bytes,
+                    if nulled { 0 } else { shared_bytes },
                     std::ptr::null_mut(),
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),

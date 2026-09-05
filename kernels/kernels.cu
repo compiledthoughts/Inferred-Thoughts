@@ -1389,6 +1389,19 @@ extern "C" __global__ void add_scaled_rows(int n, int n_rows, float s0, float s1
     acc[j] = a;
 }
 
+// Does nothing, launched with the real grid and block. See `--null-kernels`.
+//
+// **The instrument that separates the two halves of a token.** A decode step
+// measures 53.6 ms of which the shape bench accounts for 18.05 ms of kernel
+// time, and five hypotheses about the remaining 35 ms have been falsified by
+// subtracting one number from another. Replacing every kernel with this one,
+// while keeping the launch count, order, grid and block identical, makes the
+// residual something the clock reports directly: whatever the token still costs
+// is what the work was never responsible for.
+//
+// The output is garbage, deliberately. This is a stopwatch, not a mode.
+extern "C" __global__ void noop() {}
+
 // ------------------------------------------------------------- diagnostics
 //
 // Not used by the forward pass. These exist to answer one question: why does a
