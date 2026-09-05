@@ -78,6 +78,16 @@ enum Command {
         /// slab is allocated up front, so an over-large one leaves the driver
         /// short and it begins paging VRAM to host — which costs far more than
         /// the misses it avoids.
+        /// Disable CUDA graphs.
+        ///
+        /// **Also the only way to get kernel attribution back.** `launch_grid2`
+        /// returns through `graph_launch` before it reaches the launch
+        /// recorder, so with graphs on `--profile-device` replays nothing —
+        /// the instrument that is "complete by construction" goes quiet. This
+        /// restores it, and gives a direct A/B on what the graph is worth
+        /// rather than one inferred across several changes at once.
+        #[arg(long, default_value_t = false)]
+        no_graphs: bool,
         #[arg(long, default_value_t = 0.0)]
         expert_cache: f64,
         /// Cap the page-locked host tier behind the expert cache, in GiB.
@@ -247,6 +257,7 @@ fn main() -> ExitCode {
             batch,
             cuda_blocking,
             null_kernels,
+            no_graphs,
             expert_cache,
             expert_host,
             profile,
@@ -271,6 +282,7 @@ fn main() -> ExitCode {
                 expert_host,
                 cuda_blocking,
                 null_kernels,
+                no_graphs,
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
@@ -356,6 +368,8 @@ struct GenOpts {
     expert_host: f64,
     /// Ask the driver to block rather than spin on sync. Measurement only.
     cuda_blocking: bool,
+    /// Disable CUDA graphs, which also restores launch-replay attribution.
+    no_graphs: bool,
     /// Replace every kernel with a no-op. Measurement only; output is garbage.
     null_kernels: bool,
     report: bool,
@@ -425,6 +439,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         // because this is the only place that knows the context length.
         cuda.reserve_for_kv(kv_reserve_bytes(&m, o.n_ctx));
         cuda.null_kernels(o.null_kernels);
+        cuda.use_graphs(!o.no_graphs);
         cuda.record_launches(o.device);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
@@ -605,6 +620,23 @@ launches replayed from the run itself (after generation, so writes are moot)"
     }
 
     if o.device {
+        match cuda.bench_f32_variants(200) {
+            Ok(v) if !v.is_empty() => {
+                let base = v[0].1.max(1e-9);
+                eprintln!(
+                    "\nf32      decomposed, same recorded launch, one thing removed each time"
+                );
+                for (name, us) in &v {
+                    eprintln!(
+                        "         {name:<26} {us:7.1} us  {:5.0}% of baseline",
+                        100.0 * us / base
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("         f32 decomposition unavailable: {e}"),
+        }
+
         if let Ok(v) = cuda.bench_iq4_variants(200) {
             if v.len() >= 4 {
                 let base = v[0].1;

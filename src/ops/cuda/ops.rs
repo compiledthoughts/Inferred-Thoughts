@@ -624,6 +624,11 @@ impl Cuda {
         self.experts.borrow().as_ref().map(|c| c.coverage())
     }
 
+    /// Use the staged F32 matmul. Off by default; see `matmul_f32`.
+    pub fn f32_staged(&self, on: bool) {
+        self.f32_staged.set(on);
+    }
+
     /// Replace every kernel with a no-op, keeping the launch pattern exactly.
     ///
     /// The output is meaningless; the *time* is the point. See `noop` in
@@ -835,6 +840,16 @@ impl Cuda {
     ///
     /// Kept as the slow one-thread-per-row shape on purpose; see `matmul_f32`
     /// in kernels.cu for why exactness is worth more than speed here.
+    /// Whether a staged `matmul_f32_t` can serve this output width.
+    ///
+    /// One accumulator thread per output row, so the block has to be at least
+    /// as wide. Every F32 matmul in `qwen35moe` is 1, 32 or 256 wide; anything
+    /// larger falls back to the row-per-thread kernel, which is correct just
+    /// slower.
+    fn n_out_fits_impl(n_out: usize, block: u32) -> bool {
+        n_out > 0 && n_out <= block as usize
+    }
+
     /// The F32 weight transposed into column-major, uploaded once.
     ///
     /// Done on the host at first touch: it is `n_in * n_out` reads of a mapped
@@ -862,12 +877,65 @@ impl Cuda {
         Ok(ptr)
     }
 
+    /// Threads a staged `matmul_f32_t` launches, whatever `n_out` is.
+    ///
+    /// The point of the staged form is that *loading* is done by the whole
+    /// block while only `n_out` threads accumulate, so this is deliberately
+    /// unrelated to the output width.
+    const F32_STAGE_BLOCK: u32 = 256;
+
+    /// Floats of dynamic shared memory a staged launch may use.
+    ///
+    /// 48 KiB is the per-block default without an opt-in; staying under it
+    /// keeps the launch from needing `cuFuncSetAttribute` and keeps occupancy
+    /// at two blocks per SM, which matters not at all here (there is one block)
+    /// but would if this kernel ever served a batch.
+    const F32_STAGE_FLOATS: usize = 12 * 1024;
+
     fn matmul_f32(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
         let n_tok = x.len() / w.n_in;
         self.note_shape("matmul_f32_t", w.n_in, w.n_out);
         let wd = self.resident_f32_t(w)?;
         let xd = self.mirror_in(x)?;
         let od = self.mirror_out(out)?;
+
+        // **Staged when the output fits one block, which on this model is
+        // always.** Decomposed at the real geometry: of a 40.0 us call, 14.5 us
+        // is the launch and the loop with both loads removed, and the serial
+        // accumulation chain costs 1% (`dbg_f32_nochain`, 39.7 us). So the
+        // floor was never the exactness — it was one thread per output row
+        // issuing 2048 loads with ~8 outstanding, on a block of `n_out` threads,
+        // 32 of them for `ssm_alpha`. Staging through shared memory lets the
+        // whole block fetch while thread `j` still walks its own row serially in
+        // ascending `k`, which is `ops::naive::dot_row`'s order exactly.
+        // Measured 40.0 -> 15.1 us, at the no-loads floor, and bit-identical.
+        if self.f32_staged.get() && Self::n_out_fits_impl(w.n_out, Self::F32_STAGE_BLOCK) {
+            let kt = (Self::F32_STAGE_FLOATS / (w.n_out + 1)).clamp(1, w.n_in);
+            let shared = (kt * (w.n_out + 1) * 4) as u32;
+            let args = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(kt as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(xd),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `matmul_f32_t_staged`. The shared
+            // request is exactly what the kernel indexes — `kt * n_out` floats
+            // of weight tile then `kt` of activation — and `n_out` is at most
+            // the block, so every output row has an accumulator thread.
+            return unsafe {
+                self.launch_grid2(
+                    "matmul_f32_t_staged",
+                    1,
+                    n_tok as u32,
+                    Self::F32_STAGE_BLOCK,
+                    shared,
+                    &args,
+                )
+            };
+        }
+
         let args = [
             KArg::I32(w.n_in as i32),
             KArg::I32(w.n_out as i32),
@@ -1688,7 +1756,7 @@ impl Cuda {
             .filter(|(k, _)| k.0 == "matmul_iq4_xs_q8_k")
             .max_by_key(|(k, v)| v.0 * u64::from(k.1))
             .map(|(k, v)| (*k, v.1.clone()));
-        let ((_, gx, gy, block, shared), args) = match pick {
+        let ((_, gx, gy, block, shared, _, _), args) = match pick {
             Some(x) => x,
             None => return Ok(Vec::new()),
         };
@@ -1707,6 +1775,75 @@ impl Cuda {
         Ok(out)
     }
 
+    /// Decompose `matmul_f32_t`: replay its heaviest recorded launch against
+    /// variants that each remove one thing, plus the staged candidate.
+    ///
+    /// Returns `(label, gpu_us)` with the baseline first. The kernel measures
+    /// 6.5 GB/s on a card that reads VRAM at 409.6, and its own comment blames
+    /// "memory latency on a single thread" while asserting that going lower
+    /// "means splitting the reduction". The first is a hypothesis these
+    /// variants test; the second is what `matmul_f32_t_staged` disputes, by
+    /// staging through shared memory so the block fetches while thread `j`
+    /// still accumulates its own row serially.
+    ///
+    /// The staged variant is launched with its own geometry — a full block
+    /// regardless of `n_out`, and dynamic shared memory — because that is the
+    /// whole point of it. The others reuse the recorded launch exactly.
+    pub fn bench_f32_variants(&self, reps: u32) -> Result<Vec<(&'static str, f64)>> {
+        // Heaviest by calls x rows, which is how it hurts.
+        let pick = self
+            .launches
+            .borrow()
+            .iter()
+            .filter(|(k, _)| k.0 == "matmul_f32_t")
+            .max_by_key(|(_, v)| v.0)
+            .map(|(k, v)| (*k, v.1.clone()));
+        let ((_, gx, gy, block, shared, _, _), args) = match pick {
+            Some(x) => x,
+            None => return Ok(Vec::new()),
+        };
+        let (n_in, n_out) = match (args.first(), args.get(1)) {
+            (Some(KArg::I32(a)), Some(KArg::I32(b))) => (*a as usize, *b as usize),
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut out = Vec::new();
+        for name in [
+            "matmul_f32_t",
+            "dbg_f32_now",
+            "dbg_f32_nox",
+            "dbg_f32_noloads",
+            "dbg_f32_nochain",
+        ] {
+            let variants = [args.clone()];
+            let (us, _) = self.time_launches_2d(name, gx, gy, block, shared, &variants, reps)?;
+            out.push((name, us));
+        }
+
+        // The candidate. One block, `STAGE_BLOCK` threads whatever `n_out` is,
+        // and a tile sized to the shared allocation.
+        const STAGE_BLOCK: u32 = 256;
+        const STAGE_FLOATS: usize = 12 * 1024;
+        if n_out <= STAGE_BLOCK as usize && n_out > 0 {
+            let kt = (STAGE_FLOATS / (n_out + 1)).clamp(1, n_in);
+            let mut sargs = args.clone();
+            sargs.insert(2, KArg::I32(kt as i32));
+            let shared_bytes = (kt * (n_out + 1) * 4) as u32;
+            let variants = [sargs];
+            let (us, _) = self.time_launches_2d(
+                "matmul_f32_t_staged",
+                1,
+                gy,
+                STAGE_BLOCK,
+                shared_bytes,
+                &variants,
+                reps,
+            )?;
+            out.push(("matmul_f32_t_staged", us));
+        }
+        Ok(out)
+    }
+
     /// Replay every launch the run actually made, and time it.
     ///
     /// **Complete by construction.** The previous bench synthesised arguments
@@ -1721,7 +1858,7 @@ impl Cuda {
     /// afterwards. Pointers stay valid because weights, mirrors, pool slots and
     /// the expert slab all outlive the pass.
     pub fn bench_launches(&self, reps: u32) -> Result<Vec<LaunchBench>> {
-        let recorded: Vec<((&'static str, u32, u32, u32, u32), (u64, Vec<KArg>))> = self
+        let recorded: Vec<(super::LaunchKey, (u64, Vec<KArg>))> = self
             .launches
             .borrow()
             .iter()
@@ -1729,7 +1866,7 @@ impl Cuda {
             .collect();
 
         let mut out = Vec::with_capacity(recorded.len());
-        for ((kernel, gx, gy, block, shared), (calls, args)) in recorded {
+        for ((kernel, gx, gy, block, shared, _, _), (calls, args)) in recorded {
             let variants = [args];
             let (gpu_us, issue_us) =
                 self.time_launches_2d(kernel, gx, gy, block, shared, &variants, reps)?;

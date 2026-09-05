@@ -1165,3 +1165,60 @@ fn what_attention_costs_as_context_grows() {
     }
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
 }
+
+/// The staged F32 matmul is bit-identical to the oracle at every shape the
+/// model uses.
+///
+/// **The exactness here is load-bearing and was nearly given up on a false
+/// premise.** `ffn_gate_inp` is F32 because the router decides *which* experts
+/// run, so a one-ulp difference is not a rounding difference — it can pick a
+/// different expert and change the answer categorically. `matmul_f32_t`'s
+/// comment claimed its ~40 us floor could only be beaten by splitting the
+/// reduction; the decomposition says the serial chain costs 1% and the loads
+/// cost the rest, so staging through shared memory beats it 2.65x while thread
+/// `j` still walks its own row in ascending `k`.
+///
+/// That argument is only as good as this test. Shapes are the real ones:
+/// `ffn_gate_inp_shexp` is `{2048, 1}`, `ssm_alpha` and `ssm_beta` are
+/// `{2048, 32}`, `ffn_gate_inp` is `{2048, 256}` — and 257 for the boundary,
+/// which falls back to the row-per-thread kernel.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_staged_f32_matmul_is_bit_identical() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    for (n_in, n_out) in [(2048usize, 1usize), (2048, 32), (2048, 256), (2048, 257), (256, 8)] {
+        let wf = noise(n_in * n_out, 0x51ed + n_out as u64);
+        let bytes: Vec<u8> = wf.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let w = Weights { data: &bytes, ty: inferred_thoughts::gguf::GgmlType::F32, n_in, n_out, pooled: false };
+
+        for n_tok in [1usize, 3] {
+            let x = noise(n_in * n_tok, 0xbeef + n_tok as u64);
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+
+            for (i, (g, w2)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w2.to_bits(),
+                    "{{{n_in},{n_out}}} n_tok {n_tok}, row {i}: {g:e} against {w2:e}. \
+                     The staged kernel accumulates serially in ascending k per row, \
+                     exactly as naive::dot_row does, so any difference is a bug rather \
+                     than a reordering."
+                );
+            }
+        }
+    }
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error: {e}");
+    }
+}

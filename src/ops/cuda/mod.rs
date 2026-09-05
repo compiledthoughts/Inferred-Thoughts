@@ -134,6 +134,11 @@ pub struct Cuda {
     /// intervention, which is what a CUDA graph needs; see [`experts`].
     expert_host_budget: Cell<usize>,
 
+    /// Whether `matmul_f32` uses the staged kernel.
+    ///
+    /// **Off by default, on a measured regression.** See `Cuda::matmul_f32`.
+    f32_staged: Cell<bool>,
+
     /// Q8_0 weights, repacked at upload into an aligned scale array and an
     /// aligned quant array. Keyed on the mmap address of the tensor.
     ///
@@ -227,7 +232,7 @@ pub struct Cuda {
     ///
     /// Only populated under `--profile-device`; a `HashMap` probe per launch is
     /// not something the forward path should pay for.
-    launches: RefCell<HashMap<(&'static str, u32, u32, u32, u32), (u64, Vec<KArg>)>>,
+    launches: RefCell<HashMap<LaunchKey, (u64, Vec<KArg>)>>,
     /// Whether to populate `launches`.
     record_launches: Cell<bool>,
 
@@ -479,6 +484,37 @@ struct RecordedNode {
 /// later rather than rebuilt.
 ///
 /// So launches carry values and the pointer array is built at the last moment.
+/// What makes one recorded launch distinct from another.
+///
+/// Name, grid, block, shared bytes — **and the first two integer arguments**.
+///
+/// The scalars are load-bearing and were left out at first. `matmul_f32_t` runs
+/// at `{2048, 1}` for the shared-expert gate and `{2048, 32}` for `ssm_alpha`,
+/// and both launch a grid of 1x1 with 128 threads: identical geometry,
+/// different shapes. Keyed on geometry alone they collide, so the recorder kept
+/// whichever arrived first and `bench_f32_variants` could only ever replay one
+/// of them.
+///
+/// That cost a shipped 1.65x regression. A staged rewrite was decomposed
+/// against the shape the bench happened to hold, measured 2.65x faster, and was
+/// applied to all three — where the widest one needs 44 shared-memory tiles and
+/// 88 `__syncthreads` that the bench never saw. **An instrument that cannot
+/// distinguish two things will average them and report the average
+/// confidently.**
+///
+/// Two scalars rather than all of them because every kernel here takes its
+/// shape first; pointers vary per call and must not be in the key.
+pub(super) type LaunchKey = (&'static str, u32, u32, u32, u32, i32, i32);
+
+/// The first two integer arguments of a launch, or zeroes.
+pub(super) fn scalar_key(args: &[KArg]) -> (i32, i32) {
+    let at = |i: usize| match args.get(i) {
+        Some(KArg::I32(v)) => *v,
+        _ => 0,
+    };
+    (at(0), at(1))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum KArg {
     I32(i32),
@@ -649,6 +685,7 @@ impl Cuda {
                 record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
+                f32_staged: Cell::new(false),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),
@@ -773,7 +810,8 @@ impl Cuda {
         };
         self.bump(|s| s.launches += 1);
         if self.record_launches.get() {
-            let key = (name, grid_x, grid_y, block, shared_bytes);
+            let (s0, s1) = scalar_key(args);
+            let key = (name, grid_x, grid_y, block, shared_bytes, s0, s1);
             let mut m = self.launches.borrow_mut();
             match m.get_mut(&key) {
                 Some(e) => e.0 += 1,
@@ -838,7 +876,8 @@ impl Cuda {
         };
         self.bump(|s| s.launches += 1);
         if self.record_launches.get() {
-            let key = (name, grid, 1, block, shared_bytes);
+            let (s0, s1) = scalar_key(args);
+            let key = (name, grid, 1, block, shared_bytes, s0, s1);
             let mut m = self.launches.borrow_mut();
             match m.get_mut(&key) {
                 Some(e) => e.0 += 1,

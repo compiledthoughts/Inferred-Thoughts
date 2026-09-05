@@ -2121,6 +2121,132 @@ extern "C" __global__ void matmul_f32_t(int n_in, int n_out,
     out[(size_t)tok * n_out + j] = sum;
 }
 
+// ---------------------------------------------------------------- f32 debug
+//
+// Decomposing `matmul_f32_t`, which measures 6.5 GB/s on a card that reads
+// VRAM at 409.6. Each variant removes exactly one thing and is replayed at the
+// real recorded geometry with the real recorded arguments, because the last
+// three attempts to speed up a kernel by reasoning about its parts were wrong
+// and the one decomposition was right in a single pass.
+//
+// Its own comment claims the ~40 us floor is "memory latency on a single
+// thread" and that going below it "needs more loads in flight per output, which
+// means splitting the reduction". The first half is a hypothesis these variants
+// test. The second half is the interesting claim, and `matmul_f32_t_staged`
+// below is the argument that it is false.
+
+// No weight load. If this is most of the cost, the floor is the `wt` stream.
+extern "C" __global__ void dbg_f32_now(int n_in, int n_out,
+                                       const float *__restrict__ wt,
+                                       const float *__restrict__ x,
+                                       float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += 1.0f * xt[k];
+    out[(size_t)tok * n_out + j] = sum;
+}
+
+// No activation load. `x[k]` is the same address for every thread, so this
+// should be a broadcast and nearly free; if it is not, that is the finding.
+extern "C" __global__ void dbg_f32_nox(int n_in, int n_out,
+                                       const float *__restrict__ wt,
+                                       const float *__restrict__ x,
+                                       float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += wt[(size_t)k * n_out + j] * 1.0f;
+    out[(size_t)tok * n_out + j] = sum;
+}
+
+// Neither load: the launch and the loop alone.
+extern "C" __global__ void dbg_f32_noloads(int n_in, int n_out,
+                                           const float *__restrict__ wt,
+                                           const float *__restrict__ x,
+                                           float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += 1.0f;
+    out[(size_t)tok * n_out + j] = sum;
+}
+
+// Both loads, but the serial dependency broken into eight partials. Wrong
+// answer by construction -- it is timing the f32 accumulation chain, which the
+// exactness rule forbids changing, so this variant exists only to say how much
+// that rule costs.
+extern "C" __global__ void dbg_f32_nochain(int n_in, int n_out,
+                                           const float *__restrict__ wt,
+                                           const float *__restrict__ x,
+                                           float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+    float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = 0; k < n_in; k += 8) {
+#pragma unroll
+        for (int u = 0; u < 8; ++u)
+            s[u] += wt[(size_t)(k + u) * n_out + j] * xt[k + u];
+    }
+    out[(size_t)tok * n_out + j] = ((s[0] + s[1]) + (s[2] + s[3])) +
+                                   ((s[4] + s[5]) + (s[6] + s[7]));
+}
+
+// The candidate: cooperative staging, serial accumulation.
+//
+// **Loads in flight and accumulation order are independent quantities**, and
+// `matmul_f32_t`'s comment conflates them. The floor there is one thread per
+// output row issuing 2048 dependent-ish loads with ~8 outstanding, on a block
+// of `n_out` threads -- 32 of them for `ssm_alpha`, one warp on one SM of
+// thirty-six. Nothing about that is arithmetic.
+//
+// So: every thread in the block helps stage a tile of `wt` and `x` into shared
+// memory, which is a fully parallel, perfectly coalesced read (`wt` is
+// column-major, so a k-range is contiguous). Then thread `j` walks *its own*
+// row of the tile serially in ascending `k`, exactly as `ops::naive::dot_row`
+// does. **The accumulation order is untouched, so this is bit-identical**; only
+// who fetched the bytes changed.
+//
+// `kt` is the tile height, chosen on the host so `kt * (n_out + 1)` floats fit
+// the dynamic shared allocation.
+extern "C" __global__ void matmul_f32_t_staged(int n_in, int n_out, int kt,
+                                               const float *__restrict__ wt,
+                                               const float *__restrict__ x,
+                                               float *__restrict__ out) {
+    extern __shared__ float f32_stage[];
+    float *sw = f32_stage;                     // kt * n_out
+    float *sx = f32_stage + (size_t)kt * n_out;  // kt
+
+    const int t = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+
+    float sum = 0.0f;
+    for (int k0 = 0; k0 < n_in; k0 += kt) {
+        const int kn = min(kt, n_in - k0);
+        // Column-major, so `wt[k0 * n_out .. (k0 + kn) * n_out]` is one
+        // contiguous run and the whole block streams it.
+        for (int i = t; i < kn * n_out; i += nthreads)
+            sw[i] = wt[(size_t)k0 * n_out + i];
+        for (int i = t; i < kn; i += nthreads) sx[i] = xt[k0 + i];
+        __syncthreads();
+
+        if (t < n_out) {
+            // Serial, ascending, one row -- the oracle's order exactly.
+            for (int k = 0; k < kn; ++k) sum += sw[(size_t)k * n_out + t] * sx[k];
+        }
+        __syncthreads();
+    }
+    if (t < n_out) out[(size_t)tok * n_out + t] = sum;
+}
+
 // a += b * scale, elementwise.
 //
 // The MoE expert accumulation: a routed expert's output is weighted by its
