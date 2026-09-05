@@ -795,6 +795,18 @@ pub trait Ops {
     // GPU stop round-tripping without answering it.
 
     /// The model wrote `buf` directly. Any device copy is now stale.
+    /// Print whatever this backend can say about the work it has just done.
+    ///
+    /// **A hint about the backend, like the three residency hints above**, and
+    /// for the same reason: `serve` is generic over `Ops` while the interesting
+    /// counters — kernel launches, bus crossings, expert residency — belong to
+    /// one backend. Threading a concrete type through the server to reach them
+    /// would couple it to CUDA; a no-op default does not.
+    ///
+    /// Called once per turn. Implementations should print nothing unless asked
+    /// to, since this runs in a server's hot path.
+    fn device_report(&self) {}
+
     fn host_wrote(&self, _buf: &[f32]) {}
 
     /// The model is about to read `buf`. Bring back whatever the device has.

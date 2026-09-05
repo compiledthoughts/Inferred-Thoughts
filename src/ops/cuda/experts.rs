@@ -84,6 +84,54 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
 
+/// `POSIX_FADV_DONTNEED`, from `fcntl.h`.
+const POSIX_FADV_DONTNEED: c_int = 4;
+
+unsafe extern "C" {
+    fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
+}
+
+/// Evict a file from the page cache.
+///
+/// **`madvise` was not enough and this is why.** `MADV_DONTNEED` on a private
+/// file mapping unmaps the pages from *this process* — the RSS drops and it
+/// looks fixed — but the pages stay in the page cache, because they are clean
+/// and any process might want them again. Placement reads all 16.3 GiB of the
+/// expert pool through the mmap, so every process start filled WSL's cache with
+/// the model and WSL does not hand that back to Windows. Measured: 757 MB of
+/// process against **16.7 GB of cache**, and a host at 96%.
+///
+/// `posix_fadvise` evicts, which is the thing that was actually needed. It
+/// works on any descriptor for the file rather than the one the mapping was
+/// made from, so this needs no plumbing through `GgufFile` — a fresh `open` is
+/// enough.
+///
+/// Best-effort by nature: the kernel may keep pages another process has mapped,
+/// and a failure just means the cache stays, which is the behaviour before this
+/// existed.
+pub fn drop_file_cache(path: &std::path::Path) {
+    drop_file_range(path, 0, 0);
+}
+
+/// Evict `[offset, offset + len)` of a file from the page cache. `len == 0`
+/// means to the end.
+///
+/// **Per range, not once at the end, because the peak is what hurts.** Dropping
+/// the whole file after placement lowers the resting level and leaves the peak
+/// untouched: the cache still climbs to 16 GiB while the pool is being read,
+/// which is what takes a 32 GB machine to 91%. Evicting each tensor's bytes as
+/// soon as they are placed holds the cache at roughly one tensor — 142 MiB —
+/// instead.
+pub fn drop_file_range(path: &std::path::Path, offset: i64, len: i64) {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = std::fs::File::open(path) else { return };
+    // SAFETY: `f` owns a valid descriptor for the duration of the call. The
+    // range is advisory; the kernel clamps it to the file.
+    unsafe {
+        let _ = posix_fadvise(f.as_raw_fd(), offset, len, POSIX_FADV_DONTNEED);
+    }
+}
+
 /// Release the page cache backing `data`, keeping only whole pages inside it.
 ///
 /// **Eager placement made the engine unusable on this machine without this.**
@@ -194,6 +242,8 @@ pub struct ExpertStats {
     pub place_copy_us: u64,
     /// Bytes of the model's mmap handed back to the page cache after placement.
     pub released_bytes: u64,
+    /// Experts exchanged between the tiers since load.
+    pub migrated: u64,
 }
 
 impl ExpertStats {
@@ -308,6 +358,27 @@ pub(super) struct ExpertCache {
     /// The last read-back of `counts`, so `coverage` can be recomputed without
     /// touching the driver again.
     device_counts: Vec<u32>,
+    /// Global counter index -> the tensor whose table holds it, and the expert
+    /// index within that tensor. The inverse of the `base + e` numbering
+    /// `table` hands out, and what lets a counter be traced back to something
+    /// that can be moved.
+    counter_owner: Vec<(usize, u32)>,
+    /// Counts as of the last migration. The decision uses `now - then` rather
+    /// than the running total, so a slot earned early does not hold its place
+    /// for the rest of the session.
+    prev_counts: Vec<u32>,
+    /// One slot of VRAM to exchange through. A swap is three copies —
+    /// resident to staging, host to resident, staging to host — because both
+    /// tiers are full by construction and there is nowhere else to put the
+    /// evicted expert.
+    staging: Option<DeviceBuffer>,
+    /// Experts moved between tiers, and the passes that have gone by since the
+    /// last time any were.
+    migrated: u64,
+    since_migration: u64,
+    /// The model file and the address its mapping starts at. See
+    /// `ExpertCache::set_source`.
+    source: Option<(std::path::PathBuf, usize)>,
     stats: ExpertStats,
 }
 
@@ -364,6 +435,12 @@ impl ExpertCache {
             tally: None,
             next_base: 0,
             device_counts: Vec::new(),
+            counter_owner: Vec::new(),
+            prev_counts: Vec::new(),
+            staging: None,
+            migrated: 0,
+            since_migration: 0,
+            source: None,
             stats: ExpertStats {
                 slots: slots as u64,
                 slot_bytes: stride as u64,
@@ -377,7 +454,9 @@ impl ExpertCache {
     }
 
     pub fn stats(&self) -> ExpertStats {
-        self.stats
+        let mut s = self.stats;
+        s.migrated = self.migrated;
+        s
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -564,6 +643,15 @@ impl ExpertCache {
         // at the end of placement keeps peak residency to one tensor rather
         // than the whole 16.3 GiB pool.
         release_pages(data);
+        // And the page cache, which `madvise` does not touch: it unmaps the
+        // pages from this process while the kernel keeps them, because they are
+        // clean and something else might want them. That distinction is why an
+        // earlier version of this reported 757 MB of process against 16.7 GB of
+        // cache and looked fixed.
+        if let Some((path, base)) = self.source.as_ref() {
+            let offset = (data.as_ptr() as usize).saturating_sub(*base) as i64;
+            drop_file_range(path, offset, data.len() as i64);
+        }
         self.stats.released_bytes += data.len() as u64;
 
         // Counters for this tensor's slice of the global arrays.
@@ -574,6 +662,10 @@ impl ExpertCache {
         }
         let base = self.next_base;
         if base + n_expert <= COUNTER_CAP {
+            self.counter_owner.resize(base + n_expert, (0, 0));
+            for e in 0..n_expert {
+                self.counter_owner[base + e] = (key, e as u32);
+            }
             if let Some(f) = self.vram_flags.as_ref() {
                 f.write_at(base * 4, &vram)?;
             }
@@ -612,6 +704,197 @@ impl ExpertCache {
         self.stats.hits = vram_reads + host_reads;
         self.stats.host_reads = host_reads;
         self.device_counts = counts[..self.next_base.min(counts.len())].to_vec();
+    }
+
+    /// Move hot experts into VRAM and cold ones out, from the read counts.
+    ///
+    /// **This is the project's subject, finally acting rather than measuring.**
+    /// Placement is eager and in layer order — a graph needs every expert
+    /// addressable before the router can name it, and the only ordering
+    /// available at load is the order tensors are first seen. That fills VRAM
+    /// with layers 0-28 and puts the rest in the host tier hot or not, which
+    /// measures **26-27% of reads across PCIe** and a VRAM read rate of exactly
+    /// `slots / pool` — precisely what uniform routing would give, i.e. no
+    /// information used at all.
+    ///
+    /// Routing is not uniform: an oracle placement serves **99.0-99.6%** of
+    /// reads from VRAM. That gap is ~11.5 ms/token, three times anything left
+    /// in the dense kernels.
+    ///
+    /// # Why migration rather than a frozen profile
+    ///
+    /// The table is device memory, so rewriting an entry changes where a
+    /// *recorded graph* reads on its next replay, with no re-record. That is
+    /// what makes this possible at all, and it is why the two-tier design kept
+    /// the table mutable instead of taking the handoff's static partition.
+    ///
+    /// It also needs no warm-up with graphs off, no per-model artifact, and it
+    /// keeps working when a long context makes the KV cache displace slots.
+    ///
+    /// # The exchange
+    ///
+    /// Both tiers are full, so promotion is a swap: resident to staging, host
+    /// to resident, staging to host. Every copy is device-to-device — the
+    /// host tier is device-mapped, so the bytes never pass through this
+    /// program. Two eight-byte table writes follow, one per tensor involved.
+    ///
+    /// About 45 us a swap, and it decays to nothing: once the hot set is
+    /// resident there is nothing left to exchange.
+    ///
+    /// Returns how many experts moved.
+    pub fn migrate(&mut self, budget: usize, counts: &[u32]) -> Result<usize> {
+        let n = self.next_base.min(counts.len()).min(self.counter_owner.len());
+        if n == 0 || budget == 0 {
+            return Ok(0);
+        }
+        if self.prev_counts.len() < n {
+            self.prev_counts.resize(n, 0);
+        }
+
+        // **Cumulative, not this window's delta — measured.**
+        //
+        // The first version used `now - then` over a 64-pass window, for
+        // recency. It moved 6,200 experts and changed the host-read rate by
+        // nothing (26.3% -> 26.6%), hitting the 200-swap budget on every one of
+        // 31 migrations: it never converged because there was no signal to
+        // converge on. A layer makes 512 expert-selections among 256 experts in
+        // 64 passes, so the average delta is ~2 and most are 0 or 1. Sorting
+        // that is sorting noise.
+        //
+        // The running total is what `coverage` measures, and coverage is the
+        // thing that says 99.7% is available against this policy's 73.4%. So
+        // the decision uses the same quantity as the target.
+        //
+        // The cost is that an expert busy early keeps its slot — which is what
+        // "top N by total" means, and is exactly the placement coverage calls
+        // optimal. If a workload shift ever makes that wrong, the fix is a
+        // decayed score (`s = s/2 + delta` per window), not a raw delta.
+        let mut hot: Vec<(u32, usize)> = Vec::new();   // host-resident
+        let mut cold: Vec<(u32, usize)> = Vec::new();  // VRAM-resident
+        for i in 0..n {
+            let delta = counts[i];
+            let (tkey, e) = self.counter_owner[i];
+            let ekey = tkey + e as usize * self.stride;
+            match self.map.get(&ekey).map(|x| x.slot) {
+                Some(Some(_)) => cold.push((delta, i)),
+                Some(None) => hot.push((delta, i)),
+                None => {}
+            }
+        }
+        self.prev_counts[..n].copy_from_slice(&counts[..n]);
+
+        // Busiest exiles first, idlest residents first.
+        hot.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        cold.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        if self.staging.is_none() {
+            self.staging = Some(DeviceBuffer::new(self.stride)?);
+        }
+        let staging = match self.staging.as_ref() {
+            Some(b) => b.ptr,
+            None => return Ok(0),
+        };
+
+        let mut moved = 0usize;
+        for k in 0..budget.min(hot.len()).min(cold.len()) {
+            let (h_uses, h_i) = hot[k];
+            let (c_uses, c_i) = cold[k];
+            // Strictly busier, so a tie never causes churn, and nothing moves
+            // once the ordering is right.
+            if h_uses <= c_uses {
+                break;
+            }
+            let (h_tkey, h_e) = self.counter_owner[h_i];
+            let (c_tkey, c_e) = self.counter_owner[c_i];
+            let h_key = h_tkey + h_e as usize * self.stride;
+            let c_key = c_tkey + c_e as usize * self.stride;
+
+            let (h_addr, c_addr, slot) = match (self.map.get(&h_key), self.map.get(&c_key)) {
+                (Some(h), Some(c)) => match c.slot {
+                    Some(s) => (h.addr, c.addr, s),
+                    None => break,
+                },
+                _ => break,
+            };
+
+            // SAFETY: three copies of exactly `stride` bytes between
+            // allocations this cache owns. `h_addr` is device-mapped host
+            // memory and `c_addr` a slab slot, both valid for `stride`.
+            unsafe {
+                check(ffi::cuMemcpyDtoD_v2(staging, c_addr, self.stride), "swap out")?;
+                check(ffi::cuMemcpyDtoD_v2(c_addr, h_addr, self.stride), "swap in")?;
+                check(ffi::cuMemcpyDtoD_v2(h_addr, staging, self.stride), "swap back")?;
+            }
+
+            // The addresses trade places, and so do the entries.
+            if let Some(h) = self.map.get_mut(&h_key) {
+                h.addr = c_addr;
+                h.slot = Some(slot);
+            }
+            if let Some(c) = self.map.get_mut(&c_key) {
+                c.addr = h_addr;
+                c.slot = None;
+            }
+            self.owner[slot as usize] = Some(h_key);
+            self.write_table_entry(h_tkey, h_e, c_addr)?;
+            self.write_table_entry(c_tkey, c_e, h_addr)?;
+
+            // **And the residency flags the kernel counts with.**
+            //
+            // Forgetting these made the first working migration invisible: the
+            // gather kernel reads `vram[base + id]` to decide whether a read
+            // was a VRAM read or a PCIe one, and with the flags frozen at
+            // load the report described the *original* layout for the rest of
+            // the run. 6,200 experts moved, decode went 29.28 -> 32.07 tok/s,
+            // and the host-read rate printed 26.6% throughout — a policy
+            // working and an instrument saying it was not. Eighth of this kind
+            // in the repo, and the third introduced rather than inherited.
+            self.set_vram_flag(h_i, 1)?;
+            self.set_vram_flag(c_i, 0)?;
+            moved += 1;
+        }
+        self.migrated += moved as u64;
+        Ok(moved)
+    }
+
+    /// Mark a global expert index as VRAM-resident or not, for the counters.
+    fn set_vram_flag(&self, idx: usize, resident: i32) -> Result<()> {
+        match self.vram_flags.as_ref() {
+            Some(f) => f.write_at(idx * 4, &[resident]),
+            None => Ok(()),
+        }
+    }
+
+    /// Point one table entry at a new address.
+    fn write_table_entry(&self, tkey: usize, e: u32, addr: ffi::CUdeviceptr) -> Result<()> {
+        match self.tables.get(&tkey) {
+            Some(t) => t.write_at(e as usize * 8, &[addr]),
+            None => Err(Error::Cuda {
+                what: "expert table",
+                detail: "migrating an expert whose tensor has no table".to_string(),
+            }),
+        }
+    }
+
+    /// Where this pool's bytes came from, so placement can evict them from the
+    /// page cache as it goes. `None` leaves the cache alone.
+    pub fn set_source(&mut self, path: std::path::PathBuf, map_base: usize) {
+        self.source = Some((path, map_base));
+    }
+
+    /// Passes since the last migration, and how many experts have ever moved.
+    pub fn migration_state(&mut self) -> (u64, u64) {
+        self.since_migration += 1;
+        (self.since_migration, self.migrated)
+    }
+
+    pub fn migration_done(&mut self) {
+        self.since_migration = 0;
+    }
+
+    /// The last counter read-back, for the migration decision.
+    pub fn observed_counts(&self) -> &[u32] {
+        &self.device_counts
     }
 
     /// How many experts have counters, i.e. how much of the pool is observed.

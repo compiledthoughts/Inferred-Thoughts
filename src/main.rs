@@ -224,6 +224,18 @@ enum Command {
         /// Default generation budget when the request does not set one.
         #[arg(short = 'n', long, default_value_t = 512)]
         max_tokens: usize,
+        /// Count kernel launches, bus crossings and expert residency, and
+        /// report them after every turn.
+        ///
+        /// **Counts, not timings.** `generate --profile-device` also *replays*
+        /// every recorded launch to time it, which re-executes their writes and
+        /// corrupts activations and the KV cache on purpose — safe once
+        /// generation is over, ruinous in a server that has to answer the next
+        /// turn. So this reports what a turn issued and where the experts were;
+        /// for per-kernel timing use `generate` with a long prompt, which is
+        /// the same prefill.
+        #[arg(long, default_value_t = false)]
+        profile_device: bool,
         /// Compute threads for the CPU backends.
         #[arg(short = 't', long, default_value_t = 0)]
         threads: usize,
@@ -306,6 +318,7 @@ fn main() -> ExitCode {
             expert_cache,
             expert_host,
             max_tokens,
+            profile_device,
             threads,
             backend,
             rms_serial,
@@ -318,6 +331,7 @@ fn main() -> ExitCode {
             expert_cache,
             expert_host,
             max_tokens,
+            profile_device,
             threads,
             backend,
             rms_serial,
@@ -441,6 +455,8 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.null_kernels(o.null_kernels);
         cuda.use_graphs(!o.no_graphs);
         cuda.record_launches(o.device);
+        cuda.set_model_path(&f.path);
+        cuda.set_map_base(f.map_base());
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(
@@ -745,6 +761,12 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             100.0 * e.host_read_rate(),
             e.host_reads as f64 * e.slot_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
         );
+        if e.migrated > 0 {
+            eprintln!(
+                "         {} experts migrated between tiers since load",
+                e.migrated,
+            );
+        }
         if e.degraded {
             eprintln!(
                 "         DEGRADED: the host tier filled, so placement fell back to
@@ -938,6 +960,8 @@ struct ServeArgs {
     /// Cap the page-locked host tier behind it, in GiB. 0 is automatic.
     expert_host: f64,
     max_tokens: usize,
+    /// Report launch counts and expert residency after each turn.
+    profile_device: bool,
     threads: usize,
     backend: String,
     rms_serial: bool,
@@ -996,6 +1020,10 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         cuda.rms_serial(a.rms_serial);
         cuda.set_expert_budget((a.expert_cache * 1073741824.0) as usize);
         cuda.set_expert_host_budget((a.expert_host * 1073741824.0) as usize);
+        cuda.record_launches(a.profile_device);
+        cuda.set_model_path(&f.path);
+        cuda.set_map_base(f.map_base());
+        cuda.report_per_turn(a.profile_device);
         // See the same call in `generate`: the KV slabs are allocated after the
         // expert slab has already sized itself from free VRAM, so the context
         // length has to be declared here or the slab takes VRAM the cache needs.

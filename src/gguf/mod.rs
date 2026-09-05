@@ -85,6 +85,19 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
+    /// Where the mapping begins, so a byte range inside it can be turned back
+    /// into a file offset.
+    ///
+    /// **Needed to bound host memory.** Placement reads the whole expert pool
+    /// through this mapping, which fills the page cache with the model — 16 GiB
+    /// on the 35B — and WSL does not hand that back. `posix_fadvise` can evict
+    /// it as placement goes, but it addresses the *file*, so a pointer into the
+    /// mapping has to be convertible to an offset. Nothing else needs this and
+    /// nothing should read the mapping through it.
+    pub fn map_base(&self) -> usize {
+        self.mmap.as_ptr() as usize
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path).map_err(|source| Error::Io {

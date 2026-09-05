@@ -154,6 +154,10 @@ fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
         now.decode_tokens - before.decode_tokens,
         now.decode_ns - before.decode_ns,
     );
+    // Whatever the backend can say about itself. A no-op on every CPU
+    // backend; on CUDA, and only under `--profile-device`, the launch and
+    // residency counters for the turn just finished.
+    engine.ops.device_report();
     let kv = engine.kv_capacity_bytes() as f64 / 1048576.0;
     let rs = engine.recurrent_capacity_bytes() as f64 / 1048576.0;
     eprintln!(

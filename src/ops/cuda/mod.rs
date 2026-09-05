@@ -143,6 +143,17 @@ pub struct Cuda {
     /// context depth; see `Cuda::attend_impl`.
     attn_warp: Cell<Option<bool>>,
 
+    /// Print launch and residency counters after each server turn.
+    report_per_turn: Cell<bool>,
+
+    /// The model file, so its page cache can be dropped once the experts are
+    /// placed. See `experts::drop_file_cache`.
+    model_path: RefCell<Option<std::path::PathBuf>>,
+    /// Passes seen, to find the moment placement is finished.
+    passes_seen: Cell<u64>,
+    /// Where the model's mapping starts. See `Cuda::set_map_base`.
+    map_base: Cell<Option<usize>>,
+
     /// Q8_0 weights, repacked at upload into an aligned scale array and an
     /// aligned quant array. Keyed on the mmap address of the tensor.
     ///
@@ -691,6 +702,10 @@ impl Cuda {
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 attn_warp: Cell::new(None),
+                report_per_turn: Cell::new(false),
+                model_path: RefCell::new(None),
+                passes_seen: Cell::new(0),
+                map_base: Cell::new(None),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),

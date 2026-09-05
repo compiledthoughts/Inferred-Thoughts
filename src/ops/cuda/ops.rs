@@ -552,6 +552,49 @@ impl Cuda {
         self.experts.borrow().as_ref().map(|c| c.stats())
     }
 
+    /// Move hot experts into VRAM, from the counts the gather kernel writes.
+    ///
+    /// **Between passes, never inside one.** A recorded graph replays a fixed
+    /// kernel sequence, so nothing may be inserted mid-pass — but the table it
+    /// reads is ordinary device memory, and rewriting an entry here changes
+    /// where the *next* replay looks with no re-record. That is the whole
+    /// reason the two-tier design kept the table mutable.
+    ///
+    /// Every `MIGRATE_EVERY` passes, so the counter read-back (which costs a
+    /// synchronize) is amortized, and bounded at `MIGRATE_BUDGET` exchanges so
+    /// a single pass boundary cannot stall. Converges and then stops: the
+    /// exchange only happens while some host-resident expert is busier than
+    /// some resident one.
+    fn migrate_experts(&self) {
+        /// Passes between migrations. The counter read-back costs a
+        /// synchronize, so this is not free; 64 puts it under 1% of a decode
+        /// pass while still converging inside a few hundred tokens.
+        const MIGRATE_EVERY: u64 = 64;
+        /// Exchanges per migration. At ~45 us each this is ~9 ms, which lands
+        /// at a pass boundary rather than inside a token.
+        const MIGRATE_BUDGET: usize = 200;
+
+        let due = match self.experts.borrow_mut().as_mut() {
+            Some(c) => c.migration_state().0 >= MIGRATE_EVERY,
+            None => false,
+        };
+        if !due {
+            return;
+        }
+        self.absorb_expert_counters();
+        let counts = match self.experts.borrow().as_ref() {
+            Some(c) => c.observed_counts().to_vec(),
+            None => return,
+        };
+        if let Some(c) = self.experts.borrow_mut().as_mut() {
+            let r = c.migrate(MIGRATE_BUDGET, &counts);
+            c.migration_done();
+            if let Err(e) = r {
+                self.note(Err::<(), _>(e));
+            }
+        }
+    }
+
     /// Bring the device-side read counters home and fold them into the stats.
     ///
     /// **Without this the cache is unobservable.** Routing on the device means
@@ -622,6 +665,26 @@ impl Cuda {
     pub fn expert_coverage(&self) -> Option<(f64, u64)> {
         self.absorb_expert_counters();
         self.experts.borrow().as_ref().map(|c| c.coverage())
+    }
+
+    /// Tell the backend which file the weights came from, so its page cache
+    /// can be dropped once every expert has been placed.
+    ///
+    /// Not discovered from the mapping because there is no portable way back
+    /// from an address to a path; the caller opened the file and knows.
+    pub fn set_model_path(&self, path: &std::path::Path) {
+        *self.model_path.borrow_mut() = Some(path.to_path_buf());
+    }
+
+    /// Where the model's mapping starts, so a weight's address can be turned
+    /// into a file offset and its page cache evicted once it is placed.
+    pub fn set_map_base(&self, base: usize) {
+        self.map_base.set(Some(base));
+    }
+
+    /// Print launch and residency counters after each server turn.
+    pub fn report_per_turn(&self, on: bool) {
+        self.report_per_turn.set(on);
     }
 
     /// Force the warp-per-position flash-decoding kernel on or off; `None`
@@ -1658,11 +1721,15 @@ impl Cuda {
             let (free, _) = self.mem_info()?;
             let budget = free.saturating_sub(self.expert_reserve.get());
             let stride = w.stride();
-            *slot = Some(experts::ExpertCache::new(
+            let mut c = experts::ExpertCache::new(
                 stride,
                 budget / stride.max(1),
                 self.expert_host_budget.get(),
-            )?);
+            )?;
+            if let (Some(p), Some(b)) = (self.model_path.borrow().as_ref(), self.map_base.get()) {
+                c.set_source(p.clone(), b);
+            }
+            *slot = Some(c);
         }
         let cache = match slot.as_mut() {
             Some(c) => c,
@@ -3019,6 +3086,36 @@ impl Ops for Cuda {
         self.states.borrow_mut().clear();
     }
 
+    /// Launch counts and expert residency for the turn just finished.
+    ///
+    /// **Counts, not timings.** `bench_launches` also *replays* every recorded
+    /// launch, which re-executes its writes and corrupts activations and the KV
+    /// cache on purpose — fine once generation is over, ruinous in a server
+    /// that has to answer the next turn. For per-kernel timing use
+    /// `generate --profile-device` with a long prompt, which runs the same
+    /// prefill.
+    fn device_report(&self) {
+        if !self.report_per_turn.get() {
+            return;
+        }
+        let c = self.stats();
+        eprintln!(
+            "  device   {} launches, {} crossings, {} syncs this session",
+            c.launches,
+            c.h2d_calls + c.d2h_calls,
+            c.syncs,
+        );
+        if let Some(e) = self.expert_stats() {
+            eprintln!(
+                "  experts  {} reads, {:.1}% VRAM / {:.1}% PCIe, {} migrated",
+                e.lookups(),
+                100.0 * (1.0 - e.host_read_rate()),
+                100.0 * e.host_read_rate(),
+                e.migrated,
+            );
+        }
+    }
+
     fn host_wrote(&self, buf: &[f32]) {
         if let Some(m) = self.mirrors.borrow_mut().get_mut(&(buf.as_ptr() as usize)) {
             m.invalidate();
@@ -3055,6 +3152,21 @@ impl Ops for Cuda {
     }
 
     fn begin_pass(&self, n_tokens: usize) {
+        // Placement happens inside the first forward pass, tensor by tensor as
+        // each layer is reached, so the second pass is the first moment every
+        // expert is certain to be placed and the model file certain to be dead
+        // weight. Once: the counter never returns to two.
+        self.passes_seen.set(self.passes_seen.get() + 1);
+        if self.passes_seen.get() == 2 {
+            if let Some(p) = self.model_path.borrow().as_ref() {
+                experts::drop_file_cache(p);
+            }
+        }
+        // Before the pass, never inside it: a recorded graph cannot have work
+        // inserted, but the table it reads can be rewritten between replays.
+        if n_tokens == 1 {
+            self.migrate_experts();
+        }
         self.in_pass.set(true);
         self.note(self.timing_begin());
         self.note(self.graph_begin(n_tokens));
