@@ -379,7 +379,7 @@ __global__ void softmax_rows(int n, int n_rows, float *__restrict__ x) {
 // Shared memory: head_dim floats for the query, FD_CHUNK for the exponentials,
 // FD_CHUNK for the reduction scratch.
 __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
-                           int n_head_kv, float scale,
+                           int n_head_kv, int use_warp, float scale,
                            const float *__restrict__ q,
                            const unsigned short *__restrict__ k,
                            const unsigned short *__restrict__ v,
@@ -402,19 +402,60 @@ __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
     }
     __syncthreads();
 
-    // One position per thread; the dot over head_dim stays serial in-thread.
+    // **Two score phases in one kernel, chosen by `use_warp`.**
+    //
+    // They were briefly two kernels and that was a bug: the choice depends on
+    // `n_pos`, so a long run crossed the threshold mid-generation, the launch
+    // name changed, and a recorded CUDA graph cannot express a changing
+    // sequence. Replay caught it -- "launch 131 is attn_flash_warp, but the
+    // recorded step has attn_flash there". One kernel with a grid-uniform
+    // branch keeps the sequence identical every pass.
     float score = -INFINITY;
-    if (threadIdx.x < len) {
-        const unsigned short *key =
-            k + (size_t)(lo + threadIdx.x) * kv_dim + off;
-        float dot = 0.0f;
-        for (int i = 0; i < head_dim; ++i) dot += sq[i] * h2f(key[i]);
-        score = dot * scale;
+    if (use_warp) {
+        // **One warp per position, because K was being read transposed.** With
+        // one thread per position, adjacent threads are `kv_dim` apart -- 1024
+        // bytes on this model -- so a warp's load touches 32 cache lines to use
+        // two bytes from each. Here lanes stride `head_dim` instead, so lane
+        // `l` reads `key[l]`, `key[l + 32]`, ...: consecutive lanes,
+        // consecutive addresses. Measured 43 -> 133 GB/s, ~3x at 20k context.
+        //
+        // The dot becomes eight serial terms per lane plus a five-level tree,
+        // which accumulates error as O(log n) where the serial walk of 256 is
+        // O(n) -- more accurate, not less. `attend_tolerance` is unchanged and
+        // `the_warp_attention_agrees_with_the_oracle` checks it at both models'
+        // shapes, twelve depths and both batch shapes.
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int nwarps = blockDim.x >> 5;
+        // `p` is warp-uniform, so the branch never diverges within a warp and
+        // every lane reaches the shuffles.
+        for (int p = warp; p < FD_CHUNK; p += nwarps) {
+            float dot = 0.0f;
+            if (p < len) {
+                const unsigned short *key = k + (size_t)(lo + p) * kv_dim + off;
+                for (int i = lane; i < head_dim; i += 32) dot += sq[i] * h2f(key[i]);
+#pragma unroll
+                for (int sh = 16; sh > 0; sh >>= 1)
+                    dot += __shfl_down_sync(0xffffffff, dot, sh);
+            }
+            if (lane == 0) red[p] = (p < len) ? dot * scale : -INFINITY;
+        }
+        __syncthreads();
+        score = red[threadIdx.x];
+    } else {
+        // One position per thread; the dot over head_dim stays serial in-thread.
+        if (threadIdx.x < len) {
+            const unsigned short *key =
+                k + (size_t)(lo + threadIdx.x) * kv_dim + off;
+            float dot = 0.0f;
+            for (int i = 0; i < head_dim; ++i) dot += sq[i] * h2f(key[i]);
+            score = dot * scale;
+        }
+        red[threadIdx.x] = score;
     }
 
     // Chunk max. A tree here is *exact* — max never rounds — so this costs
     // nothing in accuracy.
-    red[threadIdx.x] = score;
     __syncthreads();
     for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
@@ -437,111 +478,6 @@ __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
 
     // Weighted sum of this chunk's values. Adjacent threads hold adjacent
     // elements and read adjacent halves of V, so the reads coalesce.
-    const size_t base = (size_t)hq * gridDim.y + split;
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float acc = 0.0f;
-        for (int t = 0; t < len; ++t) {
-            acc += se[t] * h2f(v[(size_t)(lo + t) * kv_dim + off + i]);
-        }
-        part_acc[base * head_dim + i] = acc;
-    }
-    if (threadIdx.x == 0) {
-        part_m[base] = m;
-        part_l[base] = l;
-    }
-}
-
-// Flash-decoding scores with **one warp per position instead of one thread**.
-//
-// `attn_flash` reads K transposed. Thread `t` walks position `lo + t`, so
-// adjacent threads are `kv_dim` elements apart -- 512 on this model, 1024 bytes
-// -- and a warp's load instruction touches 32 different cache lines to use two
-// bytes from each. The V phase immediately below it does the opposite and its
-// comment says so: adjacent threads take adjacent elements of one position, and
-// coalesce. Half the KV traffic was being read the wrong way round.
-//
-// Measured consequence: `attn_flash` saturates at ~43 GB/s where this card
-// reads VRAM at 409.6, flat from d4096 up, which at ten attending layers is
-// 9.46 ms/token at 20k context and 15.35 at 32k.
-//
-// Here a whole warp cooperates on one position and lanes stride `head_dim`, so
-// lane `l` reads `key[l]`, `key[l + 32]`, ... -- consecutive lanes, consecutive
-// addresses. The dot is then a warp shuffle tree.
-//
-// # Exactness
-//
-// This changes the dot product's summation order from serial over `head_dim` to
-// eight serial terms per lane plus a five-level tree. `attn_flash` is already
-// outside the bit-exact set -- `expf`, and flash-decoding's per-chunk
-// rescaling -- with a tolerance *derived* from that decomposition rather than
-// fitted. A tree of 32 is more accurate than a serial walk of 256, not less, so
-// this moves the derivation without loosening it. See `attend_tolerance` in
-// tests/cuda_ops.rs.
-__global__ void attn_flash_warp(int n_pos, int kv_dim, int head_dim, int n_head,
-                                int n_head_kv, float scale,
-                                const float *__restrict__ q,
-                                const unsigned short *__restrict__ k,
-                                const unsigned short *__restrict__ v,
-                                float *__restrict__ part_acc,
-                                float *__restrict__ part_m,
-                                float *__restrict__ part_l) {
-    extern __shared__ float smem[];
-    float *sq = smem;                 // [head_dim]
-    float *se = sq + head_dim;        // [FD_CHUNK]
-    float *red = se + FD_CHUNK;       // [FD_CHUNK]
-
-    const int hq = blockIdx.x;
-    const int split = blockIdx.y;
-    const int lo = split * FD_CHUNK;
-    const int len = min(FD_CHUNK, n_pos - lo);
-    const int off = (hq / (n_head / n_head_kv)) * head_dim;
-
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int nwarps = blockDim.x >> 5;
-
-    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        sq[i] = q[(size_t)hq * head_dim + i];
-    }
-    __syncthreads();
-
-    // `p` is warp-uniform, so the branch below never diverges within a warp and
-    // every lane reaches the shuffles.
-    for (int p = warp; p < FD_CHUNK; p += nwarps) {
-        float dot = 0.0f;
-        if (p < len) {
-            const unsigned short *key = k + (size_t)(lo + p) * kv_dim + off;
-            for (int i = lane; i < head_dim; i += 32) dot += sq[i] * h2f(key[i]);
-#pragma unroll
-            for (int s = 16; s > 0; s >>= 1) dot += __shfl_down_sync(0xffffffff, dot, s);
-        }
-        if (lane == 0) red[p] = (p < len) ? dot * scale : -INFINITY;
-    }
-    __syncthreads();
-
-    // From here the kernel is `attn_flash` unchanged: the scores are in `red`
-    // and every thread owns one of them.
-    const float score = red[threadIdx.x];
-    __syncthreads();
-    for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
-        }
-        __syncthreads();
-    }
-    const float m = red[0];
-    __syncthreads();
-
-    const float e = (threadIdx.x < len) ? expf(score - m) : 0.0f;
-    se[threadIdx.x] = e;
-    red[threadIdx.x] = e;
-    __syncthreads();
-    for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
-        __syncthreads();
-    }
-    const float l = red[0];
-
     const size_t base = (size_t)hq * gridDim.y + split;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float acc = 0.0f;

@@ -1265,18 +1265,50 @@ fn the_warp_attention_agrees_with_the_oracle() {
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
 
-    // The 35B's shape, and depths either side of the dispatch threshold.
-    let (head_dim, n_head, n_head_kv) = (256usize, 16usize, 2usize);
-    let kv_dim = n_head_kv * head_dim;
+    // **One slab for every shape and depth, allocated once.**
+    //
+    // A fresh `Vec` per case is a trap, and it caught this test twice before it
+    // caught anything else: the backend keys its KV mirror on the host address
+    // and records how much of it has been uploaded, so a dropped buffer whose
+    // allocation gets reused looks like the same cache with its contents
+    // already on the device. Both times the failure landed on the *unchanged*
+    // thread path, which is what gave the artifact away rather than a kernel.
+    //
+    // One live slab, sized for the widest `kv_dim`, is also the model's own
+    // layout — one slab per layer, `n_pos` growing into it.
+    const MAX_POS: usize = 5000;
+    const MAX_KV_DIM: usize = 16 * 128;
+    let q = noise(16 * 256, 21);
+    let kf = noise(MAX_POS * MAX_KV_DIM, 22);
+    let vf = noise(MAX_POS * MAX_KV_DIM, 23);
+    let k: Vec<u16> = kf.iter().map(|&x| f32_to_f16(x)).collect();
+    let v: Vec<u16> = vf.iter().map(|&x| f32_to_f16(x)).collect();
 
-    for n_pos in [768usize, 1024, 2048, 5000] {
-        let q = noise(n_head * head_dim, 21);
-        let kf = noise(n_pos * kv_dim, 22);
-        let vf = noise(n_pos * kv_dim, 23);
-        let k: Vec<u16> = kf.iter().map(|&v| f32_to_f16(v)).collect();
-        let v: Vec<u16> = vf.iter().map(|&v| f32_to_f16(v)).collect();
+    // Both models' shapes. The 0.6B's (128, 16, 8) over a handful of positions
+    // is what the whole-model differential test exercises, and covering only
+    // the 35B's (256, 16, 2) at depth is how a wrong answer there reached a
+    // commit.
+    for &(head_dim, n_head, n_head_kv) in
+        &[(256usize, 16usize, 2usize), (128, 16, 8), (128, 16, 16)]
+    {
+    let kv_dim = n_head_kv * head_dim;
+    let q = &q[..n_head * head_dim];
+
+    for n_pos in [1usize, 2, 5, 31, 96, 127, 128, 129, 768, 1024, 2048, 5000] {
+    // **Batched query rows too.** A prefill attends several rows in one call,
+    // each with its own causal window, and `attend_impl` launches them
+    // separately — which is a path a decode-shaped test never reaches. The
+    // whole-model differential test is a five-token prefill, so this is the
+    // dimension that separates the two.
+    for n_q in [1usize, 5] {
+        if n_q > n_pos {
+            continue;
+        }
+        let q = &q[..];
+        let q = &q[..(n_head * head_dim).min(q.len())];
+        let qb: Vec<f32> = (0..n_q).flat_map(|_| q.iter().copied()).collect();
         let attn = Attn {
-            q: &q,
+            q: &qb,
             k: &k,
             v: &v,
             kv_dim,
@@ -1287,20 +1319,27 @@ fn the_warp_attention_agrees_with_the_oracle() {
             scale: 1.0 / (head_dim as f32).sqrt(),
         };
 
-        let mut want = vec![0.0; n_head * head_dim];
+        let mut want = vec![0.0; n_q * n_head * head_dim];
         Naive.attend(&attn, &mut want);
         let tol = attend_tolerance(n_pos, &want);
 
         for force in [Some(false), Some(true)] {
             gpu.attn_warp(force);
-            let mut got = vec![0.0; n_head * head_dim];
-            gpu.begin_pass(1);
+            let mut got = vec![0.0; n_q * n_head * head_dim];
+            gpu.begin_pass(n_q);
             gpu.attend(&attn, &mut got);
             gpu.host_needs(&mut got);
             gpu.end_pass();
             let label = if force == Some(true) { "warp" } else { "thread" };
-            close(&format!("attend {label} d{n_pos}"), &want, &got, tol);
+            close(
+                &format!("attend {label} d{n_pos} hd{head_dim} kv{n_head_kv} nq{n_q}"),
+                &want,
+                &got,
+                tol,
+            );
         }
+    }
+    }
     }
     gpu.attn_warp(None);
     if let Some(e) = gpu.take_error() {

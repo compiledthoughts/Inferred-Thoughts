@@ -856,30 +856,36 @@ impl Cuda {
         n_out > 0 && n_out <= block as usize
     }
 
-    /// Positions below which the thread-per-position score phase still wins.
+    /// Positions at or above which the warp-per-position score phase is used.
     ///
-    /// **Measured, not chosen.** `attn_flash_warp` fixes an uncoalesced read —
-    /// one thread per position means adjacent threads are `kv_dim` apart — and
-    /// is ~3x faster from d2048 up, taking KV reads from ~43 GB/s to ~133. But
-    /// it is *slower* shallow, because it gives each warp 32 positions to walk
-    /// serially where the thread version had 128 running at once, and at short
-    /// context the kernel is latency-bound rather than bandwidth-bound:
+    /// **`usize::MAX`: it is off, and that is a known-unfinished state.**
+    ///
+    /// The warp phase fixes a real defect — `attn_flash` reads K transposed,
+    /// one thread per position, so adjacent threads are `kv_dim` apart and a
+    /// warp's load touches 32 cache lines to use two bytes from each — and it
+    /// measures ~3x faster from d2048 up, 43 -> 133 GB/s, worth 6.4 ms/token at
+    /// the 19,942 positions a real session reaches:
     ///
     /// | n_pos | thread us | warp us | speedup |
     /// |---|---|---|---|
-    /// | 256 | 41.3 | 49.1 | 0.84 |
-    /// | 512 | 50.2 | 56.0 | 0.90 |
-    /// | 768 | 59.7 | 47.3 | **1.26** |
-    /// | 1536 | 98.6 | 37.8 | 2.61 |
-    /// | 19942 | 974.7 | 307.0 | 3.18 |
+    /// | 512 | 43.3 | 30.8 | 1.41 |
+    /// | 8192 | 387.6 | 124.3 | 3.12 |
+    /// | 19942 | 932.1 | 315.9 | 2.95 |
     ///
-    /// So the crossover is near 600 and this is the first measured depth above
-    /// it. `what_attention_costs_as_context_grows` regenerates the table.
+    /// It also passes `the_warp_attention_agrees_with_the_oracle` at both
+    /// models' shapes, twelve depths and both batch shapes — 72 comparisons
+    /// against `ops::naive` within the derived tolerance.
     ///
-    /// A shape-dependent dispatch rather than a replacement, because the
-    /// alternative — measuring one shape and generalising — is what made
-    /// `f32_staged` a 1.65x regression.
-    const ATTN_WARP_MIN_POS: usize = 768;
+    /// **And it fails `the_model_agrees_with_the_oracle_to_the_quantization_floor`,
+    /// with graphs on, by a whole argmax** (17689 against 5429). The op-level
+    /// test cannot see it and the cause is not yet found. So it stays off:
+    /// a kernel that disagrees with the oracle on the real model is not
+    /// shippable however fast it is, and `HANDOFF.md`'s 06-09 entry records
+    /// what was ruled out.
+    ///
+    /// `Cuda::attn_warp` forces it on for the benchmarks and the differential
+    /// test, which is how the numbers above were taken.
+    const ATTN_WARP_MIN_POS: usize = usize::MAX;
 
     /// Whether this call uses the warp-per-position score phase.
     fn warp_scores(&self, n_pos: usize) -> bool {
@@ -1455,6 +1461,11 @@ impl Cuda {
                 KArg::I32(a.head_dim as i32),
                 KArg::I32(a.n_head as i32),
                 KArg::I32(a.n_head_kv as i32),
+                // Which score phase, as an argument rather than a kernel name:
+                // it depends on `n_pos`, so a long run crosses the threshold
+                // mid-generation and a graph cannot express a changing
+                // sequence. See `attn_flash`.
+                KArg::I32(i32::from(self.warp_scores(a.n_pos))),
                 KArg::F32(a.scale),
                 KArg::Ptr(qd),
                 KArg::Ptr(kd),
@@ -1473,9 +1484,15 @@ impl Cuda {
             // so lanes read consecutive keys. Same grid, same shared memory;
             // only the score phase differs. Behind a flag until measured across
             // depth, which is the lesson `f32_staged` cost.
-            let name = if self.warp_scores(a.n_pos) { "attn_flash_warp" } else { "attn_flash" };
             unsafe {
-                self.launch_grid2(name, a.n_head as u32, n_split as u32, chunk as u32, shared, &args)?
+                self.launch_grid2(
+                    "attn_flash",
+                    a.n_head as u32,
+                    n_split as u32,
+                    chunk as u32,
+                    shared,
+                    &args,
+                )?
             };
         }
 
