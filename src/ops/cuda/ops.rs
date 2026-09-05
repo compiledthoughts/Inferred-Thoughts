@@ -717,12 +717,37 @@ impl Cuda {
     ///
     /// Kept as the slow one-thread-per-row shape on purpose; see `matmul_f32`
     /// in kernels.cu for why exactness is worth more than speed here.
+    /// The F32 weight transposed into column-major, uploaded once.
+    ///
+    /// Done on the host at first touch: it is `n_in * n_out` reads of a mapped
+    /// file, once per tensor for the life of the run, against a kernel that
+    /// then reads it every token.
+    fn resident_f32_t(&self, w: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
+        let key = w.data.as_ptr() as usize;
+        if let Some(b) = self.f32t.borrow().get(&key) {
+            return Ok(b.ptr);
+        }
+        let mut t = vec![0.0f32; w.n_in * w.n_out];
+        for j in 0..w.n_out {
+            let row = &w.data[j * w.n_in * 4..(j + 1) * w.n_in * 4];
+            for (k, c) in row.chunks_exact(4).enumerate() {
+                t[k * w.n_out + j] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+        let buf = DeviceBuffer::from_slice(&t)?;
+        self.bump(|s| {
+            s.h2d_calls += 1;
+            s.h2d_bytes += std::mem::size_of_val(&t[..]) as u64;
+        });
+        let ptr = buf.ptr;
+        self.f32t.borrow_mut().insert(key, buf);
+        Ok(ptr)
+    }
+
     fn matmul_f32(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
         let n_tok = x.len() / w.n_in;
-        self.note_shape("matmul_f32", w.n_in, w.n_out);
-        // The mmap holds the rows as little-endian f32 already, so the device
-        // copy is the file's bytes reinterpreted rather than converted.
-        let wd = self.resident(w.data)?;
+        self.note_shape("matmul_f32_t", w.n_in, w.n_out);
+        let wd = self.resident_f32_t(w)?;
         let xd = self.mirror_in(x)?;
         let od = self.mirror_out(out)?;
         let args = [
@@ -733,11 +758,11 @@ impl Cuda {
             KArg::Ptr(od),
         ];
         let block = 128u32;
-        // SAFETY: parameters match `matmul_f32`; the grid covers exactly
-        // `n_out` rows by `n_tok` tokens.
+        // SAFETY: parameters match `matmul_f32_t`; the grid covers exactly
+        // `n_out` rows by `n_tok` tokens, and the weight is column-major.
         unsafe {
             self.launch_grid2(
-                "matmul_f32",
+                "matmul_f32_t",
                 w.n_out.div_ceil(block as usize) as u32,
                 n_tok as u32,
                 block,
@@ -1489,7 +1514,7 @@ impl Cuda {
             "matmul_iq4_xs_q8_k" => (136usize, QK_K, Some(0usize)),
             "matmul_q5_k_q8_k" => (176, QK_K, Some(0)),
             "matmul_q6_k_q8_k" => (210, QK_K, Some(208)),
-            "matmul_f32" => (4, 1, None),
+            "matmul_f32" | "matmul_f32_t" => (4, 1, None),
             // Q8_0 has its own benches, and anything else is not a matmul.
             _ => return Ok((f64::NAN, f64::NAN)),
         };
@@ -1523,7 +1548,7 @@ impl Cuda {
         let od = DeviceBuffer::new(n_out * 4)?;
 
         // The activation, in whichever form this kernel dots against.
-        let (xs, xq, xb, xf) = if kernel == "matmul_f32" {
+        let (xs, xq, xb, xf) = if kernel.starts_with("matmul_f32") {
             let x: Vec<f32> = (0..n_in).map(|i| (i % 17) as f32 * 0.01).collect();
             (None, None, None, Some(DeviceBuffer::from_slice(&x)?))
         } else {
@@ -1561,7 +1586,7 @@ impl Cuda {
         }
 
         let block = 128u32;
-        let grid = if kernel == "matmul_f32" {
+        let grid = if kernel.starts_with("matmul_f32") {
             n_out.div_ceil(block as usize) as u32
         } else {
             n_out.div_ceil((block / 32) as usize) as u32

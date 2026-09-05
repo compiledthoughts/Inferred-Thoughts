@@ -1607,6 +1607,47 @@ extern "C" __global__ void matmul_f32(int n_in, int n_out,
     out[(size_t)tok * n_out + j] = sum;
 }
 
+// F32 matrix-vector against a **column-major** weight, one thread per row.
+//
+// Replaces `matmul_f32`, which was the largest single kernel in the 35B: 22% of
+// device time for 2.3 MB of weights, at ~20 GB/s on a 448 GB/s card.
+//
+// **The serial chain was never the problem.** An exact f32 dot must accumulate
+// in order, so parallelism is capped at `n_out` and a 2048-long chain of
+// 4-cycle adds is ~3.6 us -- but the kernel measured 64-99 us, 18-28x that. The
+// cost was the access pattern: thread `j` walked its own 8 KB row, so 32
+// threads were 32 uncoalesced streams a kilobyte apart.
+//
+// Transposed, step `k` has threads 0..31 reading `wt[k*n_out + j]` -- 128
+// contiguous bytes, one transaction. **The accumulation order is untouched**,
+// `k` ascending exactly as `ops::naive::dot_row` walks it, so this is
+// bit-identical and the exactness that made the router worth keeping costs
+// nothing.
+//
+// `x[k]` is the same address for every thread, which is a broadcast rather than
+// 32 loads.
+extern "C" __global__ void matmul_f32_t(int n_in, int n_out,
+                                        const float *__restrict__ wt,
+                                        const float *__restrict__ x,
+                                        float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+
+    // The remaining floor is memory latency on a single thread, and it is
+    // where exactness stops paying. Every shape measures ~40 us whatever
+    // `n_out` is -- 1, 32 or 256 -- because 2048 loads with ~8 in flight at a
+    // few hundred cycles each is ~44 us however few threads there are.
+    // **Hoisting the loads by hand into an unrolled batch of eight changed
+    // nothing** (43.4 vs 41.6 us), so nvcc already does it. Going below this
+    // needs more loads in flight per output, which means splitting the
+    // reduction, which is the exactness the router is kept for.
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += wt[(size_t)k * n_out + j] * xt[k];
+    out[(size_t)tok * n_out + j] = sum;
+}
+
 // a += b * scale, elementwise.
 //
 // The MoE expert accumulation: a routed expert's output is weighted by its

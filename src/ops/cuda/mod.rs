@@ -98,6 +98,15 @@ pub struct Cuda {
     pass_graph: Cell<bool>,
     /// Master switch. Off for callers that drive ops one at a time.
     graphs_enabled: Cell<bool>,
+    /// F32 weights, **transposed** at upload into column-major. Keyed on the
+    /// mmap address of the tensor.
+    ///
+    /// Same bytes, and it makes `matmul_f32_t`'s reads coalesce where the
+    /// row-major original had every thread walking its own row. ~95 MiB across
+    /// the 35B — 40 routers, 60 GatedDeltaNet projections, 40 shared-expert
+    /// gates — transposed once each on the host.
+    f32t: RefCell<HashMap<usize, DeviceBuffer>>,
+
     /// Bounded VRAM residency for the MoE expert pool. See [`experts`].
     ///
     /// Separate from `weights`, which is upload-once-keep-forever and right for
@@ -595,6 +604,7 @@ impl Cuda {
                 rms_serial: Cell::new(false),
                 states: RefCell::new(HashMap::new()),
                 q8: RefCell::new(HashMap::new()),
+                f32t: RefCell::new(HashMap::new()),
                 experts: RefCell::new(None),
                 shapes: RefCell::new(HashMap::new()),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
@@ -839,6 +849,10 @@ impl Cuda {
         // exists because a memory prediction was once wrong by 1.9 GiB; it can
         // only do that job if it counts every map that allocates.
         for b in self.weights.borrow().values() {
+            r.weight_bytes += b.len_bytes() as u64;
+            r.weight_tensors += 1;
+        }
+        for b in self.f32t.borrow().values() {
             r.weight_bytes += b.len_bytes() as u64;
             r.weight_tensors += 1;
         }
