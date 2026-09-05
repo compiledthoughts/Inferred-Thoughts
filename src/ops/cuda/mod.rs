@@ -494,6 +494,13 @@ unsafe impl Send for Cuda {}
 impl Cuda {
     /// Initialize the driver, take device `ordinal`, and load the kernels.
     pub fn new(ordinal: i32) -> Result<Self> {
+        Self::with_options(ordinal, false)
+    }
+
+    /// As [`Cuda::new`], optionally asking the driver to block rather than spin
+    /// on synchronization. See the flag comment below; this exists for
+    /// measurement, not for speed.
+    pub fn with_options(ordinal: i32, blocking_sync: bool) -> Result<Self> {
         // SAFETY: every call below is checked, and each is passed either a
         // valid out-pointer to a local or a handle the driver just produced.
         unsafe {
@@ -538,7 +545,14 @@ impl Cuda {
             )?;
 
             let mut context: ffi::CUcontext = std::ptr::null_mut();
-            check(ffi::cuCtxCreate_v2(&mut context, 0, device), "cuCtxCreate")?;
+            // `CU_CTX_SCHED_BLOCKING_SYNC` (0x04) makes the driver sleep on a
+            // synchronization instead of spinning. The default, `SCHED_AUTO`,
+            // busy-waits when there are more cores than contexts — which is
+            // correct for latency and ruinous for *measuring*, because a host
+            // blocked in a copy then looks exactly like a host doing work.
+            // Off by default so nothing changes for a normal run.
+            let flags = if blocking_sync { 0x04 } else { 0x00 };
+            check(ffi::cuCtxCreate_v2(&mut context, flags, device), "cuCtxCreate")?;
 
             // The PTX is a NUL-terminated image as far as the driver is
             // concerned, so it has to be one.

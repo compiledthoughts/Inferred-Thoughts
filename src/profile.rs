@@ -480,3 +480,24 @@ mod tests {
         assert!(std::mem::size_of::<TokenRecord>() <= 32);
     }
 }
+
+/// Nanoseconds this process has actually spent **on a CPU**, or `None` where
+/// the kernel does not report it.
+///
+/// **Built to answer one question the wall clock cannot**: of a 60 ms token
+/// with only ~24 ms of measured kernel time, is the host *working* or
+/// *waiting*? Those have opposite fixes — fewer host operations versus faster
+/// kernels — and three hypotheses about that gap have already been wrong.
+///
+/// `/proc/self/schedstat` field 0 is time on-CPU in nanoseconds, which is
+/// exactly the quantity wanted and needs no libc dependency. Verified to count:
+/// a 500 ms busy loop reports 497 ms.
+///
+/// **It measures spinning as work**, which matters here: a CUDA context created
+/// with `CU_CTX_SCHED_AUTO` busy-waits on synchronization, so a host blocked in
+/// `cuMemcpyDtoH` still burns a core. `--cuda-blocking` exists to take that
+/// confound off the table — with it, on-CPU time is host work and nothing else.
+pub fn cpu_time_ns() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/self/schedstat").ok()?;
+    s.split_whitespace().next()?.parse().ok()
+}

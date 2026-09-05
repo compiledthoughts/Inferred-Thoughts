@@ -55,6 +55,14 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Ask the CUDA driver to sleep rather than spin while synchronizing.
+        ///
+        /// A **measurement** switch, not a speed one. The default context
+        /// busy-waits, so a host blocked in a copy burns a core and is
+        /// indistinguishable from a host doing work. With this on, the
+        /// `host cpu` line below counts only real host work.
+        #[arg(long)]
+        cuda_blocking: bool,
         /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
         ///
         /// The expert pool does not fit in VRAM, so it lives in a bounded slab
@@ -152,6 +160,14 @@ enum Command {
         /// costs VRAM that the model and KV cache would otherwise have.
         #[arg(long, default_value_t = inferred_thoughts::engine::DEFAULT_MAX_BATCH)]
         batch: usize,
+        /// Ask the CUDA driver to sleep rather than spin while synchronizing.
+        ///
+        /// A **measurement** switch, not a speed one. The default context
+        /// busy-waits, so a host blocked in a copy burns a core and is
+        /// indistinguishable from a host doing work. With this on, the
+        /// `host cpu` line below counts only real host work.
+        #[arg(long)]
+        cuda_blocking: bool,
         /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
         ///
         /// The expert pool does not fit in VRAM, so it lives in a bounded slab
@@ -195,6 +211,7 @@ fn main() -> ExitCode {
             ignore_eos,
             ctx,
             batch,
+            cuda_blocking,
             expert_cache,
             profile,
             profile_detail,
@@ -215,6 +232,7 @@ fn main() -> ExitCode {
                 n_ctx: ctx,
                 max_batch: batch,
                 expert_cache,
+                cuda_blocking,
                 report: profile || profile_detail,
                 detail: profile_detail,
                 json: profile_json,
@@ -233,6 +251,7 @@ fn main() -> ExitCode {
             port,
             ctx,
             batch,
+            cuda_blocking: _,
             expert_cache,
             max_tokens,
             threads,
@@ -292,6 +311,8 @@ struct GenOpts {
     max_batch: usize,
     /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
     expert_cache: f64,
+    /// Ask the driver to block rather than spin on sync. Measurement only.
+    cuda_blocking: bool,
     report: bool,
     detail: bool,
     json: Option<String>,
@@ -349,7 +370,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
     // decides its own parallelism and `-t` describes CPU workers.
     #[cfg(feature = "cuda")]
     if o.backend == "cuda" {
-        let cuda = inferred_thoughts::Cuda::new(0)?;
+        let cuda = inferred_thoughts::Cuda::with_options(0, o.cuda_blocking)?;
         cuda.time_kernels(o.kernels);
         cuda.rms_serial(o.rms_serial);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
@@ -364,18 +385,29 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         );
         // Borrowed, not moved, so the sticky error survives the engine. An op
         // that failed has produced meaningless output, so this is fatal.
+        let cpu0 = inferred_thoughts::profile::cpu_time_ns();
         let run = run_generation(m, &cuda, &tk, &tokens, &text, &o);
+        let host_cpu_ns = match (cpu0, inferred_thoughts::profile::cpu_time_ns()) {
+            (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+            _ => None,
+        };
         if let Some(e) = cuda.take_error() {
             return Err(e);
         }
         if o.report || o.device || o.kernels {
             let r = run.as_ref().ok().copied();
-            report_device(
-                &cuda,
-                &o,
-                r.map(|r| r.tokens).unwrap_or((tokens.len() + o.max_tokens) as u64),
-                r.map(|r| r.ms_per_token),
-            )?;
+            let n = r.map(|r| r.tokens).unwrap_or((tokens.len() + o.max_tokens) as u64);
+            if let (Some(ns), Some(run)) = (host_cpu_ns, r) {
+                let per = ns as f64 / n.max(1) as f64 / 1e6;
+                eprintln!(
+                    "
+host     {per:.2} ms/token on-CPU, {:.0}% of the {:.2} ms wall{}",
+                    100.0 * per / run.ms_per_token.max(1e-9),
+                    run.ms_per_token,
+                    if o.cuda_blocking { "" } else { " (driver spins; see --cuda-blocking)" },
+                );
+            }
+            report_device(&cuda, &o, n, r.map(|r| r.ms_per_token))?;
         }
         return run.map(|_| ());
     }

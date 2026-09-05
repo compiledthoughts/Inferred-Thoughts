@@ -372,6 +372,12 @@ impl Cuda {
         // A device-to-host copy cannot start until the work before it has
         // finished, so this is where the host blocks and it is timed as such.
         let started = std::time::Instant::now();
+        // Kept synchronous. Splitting it into an async copy plus
+        // `cuCtxSynchronize` was tried, to put the blocking somewhere
+        // `CU_CTX_SCHED_BLOCKING_SYNC` governs and so measure host work apart
+        // from host spinning. **WSL's driver spins either way** — on-CPU time
+        // stayed at 95% of wall — and the split cost 9% of throughput. Reverted;
+        // the finding is in `HANDOFF.md`.
         // SAFETY: as above, in the other direction.
         let r = unsafe {
             check(
