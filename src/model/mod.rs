@@ -232,6 +232,31 @@ pub(crate) fn experts<'a>(
 ///
 /// These are tiny — a few hundred KB across the whole model — so unlike the
 /// weight matrices there is no reason to keep them packed.
+/// A 1-D tensor as a one-row weight matrix.
+///
+/// `ffn_gate_inp_shexp` is stored as `{n_embd}`, not `{n_embd, 1}`, so
+/// [`matrix`] rejects it. Borrowing it as a `Weights` rather than dequantizing
+/// to a `Vec<f32>` is what lets its dot product run through the seam — and on a
+/// device backend that is the difference between a host sync per layer per
+/// token and none.
+pub(crate) fn row_matrix<'a>(f: &'a GgufFile, name: &str, n_in: usize) -> Result<Weights<'a>> {
+    let info = tensor(f, name)?;
+    if info.dims != vec![n_in as u64] {
+        return Err(Error::TensorShapeMismatch {
+            name: name.to_string(),
+            expected: vec![n_in as u64],
+            got: info.dims.clone(),
+        });
+    }
+    Ok(Weights {
+        data: f.tensor_bytes(info),
+        ty: info.ty,
+        n_in,
+        n_out: 1,
+        pooled: false,
+    })
+}
+
 pub(crate) fn vector(f: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
     let info = tensor(f, name)?;
     if info.dims != vec![len as u64] {

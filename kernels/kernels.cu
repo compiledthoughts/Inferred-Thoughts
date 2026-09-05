@@ -1623,6 +1623,24 @@ extern "C" __global__ void add_scaled(int n, float scale,
     if (i < n) a[i] += b[i] * scale;
 }
 
+// acc += b * sigmoid(logit[0]) -- the shared expert's gate.
+//
+// The scale is read from device memory rather than passed as an argument, and
+// that is the whole point: the logit is a matmul result, so taking it as a
+// kernel argument would mean copying it to the host first, which drains the
+// pipeline. `qwen35moe` did that once per layer per token.
+//
+// Inexact for the usual reason: expf. Same class as softmax, silu_mul and
+// sigmoid_mul, which the exactness boundary already covers.
+extern "C" __global__ void add_scaled_sigmoid(int n, const float *__restrict__ logit,
+                                              float *__restrict__ acc,
+                                              const float *__restrict__ b) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = 1.0f / (1.0f + expf(-logit[0]));
+    acc[i] += b[i] * s;
+}
+
 // The dual of gather_chunks: contiguous `src` written back into `dst` every
 // `stride`, starting at `offset`.
 //

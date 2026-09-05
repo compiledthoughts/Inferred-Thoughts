@@ -186,7 +186,7 @@ use crate::ops::{Attn, Delta, Experts, Ops, Weights};
 use crate::profile::{Ctx, Part};
 use crate::quant::{dequantize, dequantize_into};
 
-use super::{experts, matrix, tensor, vector};
+use super::{experts, matrix, row_matrix, tensor, vector};
 
 /// Everything the forward pass needs, read from metadata.
 #[derive(Debug, Clone)]
@@ -557,9 +557,10 @@ enum Ffn<'a> {
         shared_gate: Weights<'a>,
         shared_up: Weights<'a>,
         shared_down: Weights<'a>,
-        /// `ffn_gate_inp_shexp`: a length-`n_embd` vector, not a matrix. It
-        /// gates the shared expert's contribution with a sigmoid.
-        shared_gate_inp: Vec<f32>,
+        /// `ffn_gate_inp_shexp`: a length-`n_embd` vector, held as a one-row
+        /// matrix so its dot product goes through the seam. It gates the
+        /// shared expert's contribution with a sigmoid.
+        shared_gate_inp: Weights<'a>,
     },
 }
 
@@ -597,6 +598,9 @@ struct Scratch {
     g_all: Vec<f32>,
     u_all: Vec<f32>,
     o_all: Vec<f32>,
+    /// The shared expert's gate logit: one value, kept in a buffer so it can
+    /// stay on the device.
+    shexp_logit: Vec<f32>,
     /// The last row lifted out of `x`, its norm, and the logits. Not batched —
     /// only the final position produces output — but owned for the same reason.
     last: Vec<f32>,
@@ -687,6 +691,7 @@ impl Scratch {
             self.g_all.resize(m.n_expert_used * m.expert_ff, 0.0);
             self.u_all.resize(m.n_expert_used * m.expert_ff, 0.0);
             self.o_all.resize(m.n_expert_used * c.n_embd, 0.0);
+            self.shexp_logit.resize(1, 0.0);
         }
 
         // One row of output per pass, whatever the batch.
@@ -780,7 +785,7 @@ impl<'a> Qwen35<'a> {
                     shared_gate: matrix(f, &p("ffn_gate_shexp.weight"), n_embd, m.shared_ff)?,
                     shared_up: matrix(f, &p("ffn_up_shexp.weight"), n_embd, m.shared_ff)?,
                     shared_down: matrix(f, &p("ffn_down_shexp.weight"), m.shared_ff, n_embd)?,
-                    shared_gate_inp: vector(f, &p("ffn_gate_inp_shexp.weight"), n_embd)?,
+                    shared_gate_inp: row_matrix(f, &p("ffn_gate_inp_shexp.weight"), n_embd)?,
                 },
             };
             layers.push(Layer {
@@ -1388,7 +1393,7 @@ struct MoeWeights<'a, 'b> {
     shared_gate: &'b Weights<'a>,
     shared_up: &'b Weights<'a>,
     shared_down: &'b Weights<'a>,
-    shared_gate_inp: &'b [f32],
+    shared_gate_inp: &'b Weights<'a>,
 }
 
 /// One token through the mixture of experts, writing into `s.ffn_out` at `at`.
@@ -1430,17 +1435,6 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     // decode, where `at` is always zero, and wrong for every batched pass —
     // which is exactly how the previous three hid.
     ops.gather_chunks(&s.normed, nd, nd, at, &mut s.e_in);
-    // The shared expert's gate is a dot of `x` with a length-`n_embd` vector,
-    // computed on the host below — so on a device backend `x` has to be
-    // readable there. Asked for here, beside the router's crossing, so the two
-    // land on one stall instead of two.
-    //
-    // **Both crossings go away together.** They are `HANDOFF.md`'s fourth
-    // blocker: top-k is a host decision, so a device backend syncs once per
-    // layer per token, in a path that took 1329 crossings down to 5. Moving
-    // selection onto the device is what removes them, and it is the same change
-    // that makes the MoE decode step graphable.
-    ops.host_needs(&mut s.e_in);
     let x = &s.e_in[..];
 
     // The router is F32, so this matmul is exact and the expert choice can be
@@ -1502,15 +1496,12 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     ops.matmul(w.shared_down, &s.e_gate[..m.shared_ff], &mut s.e_out[..nd]);
 
     // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
-    let logit: f32 = w
-        .shared_gate_inp
-        .iter()
-        .zip(x)
-        .map(|(a, b)| a * b)
-        .sum();
-    let sg = 1.0 / (1.0 + (-logit).exp());
+    // Through the seam rather than as a host dot product, so the logit — which
+    // is a matmul result — never has to be read back. That read was the second
+    // of two device syncs per layer; only the router's remains.
+    ops.matmul(w.shared_gate_inp, x, &mut s.shexp_logit);
     let (acc, out) = (&mut s.moe_acc[..nd], &s.e_out[..nd]);
-    ops.add_scaled(acc, out, sg);
+    ops.add_scaled_sigmoid(acc, out, &s.shexp_logit);
 
     // Written back through the seam, for the mirror-image reason `x` is read
     // through it: a host `copy_from_slice` here would read `moe_acc` -- which

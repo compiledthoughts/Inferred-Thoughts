@@ -571,6 +571,21 @@ pub trait Ops {
         }
     }
 
+    /// `acc += b * sigmoid(logit[0])` — the shared expert's gate.
+    ///
+    /// **Exists so the logit never comes home.** It is a matmul result, so on a
+    /// device backend reading it costs a full pipeline drain, and `qwen35moe`
+    /// would pay one per layer per token — 40 of them, in a backend whose whole
+    /// design is to touch the bus five times.
+    ///
+    /// The default computes the sigmoid on the host and defers to
+    /// [`Ops::add_scaled`], which is exactly what the model used to do inline,
+    /// so no CPU backend changes by a bit.
+    fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {
+        let s = 1.0 / (1.0 + (-logit[0]).exp());
+        self.add_scaled(acc, b, s);
+    }
+
     /// `a += b * scale`, in place — the MoE expert accumulation.
     ///
     /// Separate from [`Ops::add_assign`] because a routed expert's output is

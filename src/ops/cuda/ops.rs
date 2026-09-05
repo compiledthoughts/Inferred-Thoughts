@@ -1405,18 +1405,20 @@ impl Cuda {
             }
             "matmul_iq4_xs_q8_k_moe" => {
                 // Eight experts against one shared activation, which is the
-                // gate/up shape. All eight pointers reference the same weight:
-                // the kernel is bandwidth and instruction bound and does not
-                // branch on values, and eight copies would only measure the
-                // cache differently than the real thing does.
+                // gate/up shape. **Eight distinct weights, not one repeated**:
+                // the real routed FFN reads eight different experts, and one
+                // buffer eight times would be served by L2 rather than VRAM.
                 let n_super = n_in / QK_K;
                 let row_bytes = n_super * 136;
-                let mut w = vec![0x11u8; n_out * row_bytes];
-                for r in 0..n_out {
-                    for b in 0..n_super {
-                        let at = r * row_bytes + b * 136;
-                        w[at] = 0x00;
-                        w[at + 1] = 0x38;
+                let row_set = n_out * row_bytes;
+                let mut w = vec![0x11u8; 8 * row_set];
+                for c in 0..8 {
+                    for r in 0..n_out {
+                        for b in 0..n_super {
+                            let at = c * row_set + r * row_bytes + b * 136;
+                            w[at] = 0x00;
+                            w[at + 1] = 0x38;
+                        }
                     }
                 }
                 let wd = DeviceBuffer::from_slice(&w)?;
@@ -1432,8 +1434,8 @@ impl Cuda {
                     KArg::I32(0),
                     KArg::I32(8),
                 ];
-                for _ in 0..8 {
-                    args.push(KArg::Ptr(wd.ptr));
+                for c in 0..8 {
+                    args.push(KArg::Ptr(wd.ptr + (c * row_set) as ffi::CUdeviceptr));
                 }
                 args.push(KArg::Ptr(sd.ptr));
                 args.push(KArg::Ptr(qd.ptr));
@@ -1473,7 +1475,7 @@ impl Cuda {
                 Some(b) => b,
                 None => return Ok((f64::NAN, f64::NAN)),
             };
-            return self.time_launches(kernel, grid, block, shared, &args, reps);
+            return self.time_launches(kernel, grid, block, shared, &[args], reps);
         }
         // Bytes one row of this format occupies, and the f16 scale's offset
         // within a block. `None` where the format has no f16 to protect.
@@ -1488,14 +1490,21 @@ impl Cuda {
         let n_super = n_in / block_elems;
         let row_bytes = n_super * block_bytes;
 
-        let mut w = vec![0x11u8; n_out * row_bytes];
+        // Enough copies of the weight that consecutive launches cannot all be
+        // served by L2. Capped so the LM head, already 398 MB, does not ask for
+        // three gigabytes.
+        let row_set = n_out * row_bytes;
+        let copies = ((64 << 20) / row_set.max(1)).clamp(1, 8);
+        let mut w = vec![0x11u8; copies * row_set];
         if let Some(off) = scale_at {
             // 0x3800 is f16 0.5: a real number, so the arithmetic is finite.
-            for r in 0..n_out {
-                for b in 0..n_super {
-                    let at = r * row_bytes + b * block_bytes + off;
-                    w[at] = 0x00;
-                    w[at + 1] = 0x38;
+            for c in 0..copies {
+                for r in 0..n_out {
+                    for b in 0..n_super {
+                        let at = c * row_set + r * row_bytes + b * block_bytes + off;
+                        w[at] = 0x00;
+                        w[at + 1] = 0x38;
+                    }
                 }
             }
         } else {
@@ -1523,19 +1532,27 @@ impl Cuda {
             )
         };
 
-        let mut args = vec![KArg::I32(n_in as i32), KArg::I32(n_out as i32), KArg::Ptr(wd.ptr)];
-        match (&xf, &xs, &xq, &xb) {
-            (Some(x), ..) => args.push(KArg::Ptr(x.ptr)),
-            (None, Some(s), Some(q), Some(b)) => {
-                args.push(KArg::Ptr(s.ptr));
-                args.push(KArg::Ptr(q.ptr));
-                if kernel == "matmul_q5_k_q8_k" {
-                    args.push(KArg::Ptr(b.ptr));
+        let mut variants: Vec<Vec<KArg>> = Vec::with_capacity(copies);
+        for c in 0..copies {
+            let mut args = vec![
+                KArg::I32(n_in as i32),
+                KArg::I32(n_out as i32),
+                KArg::Ptr(wd.ptr + (c * row_set) as ffi::CUdeviceptr),
+            ];
+            match (&xf, &xs, &xq, &xb) {
+                (Some(x), ..) => args.push(KArg::Ptr(x.ptr)),
+                (None, Some(s), Some(q), Some(b)) => {
+                    args.push(KArg::Ptr(s.ptr));
+                    args.push(KArg::Ptr(q.ptr));
+                    if kernel == "matmul_q5_k_q8_k" {
+                        args.push(KArg::Ptr(b.ptr));
+                    }
                 }
+                _ => {}
             }
-            _ => {}
+            args.push(KArg::Ptr(od.ptr));
+            variants.push(args);
         }
-        args.push(KArg::Ptr(od.ptr));
 
         let block = 128u32;
         let grid = if kernel == "matmul_f32" {
@@ -1550,7 +1567,7 @@ impl Cuda {
         if let Some(b) = xq { keep.push(b); }
         if let Some(b) = xb { keep.push(b); }
         if let Some(b) = xf { keep.push(b); }
-        self.time_launches(kernel, grid, block, 0, &args, reps)
+        self.time_launches(kernel, grid, block, 0, &variants, reps)
     }
 
     /// `reps` launches of one configured kernel, timed two ways: CUDA events
@@ -1560,13 +1577,22 @@ impl Cuda {
     /// sync measures latency where throughput is what matters, and inflates
     /// every kernel in proportion to how often it is called, which is what
     /// makes `--profile-kernels` shares unusable for ranking work.
+    /// As above, cycling through `variants` so consecutive launches read
+    /// different weights.
+    ///
+    /// **Replaying one buffer measures the L2, not the card.** This machine has
+    /// 32 MB of L2 and a grouped expert matmul reads 4.25 MB, so 300 repeats of
+    /// one buffer are 299 cache hits — while the real forward pass streams 11.5
+    /// GiB of distinct experts and hits VRAM every time. The tell was that the
+    /// LM head, the only shape too large to cache, was also the only one that
+    /// measured slow.
     fn time_launches(
         &self,
         kernel: &'static str,
         grid: u32,
         block: u32,
         shared: u32,
-        args: &[KArg],
+        variants: &[Vec<KArg>],
         reps: u32,
     ) -> Result<(f64, f64)> {
         // A bench is never part of a graph, and never times its own launches.
@@ -1586,13 +1612,14 @@ impl Cuda {
             // uses, so the events bracket exactly these launches.
             unsafe { check(ffi::cuEventRecord(a, std::ptr::null_mut()), "cuEventRecord")? };
             let t = std::time::Instant::now();
-            for _ in 0..n {
+            for k in 0..n {
                 // SAFETY: the caller built `args`, `grid`, `block` and
                 // `shared` to match `kernel`, and sized every buffer for the
                 // shape it describes.
                 // The grouped MoE matmul puts the expert on `blockIdx.y`; every
                 // other kernel here is one-dimensional.
                 let gy = if kernel.ends_with("_moe") { 8 } else { 1 };
+                let args = &variants[(k as usize) % variants.len()];
                 // SAFETY: as above.
                 unsafe { self.launch_grid2(kernel, grid, gy, block, shared, args)? };
             }
@@ -1859,6 +1886,28 @@ impl Cuda {
         // SAFETY: parameters match `add_scaled` in kernels.cu.
         unsafe { self.launch_shared("add_scaled", blocks, 256, 0, &args)? };
         self.mirror_out(a).map(|_| ())
+    }
+
+    fn add_scaled_sigmoid_impl(
+        &self,
+        acc: &mut [f32],
+        b: &[f32],
+        logit: &[f32],
+    ) -> Result<()> {
+        let ld = self.mirror_in(logit)?;
+        let bd = self.mirror_in(b)?;
+        let ad = self.mirror_in(acc)?;
+        let args = [
+            KArg::I32(acc.len() as i32),
+            KArg::Ptr(ld),
+            KArg::Ptr(ad),
+            KArg::Ptr(bd),
+        ];
+        self.note_shape("add_scaled_sigmoid", acc.len(), 0);
+        // SAFETY: parameters match `add_scaled_sigmoid`; `logit` holds at least
+        // one float and `acc`/`b` hold `n`.
+        unsafe { self.launch_shared("add_scaled_sigmoid", acc.len().div_ceil(256) as u32, 256, 0, &args)? };
+        self.mirror_out(acc).map(|_| ())
     }
 
     fn sigmoid_mul_impl(&self, x: &mut [f32], g: &[f32]) -> Result<()> {
@@ -2189,6 +2238,10 @@ impl Ops for Cuda {
         self.note(self.add_scaled_rows_impl(acc, rows, scales));
     }
 
+    fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {
+        self.note(self.add_scaled_sigmoid_impl(acc, b, logit));
+    }
+
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
         self.note(self.sigmoid_mul_impl(x, g));
     }
@@ -2342,6 +2395,10 @@ impl Ops for &Cuda {
 
     fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
         (*self).add_scaled_rows(acc, rows, scales)
+    }
+
+    fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {
+        (*self).add_scaled_sigmoid(acc, b, logit)
     }
 
     fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
