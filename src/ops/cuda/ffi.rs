@@ -60,6 +60,15 @@ pub struct KernelNodeParams {
     pub ctx: CUcontext,
 }
 
+/// `CU_MEMHOSTALLOC_DEVICEMAP`, from `cuda.h`.
+///
+/// Makes a pinned host allocation addressable by kernels: the device pointer
+/// from [`cuMemHostGetDevicePointer_v2`] can be dereferenced inside a kernel,
+/// which reads it across PCIe rather than requiring a copy first. That is what
+/// lets an expert live in host RAM without the host having to intervene when it
+/// is used -- the precondition for a CUDA graph, which cannot service a miss.
+pub const MEMHOSTALLOC_DEVICEMAP: c_uint = 0x02;
+
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`, from `cuda.h`.
 pub const ATTR_CC_MAJOR: c_int = 75;
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`.
@@ -93,6 +102,18 @@ unsafe extern "C" {
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
+
+    /// Page-locked host memory, optionally mapped into the device's address
+    /// space. `flags` takes [`MEMHOSTALLOC_DEVICEMAP`].
+    pub fn cuMemHostAlloc(pp: *mut *mut c_void, bytes: usize, flags: c_uint) -> CUresult;
+    pub fn cuMemFreeHost(p: *mut c_void) -> CUresult;
+    /// The device-side address of a host allocation made with
+    /// [`MEMHOSTALLOC_DEVICEMAP`]. `flags` is reserved and must be 0.
+    pub fn cuMemHostGetDevicePointer_v2(
+        dptr: *mut CUdeviceptr,
+        p: *mut c_void,
+        flags: c_uint,
+    ) -> CUresult;
 
     pub fn cuLaunchKernel(
         f: CUfunction,

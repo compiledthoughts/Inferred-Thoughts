@@ -549,6 +549,37 @@ impl Cuda {
             .set(if bytes == 0 { experts::DEFAULT_RESERVE } else { free.saturating_sub(bytes) });
     }
 
+    /// Cap the page-locked host tier behind the expert slab, in bytes.
+    ///
+    /// Zero restores [`experts::DEFAULT_HOST_BUDGET`]. Must be called before
+    /// the first pooled tensor, since the cache reads it once at construction.
+    pub fn set_expert_host_budget(&self, bytes: usize) {
+        self.expert_host_budget
+            .set(if bytes == 0 { experts::DEFAULT_HOST_BUDGET } else { bytes });
+    }
+
+    /// Hold `bytes` of VRAM back for the KV cache.
+    ///
+    /// **Fixes a sizing hole rather than tuning one.** The expert slab is sized
+    /// from free VRAM at the first pooled tensor, which is inside block 0,
+    /// while KV slabs are allocated at the first `kv_write` — block 3 on the
+    /// 35B. So without this the slab takes VRAM the KV cache is going to need,
+    /// and at a long context the KV allocation fails partway through the first
+    /// prefill. At 4k it hides inside `DEFAULT_RESERVE`'s slack; at 256k it is
+    /// 5 GiB and does not.
+    ///
+    /// Additive, because the caller knows the context length and this file
+    /// knows the rest.
+    pub fn reserve_for_kv(&self, bytes: usize) {
+        self.expert_reserve.set(self.expert_reserve.get().saturating_add(bytes));
+    }
+
+    /// What fraction of expert reads the busiest slab-many tensors accounted
+    /// for. See [`experts::ExpertCache::coverage`].
+    pub fn expert_coverage(&self) -> Option<(f64, u64)> {
+        self.experts.borrow().as_ref().map(|c| c.coverage())
+    }
+
     /// Replace every kernel with a no-op, keeping the launch pattern exactly.
     ///
     /// The output is meaningless; the *time* is the point. See `noop` in
@@ -709,6 +740,10 @@ impl Cuda {
     ///
     /// The distinction is a fact about the tensor, carried on `Weights::pooled`,
     /// not a policy. The policy is [`experts::ExpertCache`]'s.
+    ///
+    /// Note the slab is two-tier: a pooled tensor that does not fit in VRAM
+    /// gets a page-locked host address the kernel dereferences over PCIe, so
+    /// this function always returns an address and never stalls on a fill.
     fn expert_or_resident(&self, w: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
         if !w.pooled {
             return self.resident(w.data);
@@ -722,7 +757,8 @@ impl Cuda {
             let reserve = self.expert_reserve.get();
             let budget = free.saturating_sub(reserve);
             let slots = budget / w.data.len().max(1);
-            *slot = Some(experts::ExpertCache::new(w.data.len(), slots)?);
+            *slot =
+                Some(experts::ExpertCache::new(w.data.len(), slots, self.expert_host_budget.get())?);
         }
         let cache = match slot.as_mut() {
             Some(c) => c,
@@ -734,7 +770,7 @@ impl Cuda {
             }
         };
         let before = cache.stats().filled_bytes;
-        let ptr = cache.get_or_fill(w.data.as_ptr() as usize, w.data)?;
+        let ptr = cache.address_of(w.data.as_ptr() as usize, w.data)?;
         let filled = cache.stats().filled_bytes - before;
         drop(slot);
         // A miss is a bus crossing and is counted as one; a hit moves nothing.

@@ -80,6 +80,15 @@ enum Command {
         /// the misses it avoids.
         #[arg(long, default_value_t = 0.0)]
         expert_cache: f64,
+        /// Cap the page-locked host tier behind the expert cache, in GiB.
+        /// 0 uses the automatic budget.
+        ///
+        /// Experts that do not fit in VRAM live here and are read across PCIe
+        /// by the kernel itself, so the pool stays addressable without the host
+        /// in the loop — which is what lets the decode step be a CUDA graph.
+        /// Pinned pages cannot be swapped, so this is a real claim on host RAM.
+        #[arg(long, default_value_t = 0.0)]
+        expert_host: f64,
         /// Print the profile summary: phase timings, byte traffic, and the
         /// top-2 logit margins.
         #[arg(long)]
@@ -193,6 +202,15 @@ enum Command {
         /// the misses it avoids.
         #[arg(long, default_value_t = 0.0)]
         expert_cache: f64,
+        /// Cap the page-locked host tier behind the expert cache, in GiB.
+        /// 0 uses the automatic budget.
+        ///
+        /// Experts that do not fit in VRAM live here and are read across PCIe
+        /// by the kernel itself, so the pool stays addressable without the host
+        /// in the loop — which is what lets the decode step be a CUDA graph.
+        /// Pinned pages cannot be swapped, so this is a real claim on host RAM.
+        #[arg(long, default_value_t = 0.0)]
+        expert_host: f64,
         /// Default generation budget when the request does not set one.
         #[arg(short = 'n', long, default_value_t = 512)]
         max_tokens: usize,
@@ -230,6 +248,7 @@ fn main() -> ExitCode {
             cuda_blocking,
             null_kernels,
             expert_cache,
+            expert_host,
             profile,
             profile_detail,
             profile_json,
@@ -249,6 +268,7 @@ fn main() -> ExitCode {
                 n_ctx: ctx,
                 max_batch: batch,
                 expert_cache,
+                expert_host,
                 cuda_blocking,
                 null_kernels,
                 report: profile || profile_detail,
@@ -272,6 +292,7 @@ fn main() -> ExitCode {
             cuda_blocking: _,
             null_kernels: _,
             expert_cache,
+            expert_host,
             max_tokens,
             threads,
             backend,
@@ -283,6 +304,7 @@ fn main() -> ExitCode {
             ctx,
             max_batch: batch,
             expert_cache,
+            expert_host,
             max_tokens,
             threads,
             backend,
@@ -330,6 +352,8 @@ struct GenOpts {
     max_batch: usize,
     /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
     expert_cache: f64,
+    /// Cap the page-locked host tier behind it, in GiB. 0 is automatic.
+    expert_host: f64,
     /// Ask the driver to block rather than spin on sync. Measurement only.
     cuda_blocking: bool,
     /// Replace every kernel with a no-op. Measurement only; output is garbage.
@@ -395,6 +419,11 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.time_kernels(o.kernels);
         cuda.rms_serial(o.rms_serial);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
+        cuda.set_expert_host_budget((o.expert_host * 1073741824.0) as usize);
+        // The KV cache is allocated lazily, at the first attention layer, which
+        // is *after* the expert slab has sized itself from free VRAM. Told here
+        // because this is the only place that knows the context length.
+        cuda.reserve_for_kv(kv_reserve_bytes(&m, o.n_ctx));
         cuda.null_kernels(o.null_kernels);
         cuda.record_launches(o.device);
         let (free, total) = cuda.mem_info()?;
@@ -665,6 +694,34 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             gib(e.filled_bytes),
             e.filled_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
         );
+        // The host tier is the point of the two-tier design, so it is reported
+        // whether or not it was used: "0 tensors" is a result, not an absence.
+        eprintln!(
+            "         host tier {} tensors in {:.2} GiB pinned   {:.1}% of reads, {:.1} MiB/token over PCIe in-kernel",
+            e.host_slots,
+            gib(e.host_bytes),
+            100.0 * e.host_read_rate(),
+            e.host_reads as f64 * e.slot_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
+        );
+        if e.degraded {
+            eprintln!(
+                "         DEGRADED: the host tier filled, so placement fell back to
+         eviction. The pool is no longer wholly addressable and a CUDA
+         graph would be unsound. Raise --expert-host or --expert-cache."
+            );
+        }
+        // What a placement policy that knew the routing distribution in advance
+        // could have served from VRAM, against what first-touch arrival order
+        // actually served. See `ExpertCache::coverage`.
+        if let Some((frac, reads)) = cuda.expert_coverage() {
+            eprintln!(
+                "         coverage {:.1}% of {} reads go to the busiest {} tensors (first-touch got {:.1}%)",
+                100.0 * frac,
+                reads,
+                e.slots,
+                100.0 * (1.0 - e.host_read_rate()),
+            );
+        }
     }
 
     // Resident bytes, always printed. What the device *holds* is a different
@@ -836,6 +893,8 @@ struct ServeArgs {
     max_batch: usize,
     /// Cap the MoE expert cache, in GiB. 0 uses the automatic budget.
     expert_cache: f64,
+    /// Cap the page-locked host tier behind it, in GiB. 0 is automatic.
+    expert_host: f64,
     max_tokens: usize,
     threads: usize,
     backend: String,
@@ -894,6 +953,11 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         let cuda = inferred_thoughts::Cuda::new(0)?;
         cuda.rms_serial(a.rms_serial);
         cuda.set_expert_budget((a.expert_cache * 1073741824.0) as usize);
+        cuda.set_expert_host_budget((a.expert_host * 1073741824.0) as usize);
+        // See the same call in `generate`: the KV slabs are allocated after the
+        // expert slab has already sized itself from free VRAM, so the context
+        // length has to be declared here or the slab takes VRAM the cache needs.
+        cuda.reserve_for_kv(kv_reserve_bytes(&m, a.ctx));
         let (free, total) = cuda.mem_info()?;
         eprintln!(
             "device {} | {:.2} of {:.2} GiB free",
@@ -1290,4 +1354,16 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// VRAM the KV cache will want at this context length, in bytes.
+///
+/// Mirrors `KvCache::new(n_kv_layer, kv_dim, n_ctx)` and `capacity_bytes`: two
+/// f16 tensors of `n_kv_layer * n_ctx * kv_dim`. Computed rather than measured
+/// because it has to be known *before* the cache exists — the expert slab sizes
+/// itself first, and this is what stops it taking VRAM the cache is going to
+/// need.
+#[cfg(feature = "cuda")]
+fn kv_reserve_bytes(m: &inferred_thoughts::Model, n_ctx: usize) -> usize {
+    m.n_kv_layer().saturating_mul(n_ctx).saturating_mul(m.kv_dim()).saturating_mul(2 * 2)
 }

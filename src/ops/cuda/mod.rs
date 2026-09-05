@@ -119,9 +119,20 @@ pub struct Cuda {
     /// VRAM to leave free when sizing the expert slab, in bytes.
     ///
     /// Covers what is not yet allocated when the slab is built: the rest of the
-    /// permanent weights, the KV cache at full context, activation mirrors at
-    /// the configured batch, and the driver's own working set.
+    /// permanent weights, activation mirrors at the configured batch, and the
+    /// driver's own working set.
+    ///
+    /// **The KV cache is not in it by default** — its slabs are allocated
+    /// lazily at the first attention layer, which on the 35B is block 3 and so
+    /// comes after this sizing. `Cuda::reserve_for_kv` adds it, and only the
+    /// caller knows the context length.
     expert_reserve: Cell<usize>,
+
+    /// Page-locked host memory the expert cache's overflow tier may claim.
+    ///
+    /// The second tier is what makes every expert addressable without host
+    /// intervention, which is what a CUDA graph needs; see [`experts`].
+    expert_host_budget: Cell<usize>,
 
     /// Q8_0 weights, repacked at upload into an aligned scale array and an
     /// aligned quant array. Keyed on the mmap address of the tensor.
@@ -637,6 +648,7 @@ impl Cuda {
                 launches: RefCell::new(HashMap::new()),
                 record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
+                expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
                 pass_open: Cell::new(false),
