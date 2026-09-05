@@ -103,6 +103,63 @@ impl<'a> Experts<'a> {
     }
 }
 
+/// Where a token's expert choice lives.
+///
+/// **The seam's answer to a fork that would otherwise be in the model.** Expert
+/// selection is a *decision*, not arithmetic: it changes which weights are read
+/// rather than what is computed from them. Every CPU backend makes it on the
+/// host, and so did the CUDA backend until the router's probabilities could
+/// stay on the card — which they must, because a CUDA graph replays a fixed
+/// kernel sequence with no host participation, so a mid-pass read of a device
+/// result returns the *previous* pass's contents.
+///
+/// Putting the variant here rather than in `moe_token` keeps the model on one
+/// path: it asks [`Ops::route`] and hands the answer back to the three ops that
+/// consume it, without knowing or caring which side chose.
+///
+/// # Contract
+///
+/// The default [`Ops::route`] only ever returns `Host`, so a backend that
+/// overrides nothing is correct. **A backend that returns `Device` must
+/// override [`Ops::matmul_experts`], [`Ops::moe_glu`] and [`Ops::moe_finish`]**,
+/// because their defaults have no way to read ids that never came home. The
+/// whole-model differential test is what enforces it.
+#[derive(Debug, Clone)]
+pub enum Route {
+    /// Chosen on the host: expert ids in descending probability, and their
+    /// normalized weights in the same order.
+    Host { ids: Vec<usize>, weights: Vec<f32> },
+    /// Chosen on the device. The backend knows where the ids and weights are;
+    /// nothing above the seam does.
+    Device { n_used: usize },
+}
+
+impl Route {
+    /// How many experts this token visits, whichever side chose them.
+    pub fn n_used(&self) -> usize {
+        match self {
+            Route::Host { ids, .. } => ids.len(),
+            Route::Device { n_used } => *n_used,
+        }
+    }
+
+    /// The chosen ids, if the host has them.
+    pub fn ids(&self) -> Option<&[usize]> {
+        match self {
+            Route::Host { ids, .. } => Some(ids),
+            Route::Device { .. } => None,
+        }
+    }
+
+    /// The normalized weights, if the host has them.
+    pub fn weights(&self) -> Option<&[f32]> {
+        match self {
+            Route::Host { weights, .. } => Some(weights),
+            Route::Device { .. } => None,
+        }
+    }
+}
+
 /// The attention inputs for a batch of queries against one layer's history.
 ///
 /// A struct rather than ten positional arguments, which is how a `head_dim` and
@@ -541,7 +598,14 @@ pub trait Ops {
     /// safe only for a backend that addresses memory by value; a device backend
     /// must override it, and every device backend must anyway or it gains
     /// nothing.
-    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
+    fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
+        let Some(picks) = route.ids() else {
+            // Unreachable through the default `route`, which never returns
+            // `Device`. See `Route`'s contract: a backend that does must
+            // override this.
+            debug_assert!(false, "matmul_experts default given a device route");
+            return;
+        };
         let per_expert = x.len() == picks.len() * w.n_in;
         for (i, &e) in picks.iter().enumerate() {
             let xi = if per_expert { &x[i * w.n_in..(i + 1) * w.n_in] } else { x };
@@ -568,13 +632,13 @@ pub trait Ops {
         &self,
         gate: &Experts<'_>,
         up: &Experts<'_>,
-        picks: &[usize],
+        route: &Route,
         x: &[f32],
         out: &mut [f32],
         scratch: &mut [f32],
     ) {
-        self.matmul_experts(gate, picks, x, out);
-        self.matmul_experts(up, picks, x, scratch);
+        self.matmul_experts(gate, route, x, out);
+        self.matmul_experts(up, route, x, scratch);
         self.silu_mul(out, scratch);
     }
 
@@ -599,11 +663,16 @@ pub trait Ops {
         at: usize,
         n: usize,
         rows: &[f32],
-        scales: &[f32],
+        route: &Route,
         shared: &[f32],
         logit: &[f32],
         logit_at: usize,
     ) {
+        let Some(scales) = route.weights() else {
+            // As `matmul_experts`: unreachable through the default `route`.
+            debug_assert!(false, "moe_finish default given a device route");
+            return;
+        };
         let g = 1.0 / (1.0 + (-logit[logit_at]).exp());
         for j in 0..n {
             let mut v = 0.0f32;
@@ -613,6 +682,45 @@ pub trait Ops {
             v += shared[j] * g;
             out[at + j] = v;
         }
+    }
+
+    /// Choose this token's experts from the router's probabilities.
+    ///
+    /// **The rule, in one place.** It used to live inline in `qwen35::moe_token`
+    /// and is transcribed from `llm_graph_context::build_moe_ffn`: `n_used`
+    /// rounds, each scanning ascending and taking a new best only on a strict
+    /// `>` so a tie resolves to the lower id; then the chosen probabilities
+    /// summed **in selection order** and each divided by
+    /// `max(sum, 6.103515625e-5)`, f16's smallest normal.
+    ///
+    /// `probs` is the softmax over *all* experts, before selection — the
+    /// distinction `moe_token`'s doc calls out as easy to get wrong, since
+    /// `LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT` is the variant that
+    /// softmaxes the top-k instead, and qwen35moe does not use it.
+    ///
+    /// The default brings the probabilities home and decides here, which is
+    /// what every CPU backend wants and what the CUDA backend does until its
+    /// expert pointer table is complete. A device backend overrides it to keep
+    /// the decision on the card, which is what lets the pass be a CUDA graph.
+    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
+        self.host_needs(probs);
+        let mut ids: Vec<usize> = Vec::with_capacity(n_used);
+        for _ in 0..n_used {
+            let mut best = usize::MAX;
+            for e in 0..probs.len() {
+                if ids.contains(&e) {
+                    continue;
+                }
+                if best == usize::MAX || probs[e] > probs[best] {
+                    best = e;
+                }
+            }
+            ids.push(best);
+        }
+        let sum: f32 = ids.iter().map(|&e| probs[e]).sum();
+        let denom = sum.max(6.103_515_625e-5);
+        let weights = ids.iter().map(|&e| probs[e] / denom).collect();
+        Route::Host { ids, weights }
     }
 
     /// `acc[j] = sum over e of `scales[e] * rows[e * acc.len() + j]`, summed in

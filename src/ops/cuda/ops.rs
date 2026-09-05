@@ -63,7 +63,7 @@ const MM_TOK: usize = 8;
 /// `kernels/kernels.cu`.** It fixes the shared-memory request independently of
 /// `n_in`, which is what uncapped `MM_TOK`.
 const MM_SEG: usize = 64;
-use crate::ops::{Attn, Delta, Experts, Ops, Weights};
+use crate::ops::{Attn, Delta, Experts, Ops, Route, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
 mod slot {
@@ -855,12 +855,14 @@ impl Cuda {
     fn matmul_experts_impl(
         &self,
         w: &Experts<'_>,
-        picks: &[usize],
+        route: &Route,
         x: &[f32],
         out: &mut [f32],
     ) -> Result<()> {
         const QK_K: usize = 256;
         const MAX: usize = 8;
+        let picks = self.host_picks(route, "matmul_experts")?;
+        let picks = &picks[..];
         if w.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
                 what: "matmul_experts",
@@ -935,11 +937,13 @@ impl Cuda {
         &self,
         gate: &Experts<'_>,
         up: &Experts<'_>,
-        picks: &[usize],
+        route: &Route,
         x: &[f32],
         out: &mut [f32],
     ) -> Result<()> {
         const QK_K: usize = 256;
+        let picks = self.host_picks(route, "moe_glu")?;
+        let picks = &picks[..];
         const MAX: usize = 8;
         if gate.ty != GgmlType::Iq4Xs || up.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
@@ -1008,11 +1012,13 @@ impl Cuda {
         at: usize,
         n: usize,
         rows: &[f32],
-        scales: &[f32],
+        route: &Route,
         shared: &[f32],
         logit: &[f32],
         logit_at: usize,
     ) -> Result<()> {
+        let scales = self.host_weights(route, "moe_finish")?;
+        let scales = &scales[..];
         const MAX: usize = 8;
         if scales.is_empty() || scales.len() > MAX {
             return Err(Error::Cuda {
@@ -1486,6 +1492,37 @@ impl Cuda {
         self.d2h(&mut ids, idb.ptr)?;
         self.d2h(&mut weights, wb.ptr)?;
         Ok((ids, weights))
+    }
+
+    /// The host-side picks a `Route` carries, or an error naming the caller.
+    ///
+    /// **A deliberate error rather than a fallback.** `Route::Device` means the
+    /// ids never came home, so an op that needs them on the host cannot proceed
+    /// — and silently doing nothing, or routing to expert 0, would produce
+    /// fluent text from the wrong weights. Until the device pointer table is
+    /// complete this backend's `route` only returns `Host`, so this is a guard
+    /// against a future half-wired state, not a live path.
+    fn host_picks(&self, route: &Route, what: &'static str) -> Result<Vec<usize>> {
+        match route.ids() {
+            Some(ids) => Ok(ids.to_vec()),
+            None => Err(Error::Cuda {
+                what,
+                detail: "device routing, but this op still resolves picks on the host"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// As [`Cuda::host_picks`], for the normalized expert weights.
+    fn host_weights(&self, route: &Route, what: &'static str) -> Result<Vec<f32>> {
+        match route.weights() {
+            Some(w) => Ok(w.to_vec()),
+            None => Err(Error::Cuda {
+                what,
+                detail: "device routing, but this op still reads weights on the host"
+                    .to_string(),
+            }),
+        }
     }
 
     /// Record a matmul's shape, so the microbenchmark can replay it later.
@@ -2592,8 +2629,8 @@ impl Ops for Cuda {
         self.note(self.add_scaled_impl(a, b, scale));
     }
 
-    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
-        self.note(self.matmul_experts_impl(w, picks, x, out));
+    fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
+        self.note(self.matmul_experts_impl(w, route, x, out));
     }
 
     fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
@@ -2607,24 +2644,24 @@ impl Ops for Cuda {
         at: usize,
         n: usize,
         rows: &[f32],
-        scales: &[f32],
+        route: &Route,
         shared: &[f32],
         logit: &[f32],
         logit_at: usize,
     ) {
-        self.note(self.moe_finish_impl(out, at, n, rows, scales, shared, logit, logit_at));
+        self.note(self.moe_finish_impl(out, at, n, rows, route, shared, logit, logit_at));
     }
 
     fn moe_glu(
         &self,
         gate: &Experts<'_>,
         up: &Experts<'_>,
-        picks: &[usize],
+        route: &Route,
         x: &[f32],
         out: &mut [f32],
         _scratch: &mut [f32],
     ) {
-        self.note(self.moe_glu_impl(gate, up, picks, x, out));
+        self.note(self.moe_glu_impl(gate, up, route, x, out));
     }
 
     fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {
@@ -2778,8 +2815,8 @@ impl Ops for &Cuda {
         (*self).add_scaled(a, b, scale)
     }
 
-    fn matmul_experts(&self, w: &Experts<'_>, picks: &[usize], x: &[f32], out: &mut [f32]) {
-        (*self).matmul_experts(w, picks, x, out)
+    fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
+        (*self).matmul_experts(w, route, x, out)
     }
 
     fn add_scaled_rows(&self, acc: &mut [f32], rows: &[f32], scales: &[f32]) {
@@ -2793,24 +2830,24 @@ impl Ops for &Cuda {
         at: usize,
         n: usize,
         rows: &[f32],
-        scales: &[f32],
+        route: &Route,
         shared: &[f32],
         logit: &[f32],
         logit_at: usize,
     ) {
-        (*self).moe_finish(out, at, n, rows, scales, shared, logit, logit_at)
+        (*self).moe_finish(out, at, n, rows, route, shared, logit, logit_at)
     }
 
     fn moe_glu(
         &self,
         gate: &Experts<'_>,
         up: &Experts<'_>,
-        picks: &[usize],
+        route: &Route,
         x: &[f32],
         out: &mut [f32],
         scratch: &mut [f32],
     ) {
-        (*self).moe_glu(gate, up, picks, x, out, scratch)
+        (*self).moe_glu(gate, up, route, x, out, scratch)
     }
 
     fn add_scaled_sigmoid(&self, acc: &mut [f32], b: &[f32], logit: &[f32]) {

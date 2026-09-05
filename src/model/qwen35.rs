@@ -1441,30 +1441,15 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     // compared against llama.cpp directly.
     ops.matmul(w.gate_inp, x, &mut s.router);
     ops.softmax(&mut s.router);
-    // Selection is a host decision, so the probabilities have to come home. On
-    // a device backend that is one crossing per layer per token and is the
-    // first thing to remove when the MoE moves to the GPU.
-    ops.host_needs(&mut s.router);
 
-    // Top-k by probability, ties broken by the lower expert id — `argsort` in
-    // the reference is descending and stable, and exact ties in a softmax over
-    // 256 logits are vanishingly rare either way.
-    let mut pick: Vec<(usize, f32)> = Vec::with_capacity(m.n_expert_used);
-    for _ in 0..m.n_expert_used {
-        let mut best = usize::MAX;
-        for e in 0..m.n_expert {
-            if pick.iter().any(|(p, _)| *p == e) {
-                continue;
-            }
-            if best == usize::MAX || s.router[e] > s.router[best] {
-                best = e;
-            }
-        }
-        pick.push((best, s.router[best]));
-    }
-
-    let sum: f32 = pick.iter().map(|(_, p)| *p).sum();
-    let denom = sum.max(6.103_515_625e-5);
+    // **Selection through the seam, so the model has one path.** The rule —
+    // top-k descending, ties to the lower id, weights normalized by
+    // `max(sum, 6.103515625e-5)` — now lives in `Ops::route`'s default, which
+    // is what every CPU backend runs and is the oracle the device kernel is
+    // tested against. A backend that can choose on the card returns
+    // `Route::Device` and the probabilities never come home; nothing here
+    // changes either way, which is the point. `Route`'s doc has the contract.
+    let route = ops.route(&mut s.router, m.n_expert_used);
 
     // **The whole routed stage, one launch per step.** This was a loop over the
     // eight picks doing five ops each; on the GPU that cost 18.03 ms/token
@@ -1472,17 +1457,15 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
     // The arithmetic is untouched — each output is the same dot product of the
     // same bytes in the same order — so this is bit-exact by construction, the
     // same argument that made batching free.
-    let ids: Vec<usize> = pick.iter().map(|(e, _)| *e).collect();
-    let weights: Vec<f32> = pick.iter().map(|(_, p)| p / denom).collect();
     let ff = m.n_expert_used * m.expert_ff;
 
     // Gate, up and the SiLU gating in one call. Three launches became one, and
     // the pair never round-trips through device memory.
     let (g, u) = (&mut s.g_all[..ff], &mut s.u_all[..ff]);
-    ops.moe_glu(w.gate, w.up, &ids, x, g, u);
+    ops.moe_glu(w.gate, w.up, &route, x, g, u);
     // `x` here is one row per expert rather than one shared row, which
     // `matmul_experts` reads off the buffer length.
-    ops.matmul_experts(w.down, &ids, &s.g_all[..ff], &mut s.o_all[..m.n_expert_used * nd]);
+    ops.matmul_experts(w.down, &route, &s.g_all[..ff], &mut s.o_all[..m.n_expert_used * nd]);
 
 
     // The shared expert: always run, gated by a sigmoid of a single logit.
@@ -1507,7 +1490,7 @@ fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut
         at,
         nd,
         rows,
-        &weights,
+        &route,
         &s.e_out[..nd],
         &s.shexp_logit,
         0,
