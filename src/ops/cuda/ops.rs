@@ -78,6 +78,17 @@ mod slot {
     pub const COS: usize = 6;
     pub const SIN: usize = 7;
     pub const Q: usize = 8;
+    /// Device-side routing scratch: the ids and weights `moe_topk` writes, and
+    /// the expert addresses `moe_gather_ptrs` resolves for gate, up and down.
+    ///
+    /// One set shared by all forty layers, which is safe because a stream
+    /// executes in issue order: a layer's gather completes before its matmuls
+    /// start, and its matmuls complete before the next layer's gather.
+    pub const ROUTE_IDS: usize = 11;
+    pub const ROUTE_W: usize = 12;
+    pub const PTR_GATE: usize = 13;
+    pub const PTR_UP: usize = 14;
+    pub const PTR_DOWN: usize = 15;
 }
 
 /// One matmul shape, measured on the live device with the launch queue kept
@@ -537,7 +548,39 @@ impl Cuda {
     /// trace; this is better, because it is the policy actually running against
     /// the traffic actually generated.
     pub fn expert_stats(&self) -> Option<experts::ExpertStats> {
+        self.absorb_expert_counters();
         self.experts.borrow().as_ref().map(|c| c.stats())
+    }
+
+    /// Bring the device-side read counters home and fold them into the stats.
+    ///
+    /// **Without this the cache is unobservable.** Routing on the device means
+    /// the host never learns which experts a token read, so `hits`,
+    /// `host_reads` and the coverage distribution would all report zero — a
+    /// working cache saying nothing, which is worse than a broken one saying
+    /// so. Called from the two accessors rather than per token, because a
+    /// counter read costs a synchronize.
+    fn absorb_expert_counters(&self) {
+        let (counts_ptr, tally_ptr, n) = {
+            let b = self.experts.borrow();
+            let Some(c) = b.as_ref() else { return };
+            let n = c.counted_experts();
+            match c.counters_base() {
+                Some((counts, tally)) if n > 0 => (counts, tally, n),
+                _ => return,
+            }
+        };
+        if self.sync().is_err() {
+            return;
+        }
+        let mut counts = vec![0u32; n];
+        let mut tally = [0u64; 2];
+        if self.d2h(&mut counts, counts_ptr).is_err() || self.d2h(&mut tally, tally_ptr).is_err() {
+            return;
+        }
+        if let Some(c) = self.experts.borrow_mut().as_mut() {
+            c.absorb_counters(&counts, &tally);
+        }
     }
 
     /// Cap the expert slab, in bytes. Zero restores the automatic budget.
@@ -577,6 +620,7 @@ impl Cuda {
     /// What fraction of expert reads the busiest slab-many tensors accounted
     /// for. See [`experts::ExpertCache::coverage`].
     pub fn expert_coverage(&self) -> Option<(f64, u64)> {
+        self.absorb_expert_counters();
         self.experts.borrow().as_ref().map(|c| c.coverage())
     }
 
@@ -861,8 +905,6 @@ impl Cuda {
     ) -> Result<()> {
         const QK_K: usize = 256;
         const MAX: usize = 8;
-        let picks = self.host_picks(route, "matmul_experts")?;
-        let picks = &picks[..];
         if w.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
                 what: "matmul_experts",
@@ -873,7 +915,7 @@ impl Cuda {
                 ),
             });
         }
-        let n_used = picks.len();
+        let n_used = route.n_used();
         if n_used == 0 || n_used > MAX {
             return Err(Error::Cuda {
                 what: "matmul_experts",
@@ -888,13 +930,11 @@ impl Cuda {
         let x_stride_super = if rows == n_used { n_super } else { 0 };
         let (sd, qd, _) = self.quantized_k(x, rows * n_super)?;
 
-        // Each pick's bytes, from whichever residency holds them. A miss fills
-        // a cache slot here, which is the one place the policy touches the
-        // forward pass.
-        let mut ptrs = [0 as ffi::CUdeviceptr; MAX];
-        for (i, &e) in picks.iter().enumerate() {
-            ptrs[i] = self.expert_or_resident(&w.expert(e))?;
-        }
+        // The picks' addresses, resolved on the device from the slot table.
+        // Nothing here reads the router's output, which is what lets this
+        // launch live in a graph.
+        let table = self.expert_table(w)?;
+        let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
         self.note_shape("matmul_iq4_xs_q8_k_moe", w.n_in, w.n_out);
 
@@ -905,14 +945,7 @@ impl Cuda {
             KArg::I32(w.n_out as i32),
             KArg::I32(x_stride_super as i32),
             KArg::I32(n_used as i32),
-            KArg::Ptr(ptrs[0]),
-            KArg::Ptr(ptrs[1]),
-            KArg::Ptr(ptrs[2]),
-            KArg::Ptr(ptrs[3]),
-            KArg::Ptr(ptrs[4]),
-            KArg::Ptr(ptrs[5]),
-            KArg::Ptr(ptrs[6]),
-            KArg::Ptr(ptrs[7]),
+            KArg::Ptr(wptrs),
             KArg::Ptr(sd),
             KArg::Ptr(qd),
             KArg::Ptr(od),
@@ -942,8 +975,6 @@ impl Cuda {
         out: &mut [f32],
     ) -> Result<()> {
         const QK_K: usize = 256;
-        let picks = self.host_picks(route, "moe_glu")?;
-        let picks = &picks[..];
         const MAX: usize = 8;
         if gate.ty != GgmlType::Iq4Xs || up.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
@@ -951,7 +982,7 @@ impl Cuda {
                 detail: format!("{:?}/{:?} experts have no fused CUDA kernel", gate.ty, up.ty),
             });
         }
-        let n_used = picks.len();
+        let n_used = route.n_used();
         if n_used == 0 || n_used > MAX || gate.n_in != up.n_in || gate.n_out != up.n_out {
             return Err(Error::Cuda {
                 what: "moe_glu",
@@ -963,31 +994,28 @@ impl Cuda {
         let n_super = gate.n_in / QK_K;
         let (sd, qd, _) = self.quantized_k(x, n_super)?;
 
-        let mut gp = [0 as ffi::CUdeviceptr; MAX];
-        let mut upp = [0 as ffi::CUdeviceptr; MAX];
-        for (i, &e) in picks.iter().enumerate() {
-            gp[i] = self.expert_or_resident(&gate.expert(e))?;
-            upp[i] = self.expert_or_resident(&up.expert(e))?;
-        }
+        // Two slot tables, two gathers, both on the device. `gate` and `up` are
+        // separate tensors with separate tables, so an expert's gate and its up
+        // need not share a residency tier.
+        let gtab = self.expert_table(gate)?;
+        let utab = self.expert_table(up)?;
+        let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, slot::PTR_GATE)?;
+        let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
         self.note_shape("matmul_iq4_xs_q8_k_moe_glu", gate.n_in, gate.n_out);
 
         let block = 128u32;
         let rows_per_block = (block / 32) as usize;
-        let mut args = vec![
+        let args = [
             KArg::I32(gate.n_in as i32),
             KArg::I32(gate.n_out as i32),
             KArg::I32(n_used as i32),
+            KArg::Ptr(gptrs),
+            KArg::Ptr(uptrs),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
         ];
-        for p in gp {
-            args.push(KArg::Ptr(p));
-        }
-        for p in upp {
-            args.push(KArg::Ptr(p));
-        }
-        args.push(KArg::Ptr(sd));
-        args.push(KArg::Ptr(qd));
-        args.push(KArg::Ptr(od));
 
         // SAFETY: parameters match `matmul_iq4_xs_q8_k_moe_glu`; the grid covers
         // `n_out` rows by `n_used` experts, unused pointer slots are never
@@ -1017,13 +1045,12 @@ impl Cuda {
         logit: &[f32],
         logit_at: usize,
     ) -> Result<()> {
-        let scales = self.host_weights(route, "moe_finish")?;
-        let scales = &scales[..];
         const MAX: usize = 8;
-        if scales.is_empty() || scales.len() > MAX {
+        let n_used = route.n_used();
+        if n_used == 0 || n_used > MAX {
             return Err(Error::Cuda {
                 what: "moe_finish",
-                detail: format!("{} rows; the kernel carries at most {MAX}", scales.len()),
+                detail: format!("{n_used} rows; the kernel carries at most {MAX}"),
             });
         }
         let rd = self.mirror_in(rows)?;
@@ -1032,14 +1059,15 @@ impl Cuda {
         // `mirror_in`: only row `at` is written, so the rest of `out` must
         // already be on the device.
         let od = self.mirror_in(out)?;
-        let mut s = [0.0f32; MAX];
-        s[..scales.len()].copy_from_slice(scales);
+        // The weights come from the buffer `moe_topk` wrote, not from eight
+        // kernel arguments -- the same move as the expert pointers, and for the
+        // same reason: a graph bakes its arguments in at record time.
+        let wd = self.pooled(slot::ROUTE_W, n_used * 4)?;
         let args = [
             KArg::I32(n as i32),
-            KArg::I32(scales.len() as i32),
+            KArg::I32(n_used as i32),
             KArg::I32(at as i32),
-            KArg::F32(s[0]), KArg::F32(s[1]), KArg::F32(s[2]), KArg::F32(s[3]),
-            KArg::F32(s[4]), KArg::F32(s[5]), KArg::F32(s[6]), KArg::F32(s[7]),
+            KArg::Ptr(wd),
             KArg::Ptr(rd),
             KArg::Ptr(shd),
             KArg::Ptr(ld),
@@ -1492,6 +1520,112 @@ impl Cuda {
         self.d2h(&mut ids, idb.ptr)?;
         self.d2h(&mut weights, wb.ptr)?;
         Ok((ids, weights))
+    }
+
+    /// The device pointer table for one `Experts` tensor.
+    ///
+    /// Built on first sight, which places every one of its experts — see
+    /// [`experts::ExpertCache::table`] for why eager placement is the price of
+    /// a graph, and what it costs.
+    fn expert_table(&self, w: &Experts<'_>) -> Result<ffi::CUdeviceptr> {
+        let key = w.data.as_ptr() as usize;
+        let mut slot = self.experts.borrow_mut();
+        if slot.is_none() {
+            let (free, _) = self.mem_info()?;
+            let budget = free.saturating_sub(self.expert_reserve.get());
+            let stride = w.stride();
+            *slot = Some(experts::ExpertCache::new(
+                stride,
+                budget / stride.max(1),
+                self.expert_host_budget.get(),
+            )?);
+        }
+        let cache = match slot.as_mut() {
+            Some(c) => c,
+            None => {
+                return Err(Error::Cuda {
+                    what: "expert table",
+                    detail: "cache vanished between build and use".to_string(),
+                });
+            }
+        };
+        let before = cache.stats().filled_bytes;
+        let ptr = cache.table(key, w.data, w.n_expert)?;
+        let filled = cache.stats().filled_bytes - before;
+        drop(slot);
+        if filled > 0 {
+            self.bump(|st| {
+                st.h2d_calls += 1;
+                st.h2d_bytes += filled;
+            });
+        }
+        Ok(ptr)
+    }
+
+    /// Choose this token's experts on the device.
+    ///
+    /// The router's probabilities stay on the card, which is the whole point:
+    /// the host read they replace is the reason CUDA graphs are off for this
+    /// model. `moe_topk` reproduces [`Ops::route`]'s default exactly — see
+    /// `device_topk_reproduces_the_host_selection`.
+    fn route_impl(&self, probs: &[f32], n_used: usize) -> Result<()> {
+        let pd = self.mirror_in(probs)?;
+        let idd = self.pooled(slot::ROUTE_IDS, n_used * 4)?;
+        let wd = self.pooled(slot::ROUTE_W, n_used * 4)?;
+        let block = 256u32;
+        let args = [
+            KArg::I32(probs.len() as i32),
+            KArg::I32(n_used as i32),
+            KArg::Ptr(pd),
+            KArg::Ptr(idd),
+            KArg::Ptr(wd),
+        ];
+        // SAFETY: parameters match `moe_topk`; both outputs are `n_used` wide
+        // and the kernel writes exactly that. Shared memory is one float and
+        // one int per thread, which is what the kernel declares.
+        unsafe { self.launch_shared("moe_topk", 1, block, block * 8, &args) }
+    }
+
+    /// Resolve `n_used` chosen experts to addresses, from `table`.
+    ///
+    /// Also the only place the expert cache can still be observed. With the
+    /// picks living on the device the host never sees a read, so the kernel
+    /// counts them; `key` finds this tensor's slice of the global counters.
+    fn gather_ptrs(
+        &self,
+        key: usize,
+        table: ffi::CUdeviceptr,
+        n_used: usize,
+        into: usize,
+    ) -> Result<ffi::CUdeviceptr> {
+        let idd = self.pooled(slot::ROUTE_IDS, n_used * 4)?;
+        let out = self.pooled(into, n_used * 8)?;
+        let (vram, counts, tally, base) = match self.experts.borrow().as_ref().and_then(|c| c.counters(key)) {
+            Some(x) => x,
+            None => {
+                return Err(Error::Cuda {
+                    what: "moe_gather_ptrs",
+                    detail: "no counter slice for this expert tensor; the pool is larger \
+                             than the counter arrays and the cache would go unobserved"
+                        .to_string(),
+                });
+            }
+        };
+        let args = [
+            KArg::I32(n_used as i32),
+            KArg::I32(base as i32),
+            KArg::Ptr(table),
+            KArg::Ptr(idd),
+            KArg::Ptr(vram),
+            KArg::Ptr(counts),
+            KArg::Ptr(tally),
+            KArg::Ptr(out),
+        ];
+        // SAFETY: parameters match `moe_gather_ptrs`; one thread per pick, and
+        // the kernel returns on `e >= n_used`. `base + id` is inside the
+        // counter arrays because `table` refused a base that would not fit.
+        unsafe { self.launch("moe_gather_ptrs", 1, 32, &args)? };
+        Ok(out)
     }
 
     /// The host-side picks a `Route` carries, or an error naming the caller.
@@ -2629,6 +2763,18 @@ impl Ops for Cuda {
         self.note(self.add_scaled_impl(a, b, scale));
     }
 
+    /// Choose on the device, so the router's probabilities never come home.
+    ///
+    /// **Always, not conditionally.** Every expert has a permanent device
+    /// address from the first sight of its tensor (see
+    /// `experts::ExpertCache::table`), so there is no state in which the host
+    /// still has to resolve a pick — which is what keeps this backend on one
+    /// path rather than two that can disagree.
+    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
+        self.note(self.route_impl(probs, n_used));
+        Route::Device { n_used }
+    }
+
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
         self.note(self.matmul_experts_impl(w, route, x, out));
     }
@@ -2813,6 +2959,10 @@ impl Ops for &Cuda {
 
     fn add_scaled(&self, a: &mut [f32], b: &[f32], scale: f32) {
         (*self).add_scaled(a, b, scale)
+    }
+
+    fn route(&self, probs: &mut [f32], n_used: usize) -> Route {
+        (*self).route(probs, n_used)
     }
 
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {

@@ -228,8 +228,40 @@ pub(super) struct ExpertCache {
     hand: usize,
     blocks: Vec<HostBlock>,
     host_budget: usize,
+    /// One device pointer table per `Experts` tensor, keyed on its base
+    /// address: `n_expert` addresses a kernel can index with an id it computed
+    /// itself. Built on first sight of the tensor and never moved, because a
+    /// CUDA graph replays fixed arguments and an address that changed under it
+    /// would route a later token to an expert that has been evicted.
+    tables: HashMap<usize, DeviceBuffer>,
+    /// Where each tensor's experts start in the global counter arrays.
+    bases: HashMap<usize, usize>,
+    /// Global, one entry per placed expert: how many times a kernel resolved
+    /// it, and whether it resolved to VRAM.
+    ///
+    /// **The cache's only remaining eyes.** With selection on the device the
+    /// host never sees a read, so these are written by `moe_gather_ptrs` and
+    /// read back at report time. Sized once, generously, because growing them
+    /// would invalidate the bases already handed out.
+    counts: Option<DeviceBuffer>,
+    vram_flags: Option<DeviceBuffer>,
+    /// Two counters: reads that resolved to VRAM, and reads that resolved to
+    /// the host tier.
+    tally: Option<DeviceBuffer>,
+    next_base: usize,
+    /// The last read-back of `counts`, so `coverage` can be recomputed without
+    /// touching the driver again.
+    device_counts: Vec<u32>,
     stats: ExpertStats,
 }
+
+/// Experts the global counter arrays have room for.
+///
+/// The 35B needs 30,720. Overrunning it does not corrupt anything — a tensor
+/// past the cap simply gets no counters and [`ExpertCache::counters`] reports
+/// that it is incomplete, which is the behaviour an instrument should have when
+/// it cannot see everything.
+const COUNTER_CAP: usize = 65_536;
 
 impl ExpertCache {
     /// Allocate a slab of `slots` slots of `stride` bytes, with `host_budget`
@@ -269,6 +301,13 @@ impl ExpertCache {
             hand: 0,
             blocks: Vec::new(),
             host_budget,
+            tables: HashMap::new(),
+            bases: HashMap::new(),
+            counts: None,
+            vram_flags: None,
+            tally: None,
+            next_base: 0,
+            device_counts: Vec::new(),
             stats: ExpertStats {
                 slots: slots as u64,
                 slot_bytes: stride as u64,
@@ -300,7 +339,13 @@ impl ExpertCache {
     /// placement is the lever; near `slots / distinct` means the traffic is
     /// uniform and no policy beats capacity.
     pub fn coverage(&self) -> (f64, u64) {
-        let mut counts: Vec<u64> = self.map.values().map(|e| e.uses).collect();
+        // Device counts when routing happened on the card, `Entry::uses`
+        // otherwise. Both are read counts per expert; only the writer differs.
+        let mut counts: Vec<u64> = if self.device_counts.is_empty() {
+            self.map.values().map(|e| e.uses).collect()
+        } else {
+            self.device_counts.iter().map(|&c| u64::from(c)).collect()
+        };
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let total: u64 = counts.iter().sum();
         let top: u64 = counts.iter().take(self.owner.len()).sum();
@@ -346,7 +391,28 @@ impl ExpertCache {
             return Ok(addr);
         }
 
+        // First sight through a *read*, so it counts as a miss and as a read of
+        // whichever tier it lands in. `place` on its own does neither, because
+        // building a pointer table touches every expert of a tensor and those
+        // are not reads.
         self.stats.misses += 1;
+        let addr = self.place(key, src)?;
+        match self.map.get(&key).and_then(|e| e.slot) {
+            Some(_) => {}
+            None => self.stats.host_reads += 1,
+        }
+        Ok(addr)
+    }
+
+    /// Give `src` a permanent device address, without counting it as a read.
+    ///
+    /// Idempotent: an expert already placed keeps the address it has, which is
+    /// what lets a pointer table be built over a tensor whose hot experts are
+    /// already resident.
+    fn place(&mut self, key: usize, src: &[u8]) -> Result<ffi::CUdeviceptr> {
+        if let Some(e) = self.map.get(&key) {
+            return Ok(e.addr);
+        }
         self.stats.distinct += 1;
 
         // Tier 1: a free VRAM slot, while the slab is still filling.
@@ -358,15 +424,14 @@ impl ExpertCache {
             self.owner[slot as usize] = Some(key);
             self.referenced[slot as usize] = true;
             let addr = self.slot_ptr(slot);
-            self.map.insert(key, Entry { addr, slot: Some(slot), uses: 1 });
+            self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
             return Ok(addr);
         }
 
         // Tier 2: page-locked host memory the kernel can dereference directly.
         if let Some(addr) = self.place_on_host(src)? {
-            self.stats.host_reads += 1;
             self.stats.host_slots += 1;
-            self.map.insert(key, Entry { addr, slot: None, uses: 1 });
+            self.map.insert(key, Entry { addr, slot: None, uses: 0 });
             return Ok(addr);
         }
 
@@ -382,8 +447,116 @@ impl ExpertCache {
         self.owner[slot as usize] = Some(key);
         self.referenced[slot as usize] = true;
         let addr = self.slot_ptr(slot);
-        self.map.insert(key, Entry { addr, slot: Some(slot), uses: 1 });
+        self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
         Ok(addr)
+    }
+
+    /// The device pointer table for one `Experts` tensor, built on first sight.
+    ///
+    /// **Placing every expert of the tensor is the price of a CUDA graph.** A
+    /// graph replays a fixed sequence with no host participation, so it cannot
+    /// service a miss; every id the router could emit must already resolve to
+    /// something a kernel can dereference. Lazy placement can never satisfy
+    /// that, because an expert not yet routed to has no address.
+    ///
+    /// So this is eager, and the cost is placement *quality* rather than
+    /// correctness: tensors are seen in layer order, so VRAM fills with the
+    /// early layers and the late ones land in the host tier whether or not they
+    /// are hot. Measured at ~27% of expert reads across PCIe, which at
+    /// 26.6 GB/s is ~5.7 ms/token against the ~16.7 ms a graph returns. A
+    /// placement that knew the routing distribution would serve 99.6% of reads
+    /// from VRAM (see [`ExpertCache::coverage`]); that is a separate change
+    /// with its own measurement, deliberately not tangled into this one.
+    ///
+    /// `data` is the whole contiguous pool for this tensor, so every expert can
+    /// be addressed without ever having been routed to.
+    pub fn table(
+        &mut self,
+        key: usize,
+        data: &[u8],
+        n_expert: usize,
+    ) -> Result<ffi::CUdeviceptr> {
+        if let Some(t) = self.tables.get(&key) {
+            return Ok(t.ptr);
+        }
+        let stride = self.stride;
+        if data.len() != n_expert * stride {
+            return Err(Error::Cuda {
+                what: "expert table",
+                detail: format!(
+                    "{} bytes for {n_expert} experts of {stride}; the pool is not uniform",
+                    data.len()
+                ),
+            });
+        }
+        let mut addrs = Vec::with_capacity(n_expert);
+        let mut vram = Vec::with_capacity(n_expert);
+        for e in 0..n_expert {
+            let src = &data[e * stride..(e + 1) * stride];
+            let k = src.as_ptr() as usize;
+            addrs.push(self.place(k, src)?);
+            vram.push(i32::from(self.map.get(&k).and_then(|x| x.slot).is_some()));
+        }
+        let buf = DeviceBuffer::from_slice(&addrs)?;
+        let ptr = buf.ptr;
+        self.tables.insert(key, buf);
+
+        // Counters for this tensor's slice of the global arrays.
+        if self.counts.is_none() {
+            self.counts = Some(DeviceBuffer::zeroed(COUNTER_CAP * 4)?);
+            self.vram_flags = Some(DeviceBuffer::zeroed(COUNTER_CAP * 4)?);
+            self.tally = Some(DeviceBuffer::zeroed(2 * 8)?);
+        }
+        let base = self.next_base;
+        if base + n_expert <= COUNTER_CAP {
+            if let Some(f) = self.vram_flags.as_ref() {
+                f.write_at(base * 4, &vram)?;
+            }
+            self.bases.insert(key, base);
+            self.next_base = base + n_expert;
+        }
+        Ok(ptr)
+    }
+
+    /// The device counter arrays a gather launch writes: `(vram_flags, counts,
+    /// tally, base)`. `None` if this tensor is past [`COUNTER_CAP`].
+    pub fn counters(
+        &self,
+        key: usize,
+    ) -> Option<(ffi::CUdeviceptr, ffi::CUdeviceptr, ffi::CUdeviceptr, usize)> {
+        let base = *self.bases.get(&key)?;
+        Some((
+            self.vram_flags.as_ref()?.ptr,
+            self.counts.as_ref()?.ptr,
+            self.tally.as_ref()?.ptr,
+            base,
+        ))
+    }
+
+    /// Fold device-side read counts back into the statistics.
+    ///
+    /// `counts` is one entry per placed expert and `tally` is
+    /// `[vram_reads, host_reads]`; the caller does the copies because only it
+    /// can talk to the driver. Coverage is recomputed from `counts` rather than
+    /// from `Entry::uses`, which device routing no longer updates.
+    pub fn absorb_counters(&mut self, counts: &[u32], tally: &[u64]) {
+        if tally.len() < 2 {
+            return;
+        }
+        let (vram_reads, host_reads) = (tally[0], tally[1]);
+        self.stats.hits = vram_reads + host_reads;
+        self.stats.host_reads = host_reads;
+        self.device_counts = counts[..self.next_base.min(counts.len())].to_vec();
+    }
+
+    /// How many experts have counters, i.e. how much of the pool is observed.
+    pub fn counted_experts(&self) -> usize {
+        self.next_base
+    }
+
+    /// The global counter and tally buffers, for the read-back.
+    pub fn counters_base(&self) -> Option<(ffi::CUdeviceptr, ffi::CUdeviceptr)> {
+        Some((self.counts.as_ref()?.ptr, self.tally.as_ref()?.ptr))
     }
 
     /// Copy `src` into the host tier, growing it one block at a time.

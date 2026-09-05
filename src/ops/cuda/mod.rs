@@ -1593,6 +1593,20 @@ impl DeviceBuffer {
     }
 
     /// Allocate and fill from a host slice of plain data.
+    /// A zero-filled buffer.
+    ///
+    /// Counters have to start at zero and `cuMemAlloc` does not promise it, so
+    /// this is the difference between a read count and a read count plus
+    /// whatever the driver last left there.
+    pub fn zeroed(bytes: usize) -> Result<Self> {
+        let b = Self::new(bytes)?;
+        if bytes > 0 {
+            // SAFETY: `b.ptr` owns exactly `bytes`, which is what is cleared.
+            unsafe { check(ffi::cuMemsetD8_v2(b.ptr, 0, bytes), "cuMemsetD8")? };
+        }
+        Ok(b)
+    }
+
     pub fn from_slice<T: Copy>(data: &[T]) -> Result<Self> {
         let bytes = std::mem::size_of_val(data);
         let buf = Self::new(bytes)?;

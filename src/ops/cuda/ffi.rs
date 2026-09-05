@@ -102,6 +102,7 @@ unsafe extern "C" {
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
+    pub fn cuMemsetD8_v2(dst: CUdeviceptr, value: u8, n: usize) -> CUresult;
 
     /// Page-locked host memory, optionally mapped into the device's address
     /// space. `flags` takes [`MEMHOSTALLOC_DEVICEMAP`].

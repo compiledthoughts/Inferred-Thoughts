@@ -682,17 +682,20 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             e.slot_bytes as f64 / 1048576.0,
             gib(e.capacity_bytes()),
         );
+        // **Not a hit rate.** Every expert is placed before it can be routed
+        // to, so nothing misses; what varies is which tier a read resolves to.
+        // Printing 100% hit would be true and useless.
         eprintln!(
-            "         {:.1}% hit over {} lookups   {} misses, {} evictions",
-            100.0 * e.hit_rate(),
+            "         {} reads, {:.1}% from VRAM and {:.1}% across PCIe   {} evictions",
             e.lookups(),
-            e.misses,
+            100.0 * (1.0 - e.host_read_rate()),
+            100.0 * e.host_read_rate(),
             e.evictions,
         );
         eprintln!(
-            "         {:.2} GiB filled, {:.1} MiB/token of PCIe",
+            "         {:.2} GiB placed at load ({} tensors)",
             gib(e.filled_bytes),
-            e.filled_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
+            e.distinct,
         );
         // The host tier is the point of the two-tier design, so it is reported
         // whether or not it was used: "0 tensors" is a result, not an absence.
@@ -715,10 +718,10 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
         // actually served. See `ExpertCache::coverage`.
         if let Some((frac, reads)) = cuda.expert_coverage() {
             eprintln!(
-                "         coverage {:.1}% of {} reads go to the busiest {} tensors (first-touch got {:.1}%)",
+                "         coverage {:.1}% of {} reads would come from VRAM under an oracle placement,
+         against {:.1}% under this one",
                 100.0 * frac,
                 reads,
-                e.slots,
                 100.0 * (1.0 - e.host_read_rate()),
             );
         }

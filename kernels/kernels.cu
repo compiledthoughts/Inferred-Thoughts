@@ -1262,14 +1262,7 @@ __global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
 // `dot_iq4_xs_warp` over the same bytes in the same order.
 __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
                                        int n_used,
-                                       const unsigned char *__restrict__ w0,
-                                       const unsigned char *__restrict__ w1,
-                                       const unsigned char *__restrict__ w2,
-                                       const unsigned char *__restrict__ w3,
-                                       const unsigned char *__restrict__ w4,
-                                       const unsigned char *__restrict__ w5,
-                                       const unsigned char *__restrict__ w6,
-                                       const unsigned char *__restrict__ w7,
+                                       const unsigned long long *__restrict__ wptrs,
                                        const float *__restrict__ x_scales,
                                        const signed char *__restrict__ x_quants,
                                        float *__restrict__ out) {
@@ -1281,15 +1274,17 @@ __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
     const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
     if (j >= n_out) return;
 
-    // Eight pointers as kernel arguments rather than a device array: an array
-    // would need an upload per launch, 120 a token, to save nothing. When
-    // expert selection moves onto the device this becomes a slot-table lookup
-    // and the whole signature changes anyway.
-    const unsigned char *ws[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+    // **The expert's address comes from device memory, not from a kernel
+    // argument**, which is the whole point. `moe_gather_ptrs` filled `wptrs`
+    // from the slot table using ids `moe_topk` chose, so nothing in this launch
+    // depends on the host having seen the router's output -- and a CUDA graph,
+    // which bakes its arguments in at record time, still routes to the experts
+    // this token actually picked.
+    const unsigned char *w = (const unsigned char *)wptrs[e];
 
     const float sumf = dot_iq4_xs_warp(
         nb,
-        ws[e] + (size_t)j * nb * IQ4XS_BYTES,
+        w + (size_t)j * nb * IQ4XS_BYTES,
         x_scales + (size_t)e * x_stride_super,
         x_quants + (size_t)e * x_stride_super * QK_K,
         lane);
@@ -1314,22 +1309,8 @@ __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
 // in the same order, and `silu` was already outside the exact set for the usual
 // reason -- `expf` -- with its order untouched.
 __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
-                                           const unsigned char *__restrict__ g0,
-                                           const unsigned char *__restrict__ g1,
-                                           const unsigned char *__restrict__ g2,
-                                           const unsigned char *__restrict__ g3,
-                                           const unsigned char *__restrict__ g4,
-                                           const unsigned char *__restrict__ g5,
-                                           const unsigned char *__restrict__ g6,
-                                           const unsigned char *__restrict__ g7,
-                                           const unsigned char *__restrict__ u0,
-                                           const unsigned char *__restrict__ u1,
-                                           const unsigned char *__restrict__ u2,
-                                           const unsigned char *__restrict__ u3,
-                                           const unsigned char *__restrict__ u4,
-                                           const unsigned char *__restrict__ u5,
-                                           const unsigned char *__restrict__ u6,
-                                           const unsigned char *__restrict__ u7,
+                                           const unsigned long long *__restrict__ gptrs,
+                                           const unsigned long long *__restrict__ uptrs,
                                            const float *__restrict__ x_scales,
                                            const signed char *__restrict__ x_quants,
                                            float *__restrict__ out) {
@@ -1341,14 +1322,16 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
     const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
     if (j >= n_ff) return;
 
-    const unsigned char *gs[8] = {g0, g1, g2, g3, g4, g5, g6, g7};
-    const unsigned char *us[8] = {u0, u1, u2, u3, u4, u5, u6, u7};
+    // As `matmul_iq4_xs_q8_k_moe`: both addresses come from device memory, so
+    // this launch carries no trace of which experts were chosen.
+    const unsigned char *gw = (const unsigned char *)gptrs[e];
+    const unsigned char *uw = (const unsigned char *)uptrs[e];
     const size_t off = (size_t)j * nb * IQ4XS_BYTES;
 
     // Every expert reads the same activation here -- this is the gate/up half
     // of the FFN, before any per-expert intermediate exists.
-    const float g = dot_iq4_xs_warp(nb, gs[e] + off, x_scales, x_quants, lane);
-    const float u = dot_iq4_xs_warp(nb, us[e] + off, x_scales, x_quants, lane);
+    const float g = dot_iq4_xs_warp(nb, gw + off, x_scales, x_quants, lane);
+    const float u = dot_iq4_xs_warp(nb, uw + off, x_scales, x_quants, lane);
 
     if (lane == 0) {
         // silu(g) * u, exactly as `silu_mul` computes it.
@@ -1357,6 +1340,43 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
 }
 
 // The whole tail of a routed FFN in one launch: weighted sum of the experts,
+// Resolve this token's chosen experts to device addresses.
+//
+// `table` is one slot-table entry per expert of one `Experts` tensor -- 256 of
+// them, fixed at first sight of that tensor and never moved -- and `ids` is
+// what `moe_topk` chose. The result is the `n_used` addresses the expert
+// matmuls dereference.
+//
+// **This is the indirection that makes a CUDA graph possible.** A kernel
+// argument is baked into a graph node when the graph is recorded; a device
+// buffer is read when it is replayed. Moving the expert pointers from the
+// former to the latter is the whole difference between a graph that routes to
+// last token's experts and one that routes to this token's.
+extern "C" __global__ void moe_gather_ptrs(int n_used, int base,
+                                           const unsigned long long *__restrict__ table,
+                                           const int *__restrict__ ids,
+                                           const int *__restrict__ vram,
+                                           unsigned int *__restrict__ counts,
+                                           unsigned long long *__restrict__ tally,
+                                           unsigned long long *__restrict__ out) {
+    const int e = threadIdx.x;
+    if (e >= n_used) return;
+    const int id = ids[e];
+    out[e] = table[id];
+
+    // **Observation, not policy, and it is not optional.** The moment routing
+    // moved onto the device the host stopped learning which experts were read,
+    // so hit rate, host-read rate and the coverage distribution all silently
+    // went to zero -- a working cache reporting nothing, which is the exact
+    // failure `CLAUDE.md` catalogues four prior instances of. These two atomics
+    // are the fifth one caught rather than shipped.
+    //
+    // Cost is 8 atomics per expert tensor per token, ~960 a token, against a
+    // launch that already exists.
+    atomicAdd(&counts[base + id], 1u);
+    atomicAdd(&tally[vram[base + id] ? 0 : 1], 1ull);
+}
+
 // Top-k expert selection, on the device.
 //
 // **The one host decision left in a decode pass, and therefore the reason CUDA
@@ -1469,8 +1489,7 @@ extern "C" __global__ void moe_topk(int n_expert, int n_used,
 // then the shared expert added last. `expf` is the only inexactness and it was
 // already there.
 extern "C" __global__ void moe_finish(int n, int n_rows, int at,
-                                      float s0, float s1, float s2, float s3,
-                                      float s4, float s5, float s6, float s7,
+                                      const float *__restrict__ scales,
                                       const float *__restrict__ rows,
                                       const float *__restrict__ shared,
                                       const float *__restrict__ logit,
@@ -1478,9 +1497,12 @@ extern "C" __global__ void moe_finish(int n, int n_rows, int at,
                                       float *__restrict__ out) {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
-    const float sc[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    // From device memory rather than eight kernel arguments, for the same
+    // reason the expert pointers are: `moe_topk` wrote them and the host never
+    // saw them. The sum below is still serial and ascending, so the order the
+    // oracle uses is untouched.
     float v = 0.0f;
-    for (int e = 0; e < n_rows; ++e) v += sc[e] * rows[(size_t)e * n + j];
+    for (int e = 0; e < n_rows; ++e) v += scales[e] * rows[(size_t)e * n + j];
     const float g = 1.0f / (1.0f + expf(-logit[logit_at]));
     v += shared[j] * g;
     out[(size_t)at + j] = v;
