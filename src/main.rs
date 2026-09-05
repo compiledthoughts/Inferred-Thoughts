@@ -396,6 +396,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.rms_serial(o.rms_serial);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         cuda.null_kernels(o.null_kernels);
+        cuda.record_launches(o.device);
         let (free, total) = cuda.mem_info()?;
         let (major, minor) = cuda.capability();
         eprintln!(
@@ -527,6 +528,51 @@ device   {} kernel launches", s.launches);
          graph would hand it the previous pass's contents. MoE top-k is a host
          decision; this goes away when expert selection moves onto the device."
         );
+    }
+
+    // Replay every launch the run actually made. Complete by construction, and
+    // therefore the one attribution that cannot silently omit a kernel.
+    if o.device {
+        match cuda.bench_launches(200) {
+            Ok(b) if !b.is_empty() => {
+                eprintln!(
+                    "
+launches replayed from the run itself (after generation, so writes are moot)"
+                );
+                eprintln!(
+                    "         {:<28}{:>10}{:>9}{:>9}{:>10}{:>9}",
+                    "kernel", "grid", "calls/t", "gpu us", "ms/token", "share",
+                );
+                let total: f64 = b.iter().map(|r| r.gpu_ms_per_token(tokens)).sum();
+                for r in b.iter().take(28) {
+                    let ms = r.gpu_ms_per_token(tokens);
+                    if ms < 0.005 {
+                        continue;
+                    }
+                    eprintln!(
+                        "         {:<28}{:>10}{:>9.1}{:>9.1}{:>10.2}{:>8.1}% {}",
+                        r.kernel,
+                        format!("{}x{}", r.grid.0, r.grid.1),
+                        r.calls_per_token(tokens),
+                        r.gpu_us,
+                        ms,
+                        100.0 * ms / total.max(1e-9),
+                        if r.host_limited() { "?" } else { "" },
+                    );
+                }
+                eprintln!("         {:<28}{:>38.2} ms/token, {} distinct launches",
+                    "TOTAL", total, b.len());
+                if let Some(ms) = ms_per_token {
+                    eprintln!(
+                        "         against a {ms:.1} ms token: kernels {:.0}%, everything else {:.1} ms.
+         Compare `--null-kernels`, which measures that remainder directly.",
+                        100.0 * total / ms, ms - total,
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("         launch replay unavailable: {e}"),
+        }
     }
 
     // The self-configuring microbenchmark. Behind `--profile-device` because it

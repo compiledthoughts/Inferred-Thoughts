@@ -198,6 +198,28 @@ pub struct Cuda {
     /// Whether to synchronize after each launch and attribute the time.
     time_kernels: Cell<bool>,
 
+    /// One real launch of every distinct `(kernel, geometry)` this run issued,
+    /// with the arguments it was given, and how many times it happened.
+    ///
+    /// **Recorded rather than described, because describing kept going wrong.**
+    /// The previous bench synthesised arguments per kernel from a hand-written
+    /// table, so a kernel nobody added to that table was launched every token
+    /// and silently absent from its own accounting — `resident_bytes` missing a
+    /// map, the h2d counter missing a path, and this bench twice, most recently
+    /// omitting `matmul_iq4_xs_q8_k_moe_glu`, the largest kernel in the routed
+    /// FFN. Every one of those instruments defaulted to silence.
+    ///
+    /// Replaying the launch the backend actually made cannot be incomplete: if
+    /// it ran, it is here. The pointers stay valid because weights, mirrors and
+    /// pool slots all outlive the pass, and replaying after generation cannot
+    /// corrupt anything that is still read.
+    ///
+    /// Only populated under `--profile-device`; a `HashMap` probe per launch is
+    /// not something the forward path should pay for.
+    launches: RefCell<HashMap<(&'static str, u32, u32, u32, u32), (u64, Vec<KArg>)>>,
+    /// Whether to populate `launches`.
+    record_launches: Cell<bool>,
+
     /// Every `(kernel, n_in, n_out)` this run actually launched, and how often.
     ///
     /// **So the microbenchmark configures itself.** A hand-written bench picks
@@ -612,6 +634,8 @@ impl Cuda {
                 f32t: RefCell::new(HashMap::new()),
                 experts: RefCell::new(None),
                 shapes: RefCell::new(HashMap::new()),
+                launches: RefCell::new(HashMap::new()),
+                record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 warmups: Cell::new(0),
                 events: RefCell::new(None),
@@ -736,6 +760,16 @@ impl Cuda {
             )?
         };
         self.bump(|s| s.launches += 1);
+        if self.record_launches.get() {
+            let key = (name, grid_x, grid_y, block, shared_bytes);
+            let mut m = self.launches.borrow_mut();
+            match m.get_mut(&key) {
+                Some(e) => e.0 += 1,
+                None => {
+                    m.insert(key, (1, args.to_vec()));
+                }
+            }
+        }
         if self.time_kernels.get() {
             self.sync()?;
             let ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -791,6 +825,16 @@ impl Cuda {
             )?
         };
         self.bump(|s| s.launches += 1);
+        if self.record_launches.get() {
+            let key = (name, grid, 1, block, shared_bytes);
+            let mut m = self.launches.borrow_mut();
+            match m.get_mut(&key) {
+                Some(e) => e.0 += 1,
+                None => {
+                    m.insert(key, (1, args.to_vec()));
+                }
+            }
+        }
         if self.time_kernels.get() {
             // Synchronizing here is the whole point and also the whole cost:
             // without it the elapsed time measures the CPU-side enqueue, not

@@ -103,6 +103,36 @@ pub struct ShapeBench {
     pub group: usize,
 }
 
+/// One kernel launch the run actually made, replayed and timed.
+///
+/// See [`Cuda::bench_launches`]. Unlike [`ShapeBench`] this cannot omit a
+/// kernel: the entry exists because the launch happened.
+#[derive(Debug, Clone)]
+pub struct LaunchBench {
+    pub kernel: &'static str,
+    pub grid: (u32, u32),
+    pub block: u32,
+    /// Times this exact launch was issued during the run.
+    pub calls: u64,
+    /// Device microseconds for one launch, queue kept full, best of four.
+    pub gpu_us: f64,
+    /// Host microseconds to issue one.
+    pub issue_us: f64,
+}
+
+impl LaunchBench {
+    pub fn gpu_ms_per_token(&self, tokens: u64) -> f64 {
+        self.calls as f64 / tokens.max(1) as f64 * self.gpu_us / 1000.0
+    }
+    pub fn calls_per_token(&self, tokens: u64) -> f64 {
+        self.calls as f64 / tokens.max(1) as f64
+    }
+    /// Whether the host, not the device, limited this measurement.
+    pub fn host_limited(&self) -> bool {
+        self.gpu_us > 0.0 && self.issue_us / self.gpu_us > 0.7
+    }
+}
+
 impl ShapeBench {
     /// Whether the host, not the device, limited this measurement.
     ///
@@ -1385,6 +1415,56 @@ impl Cuda {
             .or_insert(0) += 1;
     }
 
+    /// Turn launch recording on. Costs a hash probe per launch, so it is off
+    /// unless `--profile-device` asked for it.
+    pub fn record_launches(&self, on: bool) {
+        self.record_launches.set(on);
+    }
+
+    /// Replay every launch the run actually made, and time it.
+    ///
+    /// **Complete by construction.** The previous bench synthesised arguments
+    /// from a hand-written table and therefore omitted whatever nobody added to
+    /// it — most recently `matmul_iq4_xs_q8_k_moe_glu`, the largest kernel in
+    /// the routed FFN, which made its total an undercount of unknown size and
+    /// sent a whole line of reasoning the wrong way. Here the entry exists
+    /// because the launch happened.
+    ///
+    /// Safe to run only **after** generation: replaying a kernel re-executes
+    /// its writes, so state is corrupted on purpose and nothing may read it
+    /// afterwards. Pointers stay valid because weights, mirrors, pool slots and
+    /// the expert slab all outlive the pass.
+    pub fn bench_launches(&self, reps: u32) -> Result<Vec<LaunchBench>> {
+        let recorded: Vec<((&'static str, u32, u32, u32, u32), (u64, Vec<KArg>))> = self
+            .launches
+            .borrow()
+            .iter()
+            .map(|(k, v)| (*k, (v.0, v.1.clone())))
+            .collect();
+
+        let mut out = Vec::with_capacity(recorded.len());
+        for ((kernel, gx, gy, block, shared), (calls, args)) in recorded {
+            let variants = [args];
+            let (gpu_us, issue_us) =
+                self.time_launches_2d(kernel, gx, gy, block, shared, &variants, reps)?;
+            out.push(LaunchBench {
+                kernel,
+                grid: (gx, gy),
+                block,
+                calls,
+                gpu_us,
+                issue_us,
+            });
+        }
+        // Most expensive per token first: that is the order in which they matter.
+        out.sort_by(|a, b| {
+            (b.calls as f64 * b.gpu_us)
+                .partial_cmp(&(a.calls as f64 * a.gpu_us))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(out)
+    }
+
     /// Time the shapes this run actually launched — **with no per-launch
     /// synchronize**, which is what `--profile-kernels` cannot do.
     ///
@@ -1751,6 +1831,20 @@ impl Cuda {
         variants: &[Vec<KArg>],
         reps: u32,
     ) -> Result<(f64, f64)> {
+        self.time_launches_2d(kernel, grid, 1, block, shared, variants, reps)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn time_launches_2d(
+        &self,
+        kernel: &'static str,
+        grid_x: u32,
+        grid_y: u32,
+        block: u32,
+        shared: u32,
+        variants: &[Vec<KArg>],
+        reps: u32,
+    ) -> Result<(f64, f64)> {
         // A bench is never part of a graph, and never times its own launches.
         let was_graph = self.pass_graph.replace(false);
         let was_timed = self.time_kernels.replace(false);
@@ -1772,12 +1866,9 @@ impl Cuda {
                 // SAFETY: the caller built `args`, `grid`, `block` and
                 // `shared` to match `kernel`, and sized every buffer for the
                 // shape it describes.
-                // The grouped MoE matmul puts the expert on `blockIdx.y`; every
-                // other kernel here is one-dimensional.
-                let gy = if kernel.ends_with("_moe") { 8 } else { 1 };
                 let args = &variants[(k as usize) % variants.len()];
                 // SAFETY: as above.
-                unsafe { self.launch_grid2(kernel, grid, gy, block, shared, args)? };
+                unsafe { self.launch_grid2(kernel, grid_x, grid_y, block, shared, args)? };
             }
             // Host time first: the launch loop returns once the driver has
             // accepted the work, so this is issue cost and not device time.
