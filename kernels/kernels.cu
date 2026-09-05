@@ -831,11 +831,30 @@ __global__ void kv_write_f16(int n, const float *__restrict__ src,
 // block_iq4_xs: { f16 d; uint16 scales_h; uint8 scales_l[4]; uint8 qs[128] }
 #define IQ4XS_BYTES 136
 
-// `kvalues_iq4nl` from ggml/src/ggml-common.h. A non-uniform grid -- the "IQ"
-// in IQ4_XS -- so a linear dequantization would be a different format.
-__constant__ signed char kvalues_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
-};
+// `kvalues_iq4nl` from ggml/src/ggml-common.h, held in **registers** rather
+// than `__constant__` memory. A non-uniform grid -- the "IQ" in IQ4_XS -- so a
+// linear dequantization would be a different format.
+//
+// **This lookup was 72% of the IQ4_XS matmul.** Constant memory is
+// broadcast-optimised: a read where lanes index different addresses serialises
+// into up to 32 transactions, and every lane here looks up a different nibble,
+// twice per byte, 64 times per output row. Decomposed against the real kernel
+// at its real geometry: 143.9 us baseline, 40.6 us with only this lookup
+// replaced by arithmetic, 36.9 us with all unpacking removed. The nibble split
+// and the 6-bit scale assembly cost ~4 us between them; the table cost ~103.
+//
+// Sixteen signed bytes are 128 bits, so the whole grid fits in two registers
+// and the lookup becomes a select and a shift. The values are identical, so
+// this is bit-exact by inspection as well as by test.
+//
+// Two earlier attempts at this kernel -- an alignment repack and a restructured
+// fold -- were aimed at the two things the decomposition later showed were free
+// (loads cost 2 us of 144, the ordered fold 2 us).
+__device__ __forceinline__ int kvalue_iq4nl(int i) {
+    const unsigned long long w =
+        (i < 8) ? 0xF6EADDCFBFAD9881ULL : 0x7159453526190D01ULL;
+    return (int)(signed char)((w >> ((i & 7) * 8)) & 0xffULL);
+}
 
 // Round to nearest, ties to even -- `nearest_int` in ggml/src/ggml-quants.c.
 //
@@ -1181,8 +1200,8 @@ __device__ __forceinline__ float dot_iq4_xs_warp(
         int s = 0;
         for (int k = p * 4; k < p * 4 + 4; ++k) {
             const unsigned char b = qs[qo + k];
-            s += (int)q8[ao + k]      * (int)kvalues_iq4nl[b & 0xf];
-            s += (int)q8[ao + 16 + k] * (int)kvalues_iq4nl[b >> 4];
+            s += (int)q8[ao + k]      * kvalue_iq4nl(b & 0xf);
+            s += (int)q8[ao + 16 + k] * kvalue_iq4nl(b >> 4);
         }
         s += __shfl_down_sync(0xffffffff, s, 2);
         s += __shfl_down_sync(0xffffffff, s, 1);
@@ -1401,6 +1420,235 @@ extern "C" __global__ void add_scaled_rows(int n, int n_rows, float s0, float s1
 //
 // The output is garbage, deliberately. This is a stopwatch, not a mode.
 extern "C" __global__ void noop() {}
+
+// ------------------------------------------------- IQ4_XS, decomposed
+//
+// Three variants of `matmul_iq4_xs_q8_k`, each removing exactly one thing, so
+// the question "what binds this kernel" is answered by measurement instead of
+// by a third guess. They are launched with the **recorded arguments of a real
+// launch**, at the real geometry, through the same replay path as the baseline.
+//
+// Two attempts to speed this kernel up have already failed — a repack that was
+// ruled out on an alignment argument covering only one of the three things a
+// repack does, and a fold restructure that came out 3% slower. Both were judged
+// by whole-token time, where this kernel is 8% of a token and a 20% change is
+// inside run-to-run noise.
+//
+// The answers are exclusive:
+//
+//   nounpack much faster  ->  the 4-bit split and 6-bit scale extraction cost,
+//                             and a pre-unpacked repack is the fix
+//   nofold much faster    ->  the ordered f32 chain costs, and exactness is
+//                             what we are paying for
+//   noweight much faster  ->  weight loads dominate, and coalescing is the fix
+//   none of them          ->  occupancy or launch latency, and every repack
+//                             would fail like the last two
+//
+// Output is garbage. These are stopwatches.
+
+// No bit-extraction: the weight byte is used directly instead of being split
+// into two nibbles and looked up, and the sub-block scale is taken as 1 instead
+// of being assembled from `scales_l` and `scales_h`. Same loads, same number of
+// products, same fold.
+extern "C" __global__ void dbg_iq4_nounpack(int n_in, int n_out,
+                                            const unsigned char *__restrict__ w,
+                                            const float *__restrict__ x_scales,
+                                            const signed char *__restrict__ x_quants,
+                                            float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int t = lane >> 2, p = lane & 3;
+    const int ib = (t >> 1) * 2, half = t & 1;
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned char *qs = blk + 4 + QK_K / 64;
+        const signed char *q8 = xq + (size_t)ibl * QK_K;
+        const float dh = d * xs[ibl];              // no (ls - 32)
+        const int qo = ib * 16 + half * 16;
+        const int ao = ib * 32 + half * 32;
+        int s = 0;
+        for (int k = p * 4; k < p * 4 + 4; ++k) {
+            const int b = (int)(signed char)qs[qo + k];   // no nibble split, no table
+            s += (int)q8[ao + k]      * b;
+            s += (int)q8[ao + 16 + k] * b;
+        }
+        s += __shfl_down_sync(0xffffffff, s, 2);
+        s += __shfl_down_sync(0xffffffff, s, 1);
+        const float term = dh * (float)s;
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, term, k * 4);
+            if (lane == 0) sumf += v;
+        }
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// No ordered fold: the eight `__shfl_sync` per super-block that walk the terms
+// in the oracle's order are gone. Everything else is the real kernel.
+extern "C" __global__ void dbg_iq4_nofold(int n_in, int n_out,
+                                          const unsigned char *__restrict__ w,
+                                          const float *__restrict__ x_scales,
+                                          const signed char *__restrict__ x_quants,
+                                          float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int t = lane >> 2, p = lane & 3;
+    const int ib = (t >> 1) * 2, half = t & 1;
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned int sh = (unsigned int)blk[2] | ((unsigned int)blk[3] << 8);
+        const unsigned char *scales_l = blk + 4;
+        const unsigned char *qs = blk + 4 + QK_K / 64;
+        const signed char *q8 = xq + (size_t)ibl * QK_K;
+        const unsigned int h  = sh >> (ib * 2);
+        const unsigned int lo = scales_l[ib >> 1];
+        const int ls = (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                                   : (int)((lo >> 4)  | ((h << 2) & 0x30));
+        const float dh = d * xs[ibl] * (float)(ls - 32);
+        const int qo = ib * 16 + half * 16;
+        const int ao = ib * 32 + half * 32;
+        int s = 0;
+        for (int k = p * 4; k < p * 4 + 4; ++k) {
+            const unsigned char b = qs[qo + k];
+            s += (int)q8[ao + k]      * kvalue_iq4nl(b & 0xf);
+            s += (int)q8[ao + 16 + k] * kvalue_iq4nl(b >> 4);
+        }
+        s += __shfl_down_sync(0xffffffff, s, 2);
+        s += __shfl_down_sync(0xffffffff, s, 1);
+        if (lane == 0) sumf += dh * (float)s;      // no ordered 8-way walk
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// No weight loads: `qs` is replaced by a constant, so the only bytes read are
+// the block header and the activation. Everything else is the real kernel.
+extern "C" __global__ void dbg_iq4_noweight(int n_in, int n_out,
+                                            const unsigned char *__restrict__ w,
+                                            const float *__restrict__ x_scales,
+                                            const signed char *__restrict__ x_quants,
+                                            float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int t = lane >> 2, p = lane & 3;
+    const int ib = (t >> 1) * 2, half = t & 1;
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned int sh = (unsigned int)blk[2] | ((unsigned int)blk[3] << 8);
+        const unsigned char *scales_l = blk + 4;
+        const signed char *q8 = xq + (size_t)ibl * QK_K;
+        const unsigned int h  = sh >> (ib * 2);
+        const unsigned int lo = scales_l[ib >> 1];
+        const int ls = (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                                   : (int)((lo >> 4)  | ((h << 2) & 0x30));
+        const float dh = d * xs[ibl] * (float)(ls - 32);
+        const int ao = ib * 32 + half * 32;
+        int s = 0;
+        for (int k = p * 4; k < p * 4 + 4; ++k) {
+            const unsigned char b = 0x5a;                 // no qs load
+            s += (int)q8[ao + k]      * kvalue_iq4nl(b & 0xf);
+            s += (int)q8[ao + 16 + k] * kvalue_iq4nl(b >> 4);
+        }
+        s += __shfl_down_sync(0xffffffff, s, 2);
+        s += __shfl_down_sync(0xffffffff, s, 1);
+        const float term = dh * (float)s;
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, term, k * 4);
+            if (lane == 0) sumf += v;
+        }
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
+
+// Keeps the nibble split and the 6-bit scale assembly, replaces only the
+// `kvalues_iq4nl[...]` lookup with arithmetic on the nibble.
+//
+// **Constant memory is broadcast-optimised.** A `__constant__` read where lanes
+// index different addresses is serialised into up to 32 transactions, and every
+// lane here looks up a different nibble, twice per byte. If this variant is the
+// fast one, the table is the cost and the fix is to hold it in registers.
+extern "C" __global__ void dbg_iq4_notable(int n_in, int n_out,
+                                           const unsigned char *__restrict__ w,
+                                           const float *__restrict__ x_scales,
+                                           const signed char *__restrict__ x_quants,
+                                           float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+
+    const int t = lane >> 2, p = lane & 3;
+    const int ib = (t >> 1) * 2, half = t & 1;
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * n_in;
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned int sh = (unsigned int)blk[2] | ((unsigned int)blk[3] << 8);
+        const unsigned char *scales_l = blk + 4;
+        const unsigned char *qs = blk + 4 + QK_K / 64;
+        const signed char *q8 = xq + (size_t)ibl * QK_K;
+        const unsigned int h  = sh >> (ib * 2);
+        const unsigned int lo = scales_l[ib >> 1];
+        const int ls = (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                                   : (int)((lo >> 4)  | ((h << 2) & 0x30));
+        const float dh = d * xs[ibl] * (float)(ls - 32);
+        const int qo = ib * 16 + half * 16;
+        const int ao = ib * 32 + half * 32;
+        int s = 0;
+        for (int k = p * 4; k < p * 4 + 4; ++k) {
+            const unsigned char b = qs[qo + k];
+            // arithmetic stand-in for the non-uniform grid, same shape of work
+            s += (int)q8[ao + k]      * (((int)(b & 0xf) << 4) - 120);
+            s += (int)q8[ao + 16 + k] * (((int)(b >> 4)  << 4) - 120);
+        }
+        s += __shfl_down_sync(0xffffffff, s, 2);
+        s += __shfl_down_sync(0xffffffff, s, 1);
+        const float term = dh * (float)s;
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, term, k * 4);
+            if (lane == 0) sumf += v;
+        }
+    }
+    if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
+}
 
 // ------------------------------------------------------------- diagnostics
 //

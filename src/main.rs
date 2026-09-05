@@ -575,6 +575,22 @@ launches replayed from the run itself (after generation, so writes are moot)"
         }
     }
 
+    if o.device {
+        if let Ok(v) = cuda.bench_iq4_variants(200) {
+            if v.len() >= 4 {
+                let base = v[0].1;
+                eprintln!("
+iq4_xs   decomposed, same recorded launch, one thing removed each time");
+                for (name, us) in &v {
+                    eprintln!(
+                        "         {:<22}{:>9.1} us{:>9.0}% of baseline",
+                        name, us, 100.0 * us / base.max(1e-9),
+                    );
+                }
+            }
+        }
+    }
+
     // The self-configuring microbenchmark. Behind `--profile-device` because it
     // runs real work on the device after the model has finished, which is not
     // something a plain `--profile` should do.

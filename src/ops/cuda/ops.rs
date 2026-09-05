@@ -1421,6 +1421,39 @@ impl Cuda {
         self.record_launches.set(on);
     }
 
+    /// Decompose the IQ4_XS matmul: replay its heaviest recorded launch
+    /// against variants that each remove one thing.
+    ///
+    /// Returns `(label, gpu_us)` with the baseline first. See the `dbg_iq4_*`
+    /// kernels for what each removes and what each answer would mean.
+    pub fn bench_iq4_variants(&self, reps: u32) -> Result<Vec<(&'static str, f64)>> {
+        // The heaviest recorded launch of the real kernel, by calls x geometry.
+        let pick = self
+            .launches
+            .borrow()
+            .iter()
+            .filter(|(k, _)| k.0 == "matmul_iq4_xs_q8_k")
+            .max_by_key(|(k, v)| v.0 * u64::from(k.1))
+            .map(|(k, v)| (*k, v.1.clone()));
+        let ((_, gx, gy, block, shared), args) = match pick {
+            Some(x) => x,
+            None => return Ok(Vec::new()),
+        };
+        let variants = [args];
+        let mut out = Vec::new();
+        for name in [
+            "matmul_iq4_xs_q8_k",
+            "dbg_iq4_nounpack",
+            "dbg_iq4_nofold",
+            "dbg_iq4_noweight",
+            "dbg_iq4_notable",
+        ] {
+            let (us, _) = self.time_launches_2d(name, gx, gy, block, shared, &variants, reps)?;
+            out.push((name, us));
+        }
+        Ok(out)
+    }
+
     /// Replay every launch the run actually made, and time it.
     ///
     /// **Complete by construction.** The previous bench synthesised arguments
