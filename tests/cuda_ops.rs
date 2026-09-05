@@ -1080,3 +1080,88 @@ fn device_topk_reproduces_the_host_selection() {
         }
     }
 }
+
+/// What `attn_flash` costs as decode context grows, at the 35B's attention
+/// shape.
+///
+/// **A benchmark at d512 never sees this and an agentic session never leaves
+/// it.** A real 22-turn Cline session reached 19,942 positions and decoded at
+/// 22.55 tok/s where a 200-token run reads 29.76 — a 24% loss that has to be
+/// attention, since it is the only term in the model that grows with context.
+/// The 10.8 ms/token difference over ~408 MB of live KV implies ~38 GB/s
+/// against a card measured at 409.6, but that is a difference of two whole-model
+/// runs at different depths, which is exactly the kind of two-point attribution
+/// that has been wrong three times in this repo. So: one kernel, one shape, one
+/// axis.
+///
+/// `qwen35moe`: 16 query heads, 2 kv heads, head_dim 256, kv_dim 512, and only
+/// 10 of 40 layers attend. Decode is one query row, so `n_q == 1`.
+///
+/// Prints rather than asserts — there is no correct answer here, only a curve,
+/// and a threshold would encode today's hardware.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_attention_costs_as_context_grows() {
+    const HEAD_DIM: usize = 256;
+    const N_HEAD: usize = 16;
+    const N_HEAD_KV: usize = 2;
+    const KV_DIM: usize = N_HEAD_KV * HEAD_DIM;
+    const LAYERS: usize = 10;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let depths = [512usize, 2048, 4096, 8192, 16384, 19942, 32768];
+    let max = depths.iter().copied().max().unwrap_or(0);
+
+    // f16 bits, as the cache stores them. 32768 x 512 x 2 bytes = 32 MiB each.
+    let k: Vec<u16> = (0..max * KV_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
+    let v: Vec<u16> = (0..max * KV_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
+    let q = noise(N_HEAD * HEAD_DIM, 7);
+    let mut out = vec![0.0f32; N_HEAD * HEAD_DIM];
+
+    println!("\nattn_flash, one query row, {N_HEAD}q/{N_HEAD_KV}kv x {HEAD_DIM}");
+    println!("  {:>7}  {:>9}  {:>10}  {:>9}  {:>12}", "n_pos", "us/call", "MiB read", "GB/s", "ms/token");
+    for d in depths {
+        let a = Attn {
+            q: &q,
+            k: &k,
+            v: &v,
+            kv_dim: KV_DIM,
+            n_pos: d,
+            head_dim: HEAD_DIM,
+            n_head: N_HEAD,
+            n_head_kv: N_HEAD_KV,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        };
+        // Warm the mirrors and the kernel, then time a batch with the queue
+        // full — a per-call synchronize is what makes a 20 us kernel read 100.
+        for _ in 0..3 {
+            gpu.begin_pass(1);
+            gpu.attend(&a, &mut out);
+            gpu.host_needs(&mut out);
+            gpu.end_pass();
+        }
+        const REPS: u32 = 50;
+        let t0 = std::time::Instant::now();
+        gpu.begin_pass(1);
+        for _ in 0..REPS {
+            gpu.attend(&a, &mut out);
+        }
+        gpu.end_pass();
+        gpu.host_needs(&mut out);
+        let us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(REPS);
+
+        // K and V, both f16, over the live window.
+        let bytes = (d * KV_DIM * 2 * 2) as f64;
+        println!(
+            "  {:>7}  {:>9.1}  {:>10.1}  {:>9.1}  {:>12.2}",
+            d,
+            us,
+            bytes / 1048576.0,
+            bytes / (us * 1e3),
+            us * LAYERS as f64 / 1000.0,
+        );
+    }
+    println!("  ms/token is one call x {LAYERS} attending layers.\n");
+}
