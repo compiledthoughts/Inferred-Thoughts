@@ -71,7 +71,51 @@
 //! graphable, and [`ExpertStats::degraded`] says so out loud.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
+
+/// `MADV_DONTNEED`, from `asm-generic/mman-common.h`.
+///
+/// On a `MAP_PRIVATE` file mapping this discards the resident pages; a later
+/// read faults them back from the file. So it is safe by construction here —
+/// worst case it costs a re-read of data nothing reads again.
+const MADV_DONTNEED: c_int = 4;
+
+unsafe extern "C" {
+    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+}
+
+/// Release the page cache backing `data`, keeping only whole pages inside it.
+///
+/// **Eager placement made the engine unusable on this machine without this.**
+/// Placing the pool copies 16.3 GiB out of the model's mmap — into VRAM, or
+/// into page-locked host blocks — and once that is done nothing reads those
+/// mmap pages again. But they stay resident, so the process holds the 18.8 GB
+/// file *and* 4.5 GiB of unevictable pinned memory against a 21 GB WSL VM. The
+/// kernel thrashes, `free` reaches zero, and the Windows host stalls with it.
+///
+/// Rounds the start up and the end down, because `madvise` needs a page-aligned
+/// address and dropping a partial page at either end would discard bytes
+/// belonging to a neighbouring tensor.
+///
+/// Advisory and best-effort: a failure means the pages stay, which is the
+/// behaviour before this existed, so the return value is deliberately ignored.
+fn release_pages(data: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = data.as_ptr() as usize;
+    let end = start + data.len();
+    let lo = start.div_ceil(PAGE) * PAGE;
+    let hi = end / PAGE * PAGE;
+    if hi <= lo {
+        return;
+    }
+    // SAFETY: `[lo, hi)` is a whole number of pages inside `data`, which is a
+    // live borrow of the model's mmap. `MADV_DONTNEED` on a private file
+    // mapping only discards the cached pages; the mapping stays valid and a
+    // later read re-faults from the file.
+    unsafe {
+        let _ = madvise(lo as *mut c_void, hi - lo, MADV_DONTNEED);
+    }
+}
 
 /// VRAM held back from the expert slab, in bytes.
 ///
@@ -148,6 +192,8 @@ pub struct ExpertStats {
     pub place_h2d_us: u64,
     pub place_pin_us: u64,
     pub place_copy_us: u64,
+    /// Bytes of the model's mmap handed back to the page cache after placement.
+    pub released_bytes: u64,
 }
 
 impl ExpertStats {
@@ -512,6 +558,13 @@ impl ExpertCache {
         let buf = DeviceBuffer::from_slice(&addrs)?;
         let ptr = buf.ptr;
         self.tables.insert(key, buf);
+
+        // Every expert of this tensor now lives in VRAM or in a pinned block,
+        // so its 142 MiB of mmap is dead weight. Dropping it here rather than
+        // at the end of placement keeps peak residency to one tensor rather
+        // than the whole 16.3 GiB pool.
+        release_pages(data);
+        self.stats.released_bytes += data.len() as u64;
 
         // Counters for this tensor's slice of the global arrays.
         if self.counts.is_none() {

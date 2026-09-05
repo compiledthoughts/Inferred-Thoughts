@@ -700,6 +700,10 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             e.place_pin_us as f64 / 1e6,
             e.place_copy_us as f64 / 1e6,
         );
+        eprintln!(
+            "         {:.2} GiB of mmap released after placement",
+            gib(e.released_bytes),
+        );
         // The host tier is the point of the two-tier design, so it is reported
         // whether or not it was used: "0 tensors" is a result, not an absence.
         eprintln!(
