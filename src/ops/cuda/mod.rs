@@ -145,6 +145,17 @@ pub struct Cuda {
     /// Force the warp-per-position score phase on or off. `None` picks by
     /// context depth; see `Cuda::attend_impl`.
     attn_warp: Cell<Option<bool>>,
+    /// Diagnostic: enable the warp score phase for one `attend` call only.
+    ///
+    /// **A bisector that needs no host reads.** `Ctx::trace` hands out host
+    /// slices, which on this backend are stale by design, so comparing traced
+    /// intermediates between two CUDA runs compares buffers neither run wrote.
+    /// Attention is called once per attending layer per pass, so enabling the
+    /// path for a single call index localises a divergence to a layer using
+    /// only the logits, which the model does bring home.
+    attn_warp_only: Cell<Option<usize>>,
+    /// `attend` calls so far this pass, reset by `begin_pass`.
+    attn_calls: Cell<usize>,
 
     /// Print launch and residency counters after each server turn.
     report_per_turn: Cell<bool>,
@@ -730,6 +741,8 @@ impl Cuda {
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),
                 attn_warp: Cell::new(None),
+                attn_warp_only: Cell::new(None),
+                attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),
                 model_path: RefCell::new(None),
                 passes_seen: Cell::new(0),

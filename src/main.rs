@@ -123,6 +123,13 @@ enum Command {
         /// so a tree is a different answer, not just a faster one.
         #[arg(long)]
         rms_serial: bool,
+        /// Force the one-thread-per-position attention score phase.
+        ///
+        /// The warp phase is on past `ATTN_WARP_MIN_POS` and is 1.4-3.1x
+        /// faster there; this restores the old path so the difference can be
+        /// measured end to end rather than only in the kernel bench.
+        #[arg(long)]
+        attn_thread: bool,
         /// Compute threads. 1 selects the scalar `naive` oracle directly and
         /// ignores --backend; anything more selects --backend, which must
         /// produce identical bits. 0 means physical cores, taken as half the
@@ -278,6 +285,7 @@ fn main() -> ExitCode {
             profile_device,
             profile_kernels,
             rms_serial,
+            attn_thread,
             threads,
             chat,
             show_special,
@@ -301,6 +309,7 @@ fn main() -> ExitCode {
                 device: profile_device,
                 kernels: profile_kernels,
                 rms_serial,
+                attn_thread,
                 threads,
                 chat,
                 show_special,
@@ -392,6 +401,7 @@ struct GenOpts {
     device: bool,
     kernels: bool,
     rms_serial: bool,
+    attn_thread: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -446,6 +456,9 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         let cuda = inferred_thoughts::Cuda::with_options(0, o.cuda_blocking)?;
         cuda.time_kernels(o.kernels);
         cuda.rms_serial(o.rms_serial);
+        // `Some(false)` pins the thread path; `None` leaves the depth threshold
+        // in charge, which is the shipping behaviour.
+        cuda.attn_warp(if o.attn_thread { Some(false) } else { None });
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         cuda.set_expert_host_budget((o.expert_host * 1073741824.0) as usize);
         // The KV cache is allocated lazily, at the first attention layer, which

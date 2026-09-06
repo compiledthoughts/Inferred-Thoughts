@@ -733,6 +733,12 @@ impl Cuda {
 
     /// Force the warp-per-position flash-decoding kernel on or off; `None`
     /// restores the depth-based choice. Benchmarks only — see `attend_impl`.
+    /// Diagnostic: run the warp score phase for the `n`-th `attend` call of
+    /// each pass and the thread path for every other. See `attn_warp_only`.
+    pub fn attn_warp_only(&self, n: Option<usize>) {
+        self.attn_warp_only.set(n);
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -983,19 +989,39 @@ impl Cuda {
     /// models' shapes, twelve depths and both batch shapes — 72 comparisons
     /// against `ops::naive` within the derived tolerance.
     ///
-    /// **And it fails `the_model_agrees_with_the_oracle_to_the_quantization_floor`,
-    /// with graphs on, by a whole argmax** (17689 against 5429). The op-level
-    /// test cannot see it and the cause is not yet found. So it stays off:
-    /// a kernel that disagrees with the oracle on the real model is not
-    /// shippable however fast it is, and `HANDOFF.md`'s 06-09 entry records
-    /// what was ruled out.
+    /// **It was disabled for a day by a test that could not tell drift from a
+    /// bug, and the kernel was never wrong.**
     ///
-    /// `Cuda::attn_warp` forces it on for the benchmarks and the differential
-    /// test, which is how the numbers above were taken.
-    const ATTN_WARP_MIN_POS: usize = usize::MAX;
+    /// `the_model_agrees_with_the_oracle_to_the_quantization_floor` failed by
+    /// "a whole argmax" (17689 against 5429), and the cause was its own method:
+    /// it drove decode with each run's `argmax`, so two runs differing *inside*
+    /// the floor eventually chose different tokens and then compared different
+    /// sequences. `CLAUDE.md` already records that reasoning as the reason
+    /// Stage 5's acceptance criterion was replaced.
+    ///
+    /// Established by a 2x2 rather than by argument
+    /// (`what_the_warp_attention_needs_to_fail`): the divergence needs decode
+    /// steps and is **identical with graphs on and off**, which eliminates the
+    /// suspect the previous session recorded. With the decode sequence fixed,
+    /// `the_warp_attention_agrees_when_both_runs_decode_the_same_tokens` gives
+    /// 1.69e-2 of magnitude against the same 9e-2 ceiling, and the same argmax.
+    ///
+    /// 512 is the lowest depth the speedup was measured at (1.41x). Below it the
+    /// warp loop still walks all `FD_CHUNK` positions with most guarded off, so
+    /// it is plausibly slower and is **unmeasured rather than known good**.
+    /// Crossing the threshold mid-run is safe: the two phases are one kernel
+    /// with a grid-uniform branch, and `use_warp` is an argument the graph
+    /// replay updates like any other.
+    ///
+    /// `Cuda::attn_warp` forces either path for the benchmarks and the
+    /// differential test, which is how the numbers above were taken.
+    const ATTN_WARP_MIN_POS: usize = 512;
 
     /// Whether this call uses the warp-per-position score phase.
     fn warp_scores(&self, n_pos: usize) -> bool {
+        if let Some(only) = self.attn_warp_only.get() {
+            return self.attn_calls.get() == only + 1;
+        }
         match self.attn_warp.get() {
             Some(force) => force,
             None => n_pos >= Self::ATTN_WARP_MIN_POS,
@@ -1657,6 +1683,8 @@ impl Cuda {
         // look like an unmirrored buffer and be uploaded from a stale host copy,
         // which is the bug `Ops::rope_neox` already carries a note about.
         let (n_q, per_row) = (a.n_q(), a.n_head * a.head_dim);
+        // Counted per `attend`, not per query row: one call is one layer.
+        self.attn_calls.set(self.attn_calls.get() + 1);
         for t in 0..n_q {
             let n_pos = a.n_pos_of(t);
             let qd = qd + (t * per_row * 4) as u64;
@@ -3639,6 +3667,7 @@ impl Ops for Cuda {
         // each layer is reached, so the second pass is the first moment every
         // expert is certain to be placed and the model file certain to be dead
         // weight. Once: the counter never returns to two.
+        self.attn_calls.set(0);
         self.passes_seen.set(self.passes_seen.get() + 1);
         if self.passes_seen.get() == 2 {
             if let Some(p) = self.model_path.borrow().as_ref() {

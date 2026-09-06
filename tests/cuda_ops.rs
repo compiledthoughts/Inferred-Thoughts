@@ -324,27 +324,42 @@ fn the_model_agrees_with_the_oracle_to_the_quantization_floor() {
     let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
     let tokens = tk.encode("The capital of France is", true, true);
 
-    // Twelve decode steps, which is past the point where the GPU stops
-    // launching kernels one by one and starts replaying the step as a CUDA
-    // graph. That transition is invisible to this comparison and should stay
-    // that way, so this is where it gets checked.
-    let steps = 12;
+    // **A fixed continuation, not each run's own argmax.** Twelve steps, which
+    // is past the point where the GPU replays the step as a CUDA graph, so that
+    // transition gets checked too.
+    //
+    // Driving decode with `argmax(&l)` per run made this test unable to
+    // distinguish drift from a bug, which is the exact reason `CLAUDE.md`
+    // replaced Stage 5's acceptance criterion: "an argmax would flip somewhere
+    // in 250 greedy decisions whether or not the cache is correct". Two runs
+    // that differ inside the floor eventually pick different tokens, and from
+    // then on they are processing different sequences and their logits are not
+    // comparable at all.
+    //
+    // It cost a real result. The warp attention kernel — 3x at depth, agreeing
+    // with the oracle across 72 op-level comparisons — was disabled for a day
+    // because this test failed by "a whole argmax" (17689 against 5429). With
+    // the sequence fixed it passes at 1.69e-2 of magnitude against this same
+    // 9e-2 ceiling. The kernel was never wrong; the harness could not tell.
+    let steps: Vec<u32> = tk.encode(" Paris, and the capital of Japan is Tokyo, and", false, true);
+    assert!(steps.len() >= 8, "need enough steps to cross the graph transition");
+    let n_ctx = tokens.len() + steps.len() + 4;
 
     let cpu_logits = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, Naive, tokens.len() + steps + 4, false);
+        let mut e = Engine::new(m, Naive, n_ctx, false);
         let mut l = e.prefill(&tokens).expect("prefill");
-        for _ in 0..steps {
-            l = e.decode(Qwen3::argmax(&l)).expect("decode");
+        for &t in &steps {
+            l = e.decode(t).expect("decode");
         }
         l
     };
     let gpu_logits = {
         let m = Qwen3::load(&f).expect("load model");
-        let mut e = Engine::new(m, &gpu, tokens.len() + steps + 4, false);
+        let mut e = Engine::new(m, &gpu, n_ctx, false);
         let mut l = e.prefill(&tokens).expect("prefill");
-        for _ in 0..steps {
-            l = e.decode(Qwen3::argmax(&l)).expect("decode");
+        for &t in &steps {
+            l = e.decode(t).expect("decode");
         }
         assert!(gpu.graph_active(), "the graph never engaged, so this tested the eager path");
         l
@@ -1607,4 +1622,198 @@ fn the_paired_f32_matmul_is_bit_identical() {
             }
         }
     }
+}
+
+/// **Which layer does the warp attention path break?**
+///
+/// A bisector, not an assertion. `the_warp_attention_agrees_with_the_oracle`
+/// says the kernel is right at op level across 72 comparisons; the whole-model
+/// test says the 0.6B answers a different token with it on. Both are true, so
+/// the question is *where*.
+///
+/// **It does not compare intermediates, and that is deliberate.** The first
+/// version of this test captured every tensor through `Ctx::trace` and reported
+/// that only the final logits differed — which is impossible if an accumulation
+/// order changed. `Ctx::trace` hands out *host* slices, and on this backend the
+/// host copy is stale by design, so it was comparing buffers neither run wrote.
+/// `CLAUDE.md`: never read a device result before `end_pass`.
+///
+/// So this uses the one value the model does bring home. `Cuda::attn_warp_only`
+/// runs the warp phase for a single `attend` call per pass — one call is one
+/// attending layer — and the logits are compared against an all-thread run.
+/// A layer that breaks the answer names itself.
+#[test]
+#[ignore = "needs an sm_120 device and the 0.6B; a diagnostic, run with --nocapture"]
+fn which_layer_does_the_warp_attention_break() {
+    common::model_or_skip!(path);
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is", true, true);
+
+    let run = |only: Option<usize>, force: Option<bool>| -> Vec<f32> {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(false);
+        gpu.attn_warp(force);
+        gpu.attn_warp_only(only);
+        let m = Qwen3::load(&f).expect("load model");
+        let mut e = Engine::new(m, &gpu, tokens.len() + 4, false);
+        let l = e.prefill(&tokens).expect("prefill");
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        l
+    };
+
+    let base = run(None, Some(false));
+    let all = run(None, Some(true));
+    let (w, n) = compare(&base, &all);
+    let mag = base.iter().fold(0.0f32, |m: f32, &v| m.max(v.abs()));
+    println!(
+        "  all layers warp   {n:>6} of {} differ  worst {w:e}  rel {:e}  argmax {} vs {}",
+        base.len(),
+        w / mag,
+        argmax(&base),
+        argmax(&all)
+    );
+
+    println!("
+  per-layer, warp on for one attend call only:");
+    let mut culprits = Vec::new();
+    for il in 0..28usize {
+        let got = run(Some(il), None);
+        let (worst, differ) = compare(&base, &got);
+        let rel = worst / mag;
+        let am = argmax(&got);
+        if differ > 0 {
+            println!(
+                "    layer {il:>2}  {differ:>6} differ  worst {worst:e}  rel {rel:e}  argmax {am}"
+            );
+        }
+        if rel > 9.0e-2 || am != argmax(&base) {
+            culprits.push((il, rel, am));
+        }
+    }
+    println!("
+  layers whose own warp call moves the answer past the floor: {culprits:?}");
+}
+
+/// **The 2x2 that isolates the warp attention failure.**
+///
+/// `which_layer_does_the_warp_attention_break` showed the warp path does *not*
+/// break a prefill with graphs off — argmax identical, 1.7e-2 of magnitude
+/// against a 9e-2 floor, and no single layer moves it. But
+/// `the_model_agrees_with_the_oracle_to_the_quantization_floor` fails by a
+/// whole argmax, and it differs in two ways: it decodes twelve steps after the
+/// prefill, and it runs with CUDA graphs on.
+///
+/// Two candidates, so vary both independently rather than together. The
+/// previous session's bisection changed the harness and the code at the same
+/// time and produced a comparison that "proved" two byte-identical branches
+/// behaved differently.
+#[test]
+#[ignore = "needs an sm_120 device and the 0.6B; a diagnostic, run with --nocapture"]
+fn what_the_warp_attention_needs_to_fail() {
+    common::model_or_skip!(path);
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is", true, true);
+
+    let run = |warp: bool, graphs: bool, steps: usize| -> (Vec<f32>, bool) {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(graphs);
+        gpu.attn_warp(Some(warp));
+        let m = Qwen3::load(&f).expect("load model");
+        let mut e = Engine::new(m, &gpu, tokens.len() + steps + 4, false);
+        let mut l = e.prefill(&tokens).expect("prefill");
+        for _ in 0..steps {
+            l = e.decode(Qwen3::argmax(&l)).expect("decode");
+        }
+        let active = gpu.graph_active();
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        (l, active)
+    };
+
+    println!("  {:<26} {:>12} {:>12} {:>8} {:>8}", "case", "rel", "differing", "argmax", "graph");
+    for (label, graphs, steps) in [
+        ("prefill only, no graphs", false, 0usize),
+        ("prefill only, graphs", true, 0),
+        ("+12 decode, no graphs", false, 12),
+        ("+12 decode, graphs", true, 12),
+    ] {
+        let (base, _) = run(false, graphs, steps);
+        let (warp, active) = run(true, graphs, steps);
+        let (worst, differing) = compare(&base, &warp);
+        let mag = base.iter().fold(0.0f32, |m: f32, &v| m.max(v.abs()));
+        println!(
+            "  {label:<26} {:>12e} {differing:>12} {:>4}/{:<4} {active:>8}",
+            worst / mag,
+            argmax(&base),
+            argmax(&warp),
+        );
+    }
+    println!("
+  the ceiling the model test uses is 9.0e-2 of magnitude");
+}
+
+/// **Is the warp attention wrong, or is the test that blocks it?**
+///
+/// `what_the_warp_attention_needs_to_fail` shows the divergence needs decode
+/// steps and is unaffected by CUDA graphs. But
+/// `the_model_agrees_with_the_oracle_to_the_quantization_floor` drives decode
+/// with `e.decode(Qwen3::argmax(&l))` — **each run picks its next token from
+/// its own logits.** Prefill already differs by 1.7e-2 of magnitude, inside the
+/// 9e-2 floor, and that is enough for one greedy choice to flip; after it the
+/// two runs are processing different sequences and their logits are not
+/// comparable at all.
+///
+/// `CLAUDE.md` records that reasoning as the reason Stage 5's acceptance
+/// criterion was replaced: "an argmax would flip somewhere in 250 greedy
+/// decisions whether or not the cache is correct — a failure could not
+/// distinguish drift from a bug."
+///
+/// So drive both runs with the *same* fixed tokens. If they then agree within
+/// the floor, the kernel is fine and the harness was the defect.
+#[test]
+#[ignore = "needs an sm_120 device and the 0.6B; run with --nocapture"]
+fn the_warp_attention_agrees_when_both_runs_decode_the_same_tokens() {
+    common::model_or_skip!(path);
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is", true, true);
+    // A fixed continuation, so neither run's own sampling can steer it.
+    let fixed = tk.encode(" Paris, and the capital of Japan is Tokyo, and", false, true);
+
+    let run = |warp: bool| -> Vec<f32> {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.attn_warp(Some(warp));
+        let m = Qwen3::load(&f).expect("load model");
+        let mut e = Engine::new(m, &gpu, tokens.len() + fixed.len() + 4, false);
+        let mut l = e.prefill(&tokens).expect("prefill");
+        for &t in &fixed {
+            l = e.decode(t).expect("decode");
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        l
+    };
+
+    let base = run(false);
+    let warp = run(true);
+    let (worst, differing) = compare(&base, &warp);
+    let mag = base.iter().fold(0.0f32, |m: f32, &v| m.max(v.abs()));
+    let rel = worst / mag;
+    let (a0, a1) = (
+        base.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0,
+        warp.iter().enumerate().fold((0usize, f32::MIN), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0,
+    );
+    println!(
+        "  {} decode steps, fixed tokens: {differing} of {} differ, worst {worst:e}, rel {rel:e}",
+        fixed.len(),
+        base.len()
+    );
+    println!("  argmax  thread {a0}  warp {a1}");
+
+    assert_eq!(a0, a1, "the two paths disagree on the next token even with the sequence fixed");
+    assert!(
+        rel <= 9.0e-2,
+        "warp attention differs by {rel:e} of magnitude over {} decode steps with the          sequence fixed, past the 9e-2 the quantization floor explains. This is the          version of the comparison that cannot be confounded by a flipped greedy          choice, so a failure here is the kernel.",
+        fixed.len()
+    );
 }
