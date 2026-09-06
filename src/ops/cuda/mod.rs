@@ -145,6 +145,8 @@ pub struct Cuda {
     /// Force the warp-per-position score phase on or off. `None` picks by
     /// context depth; see `Cuda::attend_impl`.
     attn_warp: Cell<Option<bool>>,
+    /// Force the untiled IQ4_XS matmul even for a batch, for the A/B.
+    iq4_untiled: Cell<bool>,
     /// Diagnostic: enable the warp score phase for one `attend` call only.
     ///
     /// **A bisector that needs no host reads.** `Ctx::trace` hands out host
@@ -741,6 +743,7 @@ impl Cuda {
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),
                 attn_warp: Cell::new(None),
+                iq4_untiled: Cell::new(false),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

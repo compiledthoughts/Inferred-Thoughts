@@ -1280,6 +1280,130 @@ __global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
     if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
 }
 
+// IQ4_XS x Q8_K with the batch in registers — the token-reuse variant.
+//
+// **The single-token kernel above re-reads its weight row once per token**, and
+// its own doc says so: "prefill weight traffic scales with the batch. Correct
+// first, and the reuse variant arrives as a measured change against this
+// baseline." Measured, on a 4,000-token 35B prefill: `matmul_iq4_xs_q8_k` is
+// **23.9% of prefill device time**, the largest single kernel, moving ~1.03 GB
+// of dense weight per token — 4.1 TB across that prompt.
+//
+// A warp loads its slice of a superblock once and dots it against `IQ4_TOK`
+// tokens, so weight traffic falls by that factor. This is what
+// `matmul_q8_0_batch` already does for Q8_0, which was 1.0% of the same run
+// precisely because it does it.
+//
+// **No shared memory, unlike the Q8_0 pair.** That kernel segments its
+// cross-block sum through shared memory because it defers partials; here lane 0
+// already folds each superblock into a running total, so `IQ4_TOK` running
+// totals live in registers and shared memory stays out of the occupancy
+// question entirely.
+//
+// **Bit-identical to the single-token kernel**, and for the reason recorded on
+// the Q8_0 one: adding a token axis changes which outputs share a weight load,
+// never how one output accumulates. Each token still walks `ibl` ascending and
+// folds the same eight lanes in the same order, so the sequence of f32
+// additions reaching `sumf[u]` is exactly the sequence the unbatched kernel
+// produces for that token. `the_batched_iq4_matmul_is_bit_identical` demands
+// equal bits rather than a tolerance.
+//
+// The nibble table is two `u64` immediates in registers (see `kvalue_iq4nl`),
+// so hoisting the unpack out of the token loop costs nothing — which matters,
+// because a `__constant__` lookup here was once 72% of this kernel.
+#define IQ4_TOK 8
+
+__global__ void matmul_iq4_xs_q8_k_batch(int n_in, int n_out, int n_tok,
+                                         const unsigned char *__restrict__ w,
+                                         const float *__restrict__ x_scales,
+                                         const signed char *__restrict__ x_quants,
+                                         float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+
+    const int t0 = blockIdx.y * IQ4_TOK;
+    int nt = n_tok - t0;
+    if (nt > IQ4_TOK) nt = IQ4_TOK;
+
+    // Lane layout is the single-token kernel's: `t` picks one of the eight
+    // sub-blocks the oracle folds in order, `p` splits its integer sum four
+    // ways. Ascending `t` is the reference's own order.
+    const int t    = lane >> 2;
+    const int p    = lane & 3;
+    const int ib   = (t >> 1) * 2;
+    const int half = t & 1;
+
+    // A running total per token, folded in ascending `ibl` exactly as the
+    // unbatched kernel folds its single one.
+    float sumf[IQ4_TOK];
+#pragma unroll
+    for (int u = 0; u < IQ4_TOK; ++u) sumf[u] = 0.0f;
+
+    const unsigned char *row = w + (size_t)j * nb * IQ4XS_BYTES;
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *blk = row + (size_t)ibl * IQ4XS_BYTES;
+        const float d = h2f((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+        const unsigned int sh = (unsigned int)blk[2] | ((unsigned int)blk[3] << 8);
+        const unsigned char *scales_l = blk + 4;
+        const unsigned char *qs = blk + 4 + QK_K / 64;
+
+        const unsigned int h  = sh >> (ib * 2);
+        const unsigned int lo = scales_l[ib >> 1];
+        const int ls = (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                                   : (int)((lo >> 4)  | ((h << 2) & 0x30));
+
+        const int qo = ib * 16 + half * 16;
+        const int ao = ib * 32 + half * 32;
+
+        // **The whole point: this lane's four weight bytes, read once.** The
+        // unbatched kernel re-reads them for every token.
+        int vlo[4], vhi[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const unsigned char b = qs[qo + p * 4 + k];
+            vlo[k] = kvalue_iq4nl(b & 0xf);
+            vhi[k] = kvalue_iq4nl(b >> 4);
+        }
+
+        for (int u = 0; u < nt; ++u) {
+            const signed char *q8 =
+                x_quants + (size_t)(t0 + u) * n_in + (size_t)ibl * QK_K;
+            // s1 and s2 in the reference, summed together: both integer, so
+            // joining them cannot round.
+            int s = 0;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                s += (int)q8[ao + p * 4 + k] * vlo[k];
+                s += (int)q8[ao + 16 + p * 4 + k] * vhi[k];
+            }
+            s += __shfl_down_sync(0xffffffff, s, 2);
+            s += __shfl_down_sync(0xffffffff, s, 1);
+
+            // `(d * xs) * (ls - 32)`, grouped as the reference groups it:
+            // `d4d8 = d * xs[ibl]` then `dh = d4d8 * (ls - 32)`.
+            const float d4d8 = d * x_scales[(size_t)(t0 + u) * nb + ibl];
+            const float dh = d4d8 * (float)(ls - 32);
+            // NOT fused, as the reference's compiler leaves it.
+            const float term = dh * (float)s;
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const float v = __shfl_sync(0xffffffff, term, k * 4);
+                if (lane == 0) sumf[u] += v;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        for (int u = 0; u < nt; ++u) {
+            out[(size_t)(t0 + u) * n_out + j] = sumf[u];
+        }
+    }
+}
+
 // The routed FFN's matmul: **every expert a token visits, in one launch.**
 //
 // Measured, and the reason this exists: issuing the eight experts one at a time

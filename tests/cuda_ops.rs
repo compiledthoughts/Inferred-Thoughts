@@ -1580,13 +1580,27 @@ fn the_paired_f32_matmul_is_bit_identical() {
         (256, 8, 24),
     ];
 
-    for (n_in, n_a, n_b) in cases {
-        let af = noise(n_in * n_a, 0x9a11 + n_a as u64);
-        let bf = noise(n_in * n_b, 0x5b22 + n_b as u64);
-        let abytes: Vec<u8> = af.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let bbytes: Vec<u8> = bf.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let wa = Weights { data: &abytes, ty: GgmlType::F32, n_in, n_out: n_a, pooled: false };
-        let wb = Weights { data: &bbytes, ty: GgmlType::F32, n_in, n_out: n_b, pooled: false };
+    // Held for the whole test: `resident_f32_t_pair` caches on both host
+    // pointers, and a per-case buffer that is dropped lets the allocator
+    // recycle an address into a later case, which then reads the earlier
+    // case's weights. This test failed once inside a full suite run and passed
+    // alone; that is the shape of a defect which depends on what allocated
+    // before it.
+    let held: Vec<(Vec<u8>, Vec<u8>)> = cases
+        .iter()
+        .map(|&(n_in, n_a, n_b)| {
+            let af = noise(n_in * n_a, 0x9a11 + n_a as u64);
+            let bf = noise(n_in * n_b, 0x5b22 + n_b as u64);
+            (
+                af.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                bf.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            )
+        })
+        .collect();
+
+    for (&(n_in, n_a, n_b), (abytes, bbytes)) in cases.iter().zip(&held) {
+        let wa = Weights { data: abytes, ty: GgmlType::F32, n_in, n_out: n_a, pooled: false };
+        let wb = Weights { data: bbytes, ty: GgmlType::F32, n_in, n_out: n_b, pooled: false };
 
         for n_tok in [1usize, 5] {
             let x = noise(n_in * n_tok, 0xc0de + n_tok as u64);
@@ -1816,4 +1830,134 @@ fn the_warp_attention_agrees_when_both_runs_decode_the_same_tokens() {
         "warp attention differs by {rel:e} of magnitude over {} decode steps with the          sequence fixed, past the 9e-2 the quantization floor explains. This is the          version of the comparison that cannot be confounded by a flipped greedy          choice, so a failure here is the kernel.",
         fixed.len()
     );
+}
+
+/// **The token-tiled IQ4_XS matmul is bit-identical to the unbatched one.**
+///
+/// `matmul_iq4_xs_q8_k_batch` loads a superblock once for `IQ4_TOK` tokens
+/// where `matmul_iq4_xs_q8_k` reloads it per token. That changes which outputs
+/// share a weight load and nothing else: each token still walks `ibl` ascending
+/// and folds the same eight lanes in the same order, so the sequence of f32
+/// additions reaching its accumulator is unchanged. Equal bits, not a
+/// tolerance — the same argument the Q8_0 pair already rests on.
+///
+/// Both sides run on the GPU here, against `Naive` as the third opinion. That
+/// matters: comparing only batched-vs-oracle would pass a kernel that is wrong
+/// in the same way the unbatched one is, and comparing only the two GPU paths
+/// would pass two kernels that are wrong together.
+///
+/// The shapes are the 35B's dense IQ4_XS in-block widths, plus a tail case
+/// where the last token tile is partial (`n_tok = 13` against `IQ4_TOK = 8`) —
+/// which is the one thing the batched kernel does that the other cannot get
+/// wrong, since it has no tile to clamp.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_batched_iq4_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // IQ4_XS: 136 bytes per 256-weight superblock.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        // A plausible f16 scale per superblock, so the arithmetic is not
+        // dominated by denormals.
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    // **Every weight buffer stays alive for the whole test.** `Cuda::resident`
+    // caches device copies keyed on the *host address*, and its doc states the
+    // precondition: callers are the mmap or a model-owned `Vec`, "so an address
+    // is never recycled underneath us". A test that allocates and drops a
+    // buffer per shape breaks exactly that — the allocator hands a later shape
+    // the same address and the cache returns the earlier shape's weights.
+    // Observed: three shapes passed and the fourth read -2.57e4 against
+    // 1.65e4, which is not a rounding difference.
+    let cases: Vec<(usize, usize)> =
+        vec![(2048, 512), (2048, 2048), (512, 2048), (2048, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x4711 + n_out as u64))
+        .collect();
+
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
+
+        for n_tok in [1usize, 2, 8, 13, 32] {
+            let x = noise(n_in * n_tok, 0x2f1a + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            // The unbatched kernel on the same data, one token at a time, which
+            // is the path decode takes and therefore the reference the batched
+            // form must not move away from.
+            let mut per_token = vec![0.0f32; n_out * n_tok];
+            for t in 0..n_tok {
+                let xs = x[t * n_in..(t + 1) * n_in].to_vec();
+                let mut one = vec![0.0f32; n_out];
+                gpu.begin_pass(1);
+                gpu.host_wrote(&xs);
+                gpu.matmul(&w, &xs, &mut one);
+                gpu.host_needs(&mut one);
+                gpu.end_pass();
+                per_token[t * n_out..(t + 1) * n_out].copy_from_slice(&one);
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            for (label, other) in [("unbatched GPU", &per_token), ("naive", &want)] {
+                let differing = got
+                    .iter()
+                    .zip(other.iter())
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                if differing > 0 {
+                    let (i, a, b) = got
+                        .iter()
+                        .zip(other.iter())
+                        .enumerate()
+                        .find(|(_, (a, b))| a.to_bits() != b.to_bits())
+                        .map(|(i, (a, b))| (i, *a, *b))
+                        .unwrap_or((0, 0.0, 0.0));
+                    println!(
+                        "  {{{n_in},{n_out}}} n_tok {n_tok} vs {label}: {differing} differ,                          first at {i}: {a:e} against {b:e} (ulps {})",
+                        (a.to_bits() as i64 - b.to_bits() as i64).abs()
+                    );
+                }
+                assert_eq!(
+                    differing, 0,
+                    "{{{n_in},{n_out}}} n_tok {n_tok}: {differing} of {} outputs differ from \
+                     {label}. Tiling tokens cannot change an accumulation, so suspect the \
+                     tail clamp (nt = n_tok - t0), the per-token activation offsets \
+                     (t0 + u), or the grouping of d * xs * (ls - 32).",
+                    got.len()
+                );
+            }
+        }
+    }
 }

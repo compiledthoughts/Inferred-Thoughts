@@ -739,6 +739,13 @@ impl Cuda {
         self.attn_warp_only.set(n);
     }
 
+    /// Force the untiled IQ4_XS matmul even for a batch. The A/B switch for
+    /// `matmul_iq4_xs_q8_k_batch`; decode is unaffected either way, since it
+    /// never reaches the tiled path.
+    pub fn iq4_untiled(&self, on: bool) {
+        self.iq4_untiled.set(on);
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -891,6 +898,48 @@ impl Cuda {
                 ],
             ),
         };
+
+        // **The token-reuse variant, and only for a batch.** IQ4_XS is the
+        // 35B's dense in-block format and `matmul_iq4_xs_q8_k` re-reads its
+        // weight row once per token — measured at **23.9% of a 4,000-token
+        // prefill**, the largest single kernel, ~1.03 GB of weight per token.
+        // `matmul_iq4_xs_q8_k_batch` loads a superblock once for `IQ4_TOK`
+        // tokens.
+        //
+        // Gated on `n_tok > 1`, which is what makes this safe for decode
+        // rather than merely tested: **decode runs the identical kernel it ran
+        // before**, so its bits, its occupancy and its recorded graph are
+        // untouched by construction. A graph only ever sees the `n_tok == 1`
+        // name, so the launch-sequence rule the merged attention kernel relies
+        // on holds here too.
+        const IQ4_TOK: usize = 8;
+        if n_tok > 1 && !self.iq4_untiled.get() && matches!(w.ty, GgmlType::Iq4Xs) {
+            let batched = "matmul_iq4_xs_q8_k_batch";
+            let bargs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(batched, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_iq4_xs_q8_k_batch`; the grid
+            // covers `n_out` rows by ceil(n_tok / IQ4_TOK) token tiles, the
+            // kernel clamps its own tail tile, and it uses no dynamic shared
+            // memory.
+            return unsafe {
+                self.launch_grid2(
+                    batched,
+                    grid_rows,
+                    n_tok.div_ceil(IQ4_TOK) as u32,
+                    block,
+                    0,
+                    &bargs,
+                )
+            };
+        }
 
         self.note_shape(name, w.n_in, w.n_out);
         // SAFETY: parameters match the named kernel; the grid covers exactly
