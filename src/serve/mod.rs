@@ -356,7 +356,22 @@ impl<O: Ops> Session<'_, O> {
                 .zip(&self.tokens)
                 .take_while(|(a, b)| a == b)
                 .count();
-            let how = self.return_to(common)?;
+            // **A cancelled turn leaves us holding more than the client sent.**
+            // `absorb` records the partial answer, so a client that cancels and
+            // resends the same prompt asks for a conversation we already have
+            // in full: `common` reaches the end of `want` while `self.tokens`
+            // runs on past it. That is a regeneration, not an empty request.
+            //
+            // Rewinding one token gives the pass something to run and returns
+            // the last position's logits, which is what generation needs. It
+            // was previously a 400, "the conversation added no new text" —
+            // found by a test that cancelled and then resent.
+            let target = if common == want_tokens.len() {
+                common.saturating_sub(1)
+            } else {
+                common
+            };
+            let how = self.return_to(target)?;
             (how, want_tokens[how.at()..].to_vec())
         };
 
@@ -681,6 +696,7 @@ fn generate<O: Ops>(
     mut logits: Vec<f32>,
     budget: usize,
     mut emit: impl FnMut(&str) -> Result<()>,
+    mut cancelled: impl FnMut() -> bool,
 ) -> Result<(String, &'static str, Vec<u32>)> {
     let eos = session.tk.eos_token_id;
     let mut shown = String::new();
@@ -688,6 +704,15 @@ fn generate<O: Ops>(
     let mut reason = "length";
 
     for _ in 0..budget {
+        // **Every token, and it costs nothing.** A peek is about a microsecond
+        // against a 25 ms token. Breaking rather than returning an error is
+        // deliberate: the engine has already consumed these tokens, so the
+        // caller must still absorb them or the next turn's prefix check fails
+        // and re-prefills the whole conversation.
+        if cancelled() {
+            reason = "cancelled";
+            break;
+        }
         let next = argmax(&logits);
         if Some(next) == eos {
             reason = "stop";
@@ -698,7 +723,20 @@ fn generate<O: Ops>(
         if let Ok(text) = session.tk.decode(&produced, false) {
             if let Some(delta) = text.strip_prefix(shown.as_str()) {
                 if !delta.is_empty() {
-                    emit(delta)?;
+                    // **A failed write is a gone client, not a server error.**
+                    // `emit(delta)?` propagated it, so `generate` returned
+                    // `Err` and the caller never reached `absorb` — leaving the
+                    // engine ahead of the session's own record, which costs the
+                    // *next* turn a full re-prefill. Observed: a client that
+                    // hung up inside the first token stopped generation
+                    // correctly and still poisoned the session.
+                    //
+                    // Both detections now land in the same place, so there is
+                    // one exit and it always absorbs.
+                    if emit(delta).is_err() {
+                        reason = "cancelled";
+                        break;
+                    }
                     shown = text;
                 }
             } else {
@@ -734,12 +772,20 @@ fn stream_completion<O: Ops>(
     let first = chunk(&id, created, &model, json!({"role": "assistant"}), None);
     sse(stream, &first)?;
 
+    // Cloned before `sink` borrows the stream mutably.
+    let probe = stream.try_clone().ok();
     let mut sink = |delta: &str| -> Result<()> {
         let c = chunk(&id, created, &model, json!({"content": delta}), None);
         sse(stream, &c)
     };
-    let (text, reason, ids) = generate(session, logits, budget, &mut sink)?;
+    let (text, reason, ids) = generate(session, logits, budget, &mut sink, || {
+        probe.as_ref().is_some_and(client_gone)
+    })?;
     session.absorb(&text, &ids);
+    if reason == "cancelled" {
+        eprintln!("chat: client went away after {} tokens; stopped", ids.len());
+        return Ok(());
+    }
 
     let last = chunk(&id, created, &model, json!({}), Some(reason));
     sse(stream, &last)?;
@@ -755,9 +801,19 @@ fn whole_completion<O: Ops>(
     opts: &ServeOpts,
 ) -> Result<()> {
     let prompt_tokens = session.consumed;
-    let (text, reason, ids) = generate(session, logits, budget, |_| Ok(()))?;
+    // **A non-streaming request writes nothing until it is finished**, so
+    // without this it cannot tell a cancelled turn from a live one, and ran the
+    // whole budget into a closed socket.
+    let probe = stream.try_clone().ok();
+    let (text, reason, ids) = generate(session, logits, budget, |_| Ok(()), || {
+        probe.as_ref().is_some_and(client_gone)
+    })?;
     let n = ids.len();
     session.absorb(&text, &ids);
+    if reason == "cancelled" {
+        eprintln!("chat: client went away after {n} tokens; stopped");
+        return Ok(());
+    }
 
     let body = json!({
         "id": completion_id(),
@@ -917,6 +973,32 @@ fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
         path: "http".to_string(),
         source,
     })
+}
+
+/// Has the client gone away?
+///
+/// **Because a generation nobody is listening to still costs a GPU.** A
+/// non-streaming request wrote nothing until it finished, so a cancelled Cline
+/// turn ran its whole budget -- 32,000 tokens, about thirteen minutes.
+/// Streaming noticed eventually, but only when a write failed, which needs the
+/// peer's RST to arrive first.
+///
+/// A zero-length peek on a non-blocking socket separates the three cases
+/// without consuming anything: `Ok(0)` is EOF, so the peer closed;
+/// `WouldBlock` is an open connection with nothing pending; `Ok(n)` means bytes
+/// are waiting, which is not a disconnect. Blocking mode is restored either
+/// way, because the paths that do get a response still have to write it.
+///
+/// Takes a `try_clone` of the stream so it can run while the emit closure holds
+/// the original mutably.
+fn client_gone(probe: &TcpStream) -> bool {
+    if probe.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    let gone = matches!(probe.peek(&mut byte), Ok(0));
+    let _ = probe.set_nonblocking(false);
+    gone
 }
 
 fn sse(stream: &mut TcpStream, value: &Value) -> Result<()> {
