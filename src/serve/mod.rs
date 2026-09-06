@@ -996,7 +996,25 @@ fn client_gone(probe: &TcpStream) -> bool {
         return false;
     }
     let mut byte = [0u8; 1];
-    let gone = matches!(probe.peek(&mut byte), Ok(0));
+    // **Four cases, and the first version only handled one of them.** It tested
+    // `Ok(0)` alone, which is a clean FIN. An aborted fetch frequently ends in
+    // a reset instead, and a reset surfaces as `Err(ConnectionReset)` — which
+    // the old code read as "still connected" and generation carried on.
+    //
+    // FreeToken's log settles that the signal is really there:
+    // "[FrontendAPI] WARNING Aborting request for user 11" one second after the
+    // user clicked cancel in the same client. So a missed cancellation is ours.
+    let gone = match probe.peek(&mut byte) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ),
+    };
+    // Restoring this is not optional: `try_clone` dups the descriptor, and
+    // O_NONBLOCK lives on the shared open file description, so leaving it set
+    // would make the *response* writes non-blocking too.
     let _ = probe.set_nonblocking(false);
     gone
 }
