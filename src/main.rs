@@ -490,7 +490,7 @@ host     {per:.2} ms/token on-CPU, {:.0}% of the {:.2} ms wall{}",
                     if o.cuda_blocking { "" } else { " (driver spins; see --cuda-blocking)" },
                 );
             }
-            report_device(&cuda, &o, n, tokens.len() as u64, r.map(|r| r.ms_per_token))?;
+            report_device(&cuda, &o, n, tokens.len() as u64, r.map(|r| r.ms_per_pass_token))?;
         }
         return run.map(|_| ());
     }
@@ -533,10 +533,39 @@ fn report_device(
     o: &GenOpts,
     tokens: u64,
     prefill_tokens: u64,
-    ms_per_token: Option<f64>,
+    ms_per_pass_token: Option<f64>,
 ) -> inferred_thoughts::Result<()> {
     let s = cuda.stats();
+    // **One-time setup comes out of the device counters, not just the phase
+    // timer.** `gpu_ns` brackets every pass with CUDA events, and the first
+    // pass carries expert placement -- 23 s of copies that are genuinely on the
+    // stream. Left in, it reported `gpu 161.25 ms/token` against a 37.08 ms
+    // decode token and concluded "the GPU is busy 435% of it".
+    //
+    // Subtracting it leaves per-token device time. Approximate in one direction
+    // and stated rather than hidden: `cuMemAlloc` is not stream work, so a
+    // couple of hundred milliseconds of the subtrahend was never counted in
+    // `gpu_ns` to begin with.
+    let (alloc, upload, place) = cuda.setup_parts();
+    let setup_ns = alloc + upload + place;
+    // Plain, for counters setup does not touch: only `d2h` bumps `wait_ns`, and
+    // placement copies go the other way.
     let per = |ns: u64| ns as f64 / tokens.max(1) as f64 / 1e6;
+    let per_dev = |ns: u64| ns.saturating_sub(setup_ns) as f64 / tokens.max(1) as f64 / 1e6;
+
+    // **Taken before anything replays a launch.** `bench_launches` re-runs every
+    // recorded launch 200 times, and `moe_gather_ptrs` carries the atomics that
+    // count expert reads -- so reading the counters afterwards reports the
+    // benchmark's traffic as the model's. Observed at 4,074,240 reads over 204
+    // tokens against a true 195,840: a token makes exactly 960 expert reads, so
+    // the figure was 20.8x high and `% from VRAM` and `MiB/token` with it.
+    //
+    // Fourteenth instrument here to report a wrong basis, and the first where
+    // one instrument corrupted another.
+    let experts = cuda.expert_stats();
+    // Same reason: `coverage` scores the per-expert read counts, which the
+    // replay inflates along with the totals.
+    let coverage = cuda.expert_coverage();
 
     if o.kernels {
         let times = cuda.kernel_times();
@@ -558,13 +587,23 @@ fn report_device(
     // point of an asynchronous API. What matters is the ratio.
     if s.passes > 0 {
         eprintln!("
-time     gpu    {:>6.2} ms/token   device stream, from CUDA events", per(s.gpu_ns));
-        eprintln!("         issue  {:>6.2} ms/token   host, launching and bookkeeping", per(s.issue_ns));
+time     gpu    {:>6.2} ms/token   device stream, net of one-time setup", per_dev(s.gpu_ns));
+        eprintln!("         issue  {:>6.2} ms/token   host, launching and bookkeeping", per_dev(s.issue_ns));
         eprintln!("         wait   {:>6.2} ms/token   host, blocked on a copy", per(s.wait_ns));
-        if let Some(total) = ms_per_token {
+        // `gpu`/`issue`/`wait` are divided by prefill + decode, because that is
+        // what the device counters accumulate over. `ms_per_token` is one
+        // decode token. Those are the same basis only when decode dominates, so
+        // the comparison is guarded exactly as the launch replay's is — the
+        // alternative is a percentage built from two different denominators,
+        // which is what printed "the GPU is busy 97%" of a token that was
+        // mostly one-time placement.
+        // Same basis on both sides now: pass tokens, net of setup. That is what
+        // makes the ratio mean something, and the two earlier versions of this
+        // line -- 435% and then 118% -- are what a mismatched one looks like.
+        if let Some(total) = ms_per_pass_token {
             eprintln!(
-                "         total  {total:>6.2} ms/token   wall clock, so the GPU is busy {:.0}% of it",
-                100.0 * per(s.gpu_ns) / total,
+                "         total  {total:>6.2} ms/token   one pass token net of setup, so the GPU is busy {:.0}% of it",
+                100.0 * per_dev(s.gpu_ns) / total,
             );
         }
     }
@@ -656,7 +695,7 @@ launches replayed from the run itself (after generation, so writes are moot)"
                 // decode token's wall clock while `total` is now normalised
                 // over prefill too, so on a long prompt these measure different
                 // things and subtracting them is meaningless.
-                match ms_per_token {
+                match ms_per_pass_token {
                     Some(ms) if prefill_tokens <= tokens => eprintln!(
                         "         against a {ms:.1} ms token: kernels {:.0}%, everything else {:.1} ms.
          Compare `--null-kernels`, which measures that remainder directly.",
@@ -804,7 +843,7 @@ setup    {:.1} ms cuMemAlloc + {:.1} ms weight copies + {:.1} ms expert placemen
         );
     }
 
-    if let Some(e) = cuda.expert_stats() {
+    if let Some(e) = experts {
         let gib = |b: u64| b as f64 / 1073741824.0;
         eprintln!(
             "
@@ -860,7 +899,7 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
         // What a placement policy that knew the routing distribution in advance
         // could have served from VRAM, against what first-touch arrival order
         // actually served. See `ExpertCache::coverage`.
-        if let Some((frac, reads)) = cuda.expert_coverage() {
+        if let Some((frac, reads)) = coverage {
             eprintln!(
                 "         coverage {:.1}% of {} reads would come from VRAM under an oracle placement,
          against {:.1}% under this one",
@@ -912,7 +951,9 @@ resident {:.0} MiB total on the device",
     );
     let seam = b.predicted_ms(&s, tokens);
     eprintln!("         seam costs {seam:.1} ms/token before any arithmetic");
-    if let Some(actual) = ms_per_token {
+    // `predicted_ms` scales by the per-pass crossing counts, so the measured
+    // figure it is compared against has to be per pass token too.
+    if let Some(actual) = ms_per_pass_token {
         eprintln!(
             "         {:.0}% of the {actual:.1} ms/token measured is moving 4 KiB about",
             100.0 * seam / actual,
@@ -968,7 +1009,6 @@ fn run_generation<O: inferred_thoughts::Ops>(
         }
     })?;
     let secs = started.elapsed().as_secs_f64();
-    let ms_per_token = secs * 1000.0 / produced.len().max(1) as f64;
     println!();
 
     // Reported, not inferred: the engine knows which of the three it was.
@@ -1016,8 +1056,26 @@ fn run_generation<O: inferred_thoughts::Ops>(
         })?;
         eprintln!("profile written to {path}");
     }
+    // **A decode token, not the run divided by the decoded tokens.** This was
+    // `wall / produced.len()`, which folds prefill and one-time setup into a
+    // number labelled "ms/token": a 5-token prompt with 25 s of expert
+    // placement and 199 decoded tokens reported 170.40 ms/token against a real
+    // decode of 38.3, and `report_device` then divided device time by it and
+    // printed "the GPU is busy 97% of it".
+    //
+    // Third wrong denominator of the same shape in this file. The other two are
+    // the prefill line (fixed by `Ops::setup_cost`) and the launch replay's
+    // normalisation, whose guard is copied below.
+    let ms_per_token = if engine.prof.decode_tokens > 0 {
+        engine.prof.decode_ns as f64 / engine.prof.decode_tokens as f64 / 1e6
+    } else {
+        secs * 1000.0 / total_tokens.max(1) as f64
+    };
+    let setup_ns = engine.prof.setup.map_or(0, |(ns, _)| ns);
+    let model_ns = (engine.prof.prefill_ns + engine.prof.decode_ns).saturating_sub(setup_ns);
     Ok(Run {
         ms_per_token,
+        ms_per_pass_token: model_ns as f64 / total_tokens.max(1) as f64 / 1e6,
         tokens: total_tokens,
     })
 }
@@ -1031,7 +1089,23 @@ fn run_generation<O: inferred_thoughts::Ops>(
 /// 1621 launches and 50% GPU occupancy where the truth was 3195 and ~98%.
 #[derive(Clone, Copy)]
 struct Run {
+    /// Wall clock of one **decode** token, from the profiler's own phase timer.
     ms_per_token: f64,
+    /// Model time per **pass token** — prefill plus decode, net of one-time
+    /// setup, divided by every token the device did work for.
+    ///
+    /// **The canonical basis for `report_device`.** Every device counter there
+    /// accumulates over passes, and so does the launch replay's total, so a
+    /// decode `ms/token` is the wrong thing to divide either by. Comparing them
+    /// printed "the GPU is busy 435% of it", then 118% after the setup was
+    /// subtracted but the prefill tokens were not — prefill costs ~285 ms a
+    /// token against decode's 38, so it dominates a figure normalised over all
+    /// of them.
+    ms_per_pass_token: f64,
+    /// Tokens the device did work for: prefill plus decode. The device counters
+    /// accumulate over every pass, so this is the divisor they want — and it is
+    /// deliberately not the divisor `ms_per_token` uses, which is why the two
+    /// may only be compared when the run is decode-dominated.
     tokens: u64,
 }
 
