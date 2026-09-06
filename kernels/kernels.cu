@@ -2161,6 +2161,75 @@ extern "C" __global__ void ssm_conv(int n_channels, int kernel,
     past[keep - 1] = x[c];
 }
 
+// `ssm_conv` over a whole batch, in one launch instead of `n_tok`.
+//
+// **The per-token loop was never a data dependency.** This is a causal
+// depthwise convolution: token `t`'s output reads a fixed window of the `keep`
+// samples before it and its own, and nothing token `t` computes feeds token
+// `t+1`. What was sequential is only the *state shift* the single-token kernel
+// performs after each output, which is why it had to run in order.
+//
+// Split those apart and the outputs are independent: one thread per (token,
+// channel), reading the window from the incoming state where the index falls
+// before the batch and from `x` where it does not. `ssm_conv_state` then writes
+// the final window once, after every output has read the old one.
+//
+// Measured on a 4,000-token 35B prefill: `ssm_conv` was 7.8% of device time
+// across **120,090 launches** — one per token per GDN layer. This makes it two
+// per layer per pass.
+//
+// Bit-identical: the taps are summed oldest-first and the current sample added
+// last, which is the single-token kernel's order exactly. Only which outputs
+// share a launch changes.
+extern "C" __global__ void ssm_conv_batch(int n_channels, int kernel, int n_tok,
+                                          const float *__restrict__ state,
+                                          const float *__restrict__ x,
+                                          const float *__restrict__ w,
+                                          float *__restrict__ out) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+    const int t = blockIdx.y;
+
+    const int keep = kernel - 1;
+    const float *past = state + (size_t)c * keep;
+    const float *wc = w + (size_t)c * kernel;
+
+    // Oldest tap first. Index `p` is relative to the batch, so `p < 0` names a
+    // sample the previous pass left in the state: `past[0]` is position -keep.
+    float sum = 0.0f;
+    for (int i = 0; i < keep; ++i) {
+        const int p = t - keep + i;
+        const float v = (p < 0) ? past[keep + p] : x[(size_t)p * n_channels + c];
+        sum += v * wc[i];
+    }
+    sum += x[(size_t)t * n_channels + c] * wc[keep];
+    out[(size_t)t * n_channels + c] = sum / (1.0f + expf(-sum));
+}
+
+// The window the next pass inherits: the last `keep` samples of this batch.
+//
+// A separate launch because every output above must read the *old* state
+// first, and kernels on one stream are ordered while threads within one are
+// not.
+extern "C" __global__ void ssm_conv_state(int n_channels, int kernel, int n_tok,
+                                          float *__restrict__ state,
+                                          const float *__restrict__ x) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+
+    const int keep = kernel - 1;
+    float *past = state + (size_t)c * keep;
+
+    // Read the whole new window before writing any of it: a short batch takes
+    // some of it from the window being overwritten.
+    float next[8];
+    for (int i = 0; i < keep; ++i) {
+        const int p = n_tok - keep + i;
+        next[i] = (p < 0) ? past[keep + p] : x[(size_t)p * n_channels + c];
+    }
+    for (int i = 0; i < keep; ++i) past[i] = next[i];
+}
+
 // The gated delta rule: one token, every value head, state updated in place.
 //
 // # The decomposition

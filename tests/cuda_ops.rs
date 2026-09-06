@@ -1961,3 +1961,128 @@ fn the_batched_iq4_matmul_is_bit_identical() {
         }
     }
 }
+
+/// **The batched `ssm_conv` reproduces the token-by-token one, bit for bit.**
+///
+/// `the_gdn_ops_agree_with_the_oracle` covers `ssm_conv` at one token, which is
+/// the shape decode uses and the shape the batched kernel never takes. The
+/// batched form was written because the per-token loop issued **120,090
+/// launches** on a 4,000-token 35B prefill — 7.8% of device time — and the
+/// dependency it appeared to have was not real: the convolution is causal over
+/// a fixed window, and only the state *shift* forced the ordering.
+///
+/// So the claim under test is that splitting output from state update changes
+/// nothing. Equal bits against the same GPU kernels run one token at a time,
+/// not a tolerance: the taps are summed oldest-first with the current sample
+/// last in both, so no accumulation moves.
+///
+/// The state is checked as carefully as the output. A conv window advanced
+/// twice, or written before every output has read it, produces plausible
+/// numbers and would show up only as slow drift in generated text — which is
+/// the failure `qwen35`'s own batched-prefill test exists to catch on the CPU
+/// side, and which nothing was catching here.
+///
+/// `n_tok = 5` with `keep = 3` is the case where the new window spans both the
+/// incoming state and the batch; `n_tok = 2` is the case where it is mostly
+/// state.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_batched_ssm_conv_matches_token_by_token() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    for kernel in [4usize, 2] {
+        let keep = kernel - 1;
+        let nc = 1024usize;
+        let w = noise(nc * kernel, 0x5c0 + kernel as u64);
+
+        for n_tok in [1usize, 2, 5, 8, 17] {
+            let x = noise(nc * n_tok, 0x9e1 + n_tok as u64);
+            let seed = noise(nc * keep, 0x33a + kernel as u64);
+
+            // **`forget_state` before each run, and it is not a formality.**
+            // `state_resident` caches device slabs keyed on the host address,
+            // so a `Vec` dropped at the end of one sub-case hands the next one
+            // a recycled address and the *previous* sub-case's device state.
+            // Without this, tokens 0..keep-1 — exactly those whose window
+            // reaches into the state — read someone else's history, and tokens
+            // past the window still match, which is what the failure looked
+            // like: 3 of 5 tokens wrong, the first 3.
+            //
+            // Third instance of this hazard in these tests today; `resident`
+            // documents the precondition it rests on, and a test is the one
+            // place short-lived buffers get made.
+            let mut s_batch = seed.clone();
+            let mut o_batch = vec![0.0f32; nc * n_tok];
+            gpu.forget_state();
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.ssm_conv(&mut s_batch, &x, &w, kernel, &mut o_batch);
+            gpu.host_needs(&mut o_batch);
+            gpu.end_pass();
+
+            // The same kernels, one token at a time — the path decode takes.
+            // A distinct buffer, so it gets its own device state: `state_resident`
+            // keys on the host address, and these must not alias.
+            let mut s_step = seed.clone();
+            let mut o_step = vec![0.0f32; nc * n_tok];
+            // Once, before the loop: inside it the device state must carry
+            // forward from token to token, which is the whole point.
+            gpu.forget_state();
+            for t in 0..n_tok {
+                let xt = x[t * nc..(t + 1) * nc].to_vec();
+                let mut ot = vec![0.0f32; nc];
+                gpu.begin_pass(1);
+                gpu.host_wrote(&xt);
+                gpu.ssm_conv(&mut s_step, &xt, &w, kernel, &mut ot);
+                gpu.host_needs(&mut ot);
+                gpu.end_pass();
+                o_step[t * nc..(t + 1) * nc].copy_from_slice(&ot);
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let differing = o_batch
+                .iter()
+                .zip(&o_step)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            if differing > 0 {
+                for t in 0..n_tok {
+                    let bad = (0..nc)
+                        .filter(|&c| {
+                            o_batch[t * nc + c].to_bits() != o_step[t * nc + c].to_bits()
+                        })
+                        .count();
+                    println!(
+                        "    kernel {kernel} n_tok {n_tok} token {t}: {bad}/{nc} differ                           batch {:e} step {:e}",
+                        o_batch[t * nc], o_step[t * nc]
+                    );
+                }
+            }
+            assert_eq!(
+                differing, 0,
+                "kernel {kernel}, n_tok {n_tok}: {differing} of {} outputs differ from the \
+                 per-token path. The window is a fixed causal span, so batching cannot \
+                 change a sum — suspect the index mapping (p < 0 reads past[keep + p]) or \
+                 the tap order.",
+                o_batch.len()
+            );
+
+            // And the window the next pass inherits.
+            gpu.read_state_into(&mut s_batch).expect("read batched state");
+            gpu.read_state_into(&mut s_step).expect("read stepwise state");
+            let sdiff = s_batch
+                .iter()
+                .zip(&s_step)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                sdiff, 0,
+                "kernel {kernel}, n_tok {n_tok}: the state left behind differs in {sdiff} of \
+                 {} values. `ssm_conv_state` must write the last `keep` samples of the batch, \
+                 reading the old window for a batch shorter than the window.",
+                s_batch.len()
+            );
+        }
+    }
+}

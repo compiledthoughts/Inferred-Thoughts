@@ -3251,15 +3251,51 @@ impl Cuda {
         let od = self.mirror_out(out)?;
         let blocks = nc.div_ceil(256) as u32;
 
-        // **Sequential in the batch**: each token convolves over the window the
-        // previous one advanced, so the tokens are launched in order against
-        // one state. The row offsets go on the device pointers rather than by
-        // sub-slicing `x` on the host, because this backend keys its mirrors on
-        // host addresses and a sub-slice would be uploaded from a stale copy.
+        // **The per-token loop was never a data dependency.** This is a causal
+        // depthwise convolution: token `t` reads a fixed window of the samples
+        // before it and feeds nothing to `t+1`. Only the *state shift* the
+        // single-token kernel does after each output forced the ordering.
         //
-        // This is `n_tok` launches where a chunked algorithm would need one.
-        // The seam takes the whole batch precisely so that stays a decision
-        // inside this file.
+        // Split apart, the outputs are independent and the state is written
+        // once, after every output has read the old one — two launches instead
+        // of `n_tok`. Measured at 7.8% of a 4,000-token prefill across 120,090
+        // launches before this.
+        //
+        // Gated on `n_tok > 1` so decode runs the identical kernel it always
+        // has, and `keep <= 8` because `ssm_conv_state` stages the new window
+        // in registers.
+        let keep = kernel - 1;
+        if n_tok > 1 && keep <= 8 {
+            let args = [
+                KArg::I32(nc as i32),
+                KArg::I32(kernel as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(sd),
+                KArg::Ptr(xd),
+                KArg::Ptr(w),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `ssm_conv_batch`; the grid is one
+            // thread per channel by `n_tok` tokens, guarded against the tail,
+            // and every index stays inside buffers sized `n_tok * nc`.
+            unsafe { self.launch_grid2("ssm_conv_batch", blocks, n_tok as u32, 256, 0, &args)? };
+            let sargs = [
+                KArg::I32(nc as i32),
+                KArg::I32(kernel as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(sd),
+                KArg::Ptr(xd),
+            ];
+            // SAFETY: parameters match `ssm_conv_state`; one thread per
+            // channel, and it runs after the launch above on the same stream,
+            // which is what makes reading the old window safe.
+            unsafe { self.launch_shared("ssm_conv_state", blocks, 256, 0, &sargs)? };
+            return Ok(());
+        }
+
+        // Row offsets go on the device pointers rather than by sub-slicing `x`
+        // on the host, because this backend keys its mirrors on host addresses
+        // and a sub-slice would be uploaded from a stale copy.
         for t in 0..n_tok {
             let args = [
                 KArg::I32(nc as i32),
