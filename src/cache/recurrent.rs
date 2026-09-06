@@ -77,6 +77,39 @@ impl RecurrentState {
         self.ssm.fill(0.0);
     }
 
+    /// The whole conv and SSM slabs, for a checkpoint.
+    ///
+    /// Whole-buffer rather than per layer because a checkpoint is all-or-
+    /// nothing: a state assembled from layers captured at different positions
+    /// would be a plausible-looking mixture of two histories, and nothing
+    /// downstream could tell.
+    pub fn slabs(&self) -> (&[f32], &[f32]) {
+        (&self.conv, &self.ssm)
+    }
+
+    /// Overwrite both slabs from a checkpoint.
+    ///
+    /// The caller must tell the backend afterwards — `Ops::forget_state` — or a
+    /// device that owns the authoritative copy will carry on from the state it
+    /// already has and ignore this entirely.
+    pub fn load(&mut self, conv: &[f32], ssm: &[f32]) -> Result<()> {
+        if conv.len() != self.conv.len() || ssm.len() != self.ssm.len() {
+            return Err(Error::InconsistentArchitecture {
+                what: "recurrent checkpoint",
+                detail: format!(
+                    "checkpoint holds {}+{} floats, this state is {}+{}",
+                    conv.len(),
+                    ssm.len(),
+                    self.conv.len(),
+                    self.ssm.len(),
+                ),
+            });
+        }
+        self.conv.copy_from_slice(conv);
+        self.ssm.copy_from_slice(ssm);
+        Ok(())
+    }
+
     pub fn conv(&self, il: usize) -> &[f32] {
         &self.conv[il * self.conv_len..(il + 1) * self.conv_len]
     }

@@ -932,6 +932,24 @@ pub trait Ops {
     /// positions, and a shorter one than last time already means a reset.
     fn forget_state(&self) {}
 
+    /// Bring a device-owned recurrent state slab home.
+    ///
+    /// The dual of [`Ops::forget_state`], and the other half of what a
+    /// checkpoint needs: `forget_state` says "the host slab is authoritative
+    /// again", this says "make the host slab authoritative".
+    ///
+    /// A no-op on every CPU backend, which writes the caller's slab directly
+    /// and has nothing to fetch. On CUDA the device copy is the authoritative
+    /// one after first touch — a GatedDeltaNet layer's state is written by
+    /// kernels and deliberately never comes home on the forward path — so
+    /// without this a checkpoint would save whatever the host slab held before
+    /// the sequence started, which is zeros. Silently: the restore would
+    /// succeed and the model would continue from an empty memory.
+    ///
+    /// Called per layer slice, because that is the granularity the device
+    /// keys its state mirrors on.
+    fn read_state(&self, _host: &mut [f32]) {}
+
     fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
         for (d, &s) in slab[offset..offset + src.len()].iter_mut().zip(src) {
             *d = crate::quant::half::f32_to_f16(s);

@@ -45,11 +45,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::engine::Engine;
+use crate::engine::{Checkpoint, Engine};
 use crate::error::{Error, Result};
 use crate::ops::Ops;
 use crate::tok::Tokenizer;
 use crate::tok::chat::ChatMl;
+
+/// Tokens between checkpoints, and the prefill slice size.
+///
+/// Sets the worst-case re-prefill after a divergence: land anywhere inside a
+/// window and the tokens back to its start are re-run. At the 35B's measured
+/// ~19 ms/token at 24k depth, 2,048 is ~39 s of worst case against the ~8
+/// minutes a full restart costs there.
+const CHECKPOINT_EVERY: usize = 2048;
+
+/// Return points kept at once.
+///
+/// One is the whole model's recurrent state — 84 MiB on the 35B, and **fixed
+/// whatever the context depth**, because the KV half of a rewind needs no copy
+/// at all. Eight is 672 MB of host memory, which on a 16 GB WSL guest already
+/// holding 4.49 GiB of pinned expert tier is affordable and not free.
+const MAX_CHECKPOINTS: usize = 8;
 
 /// What the CLI hands the server.
 pub struct ServeOpts {
@@ -214,6 +230,42 @@ fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
 /// merges into a single token, and every token after it shifts. Measured, a
 /// second turn re-ran 51 of 62 tokens that way. Comparing text sidesteps the
 /// re-tokenization entirely.
+/// How a turn picked up where the last one left off.
+///
+/// Four outcomes with very different costs, and the log has to say which:
+/// a restart at 24k positions is about eight minutes, a restore is the tokens
+/// back to the last checkpoint, and a continuation is free.
+#[derive(Clone, Copy)]
+enum Resume {
+    /// The text prefix matched: a pure continuation, nothing re-run.
+    Continued(usize),
+    /// The KV log was truncated to the divergence. Exact, and free — only
+    /// possible with no recurrent state to rewind.
+    Rewound(usize),
+    /// Returned to the newest checkpoint at or before the divergence.
+    Restored(usize),
+    /// No checkpoint was early enough. The whole conversation runs again.
+    Restarted,
+}
+
+impl Resume {
+    fn at(self) -> usize {
+        match self {
+            Resume::Continued(n) | Resume::Rewound(n) | Resume::Restored(n) => n,
+            Resume::Restarted => 0,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Resume::Continued(n) => format!("continued at {n}"),
+            Resume::Rewound(n) => format!("rewound to {n}"),
+            Resume::Restored(n) => format!("restored from checkpoint at {n}"),
+            Resume::Restarted => "restarted from zero".to_string(),
+        }
+    }
+}
+
 struct Session<'a, O: Ops> {
     engine: Engine<'a, O>,
     tk: Tokenizer,
@@ -222,32 +274,64 @@ struct Session<'a, O: Ops> {
     rendered: String,
     /// Tokens behind `rendered`, for reporting.
     consumed: usize,
+    /// The token ids the engine consumed, in order.
+    ///
+    /// Only read when the text prefix fails, which is the one case where the
+    /// re-tokenization hazard above does not matter: the conversation has
+    /// already diverged, so the question is no longer "can this be continued
+    /// exactly" but "how far back must we go".
+    tokens: Vec<u32>,
+    /// Return points, oldest first. Empty for an architecture with no
+    /// recurrent state, where `Engine::rewind` reaches any position for free.
+    checkpoints: Vec<Checkpoint>,
 }
 
 impl<O: Ops> Session<'_, O> {
     /// Bring the engine up to `want`, reusing what it has already consumed.
     ///
-    /// Returns the last token's logits, whether the session continued, and how
-    /// many tokens actually had to run.
-    fn advance(&mut self, want: &str) -> Result<(Vec<f32>, bool, usize)> {
-        let reused = !self.rendered.is_empty() && want.starts_with(self.rendered.as_str());
-        let text = if reused {
-            &want[self.rendered.len()..]
+    /// Returns the last token's logits, how it resumed, and how many tokens
+    /// actually had to run.
+    ///
+    /// **The path taken, not a position to infer it from.** The first version
+    /// returned the position and the caller worked out the label with
+    /// arithmetic, which cannot tell a continuation from a checkpoint restore —
+    /// both resume at a nonzero position and both then run the remainder. It
+    /// printed `continued at 4096` for a restore, hiding the mechanism this
+    /// exists for on the very run that first exercised it.
+    fn advance(&mut self, want: &str) -> Result<(Vec<f32>, Resume, usize)> {
+        // **The text prefix stays the fast path, and that is deliberate.**
+        // Comparing tokens instead was tried and rejected for a measured
+        // reason, recorded on `Session`: the model emits a newline, the client
+        // sends it back, and re-tokenizing merges it with the newline the next
+        // prompt opens with, shifting every token after it. A second turn
+        // re-ran 51 of 62 tokens that way. A pure continuation must not pay
+        // that, so it never re-tokenizes the prefix at all.
+        //
+        // Tokens are for the case the text prefix cannot express: divergence.
+        // The two must not drift: `return_to` truncates `tokens` to a position
+        // taken from the engine, so a mismatch would silently misalign the
+        // common-prefix scan against what was actually consumed.
+        debug_assert_eq!(self.tokens.len(), self.consumed, "token log and position disagree");
+
+        let (at_how, tokens) = if !self.rendered.is_empty() && want.starts_with(self.rendered.as_str())
+        {
+            let text = &want[self.rendered.len()..];
+            (Resume::Continued(self.consumed), self.tk.encode(text, false, true))
         } else {
-            // An edit, a branch, or a different client. Nothing here tries to
-            // rewind: a KV cache could be truncated to a common prefix, but a
-            // GatedDeltaNet layer's state is one matrix that has absorbed every
-            // token with no record of how to remove one. Restarting is the only
-            // correct move for `qwen35`, and doing the same for `qwen3` keeps
-            // one code path.
-            self.engine.reset();
-            self.consumed = 0;
-            want
+            // An edit, a branch, a condensed history, or a client that rewrote
+            // its system prompt. Before checkpoints this restarted from token
+            // zero, which at 24k positions and the measured 52 tok/s is about
+            // eight minutes.
+            let want_tokens = self.tk.encode(want, true, true);
+            let common = want_tokens
+                .iter()
+                .zip(&self.tokens)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let how = self.return_to(common)?;
+            (how, want_tokens[how.at()..].to_vec())
         };
 
-        // BOS belongs to the start of a sequence, so a continuation must not
-        // add one.
-        let tokens = self.tk.encode(text, !reused, true);
         if tokens.is_empty() {
             return Err(Error::InconsistentArchitecture {
                 what: "chat request",
@@ -255,19 +339,13 @@ impl<O: Ops> Session<'_, O> {
             });
         }
 
-        // Checked before a single token runs. A VS Code Copilot request carries
-        // a ~78,000-character system prompt -- tool definitions, the workspace
-        // file tree, terminal state -- which is ~20,000 tokens before the user
-        // has typed anything. When prefill was one forward pass per token that
-        // failure arrived three minutes in; batching made it fast rather than
-        // free, so checking up front still earns its place.
-        let need = self.consumed + tokens.len();
+        let at = at_how.at();
+        let need = at + tokens.len();
         if need > self.engine.n_ctx() {
             return Err(Error::InconsistentArchitecture {
                 what: "context",
                 detail: format!(
-                    "needs {need} tokens ({} held + {} new) but the context is {}. Restart with --ctx {} or larger",
-                    self.consumed,
+                    "needs {need} tokens ({at} held + {} new) but the context is {}. Restart with --ctx {} or larger",
                     tokens.len(),
                     self.engine.n_ctx(),
                     need.next_power_of_two(),
@@ -275,10 +353,93 @@ impl<O: Ops> Session<'_, O> {
             });
         }
 
-        let logits = self.engine.prefill(&tokens)?;
-        self.consumed += tokens.len();
+        // Prefilled in slices so a checkpoint can be taken between them. Each
+        // slice is an ordinary prefill at a later `start_pos` — the engine
+        // already chunks internally for memory — so this cannot change a bit,
+        // which `split_prefill_equals_single_prefill` pins down.
+        let mut logits = Vec::new();
+        let mut done = 0usize;
+        while done < tokens.len() {
+            let take = CHECKPOINT_EVERY.min(tokens.len() - done);
+            logits = self.engine.prefill(&tokens[done..done + take])?;
+            self.tokens.extend_from_slice(&tokens[done..done + take]);
+            done += take;
+            self.consumed += take;
+            // Not after the last slice: that state is the live one, and a
+            // checkpoint of it would be a copy of where we already are.
+            if done < tokens.len() {
+                self.take_checkpoint();
+            }
+        }
         self.rendered = want.to_string();
-        Ok((logits, reused, tokens.len()))
+        Ok((logits, at_how, tokens.len()))
+    }
+
+    /// Put the engine back at or before `common`, and say where it landed.
+    ///
+    /// Two mechanisms, tried in order, because they cost differently:
+    ///
+    ///   attention layers only   `rewind` truncates the KV log to any position,
+    ///                           free, exact — `qwen3` never needs a checkpoint
+    ///   recurrent state         only a saved copy will do, so the best
+    ///                           available is the newest checkpoint at or
+    ///                           before the divergence
+    ///
+    /// Falls back to a full reset when no checkpoint is early enough, which is
+    /// the old behaviour and is still correct.
+    fn return_to(&mut self, common: usize) -> Result<Resume> {
+        if self.engine.rewind(common) {
+            self.tokens.truncate(common);
+            self.consumed = common;
+            return Ok(Resume::Rewound(common));
+        }
+        if let Some(i) = self
+            .checkpoints
+            .iter()
+            .rposition(|c| c.pos() <= common && c.pos() > 0)
+        {
+            let c = self.checkpoints[i].clone();
+            self.engine.restore(&c)?;
+            self.checkpoints.truncate(i + 1);
+            self.tokens.truncate(c.pos());
+            self.consumed = c.pos();
+            return Ok(Resume::Restored(c.pos()));
+        }
+        self.engine.reset();
+        self.checkpoints.clear();
+        self.tokens.clear();
+        self.consumed = 0;
+        Ok(Resume::Restarted)
+    }
+
+    /// Save a return point, keeping at most [`MAX_CHECKPOINTS`].
+    ///
+    /// When full, every second one is dropped, keeping the newest. The ladder
+    /// then spans the whole conversation at half the resolution rather than
+    /// covering only its start or only its end — a divergence can land
+    /// anywhere: early when a client rewrites its system prompt, late when it
+    /// appends a tool result, in the middle when it condenses history.
+    ///
+    /// Repeated thinning leaves recent points dense and old ones sparse, which
+    /// is the right bias: the cost of landing between two checkpoints is the
+    /// tokens back to the earlier one, and re-running old tokens is no cheaper
+    /// than re-running recent ones.
+    fn take_checkpoint(&mut self) {
+        let Some(c) = self.engine.checkpoint() else {
+            // No recurrent state: `rewind` reaches any position for free and a
+            // checkpoint would copy nothing.
+            return;
+        };
+        self.checkpoints.push(c);
+        if self.checkpoints.len() > MAX_CHECKPOINTS {
+            let mut keep = Vec::with_capacity(MAX_CHECKPOINTS);
+            for (i, c) in self.checkpoints.drain(..).enumerate() {
+                if i % 2 == 1 || i + 1 == MAX_CHECKPOINTS + 1 {
+                    keep.push(c);
+                }
+            }
+            self.checkpoints = keep;
+        }
     }
 
     /// Record what the model produced, so the next turn sees it as a prefix.
@@ -286,9 +447,13 @@ impl<O: Ops> Session<'_, O> {
     /// The turn-ending marker is deliberately *not* added: generation stops
     /// before consuming it, so the engine has not seen it, and the next
     /// request's rendering supplies it as part of the new text.
-    fn absorb(&mut self, text: &str, tokens: usize) {
+    fn absorb(&mut self, text: &str, ids: &[u32]) {
         self.rendered.push_str(text);
-        self.consumed += tokens;
+        self.consumed += ids.len();
+        // The engine consumed these, so the next turn's common-prefix scan has
+        // to see them. Without this every turn would diverge at the start of
+        // the model's own previous answer.
+        self.tokens.extend_from_slice(ids);
     }
 }
 
@@ -314,6 +479,8 @@ pub fn serve<O: Ops>(
         tk,
         chat,
         rendered: String::new(),
+        tokens: Vec::new(),
+        checkpoints: Vec::new(),
         consumed: 0,
     };
 
@@ -441,7 +608,7 @@ fn chat_completions<O: Ops>(
     if approx > 2048 {
         eprintln!("chat: ~{approx} new tokens to prefill; this will take a while");
     }
-    let (logits, reused, fresh) = match session.advance(&want) {
+    let (logits, how, fresh) = match session.advance(&want) {
         Ok(v) => v,
         Err(e) => {
             return send_json(stream, 400, &json!({"error": {"message": e.to_string()}}));
@@ -450,7 +617,7 @@ fn chat_completions<O: Ops>(
     eprintln!(
         "chat: {} turns, {fresh} new tokens ({}), budget {budget}",
         turns.len(),
-        if reused { "continued" } else { "restarted" },
+        how.label(),
     );
 
     let r = if req.stream {
@@ -475,7 +642,7 @@ fn generate<O: Ops>(
     mut logits: Vec<f32>,
     budget: usize,
     mut emit: impl FnMut(&str) -> Result<()>,
-) -> Result<(String, &'static str, usize)> {
+) -> Result<(String, &'static str, Vec<u32>)> {
     let eos = session.tk.eos_token_id;
     let mut shown = String::new();
     let mut produced: Vec<u32> = Vec::new();
@@ -506,8 +673,9 @@ fn generate<O: Ops>(
         }
         logits = session.engine.decode(next)?;
     }
-    let n = produced.len();
-    Ok((shown, reason, n))
+    // The ids, not just how many: the next turn's common-prefix scan needs to
+    // see what the engine consumed, and the model's own output is part of that.
+    Ok((shown, reason, produced))
 }
 
 fn stream_completion<O: Ops>(
@@ -531,8 +699,8 @@ fn stream_completion<O: Ops>(
         let c = chunk(&id, created, &model, json!({"content": delta}), None);
         sse(stream, &c)
     };
-    let (text, reason, n) = generate(session, logits, budget, &mut sink)?;
-    session.absorb(&text, n);
+    let (text, reason, ids) = generate(session, logits, budget, &mut sink)?;
+    session.absorb(&text, &ids);
 
     let last = chunk(&id, created, &model, json!({}), Some(reason));
     sse(stream, &last)?;
@@ -548,8 +716,9 @@ fn whole_completion<O: Ops>(
     opts: &ServeOpts,
 ) -> Result<()> {
     let prompt_tokens = session.consumed;
-    let (text, reason, n) = generate(session, logits, budget, |_| Ok(()))?;
-    session.absorb(&text, n);
+    let (text, reason, ids) = generate(session, logits, budget, |_| Ok(()))?;
+    let n = ids.len();
+    session.absorb(&text, &ids);
 
     let body = json!({
         "id": completion_id(),

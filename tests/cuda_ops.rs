@@ -1468,3 +1468,58 @@ fn argmax(v: &[f32]) -> usize {
     }
     best
 }
+
+/// The same self-consistency check on CUDA, where the failure mode actually
+/// lives.
+///
+/// `restoring_a_checkpoint_reproduces_the_continuation` in `qwen35.rs` runs on
+/// `Spin`, where the recurrent state is the very slab the model writes and a
+/// checkpoint cannot miss it. **On CUDA the device copy is authoritative** — the
+/// state is written by kernels and never comes home on the forward path — so
+/// this is the version that would actually catch a checkpoint saving zeros, or
+/// a restore the device ignored because nobody invalidated its copy.
+///
+/// It also covers the fix that came out of the first server run: `forget_state`
+/// bumps a generation rather than freeing the state buffers, so a restore
+/// re-uploads into the allocation that already exists. If that ever regresses
+/// to a stale pointer this fails rather than reading freed memory.
+#[test]
+#[ignore = "needs an sm_120 device and the real 9B"]
+fn restoring_a_checkpoint_reproduces_the_continuation_on_the_device() {
+    use inferred_thoughts::Model;
+
+    let Some(path) = common::find_model_named("Qwen3.5-9B-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.5-9B-Q8_0.gguf found");
+        return;
+    };
+    let gpu = Cuda::new(0).expect("cuda device");
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode(
+        "The capital of France is Paris, and the capital of Japan is Tokyo, and the capital of",
+        true,
+        true,
+    );
+    let split = tokens.len() / 2;
+
+    let m = Model::load(&f).expect("load model");
+    let mut e = Engine::new(m, &gpu, tokens.len() + 8, false);
+    e.prefill(&tokens[..split]).expect("prefill the prefix");
+    let cp = e.checkpoint().expect("the 9B has recurrent state");
+
+    let first = e.prefill(&tokens[split..]).expect("continue");
+    e.restore(&cp).expect("restore");
+    let second = e.prefill(&tokens[split..]).expect("continue again");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    let differing = first
+        .iter()
+        .zip(&second)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} of {} logits differ after a device checkpoint round trip. The          recurrent state is the only thing a restore has to carry: check that          Ops::read_state brought it home before the copy, and that forget_state made          the device re-read the host slab afterwards.",
+        first.len()
+    );
+}

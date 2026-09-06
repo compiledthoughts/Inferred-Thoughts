@@ -2902,12 +2902,26 @@ impl Cuda {
     /// sequence reset visible.
     fn state_resident(&self, host: &[f32]) -> Result<ffi::CUdeviceptr> {
         let key = host.as_ptr() as usize;
-        if let Some(b) = self.states.borrow().get(&key) {
-            return Ok(b.ptr);
+        let epoch = self.state_gen.get();
+        // Read the entry out before any copy, so the `RefCell` borrow is not
+        // held across `h2d`.
+        let found = self.states.borrow().get(&key).map(|(b, filled)| (b.ptr, *filled));
+        if let Some((ptr, filled)) = found {
+            // The allocation is right; only its contents may be stale. This is
+            // the checkpoint-restore path, and re-uploading into the buffer
+            // that already exists is what makes it cheap.
+            if filled == epoch {
+                return Ok(ptr);
+            }
+            self.h2d(ptr, host)?;
+            if let Some(e) = self.states.borrow_mut().get_mut(&key) {
+                e.1 = epoch;
+            }
+            return Ok(ptr);
         }
         let buf = DeviceBuffer::from_slice(host)?;
         let ptr = buf.ptr;
-        self.states.borrow_mut().insert(key, buf);
+        self.states.borrow_mut().insert(key, (buf, epoch));
         Ok(ptr)
     }
 
@@ -2920,7 +2934,7 @@ impl Cuda {
     pub fn read_state_into(&self, host: &mut [f32]) -> Result<()> {
         let key = host.as_ptr() as usize;
         let ptr = match self.states.borrow().get(&key) {
-            Some(b) => b.ptr,
+            Some((b, _)) => b.ptr,
             None => return Ok(()),
         };
         self.sync()?;
@@ -3400,7 +3414,15 @@ impl Ops for Cuda {
     }
 
     fn forget_state(&self) {
-        self.states.borrow_mut().clear();
+        // Not `clear()`: that frees ~60 device buffers the next pass would
+        // immediately allocate again, measured at 69 ms per checkpoint restore.
+        // A generation bump marks every slab stale and keeps the memory.
+        self.state_gen.set(self.state_gen.get() + 1);
+    }
+
+    fn read_state(&self, host: &mut [f32]) {
+        let r = self.read_state_into(host);
+        self.note(r);
     }
 
     /// Launch counts and expert residency for the turn just finished.
@@ -3681,6 +3703,10 @@ impl Ops for &Cuda {
 
     fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
         (*self).delta_rule(d, state, out)
+    }
+
+    fn read_state(&self, host: &mut [f32]) {
+        (*self).read_state(host)
     }
 
     fn forget_state(&self) {

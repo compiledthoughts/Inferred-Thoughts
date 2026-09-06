@@ -171,7 +171,18 @@ pub struct Cuda {
     /// invalidates every activation mirror by design -- re-uploading ~2 MB per
     /// layer per token would undo the whole reason the seam takes a slab.
     /// Cleared by `forget_state` when the engine resets a sequence.
-    states: RefCell<HashMap<usize, DeviceBuffer>>,
+    /// Device-resident recurrent state, with the generation it was filled at.
+    ///
+    /// **Invalidated in place, never freed.** `forget_state` used to clear this
+    /// map, which dropped ~60 `DeviceBuffer`s and made the next pass allocate
+    /// them again — 69 ms per checkpoint restore, measured. That is the same
+    /// defect `begin_pass` had against the mirror map, where reallocating ~280
+    /// buffers a token cost more than the launches it was meant to save. The
+    /// fix there and here is the same: bump a generation and re-upload into the
+    /// allocation that already exists.
+    states: RefCell<HashMap<usize, (DeviceBuffer, u64)>>,
+    /// Bumped by `forget_state`; a slab filled at an older generation is stale.
+    state_gen: Cell<u64>,
 
     /// Replace every kernel with `noop`, keeping the launch pattern. See the
     /// kernel's comment; the output is garbage and the point is the clock.
@@ -704,6 +715,7 @@ impl Cuda {
                 rms_serial: Cell::new(false),
                 null_kernels: Cell::new(false),
                 states: RefCell::new(HashMap::new()),
+                state_gen: Cell::new(0),
                 q8: RefCell::new(HashMap::new()),
                 f32t: RefCell::new(HashMap::new()),
                 experts: RefCell::new(None),

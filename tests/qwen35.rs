@@ -393,3 +393,68 @@ fn batched_moe_prefill_equals_token_by_token() {
         batched.len()
     );
 }
+
+/// **A restored checkpoint reproduces the continuation, bit for bit.**
+///
+/// The mechanism has one failure mode that is invisible from the output: a
+/// checkpoint that saved the wrong thing restores *successfully* and the model
+/// carries on from a state it never had, producing fluent text with no
+/// recollection of the conversation. Nothing downstream can tell.
+///
+/// The specific hazard is device ownership. On CUDA a GatedDeltaNet layer's
+/// state is written by kernels and deliberately never comes home on the forward
+/// path, so a checkpoint taken without `Ops::read_state` saves the zeros the
+/// host slab still holds — and every assertion about tokens still passes.
+///
+/// So the test is self-consistency with an exact expected answer, the same
+/// shape as `decode-with-cache == full recompute`: run a continuation, rewind
+/// to the checkpoint, run the identical continuation again, and demand equal
+/// bits. Nothing about the model's answers is asserted, because nothing about
+/// them would catch this.
+#[test]
+#[ignore = "loads the real 9B; run with --release -- --ignored"]
+fn restoring_a_checkpoint_reproduces_the_continuation() {
+    use inferred_thoughts::{Engine, Model, Spin, Tokenizer};
+
+    let Some(path) = common::find_model_named("Qwen3.5-9B-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.5-9B-Q8_0.gguf found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode(
+        "The capital of France is Paris, and the capital of Japan is Tokyo, and the capital of",
+        true,
+        true,
+    );
+    assert!(tokens.len() >= 12, "prompt too short to split");
+    let split = tokens.len() / 2;
+
+    let m = Model::load(&f).expect("load model");
+    let mut e = Engine::new(m, Spin::new(8), tokens.len() + 8, false);
+
+    e.prefill(&tokens[..split]).expect("prefill the prefix");
+    let cp = e
+        .checkpoint()
+        .expect("the 9B has recurrent state, so a checkpoint must exist");
+    assert_eq!(cp.pos(), split, "a checkpoint stands at the position it was taken");
+
+    let first = e.prefill(&tokens[split..]).expect("continue");
+    e.restore(&cp).expect("restore");
+    assert_eq!(e.pos(), split, "restoring returns the engine to the checkpoint's position");
+    let second = e.prefill(&tokens[split..]).expect("continue again");
+
+    let differing = first
+        .iter()
+        .zip(&second)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} of {} logits differ after restoring a checkpoint and replaying the \
+         same tokens. The KV half of a rewind is a truncation and cannot be wrong, so \
+         suspect the recurrent state: either it was not read back before the copy, or \
+         the backend was not told the host slab is authoritative again.",
+        first.len()
+    );
+}

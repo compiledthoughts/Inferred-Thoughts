@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use crate::cache::{KvCache, RecurrentState};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::Model;
 use crate::ops::Ops;
 use crate::profile::{Ctx, Profile};
@@ -86,6 +86,40 @@ pub struct Engine<'a, O: Ops> {
 /// because a chunk is just a prefill at a later `start_pos`.
 pub const DEFAULT_MAX_BATCH: usize = 512;
 
+/// A point a sequence can be returned to.
+///
+/// **What has to be saved is the recurrent state, and only that.** A KV cache
+/// is a log: truncating it to `pos` leaves exactly the state that prefix would
+/// have produced, so the ten attention layers of the 35B need nothing stored.
+/// A GatedDeltaNet layer's state is not a log but one matrix that has absorbed
+/// every token with no record of how to remove one, so the thirty recurrent
+/// layers need a copy.
+///
+/// That asymmetry is what makes this cheap, and *fixed size*: 84 MiB on the 35B
+/// whatever the depth, against the 640 MiB of KV held at 24k positions.
+/// llama.cpp's context checkpoints are the same mechanism for the same reason —
+/// they exist for recurrent and hybrid models, because a pure-attention model
+/// needs only a truncation.
+#[derive(Clone)]
+pub struct Checkpoint {
+    pos: usize,
+    conv: Vec<f32>,
+    ssm: Vec<f32>,
+}
+
+impl Checkpoint {
+    /// Position this checkpoint stands at: the number of tokens already
+    /// consumed when it was taken.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Bytes held, so a caller can bound how many it keeps.
+    pub fn bytes(&self) -> usize {
+        (self.conv.len() + self.ssm.len()) * std::mem::size_of::<f32>()
+    }
+}
+
 impl<'a, O: Ops> Engine<'a, O> {
     pub fn new(model: impl Into<Model<'a>>, ops: O, n_ctx: usize, detail: bool) -> Self {
         let model = model.into();
@@ -159,6 +193,56 @@ impl<'a, O: Ops> Engine<'a, O> {
         }
         self.cache.commit(len);
         true
+    }
+
+    /// Capture the current position and recurrent state.
+    ///
+    /// `None` for an architecture with no recurrent state, where
+    /// [`Engine::rewind`] already does the job for free and a checkpoint would
+    /// be a copy of nothing.
+    ///
+    /// **Reads the state back through the seam first, and that is the part
+    /// that would fail silently.** On CUDA the device copy is authoritative
+    /// after first touch — the state is written by kernels and deliberately
+    /// never comes home on the forward path — so a checkpoint taken without
+    /// [`Ops::read_state`] would save the zeros the host slab still held. The
+    /// restore would then succeed and the model would continue from an empty
+    /// memory, producing fluent text with no recollection of the conversation.
+    pub fn checkpoint(&mut self) -> Option<Checkpoint> {
+        let r = self.recurrent.as_mut()?;
+        // Per layer slice, because that is the granularity the device keys its
+        // state mirrors on.
+        for il in 0..r.n_layer() {
+            self.ops.read_state(r.conv_mut(il));
+            self.ops.read_state(r.ssm_mut(il));
+        }
+        let (conv, ssm) = r.slabs();
+        Some(Checkpoint {
+            pos: self.cache.len(),
+            conv: conv.to_vec(),
+            ssm: ssm.to_vec(),
+        })
+    }
+
+    /// Return to a checkpoint: truncate the KV log and reload the state.
+    ///
+    /// The KV needs no stored copy — positions after `pos` are simply no longer
+    /// part of the sequence, and the next prefill overwrites them.
+    pub fn restore(&mut self, c: &Checkpoint) -> Result<()> {
+        if c.pos > self.cache.n_ctx() {
+            return Err(Error::InconsistentArchitecture {
+                what: "checkpoint",
+                detail: format!("stands at {} positions, context is {}", c.pos, self.cache.n_ctx()),
+            });
+        }
+        self.cache.commit(c.pos);
+        if let Some(r) = self.recurrent.as_mut() {
+            r.load(&c.conv, &c.ssm)?;
+            // The device owns the authoritative copy once it has touched it, so
+            // writing the host slab is invisible without this.
+            self.ops.forget_state();
+        }
+        Ok(())
     }
 
     /// Drop the cached history. The profile is kept, so a run that resets
