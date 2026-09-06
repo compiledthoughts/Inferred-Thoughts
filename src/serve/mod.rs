@@ -276,14 +276,42 @@ struct Session<'a, O: Ops> {
     consumed: usize,
     /// The token ids the engine consumed, in order.
     ///
-    /// Only read when the text prefix fails, which is the one case where the
-    /// re-tokenization hazard above does not matter: the conversation has
-    /// already diverged, so the question is no longer "can this be continued
-    /// exactly" but "how far back must we go".
+    /// # BROKEN as a prefix, and measured to be
+    ///
+    /// This is a **concatenation of independent tokenizations** — turn one's
+    /// full encode, then each later turn's new text encoded in isolation, then
+    /// the ids the model generated. `advance` compares it against a *single*
+    /// encode of the whole conversation, and the two disagree at the first turn
+    /// boundary, for exactly the reason recorded on this struct: a generated
+    /// newline merges with the newline the next prompt opens with.
+    ///
+    /// So the common prefix collapses to the end of turn one however late the
+    /// real divergence is. Measured on a ten-turn session at 8,013 positions
+    /// with checkpoints at ~2410, ~4823 and ~7231: editing turn seven should
+    /// have restored from the checkpoint at 4823 and instead restarted from
+    /// zero, because the scan stopped at ~805.
+    ///
+    /// **The fix is to tokenize the whole conversation every turn** and keep
+    /// this as that tokenization, so the engine's positions correspond to a
+    /// single encode by construction. Re-tokenizing 24k tokens costs tens of
+    /// milliseconds against a prefill of ~21 ms *per token*, so the cost the
+    /// text fast path exists to avoid is not worth what it breaks. The boundary
+    /// effect then shows up only where new text joins — a handful of tokens at
+    /// the end — instead of severing the prefix at turn one.
     tokens: Vec<u32>,
     /// Return points, oldest first. Empty for an architecture with no
     /// recurrent state, where `Engine::rewind` reaches any position for free.
     checkpoints: Vec<Checkpoint>,
+    /// Position of the newest checkpoint, so spacing is measured across turns
+    /// rather than within one.
+    ///
+    /// **Without this the ladder stays empty in the workload it exists for.**
+    /// The first version took a checkpoint only between slices of a single
+    /// prefill, so a turn adding fewer than `CHECKPOINT_EVERY` tokens took
+    /// none — which is every ordinary turn. Measured on a real Cline session:
+    /// seven turns grew the conversation to 16,050 positions with zero
+    /// checkpoints, and turn 8 diverged and re-ran all 15,275 tokens, 170.9 s.
+    last_ckpt: usize,
 }
 
 impl<O: Ops> Session<'_, O> {
@@ -365,9 +393,15 @@ impl<O: Ops> Session<'_, O> {
             self.tokens.extend_from_slice(&tokens[done..done + take]);
             done += take;
             self.consumed += take;
-            // Not after the last slice: that state is the live one, and a
-            // checkpoint of it would be a copy of where we already are.
-            if done < tokens.len() {
+            // **Spacing measured from the last checkpoint, not from the start
+            // of this turn.** The previous condition was `done < tokens.len()`,
+            // which takes a checkpoint only between slices — so a turn shorter
+            // than a slice took none, and an incrementally growing conversation
+            // accumulated nothing to return to. Checkpointing the final slice
+            // is not "a copy of where we already are": the next turn continues
+            // past it, which is precisely what makes it a return point for the
+            // divergence after that.
+            if self.consumed - self.last_ckpt >= CHECKPOINT_EVERY {
                 self.take_checkpoint();
             }
         }
@@ -391,6 +425,7 @@ impl<O: Ops> Session<'_, O> {
         if self.engine.rewind(common) {
             self.tokens.truncate(common);
             self.consumed = common;
+            self.last_ckpt = self.last_ckpt.min(common);
             return Ok(Resume::Rewound(common));
         }
         if let Some(i) = self
@@ -403,12 +438,14 @@ impl<O: Ops> Session<'_, O> {
             self.checkpoints.truncate(i + 1);
             self.tokens.truncate(c.pos());
             self.consumed = c.pos();
+            self.last_ckpt = c.pos();
             return Ok(Resume::Restored(c.pos()));
         }
         self.engine.reset();
         self.checkpoints.clear();
         self.tokens.clear();
         self.consumed = 0;
+        self.last_ckpt = 0;
         Ok(Resume::Restarted)
     }
 
@@ -430,6 +467,7 @@ impl<O: Ops> Session<'_, O> {
             // checkpoint would copy nothing.
             return;
         };
+        self.last_ckpt = self.consumed;
         self.checkpoints.push(c);
         if self.checkpoints.len() > MAX_CHECKPOINTS {
             let mut keep = Vec::with_capacity(MAX_CHECKPOINTS);
@@ -481,6 +519,7 @@ pub fn serve<O: Ops>(
         rendered: String::new(),
         tokens: Vec::new(),
         checkpoints: Vec::new(),
+        last_ckpt: 0,
         consumed: 0,
     };
 
