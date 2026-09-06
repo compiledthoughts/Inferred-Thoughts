@@ -117,15 +117,29 @@ struct Mark {
     prefill_ns: u64,
     decode_tokens: u64,
     decode_ns: u64,
+    /// One-time backend setup, cumulative — see [`Ops::setup_cost`].
+    ///
+    /// **Differenced like the rest, because it is not a per-turn cost and the
+    /// turn that pays it is the one that looks slow.** The CUDA backend places
+    /// every expert on first sight of its tensor, which happens inside the
+    /// first forward pass, so turn one's prefill contains ~25 s of placement on
+    /// the 35B. Reporting that as `prefill N tok ... tok/s` is the same wrong
+    /// basis `Profile::phases` was fixed for, in the one place a user actually
+    /// watches it happen.
+    setup_ns: u64,
+    setup_label: &'static str,
 }
 
 impl Mark {
     fn take<O: Ops>(e: &Engine<'_, O>) -> Self {
+        let (setup_ns, setup_label) = e.ops.setup_cost().unwrap_or((0, "setup"));
         Self {
             prefill_tokens: e.prof.prefill_tokens,
             prefill_ns: e.prof.prefill_ns,
             decode_tokens: e.prof.decode_tokens,
             decode_ns: e.prof.decode_ns,
+            setup_ns,
+            setup_label,
         }
     }
 }
@@ -144,10 +158,24 @@ fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
             ms / tok as f64,
         );
     };
+    // Comes out before the rate, and is printed rather than hidden: it is real
+    // time the user waited. What was wrong was dividing it by the prompt length
+    // and calling the result throughput.
+    let setup_ns = now.setup_ns.saturating_sub(before.setup_ns);
+    let prefill_ns = now.prefill_ns - before.prefill_ns;
+    if setup_ns > 0 {
+        eprintln!(
+            "  {:<9}{:>6}      {:>9.1} ms                    one-time {}, inside this turn",
+            "setup",
+            "",
+            setup_ns as f64 / 1e6,
+            now.setup_label,
+        );
+    }
     line(
         "prefill",
         now.prefill_tokens - before.prefill_tokens,
-        now.prefill_ns - before.prefill_ns,
+        prefill_ns.saturating_sub(setup_ns),
     );
     line(
         "decode",

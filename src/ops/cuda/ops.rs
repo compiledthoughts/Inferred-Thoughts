@@ -2056,6 +2056,38 @@ impl Cuda {
     /// its writes, so state is corrupted on purpose and nothing may read it
     /// afterwards. Pointers stay valid because weights, mirrors, pool slots and
     /// the expert slab all outlive the pass.
+    /// How many distinct launches the recorder holds, and how many calls they
+    /// stand for.
+    ///
+    /// **So that [`Cuda::bench_launches`] cannot fail silently.** On the 35B it
+    /// produced no output at all — not the table, not its "recorded nothing"
+    /// arm, not its error arm — while working on the 0.6B. That is only
+    /// possible if the process does not return from it, which no `match` on its
+    /// result can report. A caller that prints this first turns "nothing
+    /// happened" into "it had N launches to replay and did not come back".
+    /// # What a replayed expert launch does *not* measure
+    ///
+    /// The recorded arguments include the expert pointer table as it stood, so
+    /// a replayed `matmul_iq4_xs_q8_k_moe*` reads whichever experts that one
+    /// launch happened to route to, 200 times over. With 27.1% of the pool in
+    /// the pinned host tier those reads are drawn from a mixture of VRAM at
+    /// 448 GB/s and PCIe at 26.5, and a single frozen draw is not the mean.
+    ///
+    /// Observed directly: the decode-shaped launch at grid 128x8 timed 406 us
+    /// for eight pairs while the 5-token prefill shape at 128x40 timed 199 us
+    /// for forty — 50.8 us per pair against 5.0, a 10x spread between two rows
+    /// of the same table. Some of that is real batching benefit and some is
+    /// which side of the bus those particular experts were on, and this
+    /// instrument cannot separate them.
+    ///
+    /// So: read the expert rows as an upper bound with a wide error bar, and
+    /// use `experts ... % from VRAM` alongside them. The non-expert rows carry
+    /// no such caveat — their weights are resident for the life of the backend.
+    pub fn recorded_launches(&self) -> (usize, u64) {
+        let m = self.launches.borrow();
+        (m.len(), m.values().map(|v| v.0).sum())
+    }
+
     pub fn bench_launches(&self, reps: u32) -> Result<Vec<LaunchBench>> {
         let recorded: Vec<(super::LaunchKey, (u64, Vec<KArg>))> = self
             .launches
@@ -2170,13 +2202,18 @@ impl Cuda {
     /// `n_out == 0` marks an elementwise kernel, for which `n_in` is the
     /// buffer length. Returns `None` for anything not benched, which the
     /// caller reports as `--` rather than as a zero.
+    ///
+    /// Returns `(args, grid_x, grid_y, block, shared)`. **`grid_y` is not
+    /// decoration**: the routed FFN's kernels put the (token, pick) pair on
+    /// `blockIdx.y`, so launching them one-dimensionally runs one pair of eight
+    /// and reports an eighth of the work as the whole of it.
     fn shape_args(
         &self,
         kernel: &'static str,
         n_in: usize,
         n_out: usize,
         keep: &mut Vec<DeviceBuffer>,
-    ) -> Result<Option<(Vec<KArg>, u32, u32, u32)>> {
+    ) -> Result<Option<(Vec<KArg>, u32, u32, u32, u32)>> {
         const QK_K: usize = 256;
         // Two f32 buffers of `n` and a couple of quantized outputs cover every
         // elementwise kernel here; they are allocated once and shared.
@@ -2192,7 +2229,7 @@ impl Cuda {
             "silu_mul" | "add_assign" | "sigmoid_mul" => {
                 let (a, b) = (fbuf(n_in)?, fbuf(n_in)?);
                 let args = vec![KArg::I32(n_in as i32), KArg::Ptr(a), KArg::Ptr(b)];
-                (args, n_in.div_ceil(256) as u32, 256u32, 0u32)
+                (args, n_in.div_ceil(256) as u32, 1, 256u32, 0u32)
             }
             "add_scaled" => {
                 let (a, b) = (fbuf(n_in)?, fbuf(n_in)?);
@@ -2202,7 +2239,7 @@ impl Cuda {
                     KArg::Ptr(a),
                     KArg::Ptr(b),
                 ];
-                (args, n_in.div_ceil(256) as u32, 256, 0)
+                (args, n_in.div_ceil(256) as u32, 1, 256, 0)
             }
             "gather_chunks" | "scatter_chunks" => {
                 let (src, dst) = (fbuf(n_in * 2)?, fbuf(n_in * 2)?);
@@ -2214,7 +2251,7 @@ impl Cuda {
                     KArg::Ptr(src),
                     KArg::Ptr(dst),
                 ];
-                (args, n_in.div_ceil(256) as u32, 256, 0)
+                (args, n_in.div_ceil(256) as u32, 1, 256, 0)
             }
             "quantize_q8_k" => {
                 let n_super = n_in / QK_K;
@@ -2232,7 +2269,7 @@ impl Cuda {
                 keep.push(s);
                 keep.push(q);
                 keep.push(b);
-                (args, n_super as u32, QK_K as u32, 0)
+                (args, n_super as u32, 1, QK_K as u32, 0)
             }
             "quantize_q8_0" => {
                 let n_blocks = n_in / 32;
@@ -2247,7 +2284,7 @@ impl Cuda {
                 ];
                 keep.push(s);
                 keep.push(q);
-                (args, n_blocks.div_ceil(64) as u32, 64, 0)
+                (args, n_blocks.div_ceil(64) as u32, 1, 64, 0)
             }
             "rms_norm_tree" => {
                 let (x, w, o) = (fbuf(n_in)?, fbuf(n_in)?, fbuf(n_in)?);
@@ -2259,18 +2296,37 @@ impl Cuda {
                     KArg::Ptr(o),
                 ];
                 // One block per row; the recorded shape is a single row.
-                (args, 1, 256, 0)
+                (args, 1, 1, 256, 0)
             }
-            "matmul_iq4_xs_q8_k_moe" => {
-                // Eight experts against one shared activation, which is the
-                // gate/up shape. **Eight distinct weights, not one repeated**:
-                // the real routed FFN reads eight different experts, and one
-                // buffer eight times would be served by L2 rather than VRAM.
+            "matmul_iq4_xs_q8_k_moe" | "matmul_iq4_xs_q8_k_moe_glu" => {
+                // **This drifted from the kernel and crashed the process.** It
+                // used to push eight expert addresses as eight kernel
+                // arguments, which was the signature before routing moved onto
+                // the device. The kernel now takes one *table* pointer and
+                // dereferences `wptrs[e]`, so the old list handed it eight
+                // bytes of expert weight to use as an address:
+                //
+                //     shape bench unavailable: cuEventSynchronize failed:
+                //       CUDA_ERROR_ILLEGAL_ADDRESS
+                //     error: cuMemAlloc failed: CUDA_ERROR_ILLEGAL_ADDRESS
+                //
+                // and every later CUDA call failed with the context poisoned,
+                // so `--profile-device` exited 1 on the 35B. A hand-written
+                // argument list is a second copy of a signature, and this is
+                // what the second copy costs when only one of them is updated.
+                //
+                // Eight *distinct* weights, not one repeated: the real routed
+                // FFN reads eight different experts, and one buffer read eight
+                // times would be served by L2 rather than by VRAM.
+                let glu = kernel.ends_with("_glu");
                 let n_super = n_in / QK_K;
                 let row_bytes = n_super * 136;
                 let row_set = n_out * row_bytes;
-                let mut w = vec![0x11u8; 8 * row_set];
-                for c in 0..8 {
+                // Two stacks for the fused form: it reads a gate and an up
+                // expert per pair, so benching one would halve the traffic.
+                let sets = if glu { 16 } else { 8 };
+                let mut w = vec![0x11u8; sets * row_set];
+                for c in 0..sets {
                     for r in 0..n_out {
                         for b in 0..n_super {
                             let at = c * row_set + r * row_bytes + b * 136;
@@ -2280,30 +2336,72 @@ impl Cuda {
                     }
                 }
                 let wd = DeviceBuffer::from_slice(&w)?;
-                let scales: Vec<f32> =
-                    (0..n_super).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
-                let quants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+
+                // The pointer table the kernel actually dereferences, in device
+                // memory — which is the whole reason the old argument list was
+                // wrong, so building it here is the fix rather than a detail.
+                let addrs: Vec<u64> =
+                    (0..8).map(|c| wd.ptr as u64 + (c * row_set) as u64).collect();
+                let gtab = DeviceBuffer::from_slice(&addrs)?;
+                let utab = if glu {
+                    let up: Vec<u64> = (0..8)
+                        .map(|c| wd.ptr as u64 + ((8 + c) * row_set) as u64)
+                        .collect();
+                    Some(DeviceBuffer::from_slice(&up)?)
+                } else {
+                    None
+                };
+
+                // `_moe` is the `down` half: one intermediate per pair, so
+                // eight activation rows. `_moe_glu` is gate/up: one row shared
+                // by every expert of the token, so one.
+                let x_rows = if glu { 1 } else { 8 };
+                let scales: Vec<f32> = (0..x_rows * n_super)
+                    .map(|i| 0.01 + (i % 7) as f32 * 1e-3)
+                    .collect();
+                let quants: Vec<i8> = (0..x_rows * n_in)
+                    .map(|i| ((i % 251) as i32 - 125) as i8)
+                    .collect();
                 let sd = DeviceBuffer::from_slice(&scales)?;
                 let qd = DeviceBuffer::from_slice(&quants)?;
                 let od = DeviceBuffer::new(8 * n_out * 4)?;
-                let mut args = vec![
-                    KArg::I32(n_in as i32),
-                    KArg::I32(n_out as i32),
-                    KArg::I32(0),
-                    KArg::I32(8),
-                ];
-                for c in 0..8 {
-                    args.push(KArg::Ptr(wd.ptr + (c * row_set) as ffi::CUdeviceptr));
-                }
-                args.push(KArg::Ptr(sd.ptr));
-                args.push(KArg::Ptr(qd.ptr));
-                args.push(KArg::Ptr(od.ptr));
+
+                let args = if glu {
+                    vec![
+                        KArg::I32(n_in as i32),
+                        KArg::I32(n_out as i32),
+                        KArg::I32(8),
+                        KArg::I32(8),
+                        KArg::Ptr(gtab.ptr),
+                        KArg::Ptr(utab.as_ref().map_or(0, |b| b.ptr)),
+                        KArg::Ptr(sd.ptr),
+                        KArg::Ptr(qd.ptr),
+                        KArg::Ptr(od.ptr),
+                    ]
+                } else {
+                    vec![
+                        KArg::I32(n_in as i32),
+                        KArg::I32(n_out as i32),
+                        KArg::I32(n_super as i32),
+                        KArg::I32(8),
+                        KArg::Ptr(gtab.ptr),
+                        KArg::Ptr(sd.ptr),
+                        KArg::Ptr(qd.ptr),
+                        KArg::Ptr(od.ptr),
+                    ]
+                };
                 let grid = n_out.div_ceil(4) as u32;
                 keep.push(wd);
+                keep.push(gtab);
+                if let Some(b) = utab {
+                    keep.push(b);
+                }
                 keep.push(sd);
                 keep.push(qd);
                 keep.push(od);
-                (args, grid, 128, 0)
+                // `grid.y` is the pair count, which is what these kernels
+                // index — eight picks of one token, the decode shape.
+                (args, grid, 8, 128, 0)
             }
             _ => return Ok(None),
         };
@@ -2327,13 +2425,17 @@ impl Cuda {
         // kernel in the routed FFN — the same shape of gap that made
         // `resident_bytes` under-report by an order of magnitude.
         let mut keep: Vec<DeviceBuffer> = Vec::new();
-        if !kernel.starts_with("matmul_") || kernel.ends_with("_moe") {
+        // `contains`, not `ends_with`: `matmul_iq4_xs_q8_k_moe_glu` does not end
+        // in `_moe` and so fell through to the plain-matmul path, whose
+        // signature it does not have either. The largest kernel in the routed
+        // FFN was being benched with the wrong argument list.
+        if !kernel.starts_with("matmul_") || kernel.contains("_moe") {
             let built = self.shape_args(kernel, n_in, n_out, &mut keep)?;
-            let (args, grid, block, shared) = match built {
+            let (args, grid_x, grid_y, block, shared) = match built {
                 Some(b) => b,
                 None => return Ok((f64::NAN, f64::NAN)),
             };
-            return self.time_launches(kernel, grid, block, shared, &[args], reps);
+            return self.time_launches_2d(kernel, grid_x, grid_y, block, shared, &[args], reps);
         }
         // Bytes one row of this format occupies, and the f16 scale's offset
         // within a block. `None` where the format has no f16 to protect.

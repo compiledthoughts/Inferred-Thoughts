@@ -594,6 +594,23 @@ device   {} kernel launches", s.launches);
     // Replay every launch the run actually made. Complete by construction, and
     // therefore the one attribution that cannot silently omit a kernel.
     if o.device {
+        // **Printed before the replay, not after it.** `bench_launches` on the
+        // 35B returned nothing at all — no table, no "recorded nothing", no
+        // error — which a `match` on its result cannot distinguish from never
+        // having been called. Announcing the work first means the next failure
+        // says how much there was to do.
+        let (distinct, calls) = cuda.recorded_launches();
+        eprintln!(
+            "
+launches {distinct} distinct, {calls} calls recorded; replaying each 200x"
+        );
+        if distinct == 0 {
+            eprintln!(
+                "         nothing to replay. `--profile-device` arms the recorder, but
+         `launch_grid2` returns through `graph_launch` before reaching it, so a
+         graphed run records none. Add `--no-graphs`."
+            );
+        }
         match cuda.bench_launches(200) {
             Ok(b) if !b.is_empty() => {
                 eprintln!(
