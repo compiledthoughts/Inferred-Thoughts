@@ -2088,6 +2088,136 @@ impl Cuda {
         (m.len(), m.values().map(|v| v.0).sum())
     }
 
+    /// What an expert read costs from each tier, same kernel, same shape.
+    ///
+    /// **A controlled A/B, because every previous attempt at this number was a
+    /// subtraction.** `CLAUDE.md` carries a withdrawn "~8 GB/s effective
+    /// in-kernel" for host-resident experts: it came from a two-point config
+    /// comparison that also differed in slab size and fill volume, and a later
+    /// long run contradicted its extrapolation. The launch replay hints at the
+    /// same figure but cannot establish it either — its recorded pointer table
+    /// is one frozen draw from a 73/27 mixture, so its expert rows are a
+    /// mixture whose composition is unknown.
+    ///
+    /// Here nothing differs but the tier. The same 16 expert stacks are built
+    /// once, uploaded to VRAM for one variant and copied into a page-locked
+    /// `MEMHOSTALLOC_DEVICEMAP` block for the other — which is exactly what
+    /// `ExpertCache` does for its host tier, so the second variant is the real
+    /// mechanism and not a model of it. The kernel dereferences a pointer table
+    /// either way and cannot tell which it got.
+    ///
+    /// The mixed variant puts 2 of 8 experts on the host, near the 27% the
+    /// eager placement actually produces, so the three rows can be checked
+    /// against each other: if the cost is linear in the host fraction, mixed
+    /// should land a quarter of the way from VRAM to host.
+    ///
+    /// Shape is the 35B's: `n_in` 2048, `n_out` 512, which is a 557,056-byte
+    /// expert — the slab's slot size, not a round number chosen here.
+    pub fn bench_expert_residency(&self, reps: u32) -> Result<Vec<(&'static str, f64, f64)>> {
+        const QK_K: usize = 256;
+        let (n_in, n_out) = (2048usize, 512usize);
+        let n_super = n_in / QK_K;
+        let row_bytes = n_super * 136;
+        let row_set = n_out * row_bytes;
+        let sets = 16; // eight gate experts and eight up experts
+        let bytes = sets * row_set;
+
+        // Filler with a valid f16 scale of 1.0 at each super-block, as the
+        // shape bench builds: the kernel must read plausible data or its
+        // arithmetic is not the arithmetic being timed.
+        let mut w = vec![0x11u8; bytes];
+        for c in 0..sets {
+            for r in 0..n_out {
+                for b in 0..n_super {
+                    let at = c * row_set + r * row_bytes + b * 136;
+                    w[at] = 0x00;
+                    w[at + 1] = 0x38;
+                }
+            }
+        }
+
+        // One token's activation, shared by every expert — the gate/up shape.
+        let scales: Vec<f32> = (0..n_super).map(|i| 0.01 + (i % 7) as f32 * 1e-3).collect();
+        let quants: Vec<i8> = (0..n_in).map(|i| ((i % 251) as i32 - 125) as i8).collect();
+        let sd = DeviceBuffer::from_slice(&scales)?;
+        let qd = DeviceBuffer::from_slice(&quants)?;
+        let od = DeviceBuffer::new(8 * n_out * 4)?;
+        let vram = DeviceBuffer::from_slice(&w)?;
+
+        // The same bytes again, in a page-locked block mapped into the device
+        // address space. This is `ExpertCache::place_on_host`'s allocation.
+        let mut host_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut host_dev: ffi::CUdeviceptr = 0;
+        // SAFETY: out-parameters the driver fills, both checked before use.
+        unsafe {
+            check(
+                ffi::cuMemHostAlloc(&mut host_ptr, bytes, ffi::MEMHOSTALLOC_DEVICEMAP),
+                "cuMemHostAlloc",
+            )?;
+            check(
+                ffi::cuMemHostGetDevicePointer_v2(&mut host_dev, host_ptr, 0),
+                "cuMemHostGetDevicePointer",
+            )?;
+            // SAFETY: `host_ptr` owns `bytes` and `w` holds exactly that many.
+            std::ptr::copy_nonoverlapping(w.as_ptr(), host_ptr as *mut u8, bytes);
+        }
+
+        let addr = |base: u64, c: usize| base + (c * row_set) as u64;
+        let mut out = Vec::new();
+        let mut run = |label: &'static str, on_host: &[bool]| -> Result<(f64, f64)> {
+            // Expert `c`'s gate is stack `c` and its up is stack `8 + c`, and
+            // both follow that expert's tier — an expert is placed whole, so
+            // splitting its two halves across tiers would measure a layout the
+            // cache never produces.
+            let at = |c: usize, stack: usize| {
+                let base = if on_host[c] { host_dev as u64 } else { vram.ptr as u64 };
+                addr(base, stack)
+            };
+            let g: Vec<u64> = (0..8).map(|c| at(c, c)).collect();
+            let u: Vec<u64> = (0..8).map(|c| at(c, 8 + c)).collect();
+            let gt = DeviceBuffer::from_slice(&g)?;
+            let ut = DeviceBuffer::from_slice(&u)?;
+            let args = vec![
+                KArg::I32(n_in as i32),
+                KArg::I32(n_out as i32),
+                KArg::I32(8),
+                KArg::I32(8),
+                KArg::Ptr(gt.ptr),
+                KArg::Ptr(ut.ptr),
+                KArg::Ptr(sd.ptr),
+                KArg::Ptr(qd.ptr),
+                KArg::Ptr(od.ptr),
+            ];
+            let (gpu_us, _) = self.time_launches_2d(
+                "matmul_iq4_xs_q8_k_moe_glu",
+                n_out.div_ceil(4) as u32,
+                8,
+                128,
+                0,
+                &[args],
+                reps,
+            )?;
+            let _ = label;
+            // Every launch reads all sixteen stacks: eight gate, eight up.
+            let moved = bytes as f64;
+            Ok((gpu_us, moved / (gpu_us * 1e-6) / 1e9))
+        };
+
+        for (label, mask) in [
+            ("all VRAM", [false; 8]),
+            ("2 of 8 on host", [true, true, false, false, false, false, false, false]),
+            ("all host tier", [true; 8]),
+        ] {
+            let (us, gbs) = run(label, &mask)?;
+            out.push((label, us, gbs));
+        }
+
+        // SAFETY: allocated above by `cuMemHostAlloc` and not referenced after
+        // the last launch, which `time_launches_2d` has synchronized.
+        unsafe { check(ffi::cuMemFreeHost(host_ptr), "cuMemFreeHost")? };
+        Ok(out)
+    }
+
     pub fn bench_launches(&self, reps: u32) -> Result<Vec<LaunchBench>> {
         let recorded: Vec<(super::LaunchKey, (u64, Vec<KArg>))> = self
             .launches

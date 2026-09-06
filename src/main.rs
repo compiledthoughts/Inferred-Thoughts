@@ -700,6 +700,21 @@ launches replayed from the run itself (after generation, so writes are moot)"
             Err(e) => eprintln!("         f32 decomposition unavailable: {e}"),
         }
 
+        match cuda.bench_expert_residency(100) {
+            Ok(v) if !v.is_empty() => {
+                eprintln!(
+                    "
+experts  one expert stack read from each tier, same kernel and shape
+         (35B gate/up: n_in 2048, n_out 512, 8 experts, 8.50 MiB a launch)"
+                );
+                for (label, us, gbs) in &v {
+                    eprintln!("         {label:<22}{us:>9.1} us{gbs:>9.1} GB/s");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("         expert residency bench unavailable: {e}"),
+        }
+
         if let Ok(v) = cuda.bench_iq4_variants(200) {
             if v.len() >= 4 {
                 let base = v[0].1;
