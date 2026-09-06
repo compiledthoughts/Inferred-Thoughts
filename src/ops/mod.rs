@@ -592,6 +592,49 @@ pub trait Ops {
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);
 
+    /// Two matmuls over the **same** activation, issued together.
+    ///
+    /// `out_a` and `out_b` are separate buffers, each `n_tok` rows of that
+    /// weight's own width. Nothing is concatenated above this seam.
+    ///
+    /// **Because the cost of a small F32 matmul is reading `x`, not producing
+    /// outputs.** Measured on the 35B: 39.3 us at `n_out` 1, 41.8 at 32, 43.3
+    /// at 256 — twelve times the output for 10% more time, because every thread
+    /// walks the same 2048-element activation and that walk is 81% of the call.
+    /// Two matmuls over one activation therefore pay for it twice, and this
+    /// model does that twice per layer:
+    ///
+    /// | pair | shapes | reads |
+    /// |---|---|---|
+    /// | `ssm_alpha` + `ssm_beta` | `{2048,32}` each | `normed` |
+    /// | `ffn_gate_inp` + `..._shexp` | `{2048,256}` + `{2048,1}` | the MoE input |
+    ///
+    /// 133 calls a token, 5.51 ms of a 34 ms decode. Merging the launches
+    /// removes half of them.
+    ///
+    /// **Two destinations rather than one concatenated output**, which is the
+    /// decision that keeps this local. A combined buffer would reach [`Delta`]
+    /// (separate `alpha`/`beta` slices), [`Ops::softmax`] (a 256-wide row that
+    /// would have to skip a 257th element) and every backend's `delta_rule`.
+    /// Separate outputs reach none of them.
+    ///
+    /// The default is the two calls it replaces, so **every CPU backend is
+    /// unchanged and bit-identical by definition**. A device backend overrides
+    /// it to merge the launch; the arithmetic is untouched either way, since
+    /// each output is still one accumulation over the same values in the same
+    /// order.
+    fn matmul_pair(
+        &self,
+        a: &Weights<'_>,
+        b: &Weights<'_>,
+        x: &[f32],
+        out_a: &mut [f32],
+        out_b: &mut [f32],
+    ) {
+        self.matmul(a, x, out_a);
+        self.matmul(b, x, out_b);
+    }
+
     /// One matmul per routed expert, **issued together**.
     ///
     /// `out` is `picks.len()` consecutive rows of `w.n_out`. `x` is either one

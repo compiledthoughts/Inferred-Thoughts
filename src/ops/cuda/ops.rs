@@ -1029,6 +1029,104 @@ impl Cuda {
         Ok(ptr)
     }
 
+    /// Two F32 weights interleaved into one column-major stack, uploaded once.
+    ///
+    /// **Interleaved, not appended.** `matmul_f32_t` indexes
+    /// `wt[k * n_out + j]`, so widening the output means every super-block `k`
+    /// gains `b`'s rows after `a`'s. Appending the two buffers would put all of
+    /// `a` before all of `b`, which is a different tensor entirely.
+    ///
+    /// Keyed on both source pointers, so a weight paired with two different
+    /// partners gets two stacks rather than silently reusing the first. Built
+    /// once and kept for the life of the backend, as `resident_f32_t` is: the
+    /// merge costs nothing at run time.
+    fn resident_f32_t_pair(&self, a: &Weights<'_>, b: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
+        let key = (a.data.as_ptr() as usize, b.data.as_ptr() as usize);
+        if let Some(buf) = self.f32t_pair.borrow().get(&key) {
+            return Ok(buf.ptr);
+        }
+        let n_out = a.n_out + b.n_out;
+        let mut t = vec![0.0f32; a.n_in * n_out];
+        {
+            let mut fill = |w: &Weights<'_>, base: usize| {
+                for j in 0..w.n_out {
+                    let row = &w.data[j * w.n_in * 4..(j + 1) * w.n_in * 4];
+                    for (k, c) in row.chunks_exact(4).enumerate() {
+                        t[k * n_out + base + j] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    }
+                }
+            };
+            fill(a, 0);
+            fill(b, a.n_out);
+        }
+        let buf = DeviceBuffer::from_slice(&t)?;
+        self.bump(|st| {
+            st.h2d_calls += 1;
+            st.h2d_bytes += std::mem::size_of_val(&t[..]) as u64;
+        });
+        let ptr = buf.ptr;
+        self.f32t_pair.borrow_mut().insert(key, buf);
+        Ok(ptr)
+    }
+
+    /// Whether the merged kernel can serve this pair.
+    ///
+    /// **A fast path, not a contract — and getting that wrong broke a model.**
+    /// The first version returned an error for anything else, on the assumption
+    /// that `ssm_alpha` and `ssm_beta` are F32 because `CLAUDE.md`'s type table
+    /// says so. That table describes the *35B file*: on the 9B both are Q8_0.
+    /// So an optimisation that does not apply became a reported error, and
+    /// `restoring_a_checkpoint_reproduces_the_continuation_on_the_device`
+    /// failed on a model the change was never meant to touch.
+    ///
+    /// An optional merge must decline, not fail. The caller falls back to the
+    /// two matmuls, which is exactly what the seam's own default does.
+    fn pairable(a: &Weights<'_>, b: &Weights<'_>) -> bool {
+        a.ty == GgmlType::F32 && b.ty == GgmlType::F32 && a.n_in == b.n_in
+    }
+
+    fn matmul_pair_impl(
+        &self,
+        a: &Weights<'_>,
+        b: &Weights<'_>,
+        x: &[f32],
+        out_a: &mut [f32],
+        out_b: &mut [f32],
+    ) -> Result<()> {
+        debug_assert!(Self::pairable(a, b), "matmul_pair_impl given a pair it cannot merge");
+        let n_tok = x.len() / a.n_in;
+        let n_out = a.n_out + b.n_out;
+        self.note_shape("matmul_f32_t_pair", a.n_in, n_out);
+        let wd = self.resident_f32_t_pair(a, b)?;
+        let xd = self.mirror_in(x)?;
+        let oa = self.mirror_out(out_a)?;
+        let ob = self.mirror_out(out_b)?;
+        let args = [
+            KArg::I32(a.n_in as i32),
+            KArg::I32(a.n_out as i32),
+            KArg::I32(b.n_out as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(xd),
+            KArg::Ptr(oa),
+            KArg::Ptr(ob),
+        ];
+        let block = 128u32;
+        // SAFETY: parameters match `matmul_f32_t_pair`; the grid covers exactly
+        // `n_a + n_b` rows by `n_tok` tokens, the weight is the interleaved
+        // column-major stack of both, and each thread writes one element of
+        // whichever output its row came from.
+        unsafe {
+            self.launch_grid2(
+                "matmul_f32_t_pair",
+                n_out.div_ceil(block as usize) as u32,
+                n_tok as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
     /// Threads a staged `matmul_f32_t` launches, whatever `n_out` is.
     ///
     /// The point of the staged form is that *loading* is done by the whole
@@ -3366,6 +3464,26 @@ impl Ops for Cuda {
         Route::Device { n_used, n_tok: probs.len() / n_expert.max(1) }
     }
 
+    fn matmul_pair(
+        &self,
+        a: &Weights<'_>,
+        b: &Weights<'_>,
+        x: &[f32],
+        out_a: &mut [f32],
+        out_b: &mut [f32],
+    ) {
+        // Declines rather than fails when the merge does not apply: the 9B's
+        // `ssm_alpha`/`ssm_beta` are Q8_0 where the 35B's are F32. Stable
+        // within a run, so a recorded graph sees one branch or the other and
+        // never both.
+        if Self::pairable(a, b) {
+            self.note(self.matmul_pair_impl(a, b, x, out_a, out_b));
+        } else {
+            self.matmul(a, x, out_a);
+            self.matmul(b, x, out_b);
+        }
+    }
+
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
         self.note(self.matmul_experts_impl(w, route, x, out));
     }
@@ -3656,6 +3774,17 @@ impl Ops for &Cuda {
 
     fn route(&self, probs: &mut [f32], n_expert: usize, n_used: usize) -> Route {
         (*self).route(probs, n_expert, n_used)
+    }
+
+    fn matmul_pair(
+        &self,
+        a: &Weights<'_>,
+        b: &Weights<'_>,
+        x: &[f32],
+        out_a: &mut [f32],
+        out_b: &mut [f32],
+    ) {
+        (*self).matmul_pair(a, b, x, out_a, out_b)
     }
 
     fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {

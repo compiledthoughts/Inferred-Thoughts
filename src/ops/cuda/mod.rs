@@ -138,6 +138,9 @@ pub struct Cuda {
     ///
     /// **Off by default, on a measured regression.** See `Cuda::matmul_f32`.
     f32_staged: Cell<bool>,
+    /// Two F32 weights interleaved into one column-major stack, keyed on both
+    /// source pointers. See `Cuda::resident_f32_t_pair`.
+    f32t_pair: RefCell<HashMap<(usize, usize), DeviceBuffer>>,
 
     /// Force the warp-per-position score phase on or off. `None` picks by
     /// context depth; see `Cuda::attend_impl`.
@@ -725,6 +728,7 @@ impl Cuda {
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
+                f32t_pair: RefCell::new(HashMap::new()),
                 attn_warp: Cell::new(None),
                 report_per_turn: Cell::new(false),
                 model_path: RefCell::new(None),

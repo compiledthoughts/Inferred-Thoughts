@@ -2209,6 +2209,58 @@ extern "C" __global__ void matmul_f32_t(int n_in, int n_out,
     out[(size_t)tok * n_out + j] = sum;
 }
 
+// Two F32 matmuls over the **same** activation, in one launch.
+//
+// **The cost of this kernel is reading `x`, not producing outputs.** Its own
+// decomposition says loads are 81% of the call, and the measured times say the
+// rest: 39.3 us at `n_out` 1, 41.8 at 32, 43.3 at 256. Twelve times the output
+// for 10% more time, because every thread walks the same 2048-element
+// activation and that walk is the kernel.
+//
+// So two matmuls that read one activation pay for it twice. On this model there
+// are two such pairs per layer and they are 5.51 ms of a 34 ms token:
+//
+//   ssm_alpha + ssm_beta        {2048,32} each, both read `normed`
+//   ffn_gate_inp + _shexp       {2048,256} + {2048,1}, both read the MoE input
+//
+// **Two destinations, not one concatenated buffer**, which is what keeps this
+// change local. `out_a` and `out_b` stay the exact buffers the model already
+// owns, so nothing downstream sees a stride: `Delta` keeps separate `alpha` and
+// `beta` slices, and `softmax` keeps a 256-wide row rather than needing to skip
+// a 257th element. The alternative -- one buffer read at two offsets -- would
+// have reached `Delta`, `softmax` and every backend's `delta_rule`.
+//
+// `wt` is the two weights interleaved into one column-major stack of `n_a +
+// n_b` rows, built once at upload. Interleaved rather than appended because
+// column-major strides by the output width: row `j` of super-block `k` lives at
+// `k * (n_a + n_b) + j`.
+//
+// Bit-identical by construction, and for the same reason batching and the warp
+// matmul were: each output is still one thread walking `k` ascending over the
+// same values in the same order. Only which outputs share a launch changes.
+extern "C" __global__ void matmul_f32_t_pair(int n_in, int n_a, int n_b,
+                                             const float *__restrict__ wt,
+                                             const float *__restrict__ x,
+                                             float *__restrict__ out_a,
+                                             float *__restrict__ out_b) {
+    const int n_out = n_a + n_b;
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += wt[(size_t)k * n_out + j] * xt[k];
+
+    // The split. Thread `j` belongs to whichever weight its row came from, and
+    // writes into that weight's own output at that output's own stride.
+    if (j < n_a) {
+        out_a[(size_t)tok * n_a + j] = sum;
+    } else {
+        out_b[(size_t)tok * n_b + (j - n_a)] = sum;
+    }
+}
+
 // ---------------------------------------------------------------- f32 debug
 //
 // Decomposing `matmul_f32_t`, which measures 6.5 GB/s on a card that reads

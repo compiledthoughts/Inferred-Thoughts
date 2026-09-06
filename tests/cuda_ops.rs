@@ -1523,3 +1523,88 @@ fn restoring_a_checkpoint_reproduces_the_continuation_on_the_device() {
         first.len()
     );
 }
+
+/// **`matmul_pair` is bit-identical to the two matmuls it replaces.**
+///
+/// The merge changes which outputs share a launch and nothing else: each output
+/// is still one thread walking `k` ascending over the same values in the same
+/// order. So this demands equal bits against the oracle, not a tolerance —
+/// which is the same argument that made batching, the warp matmul and the
+/// grouped expert kernels free.
+///
+/// The shapes are the model's own pairs plus two boundary cases. `{2048,256}` +
+/// `{2048,1}` is the router with the shared-expert gate, and it crosses the
+/// 128-thread block: 257 rows is three blocks, so a thread in the last block
+/// writes `out_b` while its neighbours in earlier blocks write `out_a`. That
+/// split is the one thing this kernel does that `matmul_f32_t` does not, so it
+/// is what the boundary rows are here to catch.
+///
+/// **The interleave is the other hazard.** The weight is column-major, so
+/// merging along the output means `b`'s rows follow `a`'s *within every
+/// super-block* — appending the two buffers instead would produce a different
+/// tensor that still has the right shape and still runs. A wrong interleave
+/// shows up as `out_b` being right and `out_a` wrong past row 0, or as both
+/// drifting after the first super-block, which comparing every element catches
+/// and comparing a norm would not.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_paired_f32_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // (n_in, n_a, n_b): the model's two pairs, then a block boundary and a
+    // case where `b` is wider than `a`.
+    let cases = [
+        (2048usize, 32usize, 32usize),
+        (2048, 256, 1),
+        (2048, 100, 28),
+        (2048, 127, 2),
+        (256, 8, 24),
+    ];
+
+    for (n_in, n_a, n_b) in cases {
+        let af = noise(n_in * n_a, 0x9a11 + n_a as u64);
+        let bf = noise(n_in * n_b, 0x5b22 + n_b as u64);
+        let abytes: Vec<u8> = af.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bbytes: Vec<u8> = bf.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let wa = Weights { data: &abytes, ty: GgmlType::F32, n_in, n_out: n_a, pooled: false };
+        let wb = Weights { data: &bbytes, ty: GgmlType::F32, n_in, n_out: n_b, pooled: false };
+
+        for n_tok in [1usize, 5] {
+            let x = noise(n_in * n_tok, 0xc0de + n_tok as u64);
+            let mut want_a = vec![0.0f32; n_a * n_tok];
+            let mut want_b = vec![0.0f32; n_b * n_tok];
+            cpu.matmul(&wa, &x, &mut want_a);
+            cpu.matmul(&wb, &x, &mut want_b);
+
+            let mut got_a = vec![0.0f32; n_a * n_tok];
+            let mut got_b = vec![0.0f32; n_b * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul_pair(&wa, &wb, &x, &mut got_a, &mut got_b);
+            gpu.host_needs(&mut got_a);
+            gpu.host_needs(&mut got_b);
+            gpu.end_pass();
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            for (label, got, want) in
+                [("a", &got_a, &want_a), ("b", &got_b, &want_b)]
+            {
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "pair {{{n_in},{n_a}}}+{{{n_in},{n_b}}} n_tok {n_tok}: out_{label} \
+                         element {i} is {g:e} against {w:e}. Merging two matmuls cannot \
+                         change any accumulation, so suspect the interleave in \
+                         resident_f32_t_pair (b's rows follow a's within every super-block, \
+                         not after all of a) or the out_a/out_b split at row n_a."
+                    );
+                }
+            }
+        }
+    }
+}

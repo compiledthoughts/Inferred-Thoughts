@@ -1209,8 +1209,12 @@ impl<'a> Qwen35<'a> {
         ops.matmul(wgate, &s.normed, &mut s.z);
         ctx.trace("z", il, &s.z);
 
-        ops.matmul(ssm_alpha, &s.normed, &mut s.alpha);
-        ops.matmul(ssm_beta, &s.normed, &mut s.beta);
+        // One launch, two outputs. Both read `normed`, and reading it is 81% of
+        // a `matmul_f32_t` call -- 39.3 us at n_out 1 against 43.3 at 256 -- so
+        // issuing them separately paid for the same 2048-element walk twice.
+        // `s.alpha` and `s.beta` are unchanged, which is why nothing below here
+        // moves. See `Ops::matmul_pair`.
+        ops.matmul_pair(ssm_alpha, ssm_beta, &s.normed, &mut s.alpha, &mut s.beta);
 
         // The seam takes the state slab and advances it, so nothing about the
         // conv window is assembled here. That is what lets a device backend
@@ -1488,8 +1492,17 @@ fn moe_batch<O: Ops>(
 
     // The router is F32, so this matmul is exact and the expert choice can be
     // compared against llama.cpp directly. One row of `n_expert` per token.
-    let router = &mut s.router[..n * m.n_expert];
-    ops.matmul(w.gate_inp, x, router);
+    //
+    // Paired with the shared expert's gate, which reads the same `x`: that is
+    // 256 output rows and 1, and a `matmul_f32_t` call costs almost the same
+    // either way because the cost is walking `x`. The gate's own launch was
+    // 1.49 ms of a 34 ms token for one number per token.
+    //
+    // The logit is written where it always was, so `moe_finish` below still
+    // takes `s.shexp_logit` and an index rather than a stride into a
+    // concatenated buffer.
+    let (router, logit) = (&mut s.router[..n * m.n_expert], &mut s.shexp_logit[..n]);
+    ops.matmul_pair(w.gate_inp, w.shared_gate_inp, x, router, logit);
     // `row` is what tells softmax where one distribution ends: it is the single
     // op the batch convention cannot reach, because every other op recovers its
     // count from a second buffer and this one has only the buffer it normalizes.
@@ -1534,10 +1547,8 @@ fn moe_batch<O: Ops>(
     ops.silu_mul(g, u);
     ops.matmul(w.shared_down, &s.e_gate[..sff], &mut s.e_out[..n * nd]);
 
-    // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
-    // Through the seam rather than as a host dot product, so the logit — which
-    // is a matmul result — never has to be read back.
-    ops.matmul(w.shared_gate_inp, x, &mut s.shexp_logit[..n]);
+    // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token. It
+    // was computed above, paired with the router, because both read `x`.
 
     // The whole tail in one call: weighted expert sum per token, the shared
     // expert's sigmoid gate, and the write into rows `at..at + n`.
