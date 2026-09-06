@@ -389,6 +389,18 @@ pub struct DeviceStats {
     pub issue_ns: u64,
     /// Host time spent blocked in a device-to-host copy.
     pub wait_ns: u64,
+    /// Host time spent uploading weights on first sight, in `Cuda::resident`.
+    ///
+    /// **One-time, and it lands inside the first forward pass**, which is what
+    /// made a 0.6B report `prefill 5 tok 725.2 ms 6.9 tok/s` against a decode
+    /// of 189.63 — 0.59 GiB of weights crossing the bus, divided by five prompt
+    /// tokens and printed as a throughput. The same defect as expert placement,
+    /// two orders of magnitude smaller and on every CUDA model rather than only
+    /// the MoE one.
+    ///
+    /// Only the miss branch is timed, so a resident lookup — the case on every
+    /// token after the first — costs nothing to observe.
+    pub weight_upload_ns: u64,
 }
 
 impl DeviceStats {
@@ -1638,6 +1650,26 @@ pub struct DeviceBuffer {
     bytes: usize,
 }
 
+/// Cumulative nanoseconds inside `cuMemAlloc`, process-wide.
+///
+/// **A static because `DeviceBuffer::new` has no backend handle**, and giving
+/// it one would thread `&Cuda` through every allocation site to observe
+/// something that happens a few hundred times in a process. Process-wide is
+/// also the honest scope: a second `Cuda` in the same process shares the
+/// driver's allocator, so the cost is not separable per backend anyway.
+///
+/// Why it exists: a 0.6B CUDA prefill of 64 tokens takes ~890 ms against a
+/// marginal cost of 0.76 ms/token, so ~842 ms is fixed. Weight upload accounts
+/// for 10 ms of that and PTX JIT for ~330 (measured by `CUDA_MODULE_LOADING`),
+/// which left ~500 ms attributed to nothing. Allocation was the leading
+/// candidate and a candidate is not a measurement.
+static ALLOC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds spent in `cuMemAlloc` since the process started.
+pub fn alloc_ns() -> u64 {
+    ALLOC_NS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl DeviceBuffer {
     pub fn new(bytes: usize) -> Result<Self> {
         // A zero-byte allocation is not an error to ask for, but the driver
@@ -1646,8 +1678,13 @@ impl DeviceBuffer {
             return Ok(Self { ptr: 0, bytes: 0 });
         }
         let mut ptr: ffi::CUdeviceptr = 0;
+        let started = std::time::Instant::now();
         // SAFETY: valid out-pointer, non-zero size.
         unsafe { check(ffi::cuMemAlloc_v2(&mut ptr, bytes), "cuMemAlloc")? };
+        ALLOC_NS.fetch_add(
+            started.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(Self { ptr, bytes })
     }
 

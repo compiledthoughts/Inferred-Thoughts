@@ -106,6 +106,18 @@ pub struct Profile {
     pub decode_tokens: u64,
     pub decode_ns: u64,
 
+    /// A one-time backend cost included in `prefill_ns`, and its name.
+    ///
+    /// Set from [`crate::Ops::setup_cost`] after the run, because the cost is
+    /// incurred *inside* the first forward pass rather than around it: the CUDA
+    /// backend places every expert on first sight of its tensor. `prefill_ns`
+    /// is therefore correct as a wall clock and misleading as a rate, and
+    /// [`Profile::phases`] uses this to report both honestly.
+    ///
+    /// `None` on every CPU backend, which is what keeps the 0.6B and 9B output
+    /// byte-for-byte what it was.
+    pub setup: Option<(u64, &'static str)>,
+
     /// Bytes of quantized weight read by one full forward pass, derived from
     /// the model's tensor types and shapes rather than counted.
     pub weight_bytes: u64,
@@ -224,15 +236,47 @@ impl Profile {
     pub fn phases(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
         let ms = |ns: u64| ns as f64 / 1e6;
 
-        if self.prefill_tokens > 0 {
-            let s = self.prefill_ns as f64 / 1e9;
+        // **The one-time cost comes out before the rate is computed**, and is
+        // printed on its own line rather than folded away. It is real time the
+        // user waited, so hiding it would trade one wrong number for another;
+        // what was wrong was dividing it by the prompt length and calling the
+        // result throughput.
+        if let Some((setup_ns, label)) = self.setup {
             writeln!(
                 out,
-                "prefill  {:>6} tok  {:>9.1} ms  {:>8.1} tok/s",
-                self.prefill_tokens,
-                ms(self.prefill_ns),
-                self.prefill_tokens as f64 / s.max(1e-9),
+                "setup    {:>6}      {:>9.1} ms                    one-time {label}, inside the first pass",
+                "",
+                ms(setup_ns),
             )?;
+        }
+        if self.prefill_tokens > 0 {
+            let setup_ns = self.setup.map_or(0, |(ns, _)| ns);
+            // Saturating, and it says so if it saturated. A setup cost larger
+            // than the pass that contained it means the two clocks disagree
+            // about what they measured, which is worth a line rather than a
+            // plausible-looking rate — the failure this whole change exists to
+            // stop.
+            let net_ns = self.prefill_ns.saturating_sub(setup_ns);
+            if setup_ns > self.prefill_ns {
+                writeln!(
+                    out,
+                    "prefill  {:>6} tok  {:>9.1} ms   NO RATE: {label_ns:.1} ms of setup exceeds the                      {:.1} ms pass that contained it",
+                    self.prefill_tokens,
+                    ms(self.prefill_ns),
+                    ms(self.prefill_ns),
+                    label_ns = ms(setup_ns),
+                )?;
+            } else {
+                let s = net_ns as f64 / 1e9;
+                writeln!(
+                    out,
+                    "prefill  {:>6} tok  {:>9.1} ms  {:>8.1} tok/s{}",
+                    self.prefill_tokens,
+                    ms(net_ns),
+                    self.prefill_tokens as f64 / s.max(1e-9),
+                    if setup_ns > 0 { "  net of setup" } else { "" },
+                )?;
+            }
         }
         if self.decode_tokens > 0 {
             let s = self.decode_ns as f64 / 1e9;

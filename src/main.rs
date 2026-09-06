@@ -751,6 +751,27 @@ shapes   measured on the live device, queue full, no per-launch sync"
         }
     }
 
+    // The one-time costs, decomposed. The bare run prints their total on the
+    // `setup` line; this says where it went, which is the difference between
+    // knowing the first pass was slow and knowing why.
+    {
+        let (alloc, upload, place) = cuda.setup_parts();
+        let ms = |ns: u64| ns as f64 / 1e6;
+        eprintln!(
+            "
+setup    {:.1} ms cuMemAlloc + {:.1} ms weight copies + {:.1} ms expert placement = {:.1} ms",
+            ms(alloc),
+            ms(upload),
+            ms(place),
+            ms(alloc + upload + place),
+        );
+        eprintln!(
+            "         PTX JIT is not in this and cannot be: the driver compiles on first
+         launch and reports nothing. Measure it with CUDA_MODULE_LOADING=EAGER
+         against LAZY — ~330 ms of a 0.6B's ~842 ms fixed first pass."
+        );
+    }
+
     if let Some(e) = cuda.expert_stats() {
         let gib = |b: u64| b as f64 / 1073741824.0;
         eprintln!(
@@ -928,6 +949,11 @@ fn run_generation<O: inferred_thoughts::Ops>(
     // the cache, and on this model they differ by an order of magnitude.
     let mut err = std::io::stderr();
     let _ = writeln!(err);
+    // Asked *after* the run, because the cost is incurred inside the first
+    // forward pass: the CUDA backend places every expert on first sight of its
+    // tensor, so `prefill_ns` contains it. `None` on every CPU backend, which
+    // is what leaves the 0.6B and 9B output unchanged.
+    engine.prof.setup = engine.ops.setup_cost();
     let _ = engine.prof.phases(&mut err);
 
     // Wall clock over both phases, so its token count is the sum and not

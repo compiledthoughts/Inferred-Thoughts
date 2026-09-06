@@ -315,3 +315,81 @@ fn the_35b_generates_coherent_text() {
          or the shared expert's gate"
     );
 }
+
+/// **The 35B's routed FFN, batched against one token at a time — bit for bit.**
+///
+/// This is the instrument the MoE path did not have, and its absence is a
+/// specific gap rather than a general one. `moe_token` runs *inside* a batched
+/// pass: routing differs per token, so the FFN is a per-token loop lifting one
+/// row out of the batch and putting one back. `CLAUDE.md` names that as "the
+/// one place the batch convention does not reach", and every existing 35B test
+/// runs at `n_tok = 1`, where the distinction cannot appear:
+///
+/// * `the_35b_generates_coherent_text` decodes six tokens and greps for
+///   "paris". A token that read *another* token's experts would still answer
+///   Paris, because at `n_tok = 1` there is no other token.
+/// * `device_topk_reproduces_the_host_selection` now covers a batch, but only
+///   the selection. Nothing checks that the chosen experts are then applied to
+///   the row they were chosen for.
+///
+/// That is the exact shape of defect the warp attention kernel shipped with
+/// last session: correct at op level, wrong in the model, invisible to both
+/// existing harnesses. Writing this *before* the batched MoE lands means it
+/// passes trivially today, which is the point — a test written afterwards
+/// proves much less, because a green light then cannot distinguish "the change
+/// is right" from "the test cannot see the change".
+///
+/// Bit-identical rather than a tolerance: batching redistributes work without
+/// altering any accumulation order, so anything else is a bug. `Spin` rather
+/// than `Naive` because a 35B forward pass on one scalar thread is not a test
+/// anyone will run, and the differential tests already pin `Spin` to `Naive`.
+#[test]
+#[ignore = "loads the real 35B; run with --release -- --ignored"]
+fn batched_moe_prefill_equals_token_by_token() {
+    use inferred_thoughts::{Engine, Model, Spin, Tokenizer};
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is Paris, and the capital of", true, true);
+    // Enough tokens that a row-indexing slip lands somewhere other than row 0.
+    assert!(tokens.len() >= 6, "prompt too short to exercise the batch");
+    let n_ctx = tokens.len() + 4;
+
+    let batched = {
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, Spin::new(8), n_ctx, false);
+        e.prefill(&tokens).expect("batched prefill")
+    };
+
+    // Its own engine: 30 of 40 layers are GatedDeltaNet and recurrent state
+    // cannot be rewound, so a reset mid-run would not be the same experiment.
+    let stepwise = {
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, Spin::new(8), n_ctx, false);
+        let mut logits = e.prefill(&tokens[..1]).expect("prefill first token");
+        for &tok in tokens.iter().skip(1) {
+            logits = e.decode(tok).expect("decode");
+        }
+        logits
+    };
+
+    assert_eq!(batched.len(), stepwise.len(), "same vocabulary");
+    let differing = batched
+        .iter()
+        .zip(&stepwise)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        differing, 0,
+        "{differing} of {} logits differ between a batched prefill and the same tokens \
+         one at a time. The routed FFN is the only part of this model that indexes a \
+         row explicitly — suspect `moe_token`'s gather of `s.normed` at `at`, its \
+         scatter into `s.ffn_out`, or a route resolved for one token and applied to \
+         another.",
+        batched.len()
+    );
+}

@@ -448,7 +448,18 @@ impl Cuda {
         if let Some(b) = map.get(&key) {
             return Ok(b.ptr);
         }
-        let buf = DeviceBuffer::from_slice(data)?;
+        // Split into allocate and copy, and timed around the copy only, so
+        // this does not double-count the `cuMemAlloc` that `DeviceBuffer::new`
+        // already reports through `alloc_ns`. `from_slice` would do both and
+        // there would be no way to add the two totals without overlap.
+        //
+        // Timed below the lookup, not around it: a hit returns before reaching
+        // here, so observing this costs nothing on the path that runs every
+        // token.
+        let buf = DeviceBuffer::new(std::mem::size_of_val(data))?;
+        let started = std::time::Instant::now();
+        buf.write(data)?;
+        let upload_ns = started.elapsed().as_nanos() as u64;
         // Counted, because on the 35B this is no longer a start-up cost.
         //
         // `DeviceBuffer::from_slice` copies through the driver directly rather
@@ -461,6 +472,7 @@ impl Cuda {
         self.bump(|s| {
             s.h2d_calls += 1;
             s.h2d_bytes += std::mem::size_of_val(data) as u64;
+            s.weight_upload_ns += upload_ns;
         });
         let ptr = buf.ptr;
         map.insert(key, buf);
@@ -547,6 +559,29 @@ impl Cuda {
     /// item 2 proposed getting the hit rate from an offline replay of a routing
     /// trace; this is better, because it is the policy actually running against
     /// the traffic actually generated.
+    /// The three one-time costs the first forward pass is billed for, in
+    /// nanoseconds: `cuMemAlloc`, weight copies, expert placement.
+    ///
+    /// **Disjoint by construction**, which took a change to `resident` to make
+    /// true: it allocated and copied in one `from_slice` call, so the copy
+    /// timer contained the allocation timer and the two could not be added.
+    /// Adding overlapping measurements is how a breakdown comes to exceed the
+    /// thing it decomposes.
+    ///
+    /// They do not sum to the whole fixed cost and are not meant to. A 0.6B
+    /// first pass measures ~842 ms fixed, of which PTX JIT is ~330 —
+    /// established by running `CUDA_MODULE_LOADING=EAGER` against `LAZY`, and
+    /// not observable from inside the process, since the driver does the work
+    /// on first launch and reports nothing.
+    pub fn setup_parts(&self) -> (u64, u64, u64) {
+        let alloc = super::alloc_ns();
+        let upload = self.stats().weight_upload_ns;
+        let place = self
+            .expert_stats()
+            .map_or(0, |e| (e.place_h2d_us + e.place_pin_us + e.place_copy_us) * 1_000);
+        (alloc, upload, place)
+    }
+
     pub fn expert_stats(&self) -> Option<experts::ExpertStats> {
         self.absorb_expert_counters();
         self.experts.borrow().as_ref().map(|c| c.stats())
@@ -3142,6 +3177,32 @@ impl Ops for Cuda {
         }
     }
 
+    /// Expert placement, which happens inside the first prefill.
+    ///
+    /// `ExpertCache::table` is built on first sight of each `Experts` tensor,
+    /// and the first sight is the first `moe_glu` — so the whole eager
+    /// placement of 30,720 experts is billed to whichever pass touches them
+    /// first. That is real time and it is charged in the right place; it is
+    /// only the *label* that was missing.
+    ///
+    /// The three phases are already observed at the point each happens (see
+    /// `ExpertStats::place_h2d_us`), because a whole-prefill number cannot say
+    /// which part is expensive — an earlier attempt to explain a 46 s prefill
+    /// from arithmetic over them was wrong by 40 s.
+    ///
+    /// **This covers expert placement only**, not the ordinary weight mirrors,
+    /// which upload on first touch and are not timed. So the remainder of a
+    /// first prefill is still slightly overstated, and saying so here is
+    /// cheaper than a reader assuming otherwise.
+    fn setup_cost(&self) -> Option<(u64, &'static str)> {
+        let (alloc, upload, place) = self.setup_parts();
+        let total = alloc + upload + place;
+        if total == 0 {
+            return None;
+        }
+        Some((total, "device setup"))
+    }
+
     fn host_wrote(&self, buf: &[f32]) {
         if let Some(m) = self.mirrors.borrow_mut().get_mut(&(buf.as_ptr() as usize)) {
             m.invalidate();
@@ -3241,6 +3302,20 @@ impl Ops for &Cuda {
 
     fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
         (*self).attend(a, out)
+    }
+
+    // **These two were missing, and both defaulted to silence.** `serve` holds
+    // `&Cuda`, not `Cuda`, so `engine.ops.device_report()` resolved to the
+    // trait's no-op and `--profile-device` printed nothing per turn for as long
+    // as it has existed. Twelfth instrument in this repo to fail by producing
+    // no number at all. A forwarding impl that forwards *most* methods is the
+    // same hazard as a counter that counts *most* allocations.
+    fn device_report(&self) {
+        (*self).device_report()
+    }
+
+    fn setup_cost(&self) -> Option<(u64, &'static str)> {
+        (*self).setup_cost()
     }
 
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {

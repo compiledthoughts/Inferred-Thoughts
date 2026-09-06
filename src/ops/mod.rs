@@ -832,6 +832,31 @@ pub trait Ops {
     /// to, since this runs in a server's hot path.
     fn device_report(&self) {}
 
+    /// A one-time cost this backend charged to the forward pass, and its name.
+    ///
+    /// **Because a phase timer measures a wall clock, not a phase.** The CUDA
+    /// backend places all 30,720 experts on first sight of each tensor, which
+    /// happens *inside the first prefill* — 16.3 GB of mmap read, ~4.5 GiB
+    /// page-locked and ~22,400 host-to-device copies. A 19-token prompt
+    /// therefore reported `prefill 19 tok 25205.3 ms 0.8 tok/s`, which reads as
+    /// a throughput and is nothing of the kind: ~24 s of it happens once and
+    /// ~1.2 s is nineteen tokens of arithmetic.
+    ///
+    /// Eleventh instrument here to report an unlabelled basis, and the second
+    /// where the *denominator* rather than the number was the defect. The fix
+    /// is not to hide the cost — it is real time the user waited — but to name
+    /// it, which is what [`crate::Profile::phases`] now does.
+    ///
+    /// Returning the label with the duration rather than beside it is
+    /// deliberate: a duration with no name is exactly the failure this exists
+    /// to correct, so the type makes one impossible.
+    ///
+    /// `None` for every CPU backend, which allocates nothing lazily — so the
+    /// 0.6B and 9B lines print exactly as they did before.
+    fn setup_cost(&self) -> Option<(u64, &'static str)> {
+        None
+    }
+
     fn host_wrote(&self, _buf: &[f32]) {}
 
     /// The model is about to read `buf`. Bring back whatever the device has.
