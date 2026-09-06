@@ -375,6 +375,7 @@ pub(super) struct ExpertCache {
     /// Experts moved between tiers, and the passes that have gone by since the
     /// last time any were.
     migrated: u64,
+    /// Tokens routed since the last migration. See `migration_state`.
     since_migration: u64,
     /// The model file and the address its mapping starts at. See
     /// `ExpertCache::set_source`.
@@ -883,8 +884,17 @@ impl ExpertCache {
     }
 
     /// Passes since the last migration, and how many experts have ever moved.
-    pub fn migration_state(&mut self) -> (u64, u64) {
-        self.since_migration += 1;
+    /// Tokens seen since the last migration, and the running exchange count.
+    ///
+    /// **Tokens, not passes, and that was the whole defect.** This counted
+    /// calls, so a 512-token prefill pass advanced it by one — the same as a
+    /// single decode token — and a 1501-token prompt advanced it by three
+    /// against a threshold of 64. The evidence a pass carries is proportional
+    /// to the tokens it routed, not to the number of times `begin_pass` was
+    /// called, and counting the wrong one made the policy inert in exactly the
+    /// workload that needs it most: a long prompt and a short answer.
+    pub fn migration_state(&mut self, n_tokens: usize) -> (u64, u64) {
+        self.since_migration += n_tokens as u64;
         (self.since_migration, self.migrated)
     }
 

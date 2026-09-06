@@ -600,29 +600,38 @@ impl Cuda {
     /// a single pass boundary cannot stall. Converges and then stops: the
     /// exchange only happens while some host-resident expert is busier than
     /// some resident one.
-    fn migrate_experts(&self) {
-        /// Passes between migrations. The counter read-back costs a
+    fn migrate_experts(&self, n_tokens: usize) {
+        /// Tokens between migrations. The counter read-back costs a
         /// synchronize, so this is not free; 64 puts it under 1% of a decode
         /// pass while still converging inside a few hundred tokens.
         const MIGRATE_EVERY: u64 = 64;
-        /// Exchanges per migration. At ~45 us each this is ~9 ms, which lands
-        /// at a pass boundary rather than inside a token.
+        /// Exchanges per 64 tokens of evidence. At ~45 us each this is ~9 ms,
+        /// which lands at a pass boundary rather than inside a token.
         const MIGRATE_BUDGET: usize = 200;
+        /// Ceiling on one boundary's exchanges, so a large prefill pass cannot
+        /// turn its boundary into a visible stall. 2,000 at ~45 us is ~90 ms
+        /// against a 512-token pass that takes seconds.
+        const MIGRATE_CAP: usize = 2_000;
 
-        let due = match self.experts.borrow_mut().as_mut() {
-            Some(c) => c.migration_state().0 >= MIGRATE_EVERY,
-            None => false,
+        let since = match self.experts.borrow_mut().as_mut() {
+            Some(c) => c.migration_state(n_tokens).0,
+            None => return,
         };
-        if !due {
+        if since < MIGRATE_EVERY {
             return;
         }
+        // **Budget scales with the evidence, because the trigger now can.** A
+        // 512-token pass arrives with eight windows' worth of routing counts at
+        // once; spending one window's budget on it would take eight prefills to
+        // do what one could. Capped so a single boundary stays bounded.
+        let budget = (MIGRATE_BUDGET * (since / MIGRATE_EVERY) as usize).min(MIGRATE_CAP);
         self.absorb_expert_counters();
         let counts = match self.experts.borrow().as_ref() {
             Some(c) => c.observed_counts().to_vec(),
             None => return,
         };
         if let Some(c) = self.experts.borrow_mut().as_mut() {
-            let r = c.migrate(MIGRATE_BUDGET, &counts);
+            let r = c.migrate(budget, &counts);
             c.migration_done();
             if let Err(e) = r {
                 self.note(Err::<(), _>(e));
@@ -3498,9 +3507,18 @@ impl Ops for Cuda {
         }
         // Before the pass, never inside it: a recorded graph cannot have work
         // inserted, but the table it reads can be rewritten between replays.
-        if n_tokens == 1 {
-            self.migrate_experts();
-        }
+        //
+        // **This used to be gated on `n_tokens == 1`, which made the policy
+        // inert in prefill.** The guard was unnecessary — the constraint is
+        // *between passes*, which holds at any batch size — and it cost the
+        // workload that needs migration most. Measured on a 1501-token prompt:
+        // the VRAM read rate sat at 72.9%, which is exactly 22,392/30,720,
+        // slots over pool, the signature of a placement using no information at
+        // all. In decode the same policy reaches 93.7%.
+        //
+        // With a host read costing 11.4x a VRAM one (190.8 against 16.7 GB/s,
+        // measured by `bench_expert_residency`), that gap was ~72% of prefill.
+        self.migrate_experts(n_tokens);
         self.in_pass.set(true);
         self.note(self.timing_begin());
         self.note(self.graph_begin(n_tokens));
