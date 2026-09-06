@@ -1135,10 +1135,15 @@ impl Cuda {
         }
 
         let n_super = w.n_in / QK_K;
+        // Every (token, pick) pair gets a block on `y`. Decode is `n_tok == 1`
+        // of the same launch, which is why this cannot regress it.
+        let n_pair = n_used * route.n_tok();
         // One row shared by every expert, or one row each. Derived from the
-        // buffer, as the seam's batch count is.
+        // buffer, as the seam's batch count is — and the comparison is against
+        // the *pair* count now, since a batched `down` has one intermediate per
+        // pair rather than per pick.
         let rows = x.len() / w.n_in;
-        let x_stride_super = if rows == n_used { n_super } else { 0 };
+        let x_stride_super = if rows == n_pair { n_super } else { 0 };
         let (sd, qd, _) = self.quantized_k(x, rows * n_super)?;
 
         // The picks' addresses, resolved on the device from the slot table.
@@ -1155,7 +1160,7 @@ impl Cuda {
             KArg::I32(w.n_in as i32),
             KArg::I32(w.n_out as i32),
             KArg::I32(x_stride_super as i32),
-            KArg::I32(n_used as i32),
+            KArg::I32(n_pair as i32),
             KArg::Ptr(wptrs),
             KArg::Ptr(sd),
             KArg::Ptr(qd),
@@ -1169,7 +1174,7 @@ impl Cuda {
             self.launch_grid2(
                 "matmul_iq4_xs_q8_k_moe",
                 w.n_out.div_ceil(rows_per_block) as u32,
-                n_used as u32,
+                n_pair as u32,
                 block,
                 0,
                 &args,
@@ -1203,7 +1208,12 @@ impl Cuda {
         }
 
         let n_super = gate.n_in / QK_K;
-        let (sd, qd, _) = self.quantized_k(x, n_super)?;
+        let n_tok = route.n_tok();
+        let n_pair = n_used * n_tok;
+        // One activation row per *token*, not per pair: this half of the FFN
+        // runs before any per-expert intermediate exists, so all `n_used`
+        // experts of a token read the same row.
+        let (sd, qd, _) = self.quantized_k(x, n_tok * n_super)?;
 
         // Two slot tables, two gathers, both on the device. `gate` and `up` are
         // separate tensors with separate tables, so an expert's gate and its up
@@ -1220,6 +1230,7 @@ impl Cuda {
         let args = [
             KArg::I32(gate.n_in as i32),
             KArg::I32(gate.n_out as i32),
+            KArg::I32(n_pair as i32),
             KArg::I32(n_used as i32),
             KArg::Ptr(gptrs),
             KArg::Ptr(uptrs),
@@ -1236,7 +1247,7 @@ impl Cuda {
             self.launch_grid2(
                 "matmul_iq4_xs_q8_k_moe_glu",
                 gate.n_out.div_ceil(rows_per_block) as u32,
-                n_used as u32,
+                n_pair as u32,
                 block,
                 0,
                 &args,
@@ -1273,11 +1284,13 @@ impl Cuda {
         // The weights come from the buffer `moe_topk` wrote, not from eight
         // kernel arguments -- the same move as the expert pointers, and for the
         // same reason: a graph bakes its arguments in at record time.
-        let wd = self.pooled(slot::ROUTE_W, n_used * 4)?;
+        let n_tok = route.n_tok();
+        let wd = self.pooled(slot::ROUTE_W, n_tok * n_used * 4)?;
         let args = [
             KArg::I32(n as i32),
             KArg::I32(n_used as i32),
             KArg::I32(at as i32),
+            KArg::I32(n_tok as i32),
             KArg::Ptr(wd),
             KArg::Ptr(rd),
             KArg::Ptr(shd),
@@ -1286,10 +1299,12 @@ impl Cuda {
             KArg::Ptr(od),
         ];
         self.note_shape("moe_finish", n, 0);
-        // SAFETY: parameters match `moe_finish`; `rows` holds `scales.len() * n`
-        // floats, `shared` holds `n`, and one thread covers each element of the
-        // output row at `at`.
-        unsafe { self.launch_shared("moe_finish", n.div_ceil(256) as u32, 256, 0, &args)? };
+        // SAFETY: parameters match `moe_finish`; `rows` holds `n_tok * n_used`
+        // rows of `n` floats, `shared` holds `n_tok` of them, and one thread
+        // covers each element of the `n_tok` output rows starting at `at`.
+        unsafe {
+            self.launch_shared("moe_finish", (n * n_tok).div_ceil(256) as u32, 256, 0, &args)?
+        };
         self.mirror_out(out).map(|_| ())
     }
 

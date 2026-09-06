@@ -1362,3 +1362,109 @@ fn the_warp_attention_agrees_with_the_oracle() {
         panic!("cuda error: {e}");
     }
 }
+
+/// **The 35B's MoE forward pass, GPU against the oracle, on a batch.**
+///
+/// The gap this closes: `the_model_agrees_with_the_oracle_to_the_quantization_floor`
+/// above runs the 0.6B, which has no experts, and the 35B's own standing check
+/// runs on the CPU and greps for "paris". So nothing compared the routed FFN's
+/// CUDA kernels against anything, at any batch shape — the expert matmuls, the
+/// device top-k, the pointer gather and `moe_finish` were covered only by ops
+/// tests on synthetic data and by a generation reading plausibly.
+///
+/// A batch is the shape that matters. Every one of those kernels indexes three
+/// things that are all zero at `n_tok == 1`: the token's activation row, its
+/// slice of the expert weights, and its shared-expert gate. `moe_glu` divides
+/// `blockIdx.y` by `n_used` to recover the token, which at one token is always
+/// zero however wrong the arithmetic is.
+///
+/// Not bit-equality, and deliberately: `Spin` and `Cuda` disagree by an `expf`
+/// ulp in `softmax` and `silu_mul` — both of which the routed FFN uses, the
+/// first on the router itself — and the RMSNorm tree adds its own. The bound is
+/// `CLAUDE.md`'s quantization-amplification figure, the same one the 0.6B test
+/// uses, and the companion evidence is that the CPU path is separately proven
+/// bit-identical batched against stepwise by
+/// `qwen35::batched_moe_prefill_equals_token_by_token`.
+///
+/// A routing error is what this is really for, and routing errors are not
+/// small: picking one wrong expert of 256 changes the output categorically
+/// rather than by an ulp, so the floor below is a sharp detector even though it
+/// is not zero.
+#[test]
+#[ignore = "needs an sm_120 device and the real 35B"]
+fn the_35b_moe_agrees_with_the_oracle_on_a_batch() {
+    use inferred_thoughts::{Model, Spin};
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode(
+        "The capital of France is Paris, and the capital of Japan is Tokyo, and the capital of",
+        true,
+        true,
+    );
+    assert!(tokens.len() >= 12, "prompt too short to exercise the batch");
+    let n_ctx = tokens.len() + 4;
+
+    let cpu = {
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, Spin::new(8), n_ctx, false);
+        e.prefill(&tokens).expect("cpu prefill")
+    };
+
+    let gpu_logits = {
+        let gpu = Cuda::new(0).expect("cuda device");
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, &gpu, n_ctx, false);
+        let l = e.prefill(&tokens).expect("gpu prefill");
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        l
+    };
+
+    let (worst, differing) = compare(&cpu, &gpu_logits);
+    let magnitude = cpu.iter().fold(0.0f32, |m: f32, &v: &f32| m.max(v.abs()));
+    let relative = worst / magnitude;
+    println!(
+        "  logits          {differing:>6} of {:<6} differ   worst {worst:e}  \
+         ({relative:e} of magnitude {magnitude:.3})",
+        cpu.len()
+    );
+    println!(
+        "  argmax          cpu {}  gpu {}",
+        argmax(&cpu),
+        argmax(&gpu_logits)
+    );
+
+    // The 35B is 40 layers against the 0.6B's 28, so the same per-layer floor
+    // compounds further; the ceiling is scaled by the layer ratio rather than
+    // re-fitted, so it stays derived rather than chosen to pass.
+    let ceiling = 9.0e-2 * (40.0 / 28.0);
+    assert!(
+        relative <= ceiling,
+        "GPU logits differ from the oracle by {relative:e} of magnitude, over the \
+         {ceiling:e} that 40 layers of quantization amplification explain. A routing \
+         error is the first thing to suspect — it changes the answer categorically \
+         rather than by an ulp. Check moe_glu's token index, moe_finish's per-token \
+         slices, and moe_gather_ptrs' token-major layout."
+    );
+    assert_eq!(
+        argmax(&cpu),
+        argmax(&gpu_logits),
+        "the two backends disagree on the next token, which at this floor means a \
+         routing or indexing defect rather than drift"
+    );
+}
+
+/// Index of the largest logit; `Qwen3::argmax` is the 0.6B's and takes its own type.
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
+}

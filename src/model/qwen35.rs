@@ -589,7 +589,6 @@ struct Scratch {
     e_up: Vec<f32>,
     /// One expert's output and the running weighted sum, `n_embd` wide.
     e_out: Vec<f32>,
-    moe_acc: Vec<f32>,
     e_in: Vec<f32>,
     /// The routed experts' intermediates, all of them at once: `n_expert_used`
     /// consecutive rows. Separate from `e_gate`/`e_up`/`e_out`, which stay
@@ -629,6 +628,21 @@ struct Scratch {
     v_part: Vec<f32>,
     core: Vec<f32>,
 }
+
+/// Tokens per routed-FFN call.
+///
+/// **Bounds the one buffer set that scales with `n_used` as well as `n`.** The
+/// routed FFN holds `n_expert_used * (2 * expert_ff + n_embd)` floats per
+/// token — 96 KiB on the 35B — so an uncapped 512-token batch would hold ~50
+/// MiB of scratch for the life of the process, which on this card is about a
+/// layer and a half of expert residency. `CLAUDE.md`'s memory rule is explicit
+/// that a batch scales activations and that `resident_bytes()` is what settles
+/// it.
+///
+/// 128 keeps the launches wide — 1,024 (token, pick) pairs against 36 SMs —
+/// while capping the scratch at ~12 MiB. Nothing else in `Scratch` is chunked,
+/// because nothing else carries the `n_used` factor.
+const MOE_CHUNK: usize = 128;
 
 impl Scratch {
     /// Size every buffer for a batch of `n` tokens, token-major, **without
@@ -675,23 +689,31 @@ impl Scratch {
         z(&mut self.v_part, c.value_dim());
         z(&mut self.core, c.value_dim());
 
-        // The MoE buffers are single-token: routing differs per token, so that
-        // FFN runs as a loop and shares one set of scratch across the batch.
+        // **The MoE buffers scale with the batch now.** They were single-token
+        // because the routed FFN ran as a loop, which is what made it 58% of
+        // prefill device time: every expert's weights were re-read once per
+        // token where a batched matmul reads them once per batch.
+        //
+        // The cost is `n_expert_used * (2 * expert_ff + n_embd)` floats per
+        // token — 96 KiB on this model, against the ~405 KiB/token the rest of
+        // `Scratch` already costs. `moe_chunk` below is what bounds it; see
+        // `moe_batch` for why the routed FFN is chunked when nothing else is.
         if let Some(m) = &c.moe {
-            self.router.resize(m.n_expert, 0.0);
-            self.e_gate.resize(m.expert_ff.max(m.shared_ff), 0.0);
-            self.e_up.resize(m.expert_ff.max(m.shared_ff), 0.0);
-            self.e_out.resize(c.n_embd, 0.0);
-            self.moe_acc.resize(c.n_embd, 0.0);
-            // One token's input row, gathered out of the batch. Owned rather
-            // than sub-sliced from `normed`; see `moe_token`.
-            self.e_in.resize(c.n_embd, 0.0);
+            let nt = n.min(MOE_CHUNK);
+            self.router.resize(nt * m.n_expert, 0.0);
+            self.e_gate.resize(nt * m.expert_ff.max(m.shared_ff), 0.0);
+            self.e_up.resize(nt * m.expert_ff.max(m.shared_ff), 0.0);
+            self.e_out.resize(nt * c.n_embd, 0.0);
+            // The chunk's input rows, gathered out of the batch. Owned rather
+            // than sub-sliced from `normed`; see `moe_batch`.
+            self.e_in.resize(nt * c.n_embd, 0.0);
             // Every routed expert's intermediates, side by side, so the whole
-            // stage is one launch per step instead of one per expert.
-            self.g_all.resize(m.n_expert_used * m.expert_ff, 0.0);
-            self.u_all.resize(m.n_expert_used * m.expert_ff, 0.0);
-            self.o_all.resize(m.n_expert_used * c.n_embd, 0.0);
-            self.shexp_logit.resize(1, 0.0);
+            // stage is one launch per step instead of one per expert — and now
+            // one per chunk instead of one per token.
+            self.g_all.resize(nt * m.n_expert_used * m.expert_ff, 0.0);
+            self.u_all.resize(nt * m.n_expert_used * m.expert_ff, 0.0);
+            self.o_all.resize(nt * m.n_expert_used * c.n_embd, 0.0);
+            self.shexp_logit.resize(nt, 0.0);
         }
 
         // One row of output per pass, whatever the batch.
@@ -993,24 +1015,21 @@ impl<'a> Qwen35<'a> {
                             });
                         }
                     };
-                    for t in 0..n {
-                        let at = t * nd;
-                        moe_token(
-                            ops,
-                            &m,
-                            MoeWeights {
-                                gate_inp,
-                                gate,
-                                up,
-                                down,
-                                shared_gate,
-                                shared_up,
-                                shared_down,
-                                shared_gate_inp,
-                            },
-                            at,
-                            s,
-                        );
+                    let w = MoeWeights {
+                        gate_inp,
+                        gate,
+                        up,
+                        down,
+                        shared_gate,
+                        shared_up,
+                        shared_down,
+                        shared_gate_inp,
+                    };
+                    let mut t = 0;
+                    while t < n {
+                        let take = MOE_CHUNK.min(n - t);
+                        moe_batch(ops, &m, w, t * nd, take, nd, s);
+                        t += take;
                     }
                     ctx.trace("ffn_moe_out", il, &s.ffn_out);
                 }
@@ -1383,8 +1402,12 @@ mod tests {
     }
 }
 
-/// The weights one routed FFN needs, grouped so `moe_token` takes four
-/// arguments instead of eleven.
+/// The weights one routed FFN needs, grouped so `moe_batch` takes six
+/// arguments instead of thirteen.
+///
+/// `Copy` because the chunk loop hands the same borrows to each call; they are
+/// shared references into the mmap, so copying the struct copies nothing.
+#[derive(Clone, Copy)]
 struct MoeWeights<'a, 'b> {
     gate_inp: &'b Weights<'a>,
     gate: &'b Experts<'a>,
@@ -1396,7 +1419,8 @@ struct MoeWeights<'a, 'b> {
     shared_gate_inp: &'b Weights<'a>,
 }
 
-/// One token through the mixture of experts, writing into `s.ffn_out` at `at`.
+/// One chunk of tokens through the mixture of experts, writing into
+/// `s.ffn_out` at `at`.
 ///
 /// Transcribed from `llm_graph_context::build_moe_ffn` and
 /// `llama_model_qwen35moe::graph::build_layer_ffn`. The rule, with the two
@@ -1423,78 +1447,109 @@ struct MoeWeights<'a, 'b> {
 ///   division rather than the weights.
 ///
 /// The experts are summed in top-k order, serially, as the reference does.
-fn moe_token<O: Ops>(ops: &O, m: &Moe, w: MoeWeights<'_, '_>, at: usize, s: &mut Scratch) {
-    let nd = s.e_out.len();
+///
+/// # Why this takes a chunk rather than the whole batch
+///
+/// `CLAUDE.md` called the routed FFN "the one place the batch convention does
+/// not reach", because routing differs per token. That was true of the
+/// *selection* and never of the arithmetic: once the picks are chosen, the
+/// expert stage is `n_tok * n_used` ordinary matmuls, and issuing them together
+/// is what stops each expert's weights being re-read once per token.
+///
+/// It is chunked because its scratch is the one part of `Scratch` that scales
+/// with `n_used` as well as `n`: `n_expert_used * (2 * expert_ff + n_embd)` is
+/// 96 KiB per token on this model, so an uncapped 512-token batch would hold
+/// ~50 MiB for the life of the process — about a layer and a half of expert
+/// residency on a card where residency is the whole subject. `MOE_CHUNK` is
+/// large enough that the launches are still wide (128 tokens is 1,024 pairs
+/// against 36 SMs) and small enough that the buffers stay bounded.
+fn moe_batch<O: Ops>(
+    ops: &O,
+    m: &Moe,
+    w: MoeWeights<'_, '_>,
+    at: usize,
+    n: usize,
+    nd: usize,
+    s: &mut Scratch,
+) {
 
-    // This token's row, lifted through the seam rather than as `&s.normed[at..]`.
+    // The chunk's rows, lifted through the seam rather than as `&s.normed[at..]`.
     //
     // **`CLAUDE.md`'s sub-slice rule, and this was the fourth place it applied.**
     // A device backend keys its mirrors on the host address of a slice, so
     // `&s.normed[at..]` for `at > 0` is an address it has never seen and would
     // be uploaded from a host copy the device never wrote. It is invisible in
     // decode, where `at` is always zero, and wrong for every batched pass —
-    // which is exactly how the previous three hid.
-    ops.gather_chunks(&s.normed, nd, nd, at, &mut s.e_in);
-    let x = &s.e_in[..];
+    // which is exactly how the previous three hid. `gather_chunks` still earns
+    // its place with a batch: `at` is nonzero for every chunk after the first.
+    let x = &mut s.e_in[..n * nd];
+    ops.gather_chunks(&s.normed, n * nd, n * nd, at, x);
+    let x = &s.e_in[..n * nd];
 
     // The router is F32, so this matmul is exact and the expert choice can be
-    // compared against llama.cpp directly.
-    ops.matmul(w.gate_inp, x, &mut s.router);
-    // A row per token: `s.router` is `n_expert` wide and holds one row for
-    // every token in the batch.
-    ops.softmax(&mut s.router, m.n_expert);
+    // compared against llama.cpp directly. One row of `n_expert` per token.
+    let router = &mut s.router[..n * m.n_expert];
+    ops.matmul(w.gate_inp, x, router);
+    // `row` is what tells softmax where one distribution ends: it is the single
+    // op the batch convention cannot reach, because every other op recovers its
+    // count from a second buffer and this one has only the buffer it normalizes.
+    ops.softmax(router, m.n_expert);
 
     // **Selection through the seam, so the model has one path.** The rule —
     // top-k descending, ties to the lower id, weights normalized by
-    // `max(sum, 6.103515625e-5)` — now lives in `Ops::route`'s default, which
-    // is what every CPU backend runs and is the oracle the device kernel is
-    // tested against. A backend that can choose on the card returns
-    // `Route::Device` and the probabilities never come home; nothing here
-    // changes either way, which is the point. `Route`'s doc has the contract.
-    let route = ops.route(&mut s.router, m.n_expert, m.n_expert_used);
+    // `max(sum, 6.103515625e-5)` — lives in `Ops::route`'s default, which is
+    // what every CPU backend runs and is the oracle the device kernel is tested
+    // against. A backend that can choose on the card returns `Route::Device`
+    // and the probabilities never come home; nothing here changes either way.
+    let route = ops.route(&mut s.router[..n * m.n_expert], m.n_expert, m.n_expert_used);
+    debug_assert_eq!(route.n_tok(), n, "the route must cover the chunk it was asked for");
 
-    // **The whole routed stage, one launch per step.** This was a loop over the
-    // eight picks doing five ops each; on the GPU that cost 18.03 ms/token
-    // against 4.46 grouped, because a `{2048, 512}` matmul cannot fill 36 SMs.
+    // **The whole routed stage, one launch per step for the whole chunk.** This
+    // was a loop over tokens, each issuing the eight picks: on the GPU that made
+    // the two expert kernels 58% of prefill device time, because every expert's
+    // weights were re-read once per token where a batched matmul reads them once
+    // per batch.
+    //
     // The arithmetic is untouched — each output is the same dot product of the
     // same bytes in the same order — so this is bit-exact by construction, the
-    // same argument that made batching free.
-    let ff = m.n_expert_used * m.expert_ff;
+    // same argument that made batching free everywhere else.
+    let pairs = n * m.n_expert_used;
+    let ff = pairs * m.expert_ff;
 
-    // Gate, up and the SiLU gating in one call. Three launches became one, and
-    // the pair never round-trips through device memory.
+    // Gate, up and the SiLU gating in one call. `x` is one row per token here;
+    // every expert of a token reads the same row.
     let (g, u) = (&mut s.g_all[..ff], &mut s.u_all[..ff]);
     ops.moe_glu(w.gate, w.up, &route, x, g, u);
-    // `x` here is one row per expert rather than one shared row, which
+    // `x` here is one row per *pair* rather than one per token, which
     // `matmul_experts` reads off the buffer length.
-    ops.matmul_experts(w.down, &route, &s.g_all[..ff], &mut s.o_all[..m.n_expert_used * nd]);
+    ops.matmul_experts(w.down, &route, &s.g_all[..ff], &mut s.o_all[..pairs * nd]);
 
-
-    // The shared expert: always run, gated by a sigmoid of a single logit.
-    ops.matmul(w.shared_gate, x, &mut s.e_gate[..m.shared_ff]);
-    ops.matmul(w.shared_up, x, &mut s.e_up[..m.shared_ff]);
-    let (g, u) = (&mut s.e_gate[..m.shared_ff], &s.e_up[..m.shared_ff]);
+    // The shared expert: always run, gated by a sigmoid of a single logit per
+    // token. Batched with no change — these are ordinary matmuls and derive
+    // their count from the buffer.
+    let sff = n * m.shared_ff;
+    ops.matmul(w.shared_gate, x, &mut s.e_gate[..sff]);
+    ops.matmul(w.shared_up, x, &mut s.e_up[..sff]);
+    let (g, u) = (&mut s.e_gate[..sff], &s.e_up[..sff]);
     ops.silu_mul(g, u);
-    ops.matmul(w.shared_down, &s.e_gate[..m.shared_ff], &mut s.e_out[..nd]);
+    ops.matmul(w.shared_down, &s.e_gate[..sff], &mut s.e_out[..n * nd]);
 
     // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token.
     // Through the seam rather than as a host dot product, so the logit — which
     // is a matmul result — never has to be read back.
-    ops.matmul(w.shared_gate_inp, x, &mut s.shexp_logit);
+    ops.matmul(w.shared_gate_inp, x, &mut s.shexp_logit[..n]);
 
-    // The whole tail in one call: weighted expert sum, the shared expert's
-    // sigmoid gate, and the write into row `at`. That was three launches
-    // (`add_scaled_rows`, `add_scaled_sigmoid`, `scatter_chunks`) plus a
-    // staging buffer, to produce one vector.
-    let rows = &s.o_all[..m.n_expert_used * nd];
+    // The whole tail in one call: weighted expert sum per token, the shared
+    // expert's sigmoid gate, and the write into rows `at..at + n`.
+    let rows = &s.o_all[..pairs * nd];
     ops.moe_finish(
         &mut s.ffn_out,
         at,
         nd,
         rows,
         &route,
-        &s.e_out[..nd],
-        &s.shexp_logit,
+        &s.e_out[..n * nd],
+        &s.shexp_logit[..n],
         0,
     );
 }

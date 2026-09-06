@@ -625,9 +625,29 @@ pub trait Ops {
             debug_assert!(false, "matmul_experts default given a device route");
             return;
         };
-        let per_expert = x.len() == picks.len() * w.n_in;
+        // Which row of `x` each pick reads, derived from the buffer exactly as
+        // the batch count is everywhere else. Three shapes, and only the middle
+        // one is new:
+        //
+        //   rows == picks       one intermediate per pick — the `down` half
+        //   rows == n_tok       one activation per token  — the `gate`/`up` half
+        //   rows == 1           a single shared row       — decode, either half
+        //
+        // At `n_tok == 1` the middle and last coincide, which is why this was
+        // correct with two cases for as long as the model routed one token at a
+        // time, and silently wrong the moment it did not: every token in a
+        // batch would have read token 0's activation.
+        let n_used = route.n_used().max(1);
+        let rows = x.len() / w.n_in;
         for (i, &e) in picks.iter().enumerate() {
-            let xi = if per_expert { &x[i * w.n_in..(i + 1) * w.n_in] } else { x };
+            let r = if rows == picks.len() {
+                i
+            } else if rows > 1 {
+                i / n_used
+            } else {
+                0
+            };
+            let xi = &x[r * w.n_in..(r + 1) * w.n_in];
             self.matmul(&w.expert(e), xi, &mut out[i * w.n_out..(i + 1) * w.n_out]);
         }
     }
@@ -692,14 +712,26 @@ pub trait Ops {
             debug_assert!(false, "moe_finish default given a device route");
             return;
         };
-        let g = 1.0 / (1.0 + (-logit[logit_at]).exp());
-        for j in 0..n {
-            let mut v = 0.0f32;
-            for (e, &s) in scales.iter().enumerate() {
-                v += s * rows[e * n + j];
+        // One output row per token, `n_tok` of them starting at `at`. Decode is
+        // `n_tok == 1`, which is byte for byte the loop this replaced.
+        //
+        // Each token takes its own `n_used` expert rows, its own shared-expert
+        // row and its own gate logit — three separate indexings that a
+        // single-token version had no way to get wrong, because every one of
+        // them was zero.
+        let n_used = route.n_used().max(1);
+        let n_tok = scales.len() / n_used;
+        for t in 0..n_tok {
+            let g = 1.0 / (1.0 + (-logit[logit_at + t]).exp());
+            let w = &scales[t * n_used..(t + 1) * n_used];
+            for j in 0..n {
+                let mut v = 0.0f32;
+                for (e, &s) in w.iter().enumerate() {
+                    v += s * rows[(t * n_used + e) * n + j];
+                }
+                v += shared[t * n + j] * g;
+                out[at + t * n + j] = v;
             }
-            v += shared[j] * g;
-            out[at + j] = v;
         }
     }
 

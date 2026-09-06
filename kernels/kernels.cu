@@ -1302,13 +1302,23 @@ __global__ void matmul_iq4_xs_q8_k(int n_in, int n_out,
 // which outputs share a launch, never how one accumulates. Each output row is
 // `dot_iq4_xs_warp` over the same bytes in the same order.
 __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
-                                       int n_used,
+                                       int n_pair,
                                        const unsigned long long *__restrict__ wptrs,
                                        const float *__restrict__ x_scales,
                                        const signed char *__restrict__ x_quants,
                                        float *__restrict__ out) {
+    // **`blockIdx.y` is a (token, pick) pair, not a pick.** In decode there is
+    // one token and this is the eight picks exactly as before; in a batch it is
+    // `n_tok * n_used`, laid out token-major so pair `t * n_used + i` is
+    // token `t`'s `i`-th expert -- which is the order `moe_gather_ptrs` already
+    // writes `wptrs` in.
+    //
+    // Nothing else moves: `wptrs`, `x` and `out` are all indexed by the same
+    // pair, so this is the batch convention applied to the expert axis. Bit
+    // exact by construction, for the third time: it changes which outputs share
+    // a launch, never how one accumulates.
     const int e = blockIdx.y;
-    if (e >= n_used) return;
+    if (e >= n_pair) return;
     const int nb   = n_in / QK_K;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -1349,30 +1359,44 @@ __global__ void matmul_iq4_xs_q8_k_moe(int n_in, int n_out, int x_stride_super,
 // Bit-exactness is unchanged. Each dot is `dot_iq4_xs_warp` over the same bytes
 // in the same order, and `silu` was already outside the exact set for the usual
 // reason -- `expf` -- with its order untouched.
-__global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_used,
+__global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_pair,
+                                           int n_used,
                                            const unsigned long long *__restrict__ gptrs,
                                            const unsigned long long *__restrict__ uptrs,
                                            const float *__restrict__ x_scales,
                                            const signed char *__restrict__ x_quants,
                                            float *__restrict__ out) {
     const int e = blockIdx.y;
-    if (e >= n_used) return;
+    if (e >= n_pair) return;
     const int nb   = n_in / QK_K;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
     if (j >= n_ff) return;
 
+    // **The one asymmetry with the `down` matmul above.** There, every pair has
+    // its own `n_ff`-wide intermediate, so `x` is indexed by the pair. Here the
+    // gate and up projections read the token's activation, which all of that
+    // token's `n_used` experts share -- so `x` is indexed by the *token*, and
+    // the pair layout being token-major is what makes that a division.
+    //
+    // Getting this wrong is silent: at `n_tok == 1` the quotient is always 0
+    // and every batch shape would read token 0's activation for the whole
+    // prompt. `batched_moe_prefill_equals_token_by_token` is what catches it.
+    const int tok = e / n_used;
+
     // As `matmul_iq4_xs_q8_k_moe`: both addresses come from device memory, so
     // this launch carries no trace of which experts were chosen.
     const unsigned char *gw = (const unsigned char *)gptrs[e];
     const unsigned char *uw = (const unsigned char *)uptrs[e];
     const size_t off = (size_t)j * nb * IQ4XS_BYTES;
+    const float *xs = x_scales + (size_t)tok * nb;
+    const signed char *xq = x_quants + (size_t)tok * nb * QK_K;
 
-    // Every expert reads the same activation here -- this is the gate/up half
-    // of the FFN, before any per-expert intermediate exists.
-    const float g = dot_iq4_xs_warp(nb, gw + off, x_scales, x_quants, lane);
-    const float u = dot_iq4_xs_warp(nb, uw + off, x_scales, x_quants, lane);
+    // Every expert of *this token* reads the same activation here -- this is
+    // the gate/up half of the FFN, before any per-expert intermediate exists.
+    const float g = dot_iq4_xs_warp(nb, gw + off, xs, xq, lane);
+    const float u = dot_iq4_xs_warp(nb, uw + off, xs, xq, lane);
 
     if (lane == 0) {
         // silu(g) * u, exactly as `silu_mul` computes it.
@@ -1540,24 +1564,36 @@ extern "C" __global__ void moe_topk(int n_expert, int n_used,
 // Order is the oracle's: the experts summed in ascending pick order from zero,
 // then the shared expert added last. `expf` is the only inexactness and it was
 // already there.
-extern "C" __global__ void moe_finish(int n, int n_rows, int at,
+extern "C" __global__ void moe_finish(int n, int n_used, int at,
+                                      int n_tok,
                                       const float *__restrict__ scales,
                                       const float *__restrict__ rows,
                                       const float *__restrict__ shared,
                                       const float *__restrict__ logit,
                                       int logit_at,
                                       float *__restrict__ out) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
+    // One thread per output element of the whole batch. Decode is
+    // `n_tok == 1`, which is exactly the grid this had before.
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * n_tok) return;
+    const int t = idx / n;
+    const int j = idx - t * n;
+
     // From device memory rather than eight kernel arguments, for the same
     // reason the expert pointers are: `moe_topk` wrote them and the host never
     // saw them. The sum below is still serial and ascending, so the order the
     // oracle uses is untouched.
+    //
+    // Three indexings that were all zero at `n_tok == 1` and are all distinct
+    // in a batch: this token's slice of the weights, its own block of expert
+    // rows, and its own shared-expert row and gate logit.
     float v = 0.0f;
-    for (int e = 0; e < n_rows; ++e) v += scales[e] * rows[(size_t)e * n + j];
-    const float g = 1.0f / (1.0f + expf(-logit[logit_at]));
-    v += shared[j] * g;
-    out[(size_t)at + j] = v;
+    for (int e = 0; e < n_used; ++e) {
+        v += scales[t * n_used + e] * rows[((size_t)t * n_used + e) * n + j];
+    }
+    const float g = 1.0f / (1.0f + expf(-logit[logit_at + t]));
+    v += shared[(size_t)t * n + j] * g;
+    out[(size_t)at + (size_t)t * n + j] = v;
 }
 
 // Weighted sum of `n_rows` rows into one, in ascending row order.
