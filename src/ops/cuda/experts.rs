@@ -629,11 +629,62 @@ impl ExpertCache {
         }
         let mut addrs = Vec::with_capacity(n_expert);
         let mut vram = Vec::with_capacity(n_expert);
-        for e in 0..n_expert {
-            let src = &data[e * stride..(e + 1) * stride];
-            let k = src.as_ptr() as usize;
-            addrs.push(self.place(k, src)?);
-            vram.push(i32::from(self.map.get(&k).and_then(|x| x.slot).is_some()));
+        let mut e = 0;
+        while e < n_expert {
+            // **The run of experts that lands in consecutive fresh VRAM slots
+            // is one copy, not one per expert.**
+            //
+            // `next_slot` is monotonic while the slab fills, so expert `e` goes
+            // to slot `s` and expert `e + 1` to `s + 1`: the source is a run of
+            // this tensor's pool and the destination a run of the slab. Calling
+            // `place` per expert chopped that into 256 separate
+            // `cuMemcpyHtoD`s of 557,056 bytes each.
+            //
+            // Measured before this: 11.53 GiB at **0.87 GB/s**, against 28.6
+            // GB/s of pinned H2D on this bus — 33x below the link, and ~22.5 s
+            // of a ~30 s start-up. It is start-up only and changes no
+            // steady-state number, but it is the tax on every experiment.
+            let mut run = 0;
+            while e + run < n_expert
+                && self.next_slot + run < self.owner.len()
+                && !self
+                    .map
+                    .contains_key(&(data[(e + run) * stride..].as_ptr() as usize))
+            {
+                run += 1;
+            }
+
+            if run == 0 {
+                // Not a fresh-slot case: already placed, or the slab is full
+                // and this belongs to the host tier or an eviction. One at a
+                // time, exactly as before.
+                let src = &data[e * stride..(e + 1) * stride];
+                let k = src.as_ptr() as usize;
+                addrs.push(self.place(k, src)?);
+                vram.push(i32::from(self.map.get(&k).and_then(|x| x.slot).is_some()));
+                e += 1;
+                continue;
+            }
+
+            let first = self.next_slot;
+            let src = &data[e * stride..(e + run) * stride];
+            let t = std::time::Instant::now();
+            self.slab.write_at(first * stride, src)?;
+            self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
+            self.stats.filled_bytes += src.len() as u64;
+            for i in 0..run {
+                let slot = (first + i) as u32;
+                let k = data[(e + i) * stride..].as_ptr() as usize;
+                self.stats.distinct += 1;
+                self.owner[slot as usize] = Some(k);
+                self.referenced[slot as usize] = true;
+                let addr = self.slot_ptr(slot);
+                self.map.insert(k, Entry { addr, slot: Some(slot), uses: 0 });
+                addrs.push(addr);
+                vram.push(1);
+            }
+            self.next_slot += run;
+            e += run;
         }
         let buf = DeviceBuffer::from_slice(&addrs)?;
         let ptr = buf.ptr;
