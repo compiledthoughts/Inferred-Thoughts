@@ -107,6 +107,15 @@ mod slot {
 /// bound here, and the two disagreeing is silent.
 const MOE_TOK: usize = 8;
 
+/// Pairs per grouped-expert tile on the tensor-core path. **Must equal
+/// `MOE_MMA_TOK` in `kernels/kernels.cu`.**
+///
+/// Wider than `MOE_TOK` because the two kernels have opposite constraints: the
+/// scalar one holds a per-token register array, the MMA one holds only
+/// accumulators per 8-token sub-tile and wants the widest tile routing can
+/// fill.
+const MOE_MMA_TOK: usize = 16;
+
 /// One matmul shape, measured on the live device with the launch queue kept
 /// full — the thing `--profile-kernels` cannot report, because synchronizing
 /// per launch is exactly what changes the answer.
@@ -1012,7 +1021,8 @@ impl Cuda {
                 self.launch_grid2(
                     mma,
                     w.n_out.div_ceil(64) as u32,
-                    n_tok.div_ceil(8) as u32,
+                    // 8 tokens per MMA times MMA_NTILE tiles per weight load.
+                    n_tok.div_ceil(32) as u32,
                     128,
                     0,
                     &margs,
@@ -1418,6 +1428,7 @@ impl Cuda {
         n_expert: usize,
         n_used: usize,
         n_tok: usize,
+        e_tok: usize,
     ) -> Result<(
         ffi::CUdeviceptr,
         ffi::CUdeviceptr,
@@ -1426,7 +1437,7 @@ impl Cuda {
         u32,
     )> {
         let n_pair = n_used * n_tok;
-        let n_tile_max = n_pair.div_ceil(MOE_TOK) + n_expert.min(n_pair);
+        let n_tile_max = n_pair.div_ceil(e_tok) + n_expert.min(n_pair);
         // Exactly the size `route_impl` asked for, so this cannot reallocate
         // the buffer `moe_topk` just wrote its ids into.
         let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
@@ -1439,7 +1450,7 @@ impl Cuda {
         let args = [
             KArg::I32(n_pair as i32),
             KArg::I32(n_expert as i32),
-            KArg::I32(MOE_TOK as i32),
+            KArg::I32(e_tok as i32),
             KArg::Ptr(ids),
             KArg::Ptr(perm),
             KArg::Ptr(first),
@@ -1514,11 +1525,15 @@ impl Cuda {
         // shared-activation form (stride 0) belongs to the gate/up half and
         // goes through `moe_glu` instead.
         if route.n_tok() > 1 && x_stride_super == n_super && !self.moe_ungrouped.get() {
-            let (perm, first, count, n_tile, n_tile_max) =
-                self.moe_groups(w.n_expert, n_used, route.n_tok())?;
+            let mma = self.iq4_mma.get() && w.n_out % 16 == 0;
+            let (perm, first, count, n_tile, n_tile_max) = self.moe_groups(
+                w.n_expert,
+                n_used,
+                route.n_tok(),
+                if mma { MOE_MMA_TOK } else { MOE_TOK },
+            )?;
             // Same argument list either way, so the tensor-core variant is a
             // name and a grid: one warp covers 16 rows there against 4 here.
-            let mma = self.iq4_mma.get() && w.n_out % 16 == 0;
             let name = if mma {
                 "matmul_iq4_xs_q8_k_moe_grouped_mma"
             } else {
@@ -1628,9 +1643,13 @@ impl Cuda {
         // This is the larger half: measured at 43% of prefill kernel time
         // against the down matmul's 18%.
         if n_tok > 1 && !self.moe_ungrouped.get() {
-            let (perm, first, count, n_tile, n_tile_max) =
-                self.moe_groups(gate.n_expert, n_used, n_tok)?;
             let mma = self.iq4_mma.get() && gate.n_out % 16 == 0;
+            let (perm, first, count, n_tile, n_tile_max) = self.moe_groups(
+                gate.n_expert,
+                n_used,
+                n_tok,
+                if mma { MOE_MMA_TOK } else { MOE_TOK },
+            )?;
             let name = if mma {
                 "matmul_iq4_xs_q8_k_moe_glu_grouped_mma"
             } else {

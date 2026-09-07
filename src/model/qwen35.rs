@@ -642,7 +642,7 @@ struct Scratch {
 /// 128 keeps the launches wide — 1,024 (token, pick) pairs against 36 SMs —
 /// while capping the scratch at ~12 MiB. Nothing else in `Scratch` is chunked,
 /// because nothing else carries the `n_used` factor.
-const MOE_CHUNK: usize = 128;
+const MOE_CHUNK: usize = 512;
 
 impl Scratch {
     /// Size every buffer for a batch of `n` tokens, token-major, **without

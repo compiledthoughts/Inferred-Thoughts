@@ -1559,6 +1559,18 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu(int n_in, int n_ff, int n_pair,
 // accumulator arrays and two unpacked weight sets.
 #define MOE_TOK 8
 
+// Tile width for the tensor-core routed FFN, and how many 8-token MMA tiles it
+// is cut into.
+//
+// **Separate from `MOE_TOK` because the two kernels have opposite constraints.**
+// The scalar grouped kernel holds a per-token register array, so 8 is already
+// its ceiling; the MMA kernel holds only accumulators per sub-tile and wants the
+// widest tile the routing can fill. At `MOE_CHUNK` 512 a chunk is 4,096 picks
+// over 256 experts, so the mean expert collects 16 -- measured 5.17 at chunk
+// 128, which is what capped the first version.
+#define MOE_MMA_TOK 16
+#define MOE_MMA_NTILE 2
+
 // Sort a chunk's (token, pick) pairs by expert id, and cut the result into
 // tiles a block can own.
 //
@@ -1970,6 +1982,28 @@ __device__ __forceinline__ void mma_m16n8k32_s8(
 // The sub-block layout falls out of it: element `k` of sub-block `t` is the low
 // nibble of `qs[16t + k]` for k < 16 and the high nibble of `qs[16t + k - 16]`
 // above, so a0/a2 come from a single aligned 4-byte load and so do a1/a3.
+// The 6-bit sub-block scale, assembled exactly as `dot_iq4_xs_warp` does it:
+// four low bits from `scales_l` and two high bits from `scales_h`, with the
+// reference shifting `h` right by `2 * ib` before it reads them.
+__device__ __forceinline__ int iq4_ls(unsigned int sh, unsigned int lo, int ib, int half) {
+    const unsigned int h = sh >> (ib * 2);
+    return (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                       : (int)((lo >> 4)  | ((h << 2) & 0x30));
+}
+
+// Token tiles per weight load.
+//
+// **The A fragment is the expensive load; B is cheap.** One `mma.m16n8k32`
+// covers 8 tokens, so the first version re-read and re-unpacked a weight row
+// once per 8 tokens of the batch. Holding A in registers across `MMA_NTILE`
+// tiles divides that traffic by the same factor, for four more accumulators and
+// one more B load per tile.
+//
+// 4 is 32 tokens per weight load, against `MM_TOK` 8 for the warp-dot kernel it
+// replaced. Higher costs accumulators: `acc` is `MMA_NTILE * 4` floats and the
+// kernel already carries A, B and the scale pairs.
+#define MMA_NTILE 4
+
 __global__ void matmul_iq4_xs_q8_k_mma(int n_in, int n_out, int n_tok,
                                        const unsigned char *__restrict__ w,
                                        const float *__restrict__ x_scales,
@@ -1979,26 +2013,29 @@ __global__ void matmul_iq4_xs_q8_k_mma(int n_in, int n_out, int n_tok,
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
 
-    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;  // first row
-    const int t0 = blockIdx.y * 8;                                // first token
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;   // first row
+    const int t0 = blockIdx.y * (8 * MMA_NTILE);                   // first token
     if (j0 >= n_out) return;
 
     const int g = lane >> 2;
     const int q = lane & 3;
 
-    // This lane owns rows j0+g and j0+g+8, and tokens t0+2q and t0+2q+1.
+    // This lane owns rows j0+g and j0+g+8. Within each token tile it loads B
+    // for column `g` and accumulates columns `2q` and `2q+1`.
     const int row_a = j0 + g;
     const int row_b = j0 + g + 8;
-    const int tok_b = t0 + g;          // the column this lane loads B for
-    const int col_0 = t0 + 2 * q;
-    const int col_1 = t0 + 2 * q + 1;
 
     const unsigned char *ra = w + (size_t)row_a * nb * IQ4XS_BYTES;
     const unsigned char *rb = w + (size_t)row_b * nb * IQ4XS_BYTES;
 
-    // The reference folds into one f32 accumulator per output, ascending. Four
-    // outputs per lane, four accumulators, same order.
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // One f32 accumulator per output, folded ascending exactly as the reference
+    // folds its single one.
+    float acc[MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc[n][k] = 0.0f;
+    }
 
     for (int ibl = 0; ibl < nb; ++ibl) {
         const unsigned char *ba = ra + (size_t)ibl * IQ4XS_BYTES;
@@ -2009,100 +2046,85 @@ __global__ void matmul_iq4_xs_q8_k_mma(int n_in, int n_out, int n_tok,
         const unsigned int sha = (unsigned int)ba[2] | ((unsigned int)ba[3] << 8);
         const unsigned int shb = (unsigned int)bb[2] | ((unsigned int)bb[3] << 8);
 
-        // One activation scale per superblock per token, so it is loaded here
-        // and multiplied in the reference's grouping below.
-        const float xs0 = (col_0 < n_tok) ? x_scales[(size_t)col_0 * nb + ibl] : 0.0f;
-        const float xs1 = (col_1 < n_tok) ? x_scales[(size_t)col_1 * nb + ibl] : 0.0f;
+        // Activation scales are per (token, superblock), so they depend on the
+        // tile but not on the sub-block: hoisted out of the `t` loop.
+        float xs[MMA_NTILE][2];
+#pragma unroll
+        for (int n = 0; n < MMA_NTILE; ++n) {
+            const int c0 = t0 + n * 8 + 2 * q;
+            const int c1 = c0 + 1;
+            xs[n][0] = (c0 < n_tok) ? x_scales[(size_t)c0 * nb + ibl] : 0.0f;
+            xs[n][1] = (c1 < n_tok) ? x_scales[(size_t)c1 * nb + ibl] : 0.0f;
+        }
 
         for (int t = 0; t < 8; ++t) {
             const int ib   = (t >> 1) * 2;
             const int half = t & 1;
 
-            // `ls` per row, exactly as `dot_iq4_xs_warp` derives it.
-            const unsigned int ha = sha >> (ib * 2);
-            const unsigned int hb = shb >> (ib * 2);
-            const unsigned int la = ba[4 + (ib >> 1)];
-            const unsigned int lb = bb[4 + (ib >> 1)];
-            const int lsa = (half == 0) ? (int)((la & 0xf) | ((ha << 4) & 0x30))
-                                        : (int)((la >> 4)  | ((ha << 2) & 0x30));
-            const int lsb = (half == 0) ? (int)((lb & 0xf) | ((hb << 4) & 0x30))
-                                        : (int)((lb >> 4)  | ((hb << 2) & 0x30));
+            const int lsa = iq4_ls(sha, ba[4 + (ib >> 1)], ib, half);
+            const int lsb = iq4_ls(shb, bb[4 + (ib >> 1)], ib, half);
 
-            // Sub-block `t` is qs bytes [16t, 16t+16) and activations
-            // [32t, 32t+32). Both offsets below are 4-byte aligned.
-            const unsigned char *qa = ba + 4 + QK_K / 64 + t * 16 + q * 4;
-            const unsigned char *qb = bb + 4 + QK_K / 64 + t * 16 + q * 4;
-
+            // **Loaded and unpacked once for every token tile below.** Sub-block
+            // `t` is qs bytes [16t, 16t+16) and activations [32t, 32t+32); the
+            // low nibbles of these four bytes are k < 16 and the high nibbles
+            // k >= 16, so one aligned 4-byte load fills two A registers.
+            const int off = 4 + QK_K / 64 + t * 16 + q * 4;
             int a[4];
-            unpack_iq4_pair(*(const int *)qa, a[0], a[2]);
-            unpack_iq4_pair(*(const int *)qb, a[1], a[3]);
+            unpack_iq4_pair(*(const int *)(ba + off), a[0], a[2]);
+            unpack_iq4_pair(*(const int *)(bb + off), a[1], a[3]);
 
-            int b[2] = {0, 0};
-            if (tok_b < n_tok) {
-                const signed char *q8 =
-                    x_quants + (size_t)tok_b * n_in + (size_t)ibl * QK_K + t * 32;
-                b[0] = *(const int *)(q8 + q * 4);
-                b[1] = *(const int *)(q8 + 16 + q * 4);
+
+#pragma unroll
+            for (int n = 0; n < MMA_NTILE; ++n) {
+                const int tb = t0 + n * 8 + g;
+                int b[2] = {0, 0};
+                if (tb < n_tok) {
+                    const signed char *q8 =
+                        x_quants + (size_t)tb * n_in + (size_t)ibl * QK_K + t * 32;
+                    b[0] = *(const int *)(q8 + q * 4);
+                    b[1] = *(const int *)(q8 + 16 + q * 4);
+                }
+
+                // Zeroed per k-tile, which the format requires anyway: IQ4_XS
+                // carries a scale per 32 weights, so an int32 accumulator
+                // cannot span two of them.
+                const int zero[4] = {0, 0, 0, 0};
+                int s[4];
+                mma_m16n8k32_s8(s, a, b, zero);
+
+                // `(d * xs) * (ls - 32)` then `* s`, the reference's grouping,
+                // and not fused -- `--fmad=false` is global.
+                acc[n][0] += (da * xs[n][0]) * (float)(lsa - 32) * (float)s[0];
+                acc[n][1] += (da * xs[n][1]) * (float)(lsa - 32) * (float)s[1];
+                acc[n][2] += (db * xs[n][0]) * (float)(lsb - 32) * (float)s[2];
+                acc[n][3] += (db * xs[n][1]) * (float)(lsb - 32) * (float)s[3];
             }
-
-            // Zeroed every k-tile, which is not a concession: IQ4_XS has a
-            // scale per 32 weights, so an int32 accumulator cannot span two.
-            const int zero[4] = {0, 0, 0, 0};
-            int s[4];
-            mma_m16n8k32_s8(s, a, b, zero);
-
-            // `d4d8 = d * xs` then `dh = d4d8 * (ls - 32)` then `dh * s`, the
-            // reference's grouping, not fused -- `--fmad=false` is global.
-            acc[0] += ((da * xs0) * (float)(lsa - 32)) * (float)s[0];
-            acc[1] += ((da * xs1) * (float)(lsa - 32)) * (float)s[1];
-            acc[2] += ((db * xs0) * (float)(lsb - 32)) * (float)s[2];
-            acc[3] += ((db * xs1) * (float)(lsb - 32)) * (float)s[3];
         }
     }
 
-    if (col_0 < n_tok) {
-        if (row_a < n_out) out[(size_t)col_0 * n_out + row_a] = acc[0];
-        if (row_b < n_out) out[(size_t)col_0 * n_out + row_b] = acc[2];
-    }
-    if (col_1 < n_tok) {
-        if (row_a < n_out) out[(size_t)col_1 * n_out + row_a] = acc[1];
-        if (row_b < n_out) out[(size_t)col_1 * n_out + row_b] = acc[3];
+#pragma unroll
+    for (int n = 0; n < MMA_NTILE; ++n) {
+        const int c0 = t0 + n * 8 + 2 * q;
+        const int c1 = c0 + 1;
+        if (c0 < n_tok) {
+            if (row_a < n_out) out[(size_t)c0 * n_out + row_a] = acc[n][0];
+            if (row_b < n_out) out[(size_t)c0 * n_out + row_b] = acc[n][2];
+        }
+        if (c1 < n_tok) {
+            if (row_a < n_out) out[(size_t)c1 * n_out + row_a] = acc[n][1];
+            if (row_b < n_out) out[(size_t)c1 * n_out + row_b] = acc[n][3];
+        }
     }
 }
-
-// ---------------------------------------------------------------------------
-// The routed FFN through the int8 tensor cores
-// ---------------------------------------------------------------------------
-//
-// **The grouping work built exactly what MMA needs.** A tile is up to `MOE_TOK`
-// (token, pick) pairs that share one expert, and `MOE_TOK` is 8 — which is the
-// N dimension of `mma.m16n8k32`. So the tile *is* the MMA fragment: 16 rows of
-// the expert weight against the 8 tokens routed to it.
-//
-// Bit-exact for the reason the probe established: the 32 int8 products of a
-// sub-block sum in int32 and cannot round, one sub-block is one k = 32 tile,
-// and the f32 fold outside it stays serial and ascending in a register.
-// `the_mma_iq4_matmul_is_bit_identical` proves that decomposition on 428,032
-// outputs; these two kernels apply it to the shapes the routed FFN uses.
-//
-// Measured on the dense matmul first: 169.4 -> 223.0 tok/s of whole prefill for
-// one kernel at ~28% of kernel time. These two are ~61%.
-
-// The 6-bit sub-block scale, assembled exactly as `dot_iq4_xs_warp` does it:
-// four low bits from `scales_l` and two high bits from `scales_h`, with the
-// reference shifting `h` right by `2 * ib` before it reads them.
-__device__ __forceinline__ int iq4_ls(unsigned int sh, unsigned int lo, int ib, int half) {
-    const unsigned int h = sh >> (ib * 2);
-    return (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
-                       : (int)((lo >> 4)  | ((h << 2) & 0x30));
-}
-
 // Gate, up and the SiLU gating for one expert tile, on the tensor cores.
 //
-// `x` is indexed by *token* here — every expert of a token reads the same
-// activation in this half of the FFN — where the `down` kernel below indexes it
-// by pair. That asymmetry is invisible at `n_tok == 1` and is what
-// `batched_moe_prefill_equals_token_by_token` exists to catch.
+// The tile is `MOE_MMA_TOK` pairs sharing one expert, cut into `MOE_MMA_NTILE`
+// MMA tiles of 8 that share one A fragment -- so a weight row is loaded and
+// unpacked once per `MOE_MMA_TOK` tokens rather than once per 8.
+//
+// `x` is indexed by *token* here (every expert of a token reads the same
+// activation) where the `down` kernel indexes it by pair. That asymmetry is
+// invisible at `n_tok == 1`.
 __global__ void matmul_iq4_xs_q8_k_moe_glu_grouped_mma(
         int n_in, int n_ff, int n_used,
         const int *__restrict__ n_tile,
@@ -2125,27 +2147,36 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu_grouped_mma(
 
     const int first = tile_first[tl];
     const int nt    = tile_n[tl];
-
     const int g = lane >> 2;
     const int q = lane & 3;
 
-    // The tile slots this lane owns: `g` for the B fragment it loads, and
-    // `2q`, `2q + 1` for the two output columns it accumulates.
-    const int pair_b = (g < nt) ? perm[first + g] : -1;
-    const int pair_0 = (2 * q < nt) ? perm[first + 2 * q] : -1;
-    const int pair_1 = (2 * q + 1 < nt) ? perm[first + 2 * q + 1] : -1;
-    const int tok_b  = (pair_b >= 0) ? pair_b / n_used : -1;
-    const int tok_0  = (pair_0 >= 0) ? pair_0 / n_used : -1;
-    const int tok_1  = (pair_1 >= 0) ? pair_1 / n_used : -1;
+    // Slots this lane touches in each sub-tile: `g` for the B fragment it
+    // loads, `2q` and `2q+1` for the columns it accumulates.
+    int pb[MOE_MMA_NTILE], p0[MOE_MMA_NTILE], p1[MOE_MMA_NTILE];
+    int tb[MOE_MMA_NTILE], t0i[MOE_MMA_NTILE], t1i[MOE_MMA_NTILE];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        const int sb = n * 8 + g, s0 = n * 8 + 2 * q, s1 = s0 + 1;
+        pb[n] = (sb < nt) ? perm[first + sb] : -1;
+        p0[n] = (s0 < nt) ? perm[first + s0] : -1;
+        p1[n] = (s1 < nt) ? perm[first + s1] : -1;
+        tb[n] = (pb[n] >= 0) ? pb[n] / n_used : -1;
+        t0i[n] = (p0[n] >= 0) ? p0[n] / n_used : -1;
+        t1i[n] = (p1[n] >= 0) ? p1[n] / n_used : -1;
+    }
 
-    // Every pair in the tile shares an expert, so one pointer serves it.
+    // Every pair in the tile shares an expert, so one pointer pair serves it.
     const unsigned char *gw = (const unsigned char *)gptrs[perm[first]];
     const unsigned char *uw = (const unsigned char *)uptrs[perm[first]];
     const size_t ra = (size_t)(j0 + g) * nb * IQ4XS_BYTES;
     const size_t rb = (size_t)(j0 + g + 8) * nb * IQ4XS_BYTES;
 
-    float ag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float au[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float ag[MOE_MMA_NTILE][4], au[MOE_MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { ag[n][k] = 0.0f; au[n][k] = 0.0f; }
+    }
 
     for (int ibl = 0; ibl < nb; ++ibl) {
         const unsigned char *ga = gw + ra + (size_t)ibl * IQ4XS_BYTES;
@@ -2157,24 +2188,27 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu_grouped_mma(
         const float dgb = h2f((unsigned short)gb[0] | ((unsigned short)gb[1] << 8));
         const float dua = h2f((unsigned short)ua[0] | ((unsigned short)ua[1] << 8));
         const float dub = h2f((unsigned short)ub[0] | ((unsigned short)ub[1] << 8));
-
         const unsigned int hga = (unsigned int)ga[2] | ((unsigned int)ga[3] << 8);
         const unsigned int hgb = (unsigned int)gb[2] | ((unsigned int)gb[3] << 8);
         const unsigned int hua = (unsigned int)ua[2] | ((unsigned int)ua[3] << 8);
         const unsigned int hub = (unsigned int)ub[2] | ((unsigned int)ub[3] << 8);
 
-        const float xs0 = (tok_0 >= 0) ? x_scales[(size_t)tok_0 * nb + ibl] : 0.0f;
-        const float xs1 = (tok_1 >= 0) ? x_scales[(size_t)tok_1 * nb + ibl] : 0.0f;
+        // Gate and up read the same activation, so one scale pair per sub-tile.
+        float xs[MOE_MMA_NTILE][2];
+#pragma unroll
+        for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+            xs[n][0] = (t0i[n] >= 0) ? x_scales[(size_t)t0i[n] * nb + ibl] : 0.0f;
+            xs[n][1] = (t1i[n] >= 0) ? x_scales[(size_t)t1i[n] * nb + ibl] : 0.0f;
+        }
 
         for (int t = 0; t < 8; ++t) {
-            const int ib   = (t >> 1) * 2;
-            const int half = t & 1;
-
+            const int ib = (t >> 1) * 2, half = t & 1;
             const int lsga = iq4_ls(hga, ga[4 + (ib >> 1)], ib, half);
             const int lsgb = iq4_ls(hgb, gb[4 + (ib >> 1)], ib, half);
             const int lsua = iq4_ls(hua, ua[4 + (ib >> 1)], ib, half);
             const int lsub = iq4_ls(hub, ub[4 + (ib >> 1)], ib, half);
 
+            // **Unpacked once for every sub-tile below.**
             const int off = 4 + QK_K / 64 + t * 16 + q * 4;
             int fg[4], fu[4];
             unpack_iq4_pair(*(const int *)(ga + off), fg[0], fg[2]);
@@ -2182,45 +2216,48 @@ __global__ void matmul_iq4_xs_q8_k_moe_glu_grouped_mma(
             unpack_iq4_pair(*(const int *)(ua + off), fu[0], fu[2]);
             unpack_iq4_pair(*(const int *)(ub + off), fu[1], fu[3]);
 
-            int b[2] = {0, 0};
-            if (tok_b >= 0) {
-                const signed char *q8 =
-                    x_quants + (size_t)tok_b * n_in + (size_t)ibl * QK_K + t * 32;
-                b[0] = *(const int *)(q8 + q * 4);
-                b[1] = *(const int *)(q8 + 16 + q * 4);
+#pragma unroll
+            for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+                int b[2] = {0, 0};
+                if (tb[n] >= 0) {
+                    const signed char *q8 =
+                        x_quants + (size_t)tb[n] * n_in + (size_t)ibl * QK_K + t * 32;
+                    b[0] = *(const int *)(q8 + q * 4);
+                    b[1] = *(const int *)(q8 + 16 + q * 4);
+                }
+                const int zero[4] = {0, 0, 0, 0};
+                int sg[4], su[4];
+                mma_m16n8k32_s8(sg, fg, b, zero);
+                mma_m16n8k32_s8(su, fu, b, zero);
+
+                ag[n][0] += (dga * xs[n][0]) * (float)(lsga - 32) * (float)sg[0];
+                ag[n][1] += (dga * xs[n][1]) * (float)(lsga - 32) * (float)sg[1];
+                ag[n][2] += (dgb * xs[n][0]) * (float)(lsgb - 32) * (float)sg[2];
+                ag[n][3] += (dgb * xs[n][1]) * (float)(lsgb - 32) * (float)sg[3];
+
+                au[n][0] += (dua * xs[n][0]) * (float)(lsua - 32) * (float)su[0];
+                au[n][1] += (dua * xs[n][1]) * (float)(lsua - 32) * (float)su[1];
+                au[n][2] += (dub * xs[n][0]) * (float)(lsub - 32) * (float)su[2];
+                au[n][3] += (dub * xs[n][1]) * (float)(lsub - 32) * (float)su[3];
             }
-
-            const int zero[4] = {0, 0, 0, 0};
-            int sg[4], su[4];
-            mma_m16n8k32_s8(sg, fg, b, zero);
-            mma_m16n8k32_s8(su, fu, b, zero);
-
-            ag[0] += ((dga * xs0) * (float)(lsga - 32)) * (float)sg[0];
-            ag[1] += ((dga * xs1) * (float)(lsga - 32)) * (float)sg[1];
-            ag[2] += ((dgb * xs0) * (float)(lsgb - 32)) * (float)sg[2];
-            ag[3] += ((dgb * xs1) * (float)(lsgb - 32)) * (float)sg[3];
-
-            au[0] += ((dua * xs0) * (float)(lsua - 32)) * (float)su[0];
-            au[1] += ((dua * xs1) * (float)(lsua - 32)) * (float)su[1];
-            au[2] += ((dub * xs0) * (float)(lsub - 32)) * (float)su[2];
-            au[3] += ((dub * xs1) * (float)(lsub - 32)) * (float)su[3];
         }
     }
 
-    // silu(g) * u, exactly as `silu_mul` computes it.
-    const int row_a = j0 + g;
-    const int row_b = j0 + g + 8;
-    if (pair_0 >= 0) {
-        if (row_a < n_ff)
-            out[(size_t)pair_0 * n_ff + row_a] = ag[0] / (1.0f + expf(-ag[0])) * au[0];
-        if (row_b < n_ff)
-            out[(size_t)pair_0 * n_ff + row_b] = ag[2] / (1.0f + expf(-ag[2])) * au[2];
-    }
-    if (pair_1 >= 0) {
-        if (row_a < n_ff)
-            out[(size_t)pair_1 * n_ff + row_a] = ag[1] / (1.0f + expf(-ag[1])) * au[1];
-        if (row_b < n_ff)
-            out[(size_t)pair_1 * n_ff + row_b] = ag[3] / (1.0f + expf(-ag[3])) * au[3];
+    const int row_a = j0 + g, row_b = j0 + g + 8;
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        if (p0[n] >= 0) {
+            if (row_a < n_ff)
+                out[(size_t)p0[n] * n_ff + row_a] = ag[n][0] / (1.0f + expf(-ag[n][0])) * au[n][0];
+            if (row_b < n_ff)
+                out[(size_t)p0[n] * n_ff + row_b] = ag[n][2] / (1.0f + expf(-ag[n][2])) * au[n][2];
+        }
+        if (p1[n] >= 0) {
+            if (row_a < n_ff)
+                out[(size_t)p1[n] * n_ff + row_a] = ag[n][1] / (1.0f + expf(-ag[n][1])) * au[n][1];
+            if (row_b < n_ff)
+                out[(size_t)p1[n] * n_ff + row_b] = ag[n][3] / (1.0f + expf(-ag[n][3])) * au[n][3];
+        }
     }
 }
 
@@ -2248,19 +2285,28 @@ __global__ void matmul_iq4_xs_q8_k_moe_grouped_mma(
 
     const int first = tile_first[tl];
     const int nt    = tile_n[tl];
-
     const int g = lane >> 2;
     const int q = lane & 3;
 
-    const int pair_b = (g < nt) ? perm[first + g] : -1;
-    const int pair_0 = (2 * q < nt) ? perm[first + 2 * q] : -1;
-    const int pair_1 = (2 * q + 1 < nt) ? perm[first + 2 * q + 1] : -1;
+    int pb[MOE_MMA_NTILE], p0[MOE_MMA_NTILE], p1[MOE_MMA_NTILE];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        const int sb = n * 8 + g, s0 = n * 8 + 2 * q, s1 = s0 + 1;
+        pb[n] = (sb < nt) ? perm[first + sb] : -1;
+        p0[n] = (s0 < nt) ? perm[first + s0] : -1;
+        p1[n] = (s1 < nt) ? perm[first + s1] : -1;
+    }
 
     const unsigned char *w = (const unsigned char *)wptrs[perm[first]];
     const size_t ra = (size_t)(j0 + g) * nb * IQ4XS_BYTES;
     const size_t rb = (size_t)(j0 + g + 8) * nb * IQ4XS_BYTES;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[MOE_MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc[n][k] = 0.0f;
+    }
 
     for (int ibl = 0; ibl < nb; ++ibl) {
         const unsigned char *ba = w + ra + (size_t)ibl * IQ4XS_BYTES;
@@ -2271,13 +2317,15 @@ __global__ void matmul_iq4_xs_q8_k_moe_grouped_mma(
         const unsigned int sha = (unsigned int)ba[2] | ((unsigned int)ba[3] << 8);
         const unsigned int shb = (unsigned int)bb[2] | ((unsigned int)bb[3] << 8);
 
-        const float xs0 = (pair_0 >= 0) ? x_scales[(size_t)pair_0 * nb + ibl] : 0.0f;
-        const float xs1 = (pair_1 >= 0) ? x_scales[(size_t)pair_1 * nb + ibl] : 0.0f;
+        float xs[MOE_MMA_NTILE][2];
+#pragma unroll
+        for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+            xs[n][0] = (p0[n] >= 0) ? x_scales[(size_t)p0[n] * nb + ibl] : 0.0f;
+            xs[n][1] = (p1[n] >= 0) ? x_scales[(size_t)p1[n] * nb + ibl] : 0.0f;
+        }
 
         for (int t = 0; t < 8; ++t) {
-            const int ib   = (t >> 1) * 2;
-            const int half = t & 1;
-
+            const int ib = (t >> 1) * 2, half = t & 1;
             const int lsa = iq4_ls(sha, ba[4 + (ib >> 1)], ib, half);
             const int lsb = iq4_ls(shb, bb[4 + (ib >> 1)], ib, half);
 
@@ -2286,36 +2334,41 @@ __global__ void matmul_iq4_xs_q8_k_moe_grouped_mma(
             unpack_iq4_pair(*(const int *)(ba + off), a[0], a[2]);
             unpack_iq4_pair(*(const int *)(bb + off), a[1], a[3]);
 
-            int b[2] = {0, 0};
-            if (pair_b >= 0) {
-                const signed char *q8 =
-                    x_quants + (size_t)pair_b * n_in + (size_t)ibl * QK_K + t * 32;
-                b[0] = *(const int *)(q8 + q * 4);
-                b[1] = *(const int *)(q8 + 16 + q * 4);
+#pragma unroll
+            for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+                int b[2] = {0, 0};
+                if (pb[n] >= 0) {
+                    const signed char *q8 =
+                        x_quants + (size_t)pb[n] * n_in + (size_t)ibl * QK_K + t * 32;
+                    b[0] = *(const int *)(q8 + q * 4);
+                    b[1] = *(const int *)(q8 + 16 + q * 4);
+                }
+                const int zero[4] = {0, 0, 0, 0};
+                int s[4];
+                mma_m16n8k32_s8(s, a, b, zero);
+
+                acc[n][0] += (da * xs[n][0]) * (float)(lsa - 32) * (float)s[0];
+                acc[n][1] += (da * xs[n][1]) * (float)(lsa - 32) * (float)s[1];
+                acc[n][2] += (db * xs[n][0]) * (float)(lsb - 32) * (float)s[2];
+                acc[n][3] += (db * xs[n][1]) * (float)(lsb - 32) * (float)s[3];
             }
-
-            const int zero[4] = {0, 0, 0, 0};
-            int s[4];
-            mma_m16n8k32_s8(s, a, b, zero);
-
-            acc[0] += ((da * xs0) * (float)(lsa - 32)) * (float)s[0];
-            acc[1] += ((da * xs1) * (float)(lsa - 32)) * (float)s[1];
-            acc[2] += ((db * xs0) * (float)(lsb - 32)) * (float)s[2];
-            acc[3] += ((db * xs1) * (float)(lsb - 32)) * (float)s[3];
         }
     }
 
-    const int row_a = j0 + g;
-    const int row_b = j0 + g + 8;
-    if (pair_0 >= 0) {
-        if (row_a < n_out) out[(size_t)pair_0 * n_out + row_a] = acc[0];
-        if (row_b < n_out) out[(size_t)pair_0 * n_out + row_b] = acc[2];
-    }
-    if (pair_1 >= 0) {
-        if (row_a < n_out) out[(size_t)pair_1 * n_out + row_a] = acc[1];
-        if (row_b < n_out) out[(size_t)pair_1 * n_out + row_b] = acc[3];
+    const int row_a = j0 + g, row_b = j0 + g + 8;
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        if (p0[n] >= 0) {
+            if (row_a < n_out) out[(size_t)p0[n] * n_out + row_a] = acc[n][0];
+            if (row_b < n_out) out[(size_t)p0[n] * n_out + row_b] = acc[n][2];
+        }
+        if (p1[n] >= 0) {
+            if (row_a < n_out) out[(size_t)p1[n] * n_out + row_a] = acc[n][1];
+            if (row_b < n_out) out[(size_t)p1[n] * n_out + row_b] = acc[n][3];
+        }
     }
 }
+
 
 
 
