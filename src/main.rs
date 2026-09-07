@@ -126,6 +126,9 @@ enum Command {
         /// Force the untiled IQ4_XS matmul, for the prefill A/B.
         #[arg(long)]
         iq4_untiled: bool,
+        /// Force the per-pair routed FFN, for the prefill A/B.
+        #[arg(long)]
+        moe_ungrouped: bool,
         /// Force the one-thread-per-position attention score phase.
         ///
         /// The warp phase is on past `ATTN_WARP_MIN_POS` and is 1.4-3.1x
@@ -290,6 +293,7 @@ fn main() -> ExitCode {
             rms_serial,
             attn_thread,
             iq4_untiled,
+            moe_ungrouped,
             threads,
             chat,
             show_special,
@@ -315,6 +319,7 @@ fn main() -> ExitCode {
                 rms_serial,
                 attn_thread,
                 iq4_untiled,
+                moe_ungrouped,
                 threads,
                 chat,
                 show_special,
@@ -408,6 +413,7 @@ struct GenOpts {
     rms_serial: bool,
     attn_thread: bool,
     iq4_untiled: bool,
+    moe_ungrouped: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -466,6 +472,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         // in charge, which is the shipping behaviour.
         cuda.attn_warp(if o.attn_thread { Some(false) } else { None });
         cuda.iq4_untiled(o.iq4_untiled);
+        cuda.moe_ungrouped(o.moe_ungrouped);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         cuda.set_expert_host_budget((o.expert_host * 1073741824.0) as usize);
         // The KV cache is allocated lazily, at the first attention layer, which

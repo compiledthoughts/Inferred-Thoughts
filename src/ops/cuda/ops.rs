@@ -89,7 +89,23 @@ mod slot {
     pub const PTR_GATE: usize = 13;
     pub const PTR_UP: usize = 14;
     pub const PTR_DOWN: usize = 15;
+    /// What `moe_group` writes: this chunk's (token, pick) pairs permuted into
+    /// ascending expert order, the tile table cut over that permutation, and
+    /// the tile count.
+    ///
+    /// Shares the routing scratch's argument for safety — one set for all forty
+    /// layers, because a stream executes in issue order, so a layer's grouping
+    /// completes before its matmuls start.
+    pub const PERM: usize = 16;
+    pub const TILE_FIRST: usize = 17;
+    pub const TILE_N: usize = 18;
+    pub const N_TILE: usize = 19;
 }
+
+/// Pairs per grouped-expert tile. **Must equal `MOE_TOK` in
+/// `kernels/kernels.cu`** — it sizes the register arrays there and the grid
+/// bound here, and the two disagreeing is silent.
+const MOE_TOK: usize = 8;
 
 /// One matmul shape, measured on the live device with the launch queue kept
 /// full — the thing `--profile-kernels` cannot report, because synchronizing
@@ -746,6 +762,46 @@ impl Cuda {
         self.iq4_untiled.set(on);
     }
 
+    /// Tiles the last grouped routed FFN cut its chunk into, or `None` if no
+    /// grouped launch has happened.
+    ///
+    /// **Only so a test can say whether the thing it is testing actually ran.**
+    /// `the_grouped_routed_ffn_is_bit_identical` compares grouped against
+    /// per-pair on a batch, and would report a clean pass if every tile held a
+    /// single token — which is the case the change exists to avoid and the case
+    /// where the reuse loop never executes. Comparing this against the pair
+    /// count turns "I calculated that tiles should pack" into an observation.
+    ///
+    /// **Read it after `end_pass`, never during a pass.** It is an ordinary
+    /// device read, so mid-pass it returns the previous pass's value and latches
+    /// graphs off for the run — exactly the hazard `CLAUDE.md` records.
+    pub fn last_moe_tiles(&self) -> Option<u32> {
+        let pool = self.pool.borrow();
+        let buf = pool.get(slot::N_TILE)?;
+        if buf.len_bytes() < 4 {
+            return None;
+        }
+        let ptr = buf.ptr;
+        drop(pool);
+        let mut n = [0u32; 1];
+        self.d2h(&mut n, ptr).ok()?;
+        Some(n[0])
+    }
+
+    /// Force the per-pair routed FFN even for a batch. The A/B switch for the
+    /// two grouped expert kernels; decode is unaffected either way, since it
+    /// never reaches the grouped path.
+    ///
+    /// **This is what makes the bit-exactness claim testable rather than
+    /// asserted.** Grouping changes which block computes an output and which
+    /// weight loads are shared, never how one output accumulates — so the two
+    /// paths must agree to the bit, and
+    /// `the_grouped_routed_ffn_is_bit_identical` demands exactly that on a
+    /// batch large enough for tiles to actually pack.
+    pub fn moe_ungrouped(&self, on: bool) {
+        self.moe_ungrouped.set(on);
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -1289,6 +1345,62 @@ impl Cuda {
     /// expert format would need its own grouped kernel; failing loudly is
     /// better than falling back to the trait default, whose sub-slicing of
     /// `out` would hand this backend addresses it has never mirrored.
+    /// Group this chunk's (token, pick) pairs by expert, so a weight row is
+    /// loaded once per tile instead of once per pair.
+    ///
+    /// Returns the buffers `moe_group` fills plus the bound the grid must use.
+    /// That bound is a function of shape alone —
+    /// `sum ceil(count / MOE_TOK) <= n_pair / MOE_TOK + min(n_expert, n_pair)`
+    /// — which is what lets it be a launch parameter while the *actual* count
+    /// stays on the device: blocks past it read `n_tile` and exit. A grid sized
+    /// from a host-visible routing decision would be exactly the mid-pass read
+    /// that disables graphs.
+    ///
+    /// **Run by both expert matmuls rather than once per chunk.** They are
+    /// always called in the same order today, so computing it in the first and
+    /// reusing it in the second would work — and would make the down matmul
+    /// silently wrong the day that order changes. One block over at most 1,024
+    /// pairs, against a matmul that reads hundreds of megabytes, is not worth
+    /// the coupling.
+    fn moe_groups(
+        &self,
+        n_expert: usize,
+        n_used: usize,
+        n_tok: usize,
+    ) -> Result<(
+        ffi::CUdeviceptr,
+        ffi::CUdeviceptr,
+        ffi::CUdeviceptr,
+        ffi::CUdeviceptr,
+        u32,
+    )> {
+        let n_pair = n_used * n_tok;
+        let n_tile_max = n_pair.div_ceil(MOE_TOK) + n_expert.min(n_pair);
+        // Exactly the size `route_impl` asked for, so this cannot reallocate
+        // the buffer `moe_topk` just wrote its ids into.
+        let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
+        let perm = self.pooled(slot::PERM, n_pair * 4)?;
+        let first = self.pooled(slot::TILE_FIRST, n_tile_max * 4)?;
+        let count = self.pooled(slot::TILE_N, n_tile_max * 4)?;
+        let n_tile = self.pooled(slot::N_TILE, 4)?;
+        // `n_pair + n_expert + 2 * (n_expert + 1)` ints, as the kernel carves it.
+        let shared = ((n_pair + n_expert + 2 * (n_expert + 1)) * 4) as u32;
+        let args = [
+            KArg::I32(n_pair as i32),
+            KArg::I32(n_expert as i32),
+            KArg::I32(MOE_TOK as i32),
+            KArg::Ptr(ids),
+            KArg::Ptr(perm),
+            KArg::Ptr(first),
+            KArg::Ptr(count),
+            KArg::Ptr(n_tile),
+        ];
+        // SAFETY: parameters match `moe_group`; one block of 256 threads, and
+        // `shared` is exactly the four arrays the kernel carves out of it.
+        unsafe { self.launch_shared("moe_group", 1, 256, shared, &args)? };
+        Ok((perm, first, count, n_tile, n_tile_max as u32))
+    }
+
     fn matmul_experts_impl(
         &self,
         w: &Experts<'_>,
@@ -1334,10 +1446,55 @@ impl Cuda {
         let table = self.expert_table(w)?;
         let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, route.n_tok(), slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
-        self.note_shape("matmul_iq4_xs_q8_k_moe", w.n_in, w.n_out);
 
         let block = 128u32;
         let rows_per_block = (block / 32) as usize;
+
+        // **Grouped by expert once there is a batch to group.**
+        //
+        // Gated on `n_tok > 1`, so decode runs the identical kernel and cannot
+        // regress by construction rather than by measurement — the same gate
+        // the token-tiled dense matmul and the batched `ssm_conv` use. At one
+        // token there is nothing to group anyway: eight picks are eight
+        // distinct experts, so the per-pair form already loads each row once.
+        //
+        // `x_stride_super` guards the other precondition. The grouped kernel
+        // indexes `x` per *pair*, which is what a batched `down` hands it; the
+        // shared-activation form (stride 0) belongs to the gate/up half and
+        // goes through `moe_glu` instead.
+        if route.n_tok() > 1 && x_stride_super == n_super && !self.moe_ungrouped.get() {
+            let (perm, first, count, n_tile, n_tile_max) =
+                self.moe_groups(w.n_expert, n_used, route.n_tok())?;
+            self.note_shape("matmul_iq4_xs_q8_k_moe_grouped", w.n_in, w.n_out);
+            let args = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::Ptr(n_tile),
+                KArg::Ptr(perm),
+                KArg::Ptr(first),
+                KArg::Ptr(count),
+                KArg::Ptr(wptrs),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `matmul_iq4_xs_q8_k_moe_grouped`; the
+            // grid covers `n_out` rows by the shape bound on tiles, blocks past
+            // the device-side count return before touching a pointer, and the
+            // kernel uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(
+                    "matmul_iq4_xs_q8_k_moe_grouped",
+                    w.n_out.div_ceil(rows_per_block) as u32,
+                    n_tile_max,
+                    block,
+                    0,
+                    &args,
+                )
+            };
+        }
+
+        self.note_shape("matmul_iq4_xs_q8_k_moe", w.n_in, w.n_out);
         let args = [
             KArg::I32(w.n_in as i32),
             KArg::I32(w.n_out as i32),
@@ -1405,10 +1562,49 @@ impl Cuda {
         let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, route.n_tok(), slot::PTR_GATE)?;
         let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, route.n_tok(), slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
-        self.note_shape("matmul_iq4_xs_q8_k_moe_glu", gate.n_in, gate.n_out);
 
         let block = 128u32;
         let rows_per_block = (block / 32) as usize;
+
+        // Grouped by expert once there is a batch to group — see
+        // `matmul_experts_impl` for the gate and the reason it is `n_tok > 1`.
+        // This is the larger half: measured at 43% of prefill kernel time
+        // against the down matmul's 18%.
+        if n_tok > 1 && !self.moe_ungrouped.get() {
+            let (perm, first, count, n_tile, n_tile_max) =
+                self.moe_groups(gate.n_expert, n_used, n_tok)?;
+            self.note_shape("matmul_iq4_xs_q8_k_moe_glu_grouped", gate.n_in, gate.n_out);
+            let args = [
+                KArg::I32(gate.n_in as i32),
+                KArg::I32(gate.n_out as i32),
+                KArg::I32(n_used as i32),
+                KArg::Ptr(n_tile),
+                KArg::Ptr(perm),
+                KArg::Ptr(first),
+                KArg::Ptr(count),
+                KArg::Ptr(gptrs),
+                KArg::Ptr(uptrs),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `matmul_iq4_xs_q8_k_moe_glu_grouped`;
+            // the grid covers `n_out` rows by the shape bound on tiles, blocks
+            // past the device-side count return before touching a pointer, and
+            // the kernel uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(
+                    "matmul_iq4_xs_q8_k_moe_glu_grouped",
+                    gate.n_out.div_ceil(rows_per_block) as u32,
+                    n_tile_max,
+                    block,
+                    0,
+                    &args,
+                )
+            };
+        }
+
+        self.note_shape("matmul_iq4_xs_q8_k_moe_glu", gate.n_in, gate.n_out);
         let args = [
             KArg::I32(gate.n_in as i32),
             KArg::I32(gate.n_out as i32),

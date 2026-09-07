@@ -2086,3 +2086,130 @@ fn the_batched_ssm_conv_matches_token_by_token() {
         }
     }
 }
+
+/// **Grouping the routed FFN by expert changes no bit.**
+///
+/// The claim the grouped kernels make in their own comments is that they change
+/// which block computes an output and which weight loads are shared, never how
+/// one output accumulates — every dot is still the arithmetic of
+/// `dot_iq4_xs_warp` over the same bytes in the same order. That is a claim
+/// about equal bits, so it is tested as one rather than under a tolerance.
+///
+/// # Why not the existing MoE differential
+///
+/// `the_35b_moe_agrees_with_the_oracle_on_a_batch` compares CUDA against
+/// `Spin`, so its bound is the quantization floor rather than zero, and its
+/// twenty-token prompt gives 160 (token, pick) pairs over 256 experts — nearly
+/// every expert collects exactly one token, so the tile-packing loop that this
+/// change is entirely about essentially never runs. It would pass with the
+/// grouped path broken for any tile of more than one.
+///
+/// This prompt is long enough to fill whole `MOE_CHUNK`s: at 128 tokens a chunk
+/// is 1,024 pairs and the mean expert collects four, which is the shape the
+/// kernel was written for. The tail chunk is deliberately partial.
+///
+/// # One engine, two passes, and that is not incidental
+///
+/// The obvious form — two `Engine`s, one per path — is the bug this repo
+/// learned three times in one day. `Cuda` keys `resident`, `resident_f32_t_pair`
+/// and `state_resident` on **host addresses**, so dropping the first engine
+/// lets the allocator hand its address to the second and the cache serves the
+/// first pass's device data. `Engine::reset` is the supported way through: it
+/// clears the KV cache and the recurrent state and calls `Ops::forget_state`,
+/// and reusing one engine keeps every host buffer at the address its mirror was
+/// built for. It also loads the 35B once rather than twice, which matters when
+/// one copy is 13.4 GiB of a 16 GiB card.
+#[test]
+#[ignore = "needs an sm_120 device and the real 35B"]
+fn the_grouped_routed_ffn_is_bit_identical() {
+    use inferred_thoughts::Model;
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+
+    // Long enough for two full 128-token chunks and a partial third, so both
+    // the packed path and the tail are exercised.
+    let mut text = String::new();
+    for i in 0..40 {
+        text.push_str(
+            "The capital of France is Paris, and the capital of Japan is Tokyo. \
+             Routing depends on the token, so a varied prompt spreads the picks. ",
+        );
+        text.push_str(&i.to_string());
+        text.push(' ');
+    }
+    let tokens = tk.encode(&text, true, true);
+    assert!(
+        tokens.len() > 300,
+        "prompt is {} tokens; it must exceed one MOE_CHUNK of 128 for tiles to pack",
+        tokens.len()
+    );
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    let m = Model::load(&f).expect("load the 35B");
+    let n_ctx = tokens.len() + 4;
+    let mut e = Engine::new(m, &gpu, n_ctx, false);
+
+    gpu.moe_ungrouped(true);
+    let per_pair = e.prefill(&tokens).expect("per-pair prefill");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    // Clears the KV cache and the recurrent state, and tells the device to
+    // forget its copy of the latter. Without the `forget_state` inside it the
+    // second pass would continue from the first pass's GatedDeltaNet state.
+    e.reset();
+
+    gpu.moe_ungrouped(false);
+    let grouped = e.prefill(&tokens).expect("grouped prefill");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    // **Did tiles actually pack?** Without this the test would pass cleanly
+    // with every tile holding one token -- the case grouping exists to avoid,
+    // and the one where the reuse loop never runs. The last chunk of the last
+    // layer is a partial one, so compare against its own pair count rather than
+    // a full MOE_CHUNK.
+    let tail = tokens.len() % 128;
+    let pairs_in_last_chunk = if tail == 0 { 128 } else { tail } * 8;
+    let tiles = gpu
+        .last_moe_tiles()
+        .expect("a grouped launch should have recorded a tile count")
+        as usize;
+    println!(
+        "  last chunk      {pairs_in_last_chunk} pairs into {tiles} tiles          ({:.2} pairs per weight load)",
+        pairs_in_last_chunk as f64 / tiles as f64
+    );
+    assert!(
+        tiles < pairs_in_last_chunk * 3 / 4,
+        "{tiles} tiles for {pairs_in_last_chunk} pairs: tiles are not packing, so this          test is not exercising the reuse it exists to check. Expect roughly          min(n_expert, pairs) tiles."
+    );
+
+    assert_eq!(per_pair.len(), grouped.len(), "same vocabulary");
+    let differing = per_pair
+        .iter()
+        .zip(&grouped)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let worst = per_pair
+        .iter()
+        .zip(&grouped)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+    println!(
+        "  grouped vs per-pair   {differing} of {} logits differ, worst {worst:e}",
+        per_pair.len()
+    );
+    assert_eq!(
+        differing, 0,
+        "{differing} of {} logits differ between the grouped routed FFN and the \
+         per-pair one, worst {worst:e}. These must be equal bits: grouping changes \
+         which block computes an output and which weight loads it shares, never the \
+         order anything accumulates in. Suspect the token index in \
+         `matmul_iq4_xs_q8_k_moe_glu_grouped` (it divides a *pair* by `n_used`, while \
+         the down matmul indexes `x` by the pair itself), the tail tile where \
+         `nt < MOE_TOK`, or `moe_group`'s prefix sums.",
+        per_pair.len()
+    );
+}
