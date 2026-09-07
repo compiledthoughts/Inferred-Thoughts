@@ -1857,6 +1857,12 @@ fn the_batched_iq4_matmul_is_bit_identical() {
 
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // **The subject is `matmul_iq4_xs_q8_k_batch`, so say so.** The int8
+    // tensor-core kernel is the default for a batch now, and without this the
+    // test would pass while exercising a kernel it says nothing about — the
+    // same way `batched_moe_prefill_equals_token_by_token` passed on the CPU
+    // backend while claiming to cover the CUDA routed FFN.
+    gpu.iq4_mma(false);
     let cpu = Naive;
 
     // IQ4_XS: 136 bytes per 256-weight superblock.
@@ -2164,7 +2170,18 @@ fn the_grouped_routed_ffn_is_bit_identical() {
     e.reset();
 
     gpu.moe_ungrouped(false);
+    gpu.iq4_mma(false);
     let grouped = e.prefill(&tokens).expect("grouped prefill");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    // And the same tiles through the int8 tensor cores. The MMA kernels are a
+    // third implementation of the same arithmetic, so they must land on the
+    // same bits as both of the others: the sub-block sum is integer and the
+    // f32 fold outside it is unchanged.
+    e.reset();
+    gpu.iq4_mma(std::env::var("MMA_ARM").is_ok());
+    let mma = e.prefill(&tokens).expect("mma prefill");
+    gpu.iq4_mma(false);
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 
     // **Did tiles actually pack?** Without this the test would pass cleanly
@@ -2201,6 +2218,21 @@ fn the_grouped_routed_ffn_is_bit_identical() {
         "  grouped vs per-pair   {differing} of {} logits differ, worst {worst:e}",
         per_pair.len()
     );
+    let mma_differing = per_pair
+        .iter()
+        .zip(&mma)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "  mma vs per-pair       {mma_differing} of {} logits differ",
+        per_pair.len()
+    );
+    assert_eq!(
+        mma_differing, 0,
+        "{mma_differing} of {} logits differ between the tensor-core routed FFN and          the per-pair one. Suspect the m16n8k32 fragment layout, or a tile slot past          `nt` contributing something other than zero.",
+        per_pair.len()
+    );
+
     assert_eq!(
         differing, 0,
         "{differing} of {} logits differ between the grouped routed FFN and the \
@@ -2212,4 +2244,120 @@ fn the_grouped_routed_ffn_is_bit_identical() {
          `nt < MOE_TOK`, or `moe_group`'s prefix sums.",
         per_pair.len()
     );
+}
+
+/// **The probe: IQ4_XS through `mma.m16n8k32.s8`, against the oracle, bit for bit.**
+///
+/// This settles a question the project has now got wrong three times — that
+/// going faster must cost bit-exactness. It was assumed for the fast matmul,
+/// for `__dp4a`, and for batching, and was false every time, because the
+/// arithmetic had an exact decomposition hiding in it.
+///
+/// The decomposition here: the reference sums 32 int8 products per sub-block,
+/// which is *integer* and therefore cannot round, so any split of it is exact.
+/// One such sub-block is precisely one `k = 32` MMA tile. What must stay put is
+/// the f32 chain outside it — `dh * s` accumulated over sub-blocks ascending —
+/// and in an MMA tile a lane owns its output, so that chain lives in a register
+/// rather than in eight shuffles to lane 0.
+///
+/// If this passes, the tensor cores are reachable *without* leaving the exact
+/// set, and the fold and the scalar unpack that two traffic experiments failed
+/// to move (8x for 1.54x, 5.17x for 1.12x) are addressable. If it fails, the
+/// direction cost an hour.
+///
+/// Shapes are the 35B's real IQ4_XS widths. `n_tok` includes 13 and 21, which
+/// are not multiples of the 8-token tile, because the tail is where an MMA
+/// fragment layout goes wrong quietly: a column past `n_tok` must contribute
+/// zero rather than garbage, and it must not be written back.
+///
+/// Every weight buffer is held for the whole test — `Cuda::resident` keys its
+/// device copies on the host address, so a per-shape buffer that is dropped
+/// hands the next shape a recycled address and the previous shape's weights.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_mma_iq4_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // IQ4_XS: 136 bytes per 256-weight superblock, as `build` in
+    // `the_batched_iq4_matmul_is_bit_identical`.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> =
+        vec![(2048, 512), (2048, 2048), (512, 2048), (2048, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x9e37 + n_out as u64))
+        .collect();
+
+    let mut checked = 0usize;
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
+
+        for n_tok in [2usize, 8, 13, 21, 32] {
+            let x = noise(n_in * n_tok, 0x51c7 + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            gpu.iq4_mma(true);
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            gpu.iq4_mma(false);
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let differing = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f32, |m: f32, (a, b)| m.max((a - b).abs()));
+            println!(
+                "  mma {n_in:>5}x{n_out:<5} n_tok {n_tok:<3} \
+                 {differing:>7} of {:<7} differ   worst {worst:e}",
+                want.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "{differing} of {} outputs differ at {n_in}x{n_out}, n_tok {n_tok}, \
+                 worst {worst:e}. The MMA path must equal the oracle bit for bit: the \
+                 32-product sub-block sum is integer and so exact under any \
+                 decomposition, and the f32 fold outside it is unchanged. Suspect the \
+                 m16n8k32 fragment layout (A rows g and g+8, B column g, C at rows \
+                 g/g+8 by columns 2q/2q+1), the nibble split (low nibbles are k<16, \
+                 high nibbles k>=16 of the same four bytes), or the token tail.",
+                want.len()
+            );
+            checked += want.len();
+        }
+    }
+    println!("  {checked} outputs compared, all bit-identical");
 }

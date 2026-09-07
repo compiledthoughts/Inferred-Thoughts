@@ -802,6 +802,21 @@ impl Cuda {
         self.moe_ungrouped.set(on);
     }
 
+    /// Route batched IQ4_XS matmuls through `mma.m16n8k32.s8`.
+    ///
+    /// **A probe, not a product.** It answers one question: whether the int8
+    /// tensor cores can reproduce the oracle bit for bit on this format. The
+    /// reference sums 32 int8 products per sub-block, which is integer and
+    /// therefore exact under any decomposition, and one such sub-block is
+    /// exactly one `k = 32` MMA tile — so the f32 chain outside it can stay
+    /// serial and ascending in a register, which is what the reference does.
+    ///
+    /// Off by default, and gated on `n_tok > 1` and `n_out % 16 == 0`, so
+    /// nothing reaches it unless a caller asks.
+    pub fn iq4_mma(&self, on: bool) {
+        self.iq4_mma.set(on);
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -969,6 +984,42 @@ impl Cuda {
         // name, so the launch-sequence rule the merged attention kernel relies
         // on holds here too.
         const IQ4_TOK: usize = 8;
+
+        // The tensor-core probe. One warp per 16x8 output tile, so `n_out` must
+        // be a whole number of 16-row tiles — every IQ4_XS width the 35B uses
+        // is (512, 1024, 2048, 4096, 8192), and anything else falls through to
+        // the kernels above rather than reading past a row.
+        if n_tok > 1
+            && self.iq4_mma.get()
+            && matches!(w.ty, GgmlType::Iq4Xs)
+            && w.n_out % 16 == 0
+        {
+            let mma = "matmul_iq4_xs_q8_k_mma";
+            let margs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(mma, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_iq4_xs_q8_k_mma`; `block` is 128
+            // threads, so four warps cover 64 rows per block, the kernel clamps
+            // its own token tail, and it uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(
+                    mma,
+                    w.n_out.div_ceil(64) as u32,
+                    n_tok.div_ceil(8) as u32,
+                    128,
+                    0,
+                    &margs,
+                )
+            };
+        }
+
         if n_tok > 1 && !self.iq4_untiled.get() && matches!(w.ty, GgmlType::Iq4Xs) {
             let batched = "matmul_iq4_xs_q8_k_batch";
             let bargs = [
@@ -1465,7 +1516,20 @@ impl Cuda {
         if route.n_tok() > 1 && x_stride_super == n_super && !self.moe_ungrouped.get() {
             let (perm, first, count, n_tile, n_tile_max) =
                 self.moe_groups(w.n_expert, n_used, route.n_tok())?;
-            self.note_shape("matmul_iq4_xs_q8_k_moe_grouped", w.n_in, w.n_out);
+            // Same argument list either way, so the tensor-core variant is a
+            // name and a grid: one warp covers 16 rows there against 4 here.
+            let mma = self.iq4_mma.get() && w.n_out % 16 == 0;
+            let name = if mma {
+                "matmul_iq4_xs_q8_k_moe_grouped_mma"
+            } else {
+                "matmul_iq4_xs_q8_k_moe_grouped"
+            };
+            let grid_rows = if mma {
+                w.n_out.div_ceil(64) as u32
+            } else {
+                w.n_out.div_ceil(rows_per_block) as u32
+            };
+            self.note_shape(name, w.n_in, w.n_out);
             let args = [
                 KArg::I32(w.n_in as i32),
                 KArg::I32(w.n_out as i32),
@@ -1483,14 +1547,7 @@ impl Cuda {
             // the device-side count return before touching a pointer, and the
             // kernel uses no dynamic shared memory.
             return unsafe {
-                self.launch_grid2(
-                    "matmul_iq4_xs_q8_k_moe_grouped",
-                    w.n_out.div_ceil(rows_per_block) as u32,
-                    n_tile_max,
-                    block,
-                    0,
-                    &args,
-                )
+                self.launch_grid2(name, grid_rows, n_tile_max, block, 0, &args)
             };
         }
 
@@ -1573,7 +1630,18 @@ impl Cuda {
         if n_tok > 1 && !self.moe_ungrouped.get() {
             let (perm, first, count, n_tile, n_tile_max) =
                 self.moe_groups(gate.n_expert, n_used, n_tok)?;
-            self.note_shape("matmul_iq4_xs_q8_k_moe_glu_grouped", gate.n_in, gate.n_out);
+            let mma = self.iq4_mma.get() && gate.n_out % 16 == 0;
+            let name = if mma {
+                "matmul_iq4_xs_q8_k_moe_glu_grouped_mma"
+            } else {
+                "matmul_iq4_xs_q8_k_moe_glu_grouped"
+            };
+            let grid_rows = if mma {
+                gate.n_out.div_ceil(64) as u32
+            } else {
+                gate.n_out.div_ceil(rows_per_block) as u32
+            };
+            self.note_shape(name, gate.n_in, gate.n_out);
             let args = [
                 KArg::I32(gate.n_in as i32),
                 KArg::I32(gate.n_out as i32),
@@ -1593,14 +1661,7 @@ impl Cuda {
             // past the device-side count return before touching a pointer, and
             // the kernel uses no dynamic shared memory.
             return unsafe {
-                self.launch_grid2(
-                    "matmul_iq4_xs_q8_k_moe_glu_grouped",
-                    gate.n_out.div_ceil(rows_per_block) as u32,
-                    n_tile_max,
-                    block,
-                    0,
-                    &args,
-                )
+                self.launch_grid2(name, grid_rows, n_tile_max, block, 0, &args)
             };
         }
 

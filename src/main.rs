@@ -129,6 +129,10 @@ enum Command {
         /// Force the per-pair routed FFN, for the prefill A/B.
         #[arg(long)]
         moe_ungrouped: bool,
+        /// Restore the warp dot product for batched IQ4_XS, for the A/B.
+        /// The int8 tensor cores are the default and are bit-identical.
+        #[arg(long)]
+        iq4_scalar: bool,
         /// Force the one-thread-per-position attention score phase.
         ///
         /// The warp phase is on past `ATTN_WARP_MIN_POS` and is 1.4-3.1x
@@ -294,6 +298,7 @@ fn main() -> ExitCode {
             attn_thread,
             iq4_untiled,
             moe_ungrouped,
+            iq4_scalar,
             threads,
             chat,
             show_special,
@@ -320,6 +325,7 @@ fn main() -> ExitCode {
                 attn_thread,
                 iq4_untiled,
                 moe_ungrouped,
+                iq4_scalar,
                 threads,
                 chat,
                 show_special,
@@ -414,6 +420,7 @@ struct GenOpts {
     attn_thread: bool,
     iq4_untiled: bool,
     moe_ungrouped: bool,
+    iq4_scalar: bool,
     threads: usize,
     chat: bool,
     show_special: bool,
@@ -473,6 +480,7 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.attn_warp(if o.attn_thread { Some(false) } else { None });
         cuda.iq4_untiled(o.iq4_untiled);
         cuda.moe_ungrouped(o.moe_ungrouped);
+        cuda.iq4_mma(!o.iq4_scalar);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         cuda.set_expert_host_budget((o.expert_host * 1073741824.0) as usize);
         // The KV cache is allocated lazily, at the first attention layer, which

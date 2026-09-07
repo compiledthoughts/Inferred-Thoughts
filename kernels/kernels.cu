@@ -1880,6 +1880,445 @@ __global__ void matmul_iq4_xs_q8_k_moe_grouped(
     }
 }
 
+// ---------------------------------------------------------------------------
+// IQ4_XS through the int8 tensor cores — the exactness probe
+// ---------------------------------------------------------------------------
+//
+// **The question this exists to answer.** Two independent experiments have now
+// cut weight traffic and got a fraction of it back: token-tiling the dense
+// matmul, 8x for 1.54x, and grouping the routed FFN by expert, 5.17x for 1.12x.
+// Both share `dot_iq4_xs_warp`, so both say the same thing -- the kernel is
+// bound by instruction issue, not by bytes. What it issues per 32-element
+// sub-block per token is a scalar nibble unpack, eight `imad`, two reduction
+// shuffles, and then eight `__shfl_sync` with eight *dependent* f32 adds on
+// lane 0 to preserve the reference's summation order.
+//
+// One `mma.sync.aligned.m16n8k32.s8` replaces all of that for a 16x8 tile.
+//
+// **And the standing worry is that it costs bit-exactness. It should not.**
+// The reference's arithmetic for one output is
+//
+//     for ibl in 0..nb:                       # superblocks of 256
+//       for t in 0..8:                        # sub-blocks of 32, ascending
+//         s   = sum of 32 int8 products       # INTEGER, so it cannot round
+//         dh  = (d * xs[ibl]) * (ls_t - 32)
+//         sumf += dh * s
+//
+// The inner sum is integer, so any decomposition of it is exact -- the same
+// property that let `matmul_q8_0` split blocks across lanes and stay
+// bit-identical. And `s` for one sub-block is precisely one `k = 32` MMA tile.
+// The f32 chain outside it stays serial and ascending, in a register, which is
+// what the reference does.
+//
+// The format forces that shape on everyone: IQ4_XS carries a scale per 32
+// weights, so nobody can accumulate int32 across k-tiles. llama.cpp's
+// `vec_dot_q8_0_q8_1_mma` declares its accumulator *inside* the k loop for the
+// same reason.
+//
+// So this is a probe, not a product: one warp per 16x8 output tile, scalar
+// scale loads, no shared-memory staging and no double buffering. If it is
+// bit-identical, the direction is real and worth building properly. If it is
+// not, an hour was spent rather than a session.
+
+// Pack four already-mapped IQ4_NL values as four s8 in one register, which is
+// the operand form the MMA wants.
+__device__ __forceinline__ int pack_s8x4(int n0, int n1, int n2, int n3) {
+    return (n0 & 0xff) | ((n1 & 0xff) << 8) | ((n2 & 0xff) << 16) | ((n3 & 0xff) << 24);
+}
+
+// `aux` is four packed IQ4_XS bytes, i.e. eight nibbles. The low nibbles are
+// sub-block elements k..k+3 and the high nibbles elements k+16..k+19 -- so one
+// aligned 4-byte load serves two of the four A registers.
+__device__ __forceinline__ void unpack_iq4_pair(int aux, int &lo, int &hi) {
+    const unsigned int u = (unsigned int)aux;
+    lo = pack_s8x4(kvalue_iq4nl((int)((u >>  0) & 0xf)),
+                   kvalue_iq4nl((int)((u >>  8) & 0xf)),
+                   kvalue_iq4nl((int)((u >> 16) & 0xf)),
+                   kvalue_iq4nl((int)((u >> 24) & 0xf)));
+    hi = pack_s8x4(kvalue_iq4nl((int)((u >>  4) & 0xf)),
+                   kvalue_iq4nl((int)((u >> 12) & 0xf)),
+                   kvalue_iq4nl((int)((u >> 20) & 0xf)),
+                   kvalue_iq4nl((int)((u >> 28) & 0xf)));
+}
+
+// `D = A * B + C` over s8 with an s32 accumulator, 16x8x32.
+//
+// Available from sm_80; this project targets sm_120 only, so there is no
+// fallback path and no dispatch.
+__device__ __forceinline__ void mma_m16n8k32_s8(
+        int (&d)[4], const int (&a)[4], const int (&b)[2], const int (&c)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
+}
+
+// One warp computes a 16 (weight row) x 8 (token) tile.
+//
+// Fragment layout for m16n8k32, from the PTX ISA. With `g = lane >> 2` and
+// `q = lane & 3`:
+//
+//   A   a0: row g,     k = 4q + 0..3        a1: row g + 8, k = 4q + 0..3
+//       a2: row g,     k = 4q + 16..19      a3: row g + 8, k = 4q + 16..19
+//   B   b0: col g,     k = 4q + 0..3        b1: col g,     k = 4q + 16..19
+//   C   c0: row g,     col 2q               c1: row g,     col 2q + 1
+//       c2: row g + 8, col 2q               c3: row g + 8, col 2q + 1
+//
+// The sub-block layout falls out of it: element `k` of sub-block `t` is the low
+// nibble of `qs[16t + k]` for k < 16 and the high nibble of `qs[16t + k - 16]`
+// above, so a0/a2 come from a single aligned 4-byte load and so do a1/a3.
+__global__ void matmul_iq4_xs_q8_k_mma(int n_in, int n_out, int n_tok,
+                                       const unsigned char *__restrict__ w,
+                                       const float *__restrict__ x_scales,
+                                       const signed char *__restrict__ x_quants,
+                                       float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;  // first row
+    const int t0 = blockIdx.y * 8;                                // first token
+    if (j0 >= n_out) return;
+
+    const int g = lane >> 2;
+    const int q = lane & 3;
+
+    // This lane owns rows j0+g and j0+g+8, and tokens t0+2q and t0+2q+1.
+    const int row_a = j0 + g;
+    const int row_b = j0 + g + 8;
+    const int tok_b = t0 + g;          // the column this lane loads B for
+    const int col_0 = t0 + 2 * q;
+    const int col_1 = t0 + 2 * q + 1;
+
+    const unsigned char *ra = w + (size_t)row_a * nb * IQ4XS_BYTES;
+    const unsigned char *rb = w + (size_t)row_b * nb * IQ4XS_BYTES;
+
+    // The reference folds into one f32 accumulator per output, ascending. Four
+    // outputs per lane, four accumulators, same order.
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *ba = ra + (size_t)ibl * IQ4XS_BYTES;
+        const unsigned char *bb = rb + (size_t)ibl * IQ4XS_BYTES;
+
+        const float da = h2f((unsigned short)ba[0] | ((unsigned short)ba[1] << 8));
+        const float db = h2f((unsigned short)bb[0] | ((unsigned short)bb[1] << 8));
+        const unsigned int sha = (unsigned int)ba[2] | ((unsigned int)ba[3] << 8);
+        const unsigned int shb = (unsigned int)bb[2] | ((unsigned int)bb[3] << 8);
+
+        // One activation scale per superblock per token, so it is loaded here
+        // and multiplied in the reference's grouping below.
+        const float xs0 = (col_0 < n_tok) ? x_scales[(size_t)col_0 * nb + ibl] : 0.0f;
+        const float xs1 = (col_1 < n_tok) ? x_scales[(size_t)col_1 * nb + ibl] : 0.0f;
+
+        for (int t = 0; t < 8; ++t) {
+            const int ib   = (t >> 1) * 2;
+            const int half = t & 1;
+
+            // `ls` per row, exactly as `dot_iq4_xs_warp` derives it.
+            const unsigned int ha = sha >> (ib * 2);
+            const unsigned int hb = shb >> (ib * 2);
+            const unsigned int la = ba[4 + (ib >> 1)];
+            const unsigned int lb = bb[4 + (ib >> 1)];
+            const int lsa = (half == 0) ? (int)((la & 0xf) | ((ha << 4) & 0x30))
+                                        : (int)((la >> 4)  | ((ha << 2) & 0x30));
+            const int lsb = (half == 0) ? (int)((lb & 0xf) | ((hb << 4) & 0x30))
+                                        : (int)((lb >> 4)  | ((hb << 2) & 0x30));
+
+            // Sub-block `t` is qs bytes [16t, 16t+16) and activations
+            // [32t, 32t+32). Both offsets below are 4-byte aligned.
+            const unsigned char *qa = ba + 4 + QK_K / 64 + t * 16 + q * 4;
+            const unsigned char *qb = bb + 4 + QK_K / 64 + t * 16 + q * 4;
+
+            int a[4];
+            unpack_iq4_pair(*(const int *)qa, a[0], a[2]);
+            unpack_iq4_pair(*(const int *)qb, a[1], a[3]);
+
+            int b[2] = {0, 0};
+            if (tok_b < n_tok) {
+                const signed char *q8 =
+                    x_quants + (size_t)tok_b * n_in + (size_t)ibl * QK_K + t * 32;
+                b[0] = *(const int *)(q8 + q * 4);
+                b[1] = *(const int *)(q8 + 16 + q * 4);
+            }
+
+            // Zeroed every k-tile, which is not a concession: IQ4_XS has a
+            // scale per 32 weights, so an int32 accumulator cannot span two.
+            const int zero[4] = {0, 0, 0, 0};
+            int s[4];
+            mma_m16n8k32_s8(s, a, b, zero);
+
+            // `d4d8 = d * xs` then `dh = d4d8 * (ls - 32)` then `dh * s`, the
+            // reference's grouping, not fused -- `--fmad=false` is global.
+            acc[0] += ((da * xs0) * (float)(lsa - 32)) * (float)s[0];
+            acc[1] += ((da * xs1) * (float)(lsa - 32)) * (float)s[1];
+            acc[2] += ((db * xs0) * (float)(lsb - 32)) * (float)s[2];
+            acc[3] += ((db * xs1) * (float)(lsb - 32)) * (float)s[3];
+        }
+    }
+
+    if (col_0 < n_tok) {
+        if (row_a < n_out) out[(size_t)col_0 * n_out + row_a] = acc[0];
+        if (row_b < n_out) out[(size_t)col_0 * n_out + row_b] = acc[2];
+    }
+    if (col_1 < n_tok) {
+        if (row_a < n_out) out[(size_t)col_1 * n_out + row_a] = acc[1];
+        if (row_b < n_out) out[(size_t)col_1 * n_out + row_b] = acc[3];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The routed FFN through the int8 tensor cores
+// ---------------------------------------------------------------------------
+//
+// **The grouping work built exactly what MMA needs.** A tile is up to `MOE_TOK`
+// (token, pick) pairs that share one expert, and `MOE_TOK` is 8 — which is the
+// N dimension of `mma.m16n8k32`. So the tile *is* the MMA fragment: 16 rows of
+// the expert weight against the 8 tokens routed to it.
+//
+// Bit-exact for the reason the probe established: the 32 int8 products of a
+// sub-block sum in int32 and cannot round, one sub-block is one k = 32 tile,
+// and the f32 fold outside it stays serial and ascending in a register.
+// `the_mma_iq4_matmul_is_bit_identical` proves that decomposition on 428,032
+// outputs; these two kernels apply it to the shapes the routed FFN uses.
+//
+// Measured on the dense matmul first: 169.4 -> 223.0 tok/s of whole prefill for
+// one kernel at ~28% of kernel time. These two are ~61%.
+
+// The 6-bit sub-block scale, assembled exactly as `dot_iq4_xs_warp` does it:
+// four low bits from `scales_l` and two high bits from `scales_h`, with the
+// reference shifting `h` right by `2 * ib` before it reads them.
+__device__ __forceinline__ int iq4_ls(unsigned int sh, unsigned int lo, int ib, int half) {
+    const unsigned int h = sh >> (ib * 2);
+    return (half == 0) ? (int)((lo & 0xf) | ((h << 4) & 0x30))
+                       : (int)((lo >> 4)  | ((h << 2) & 0x30));
+}
+
+// Gate, up and the SiLU gating for one expert tile, on the tensor cores.
+//
+// `x` is indexed by *token* here — every expert of a token reads the same
+// activation in this half of the FFN — where the `down` kernel below indexes it
+// by pair. That asymmetry is invisible at `n_tok == 1` and is what
+// `batched_moe_prefill_equals_token_by_token` exists to catch.
+__global__ void matmul_iq4_xs_q8_k_moe_glu_grouped_mma(
+        int n_in, int n_ff, int n_used,
+        const int *__restrict__ n_tile,
+        const int *__restrict__ perm,
+        const int *__restrict__ tile_first,
+        const int *__restrict__ tile_n,
+        const unsigned long long *__restrict__ gptrs,
+        const unsigned long long *__restrict__ uptrs,
+        const float *__restrict__ x_scales,
+        const signed char *__restrict__ x_quants,
+        float *__restrict__ out) {
+    const int tl = blockIdx.y;
+    if (tl >= *n_tile) return;
+
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j0   = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    if (j0 >= n_ff) return;
+
+    const int first = tile_first[tl];
+    const int nt    = tile_n[tl];
+
+    const int g = lane >> 2;
+    const int q = lane & 3;
+
+    // The tile slots this lane owns: `g` for the B fragment it loads, and
+    // `2q`, `2q + 1` for the two output columns it accumulates.
+    const int pair_b = (g < nt) ? perm[first + g] : -1;
+    const int pair_0 = (2 * q < nt) ? perm[first + 2 * q] : -1;
+    const int pair_1 = (2 * q + 1 < nt) ? perm[first + 2 * q + 1] : -1;
+    const int tok_b  = (pair_b >= 0) ? pair_b / n_used : -1;
+    const int tok_0  = (pair_0 >= 0) ? pair_0 / n_used : -1;
+    const int tok_1  = (pair_1 >= 0) ? pair_1 / n_used : -1;
+
+    // Every pair in the tile shares an expert, so one pointer serves it.
+    const unsigned char *gw = (const unsigned char *)gptrs[perm[first]];
+    const unsigned char *uw = (const unsigned char *)uptrs[perm[first]];
+    const size_t ra = (size_t)(j0 + g) * nb * IQ4XS_BYTES;
+    const size_t rb = (size_t)(j0 + g + 8) * nb * IQ4XS_BYTES;
+
+    float ag[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float au[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *ga = gw + ra + (size_t)ibl * IQ4XS_BYTES;
+        const unsigned char *gb = gw + rb + (size_t)ibl * IQ4XS_BYTES;
+        const unsigned char *ua = uw + ra + (size_t)ibl * IQ4XS_BYTES;
+        const unsigned char *ub = uw + rb + (size_t)ibl * IQ4XS_BYTES;
+
+        const float dga = h2f((unsigned short)ga[0] | ((unsigned short)ga[1] << 8));
+        const float dgb = h2f((unsigned short)gb[0] | ((unsigned short)gb[1] << 8));
+        const float dua = h2f((unsigned short)ua[0] | ((unsigned short)ua[1] << 8));
+        const float dub = h2f((unsigned short)ub[0] | ((unsigned short)ub[1] << 8));
+
+        const unsigned int hga = (unsigned int)ga[2] | ((unsigned int)ga[3] << 8);
+        const unsigned int hgb = (unsigned int)gb[2] | ((unsigned int)gb[3] << 8);
+        const unsigned int hua = (unsigned int)ua[2] | ((unsigned int)ua[3] << 8);
+        const unsigned int hub = (unsigned int)ub[2] | ((unsigned int)ub[3] << 8);
+
+        const float xs0 = (tok_0 >= 0) ? x_scales[(size_t)tok_0 * nb + ibl] : 0.0f;
+        const float xs1 = (tok_1 >= 0) ? x_scales[(size_t)tok_1 * nb + ibl] : 0.0f;
+
+        for (int t = 0; t < 8; ++t) {
+            const int ib   = (t >> 1) * 2;
+            const int half = t & 1;
+
+            const int lsga = iq4_ls(hga, ga[4 + (ib >> 1)], ib, half);
+            const int lsgb = iq4_ls(hgb, gb[4 + (ib >> 1)], ib, half);
+            const int lsua = iq4_ls(hua, ua[4 + (ib >> 1)], ib, half);
+            const int lsub = iq4_ls(hub, ub[4 + (ib >> 1)], ib, half);
+
+            const int off = 4 + QK_K / 64 + t * 16 + q * 4;
+            int fg[4], fu[4];
+            unpack_iq4_pair(*(const int *)(ga + off), fg[0], fg[2]);
+            unpack_iq4_pair(*(const int *)(gb + off), fg[1], fg[3]);
+            unpack_iq4_pair(*(const int *)(ua + off), fu[0], fu[2]);
+            unpack_iq4_pair(*(const int *)(ub + off), fu[1], fu[3]);
+
+            int b[2] = {0, 0};
+            if (tok_b >= 0) {
+                const signed char *q8 =
+                    x_quants + (size_t)tok_b * n_in + (size_t)ibl * QK_K + t * 32;
+                b[0] = *(const int *)(q8 + q * 4);
+                b[1] = *(const int *)(q8 + 16 + q * 4);
+            }
+
+            const int zero[4] = {0, 0, 0, 0};
+            int sg[4], su[4];
+            mma_m16n8k32_s8(sg, fg, b, zero);
+            mma_m16n8k32_s8(su, fu, b, zero);
+
+            ag[0] += ((dga * xs0) * (float)(lsga - 32)) * (float)sg[0];
+            ag[1] += ((dga * xs1) * (float)(lsga - 32)) * (float)sg[1];
+            ag[2] += ((dgb * xs0) * (float)(lsgb - 32)) * (float)sg[2];
+            ag[3] += ((dgb * xs1) * (float)(lsgb - 32)) * (float)sg[3];
+
+            au[0] += ((dua * xs0) * (float)(lsua - 32)) * (float)su[0];
+            au[1] += ((dua * xs1) * (float)(lsua - 32)) * (float)su[1];
+            au[2] += ((dub * xs0) * (float)(lsub - 32)) * (float)su[2];
+            au[3] += ((dub * xs1) * (float)(lsub - 32)) * (float)su[3];
+        }
+    }
+
+    // silu(g) * u, exactly as `silu_mul` computes it.
+    const int row_a = j0 + g;
+    const int row_b = j0 + g + 8;
+    if (pair_0 >= 0) {
+        if (row_a < n_ff)
+            out[(size_t)pair_0 * n_ff + row_a] = ag[0] / (1.0f + expf(-ag[0])) * au[0];
+        if (row_b < n_ff)
+            out[(size_t)pair_0 * n_ff + row_b] = ag[2] / (1.0f + expf(-ag[2])) * au[2];
+    }
+    if (pair_1 >= 0) {
+        if (row_a < n_ff)
+            out[(size_t)pair_1 * n_ff + row_a] = ag[1] / (1.0f + expf(-ag[1])) * au[1];
+        if (row_b < n_ff)
+            out[(size_t)pair_1 * n_ff + row_b] = ag[3] / (1.0f + expf(-ag[3])) * au[3];
+    }
+}
+
+// The routed FFN `down` matmul for one expert tile, on the tensor cores.
+//
+// `x` is indexed by pair: each pair has its own `n_ff`-wide intermediate.
+__global__ void matmul_iq4_xs_q8_k_moe_grouped_mma(
+        int n_in, int n_out,
+        const int *__restrict__ n_tile,
+        const int *__restrict__ perm,
+        const int *__restrict__ tile_first,
+        const int *__restrict__ tile_n,
+        const unsigned long long *__restrict__ wptrs,
+        const float *__restrict__ x_scales,
+        const signed char *__restrict__ x_quants,
+        float *__restrict__ out) {
+    const int tl = blockIdx.y;
+    if (tl >= *n_tile) return;
+
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j0   = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    if (j0 >= n_out) return;
+
+    const int first = tile_first[tl];
+    const int nt    = tile_n[tl];
+
+    const int g = lane >> 2;
+    const int q = lane & 3;
+
+    const int pair_b = (g < nt) ? perm[first + g] : -1;
+    const int pair_0 = (2 * q < nt) ? perm[first + 2 * q] : -1;
+    const int pair_1 = (2 * q + 1 < nt) ? perm[first + 2 * q + 1] : -1;
+
+    const unsigned char *w = (const unsigned char *)wptrs[perm[first]];
+    const size_t ra = (size_t)(j0 + g) * nb * IQ4XS_BYTES;
+    const size_t rb = (size_t)(j0 + g + 8) * nb * IQ4XS_BYTES;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *ba = w + ra + (size_t)ibl * IQ4XS_BYTES;
+        const unsigned char *bb = w + rb + (size_t)ibl * IQ4XS_BYTES;
+
+        const float da = h2f((unsigned short)ba[0] | ((unsigned short)ba[1] << 8));
+        const float db = h2f((unsigned short)bb[0] | ((unsigned short)bb[1] << 8));
+        const unsigned int sha = (unsigned int)ba[2] | ((unsigned int)ba[3] << 8);
+        const unsigned int shb = (unsigned int)bb[2] | ((unsigned int)bb[3] << 8);
+
+        const float xs0 = (pair_0 >= 0) ? x_scales[(size_t)pair_0 * nb + ibl] : 0.0f;
+        const float xs1 = (pair_1 >= 0) ? x_scales[(size_t)pair_1 * nb + ibl] : 0.0f;
+
+        for (int t = 0; t < 8; ++t) {
+            const int ib   = (t >> 1) * 2;
+            const int half = t & 1;
+
+            const int lsa = iq4_ls(sha, ba[4 + (ib >> 1)], ib, half);
+            const int lsb = iq4_ls(shb, bb[4 + (ib >> 1)], ib, half);
+
+            const int off = 4 + QK_K / 64 + t * 16 + q * 4;
+            int a[4];
+            unpack_iq4_pair(*(const int *)(ba + off), a[0], a[2]);
+            unpack_iq4_pair(*(const int *)(bb + off), a[1], a[3]);
+
+            int b[2] = {0, 0};
+            if (pair_b >= 0) {
+                const signed char *q8 =
+                    x_quants + (size_t)pair_b * n_in + (size_t)ibl * QK_K + t * 32;
+                b[0] = *(const int *)(q8 + q * 4);
+                b[1] = *(const int *)(q8 + 16 + q * 4);
+            }
+
+            const int zero[4] = {0, 0, 0, 0};
+            int s[4];
+            mma_m16n8k32_s8(s, a, b, zero);
+
+            acc[0] += ((da * xs0) * (float)(lsa - 32)) * (float)s[0];
+            acc[1] += ((da * xs1) * (float)(lsa - 32)) * (float)s[1];
+            acc[2] += ((db * xs0) * (float)(lsb - 32)) * (float)s[2];
+            acc[3] += ((db * xs1) * (float)(lsb - 32)) * (float)s[3];
+        }
+    }
+
+    const int row_a = j0 + g;
+    const int row_b = j0 + g + 8;
+    if (pair_0 >= 0) {
+        if (row_a < n_out) out[(size_t)pair_0 * n_out + row_a] = acc[0];
+        if (row_b < n_out) out[(size_t)pair_0 * n_out + row_b] = acc[2];
+    }
+    if (pair_1 >= 0) {
+        if (row_a < n_out) out[(size_t)pair_1 * n_out + row_a] = acc[1];
+        if (row_b < n_out) out[(size_t)pair_1 * n_out + row_b] = acc[3];
+    }
+}
+
+
+
 
 // The whole tail of a routed FFN in one launch: weighted sum of the experts,
 // Resolve this token's chosen experts to device addresses.

@@ -149,6 +149,11 @@ pub struct Cuda {
     iq4_untiled: Cell<bool>,
     /// Force the per-pair routed FFN even for a batch, for the A/B.
     moe_ungrouped: Cell<bool>,
+    /// Route batched IQ4_XS matmuls through the int8 tensor cores.
+    ///
+    /// **On by default**, because it is bit-identical to the oracle and 1.72x
+    /// on prefill. `--iq4-scalar` restores the warp dot for the A/B.
+    iq4_mma: Cell<bool>,
     /// Diagnostic: enable the warp score phase for one `attend` call only.
     ///
     /// **A bisector that needs no host reads.** `Ctx::trace` hands out host
@@ -747,6 +752,7 @@ impl Cuda {
                 attn_warp: Cell::new(None),
                 iq4_untiled: Cell::new(false),
                 moe_ungrouped: Cell::new(false),
+                iq4_mma: Cell::new(true),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),
