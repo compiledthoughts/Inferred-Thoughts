@@ -550,6 +550,146 @@ __global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
     }
 }
 
+
+// Attention for a batch: the whole KV walk in one block, per (query row, head).
+//
+// **The partials were the cost, not the keys.** `attn_flash` splits the KV
+// sequence across blocks and writes each chunk's `(acc, m, l)` to global for
+// `attn_flash_combine` to read back. At n_q 128, n_pos 8192 that is
+// `n_q * n_head * n_split * head_dim` floats -- **537 MiB written and read back
+// per attending layer**, about 17% of this card's bandwidth spent on scratch.
+// And it grows with `n_split`, i.e. with context, which is exactly the shape of
+// the depth problem: llama.cpp holds ~1,040 tok/s flat from 2.9k to 13.5k while
+// this engine falls 40%.
+//
+// Splitting the sequence exists because **decode has one query row** and no
+// other parallelism to fill 36 SMs with. A batch has `n_q * n_head` blocks
+// before splitting anything, so the split buys nothing and costs the scratch.
+// Gated on `n_q > 1`; decode keeps the two-kernel path unchanged.
+//
+// The online-softmax merge moves from `attn_flash_combine` into this loop. Same
+// algebra -- a chunk's numbers are relative to its own max, so rescaling by
+// `exp(m_chunk - m_new)` puts them on one reference before they are added --
+// but associated left-to-right across chunks instead of all at once against a
+// global max, so it is a different rounding of the same quantity.
+__global__ void attn_flash_fused(int n_pos_first, int kv_dim, int head_dim,
+                                 int n_head, int n_head_kv, int use_warp,
+                                 float scale,
+                                 const float *__restrict__ q,
+                                 const unsigned short *__restrict__ k,
+                                 const unsigned short *__restrict__ v,
+                                 float *__restrict__ out) {
+    extern __shared__ float smem[];
+    float *sq  = smem;                  // [head_dim] the query
+    float *se  = sq + head_dim;         // [FD_CHUNK] exp(score - m) per position
+    float *red = se + FD_CHUNK;         // [FD_CHUNK] reduction scratch
+    float *acc = red + FD_CHUNK;        // [head_dim] running output, unnormalized
+    __shared__ float run_m, run_l, ra, rb;
+
+    const int hq = blockIdx.x % n_head;
+    const int r  = blockIdx.x / n_head;
+    // Row `r` attends over `n_pos_first + r` positions -- consecutive rows,
+    // which is `Attn::n_pos_of`.
+    const int n_pos = n_pos_first + r;
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        sq[i] = q[((size_t)r * n_head + hq) * head_dim + i];
+        acc[i] = 0.0f;
+    }
+    if (threadIdx.x == 0) { run_m = -INFINITY; run_l = 0.0f; }
+    __syncthreads();
+
+    const int n_split = (n_pos + FD_CHUNK - 1) / FD_CHUNK;
+    for (int split = 0; split < n_split; ++split) {
+        const int lo = split * FD_CHUNK;
+        const int len = min(FD_CHUNK, n_pos - lo);
+
+        // --- scores, exactly as `attn_flash` computes them ---
+        float score = -INFINITY;
+        if (use_warp) {
+            const int lane = threadIdx.x & 31;
+            const int warp = threadIdx.x >> 5;
+            const int nwarps = blockDim.x >> 5;
+            for (int p = warp; p < FD_CHUNK; p += nwarps) {
+                float dot = 0.0f;
+                if (p < len) {
+                    const unsigned short *key = k + (size_t)(lo + p) * kv_dim + off;
+                    for (int i = lane; i < head_dim; i += 32) dot += sq[i] * h2f(key[i]);
+#pragma unroll
+                    for (int sh = 16; sh > 0; sh >>= 1)
+                        dot += __shfl_down_sync(0xffffffff, dot, sh);
+                }
+                if (lane == 0) red[p] = (p < len) ? dot * scale : -INFINITY;
+            }
+            __syncthreads();
+            score = red[threadIdx.x];
+        } else {
+            if (threadIdx.x < len) {
+                const unsigned short *key =
+                    k + (size_t)(lo + threadIdx.x) * kv_dim + off;
+                float dot = 0.0f;
+                for (int i = 0; i < head_dim; ++i) dot += sq[i] * h2f(key[i]);
+                score = dot * scale;
+            }
+            red[threadIdx.x] = score;
+        }
+
+        // Chunk max. A tree is exact here -- max never rounds.
+        __syncthreads();
+        for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+            }
+            __syncthreads();
+        }
+        const float m = red[0];
+        __syncthreads();
+
+        const float e = (threadIdx.x < len) ? expf(score - m) : 0.0f;
+        se[threadIdx.x] = e;
+        red[threadIdx.x] = e;
+        __syncthreads();
+        for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        const float l = red[0];
+
+        // --- merge this chunk into the running total ---
+        //
+        // One thread decides the rescaling so every thread applies the same
+        // two numbers. `run_m` starts at -INFINITY, so the first chunk gets
+        // `ra = exp(-inf) = 0` against `acc = 0` and contributes exactly
+        // itself.
+        if (threadIdx.x == 0) {
+            const float nm = fmaxf(run_m, m);
+            ra = expf(run_m - nm);
+            rb = expf(m - nm);
+            run_l = run_l * ra + l * rb;
+            run_m = nm;
+        }
+        __syncthreads();
+
+        // Weighted sum of this chunk's values, folded straight into `acc`.
+        // Adjacent threads hold adjacent elements and read adjacent halves of
+        // V, so the reads coalesce as they did before.
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            float chunk = 0.0f;
+            for (int t = 0; t < len; ++t) {
+                chunk += se[t] * h2f(v[(size_t)(lo + t) * kv_dim + off + i]);
+            }
+            acc[i] = acc[i] * ra + chunk * rb;
+        }
+        __syncthreads();
+    }
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        out[((size_t)r * n_head + hq) * head_dim + i] = acc[i] / run_l;
+    }
+}
+
+
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.
 __global__ void silu_mul(int n, float *__restrict__ gate,
                          const float *__restrict__ up) {

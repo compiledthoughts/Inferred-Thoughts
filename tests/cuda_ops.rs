@@ -2362,7 +2362,7 @@ fn the_mma_iq4_matmul_is_bit_identical() {
     println!("  {checked} outputs compared, all bit-identical");
 }
 
-/// **What a query-row group is worth, at prefill shapes, in seconds.**
+/// **What each attention variant costs, at prefill shapes, in seconds.**
 ///
 /// `what_attention_costs_as_context_grows` drives one query row, which is the
 /// decode shape — it cannot see a change that is entirely about how many rows
@@ -2374,7 +2374,7 @@ fn the_mma_iq4_matmul_is_bit_identical() {
 /// rebuild, no model load, no expert placement and no drift between them.
 #[test]
 #[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
-fn what_a_query_row_group_is_worth() {
+fn what_the_attention_variants_cost() {
     const HEAD_DIM: usize = 256;
     const N_HEAD: usize = 16;
     const N_HEAD_KV: usize = 2;
@@ -2384,7 +2384,7 @@ fn what_a_query_row_group_is_worth() {
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
 
-    let max_pos = 16384usize;
+    let max_pos = 32768usize;
     let k: Vec<u16> = (0..max_pos * KV_DIM)
         .map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff)
         .collect();
@@ -2395,7 +2395,7 @@ fn what_a_query_row_group_is_worth() {
     // One query buffer per batch shape, all held for the whole test: `Cuda`
     // keys its mirrors on host addresses, so a buffer dropped between cases
     // hands the next one a recycled address and the previous case's data.
-    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (64, 8192), (128, 8192), (128, 16384)];
+    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (64, 8192), (128, 8192), (128, 16384), (128, 32768), (256, 32768)];
     let held: Vec<Vec<f32>> = shapes
         .iter()
         .map(|&(n_q, _)| noise(n_q * N_HEAD * HEAD_DIM, 7 + n_q as u64))
@@ -2404,7 +2404,7 @@ fn what_a_query_row_group_is_worth() {
     println!("\nattention, prefill shapes, {N_HEAD}q/{N_HEAD_KV}kv x {HEAD_DIM}, x{LAYERS} layers");
     println!(
         "  {:>5} {:>7}  {:>10} {:>10}  {:>8}  {:>12}",
-        "n_q", "n_pos", "qgroup 1", "qgroup 8", "speedup", "ms/tok x10"
+        "n_q", "n_pos", "split", "fused", "speedup", "ms/tok x10"
     );
 
     for (&(n_q, n_pos), q) in shapes.iter().zip(&held) {
@@ -2424,8 +2424,8 @@ fn what_a_query_row_group_is_worth() {
         // Interleaved, so any drift lands on both arms equally.
         let mut best = [f64::MAX; 2];
         for _ in 0..3 {
-            for (slot, g) in [1usize, 8].iter().enumerate() {
-                gpu.set_qgroup(*g);
+            for (slot, fused) in [false, true].iter().enumerate() {
+                gpu.set_attn_fused(*fused);
                 for _ in 0..2 {
                     gpu.begin_pass(n_q);
                     gpu.attend(&a, &mut out);
@@ -2446,7 +2446,7 @@ fn what_a_query_row_group_is_worth() {
                 }
             }
         }
-        gpu.set_qgroup(8);
+        gpu.set_attn_fused(true);
         assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 
         // What ten attending layers cost per prompt token at this shape.

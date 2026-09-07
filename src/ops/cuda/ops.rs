@@ -837,6 +837,19 @@ impl Cuda {
         self.qgroup.set(n.max(1));
     }
 
+    /// Walk the whole KV in one block per (query row, head) for a batch,
+    /// rather than splitting the sequence and combining partials through
+    /// global memory.
+    ///
+    /// **Off by default: measured 0.92-1.05x, mean 0.96x.** It removes 537 MiB
+    /// of partial traffic per layer at n_q 128, n_pos 8192 and buys nothing,
+    /// because attention runs at 4% of this card's bandwidth -- traffic was
+    /// never what bound it. Kept as the A/B, and because the same structure is
+    /// what a tensor-core score GEMM would be built on.
+    pub fn set_attn_fused(&self, on: bool) {
+        self.attn_fused.set(on);
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -2023,6 +2036,42 @@ impl Cuda {
         let (n_q, per_row) = (a.n_q(), a.n_head * a.head_dim);
         // Counted per `attend`, not per query row: one call is one layer.
         self.attn_calls.set(self.attn_calls.get() + 1);
+
+        // **A batch walks the whole KV in one block per (row, head).** The
+        // sequence split exists so decode, which has a single query row, can
+        // fill the machine; a batch already has `n_q * n_head` blocks and the
+        // split only buys 537 MiB of partials per layer at n_q 128, n_pos 8192.
+        // Decode falls through to the two-kernel path unchanged.
+        if n_q > 1 && self.attn_fused.get() {
+            let args = [
+                KArg::I32(a.n_pos_of(0) as i32),
+                KArg::I32(a.kv_dim as i32),
+                KArg::I32(a.head_dim as i32),
+                KArg::I32(a.n_head as i32),
+                KArg::I32(a.n_head_kv as i32),
+                KArg::I32(i32::from(self.warp_scores(a.n_pos))),
+                KArg::F32(a.scale),
+                KArg::Ptr(qd),
+                KArg::Ptr(kd),
+                KArg::Ptr(vd),
+                KArg::Ptr(od),
+            ];
+            // `sq` + `se` + `red` + `acc`, which is what the kernel indexes.
+            let shared = ((2 * a.head_dim + 2 * CHUNK) * 4) as u32;
+            // SAFETY: parameters match `attn_flash_fused`; one block per
+            // (query row, query head), `CHUNK` threads as the reductions
+            // assume, and `shared` is the four arrays it carves out.
+            unsafe {
+                self.launch_shared(
+                    "attn_flash_fused",
+                    (a.n_head * n_q) as u32,
+                    CHUNK as u32,
+                    shared,
+                    &args,
+                )?
+            };
+            return Ok(());
+        }
         // **Query rows go up in groups now.** One launch per row read that
         // row's whole K/V window from DRAM by itself; rows of a group run
         // concurrently, so the blocks sharing a chunk find it in L2. Decode is
