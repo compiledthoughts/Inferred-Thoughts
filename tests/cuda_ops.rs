@@ -2395,7 +2395,11 @@ fn what_the_attention_variants_cost() {
     // One query buffer per batch shape, all held for the whole test: `Cuda`
     // keys its mirrors on host addresses, so a buffer dropped between cases
     // hands the next one a recycled address and the previous case's data.
-    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (64, 8192), (128, 8192), (128, 16384), (128, 32768), (256, 32768)];
+    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (64, 8192), (128, 8192), (128, 16384), (128, 32768), (256, 32768),
+             // Shapes the model actually runs that the bench never had: the
+             // 512-token prefill batch, and the early chunks where the causal
+             // window is barely longer than the batch itself.
+             (512, 8192), (512, 512), (512, 1024), (17, 17)];
     let held: Vec<Vec<f32>> = shapes
         .iter()
         .map(|&(n_q, _)| noise(n_q * N_HEAD * HEAD_DIM, 7 + n_q as u64))
@@ -2451,11 +2455,55 @@ fn what_the_attention_variants_cost() {
 
         // What ten attending layers cost per prompt token at this shape.
         let per_tok = best[1] * LAYERS as f64 / n_q as f64;
+        // Third arm: the score matrix on the tensor cores. Timed the same way,
+        // and checked against the split path -- it is a precision change, so
+        // the interesting number is how far it moves, not whether it is equal.
+        let mut reference = vec![0.0f32; n_q * N_HEAD * HEAD_DIM];
+        gpu.set_attn_mma(false);
+        gpu.set_attn_fused(false);
+        gpu.begin_pass(n_q);
+        gpu.attend(&a, &mut reference);
+        gpu.host_needs(&mut reference);
+        gpu.end_pass();
+
+        gpu.set_attn_mma(true);
+        let mut mma_out = vec![0.0f32; n_q * N_HEAD * HEAD_DIM];
+        let mut mma_ms = f64::MAX;
+        for _ in 0..3 {
+            for _ in 0..2 {
+                gpu.begin_pass(n_q);
+                gpu.attend(&a, &mut mma_out);
+                gpu.host_needs(&mut mma_out);
+                gpu.end_pass();
+            }
+            let t = std::time::Instant::now();
+            const R: u32 = 5;
+            for _ in 0..R {
+                gpu.begin_pass(n_q);
+                gpu.attend(&a, &mut mma_out);
+                gpu.host_needs(&mut mma_out);
+                gpu.end_pass();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / R as f64;
+            if ms < mma_ms {
+                mma_ms = ms;
+            }
+        }
+        gpu.set_attn_mma(false);
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        let mag = reference.iter().fold(0.0f32, |m: f32, &v| m.max(v.abs()));
+        let worst = reference
+            .iter()
+            .zip(&mma_out)
+            .fold(0.0f32, |m: f32, (x, y)| m.max((x - y).abs()));
+        let rel = worst / mag.max(1e-30);
+
         println!(
-            "  {n_q:>5} {n_pos:>7}  {:>9.3}ms {:>9.3}ms  {:>7.2}x  {per_tok:>11.3}",
+            "  {n_q:>5} {n_pos:>7}  {:>9.3}ms {:>9.3}ms  {:>7.2}x  {per_tok:>11.3}                mma {mma_ms:>8.3}ms {:>6.2}x  rel {rel:.2e}",
             best[0],
             best[1],
-            best[0] / best[1]
+            best[0] / best[1],
+            best[0] / mma_ms
         );
     }
 }

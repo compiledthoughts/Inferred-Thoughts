@@ -105,6 +105,10 @@ mod slot {
 /// Pairs per grouped-expert tile. **Must equal `MOE_TOK` in
 /// `kernels/kernels.cu`** — it sizes the register arrays there and the grid
 /// bound here, and the two disagreeing is silent.
+/// Query rows per tensor-core attention tile. **Must equal `ATT_QT` in
+/// `kernels/kernels.cu`.**
+const ATT_QT: usize = 16;
+
 const MOE_TOK: usize = 8;
 
 /// Pairs per grouped-expert tile on the tensor-core path. **Must equal
@@ -848,6 +852,18 @@ impl Cuda {
     /// what a tensor-core score GEMM would be built on.
     pub fn set_attn_fused(&self, on: bool) {
         self.attn_fused.set(on);
+    }
+
+    /// Compute the score matrix on the tensor cores.
+    ///
+    /// **A precision change, not a reordering**: the GEMM operands must be f16
+    /// and Q arrives as f32, so it rounds to ten mantissa bits. K and V are
+    /// already f16 in the cache, and the running max, running sum, rescaling
+    /// and output accumulator all stay f32 -- the split FlashAttention makes,
+    /// whose measured RMSE is better than a naive f32 kernel for that reason.
+    /// Off by default; `attend_tolerance` does not cover it.
+    pub fn set_attn_mma(&self, on: bool) {
+        self.attn_mma.set(on);
     }
 
     pub fn attn_warp(&self, force: Option<bool>) {
@@ -2021,7 +2037,7 @@ impl Cuda {
         // Per-chunk partials: an output vector, plus the max and sum that let
         // chunks be combined without ever materializing the scores.
         // Sized for a whole group of query rows, at the widest window in it.
-        let g = self.qgroup.get().max(1).min(a.n_q());
+        let g = self.attend_group(a.n_q()).min(a.n_q());
         let pa = self.pooled(slot::SCORES, g * a.n_head * n_split * a.head_dim * 4)?;
         let pm = self.pooled(slot::PART_M, g * a.n_head * n_split * 4)?;
         let pl = self.pooled(slot::PART_L, g * a.n_head * n_split * 4)?;
@@ -2076,7 +2092,7 @@ impl Cuda {
         // row's whole K/V window from DRAM by itself; rows of a group run
         // concurrently, so the blocks sharing a chunk find it in L2. Decode is
         // a group of one and reaches the identical kernels.
-        let qg = self.qgroup.get().max(1);
+        let qg = self.attend_group(n_q);
         for t0 in (0..n_q).step_by(qg) {
             let rows = qg.min(n_q - t0);
             let qd = qd + (t0 * per_row * 4) as u64;
@@ -2084,6 +2100,18 @@ impl Cuda {
             self.attend_rows(a, t0, rows, CHUNK, qd, kd, vd, od, pa, pm, pl)?;
         }
         Ok(())
+    }
+
+    /// Query rows per attention launch.
+    ///
+    /// The tensor-core path needs a whole `ATT_QT` tile in one block, so it
+    /// fixes the group; otherwise this is the tunable cache-locality group.
+    fn attend_group(&self, n_q: usize) -> usize {
+        if n_q > 1 && self.attn_mma.get() {
+            ATT_QT
+        } else {
+            self.qgroup.get().max(1)
+        }
     }
 
     /// A group of query rows against the cache — the flash-decoding pair.
@@ -2129,6 +2157,50 @@ impl Cuda {
                 KArg::Ptr(pl),
             ];
             let shared = ((a.head_dim + 2 * chunk) * 4) as u32;
+            // **`n_q > 1`, as every prefill-only path here is gated.** Without
+            // it decode runs a 16-row tile for its single row -- 16x the work,
+            // measured at 37.85 -> 23.14 tok/s -- and, worse, `serve` records
+            // decode as a CUDA graph, so a kernel the graph has never seen gets
+            // its position-dependent arguments baked in and every step after
+            // the first attends with stale ones. That produced fluent-looking
+            // nonsense in a real session while prefill was correct and faster.
+            if self.attn_mma.get() && a.n_q() > 1 && a.head_dim % 16 == 0 {
+                let margs = [
+                    KArg::I32(n_pos_first as i32),
+                    KArg::I32(rows as i32),
+                    KArg::I32(a.kv_dim as i32),
+                    KArg::I32(a.head_dim as i32),
+                    KArg::I32(a.n_head as i32),
+                    KArg::I32(a.n_head_kv as i32),
+                    KArg::I32(n_split as i32),
+                    KArg::F32(a.scale),
+                    KArg::Ptr(qd),
+                    KArg::Ptr(kd),
+                    KArg::Ptr(vd),
+                    KArg::Ptr(pa),
+                    KArg::Ptr(pm),
+                    KArg::Ptr(pl),
+                ];
+                const ATT_KC: usize = 32;
+                let mshared = (ATT_QT * a.head_dim * 2
+                    + ATT_KC * a.head_dim * 2
+                    + ATT_QT * ATT_KC * 4
+                    + 4 * ATT_QT * 4) as u32;
+                // SAFETY: parameters match `attn_flash_mma`; one block per
+                // (head, chunk), 128 threads as its four-warp score tile
+                // assumes, and `mshared` is the query tile, the K/V staging
+                // buffer, the score tile and the four per-row vectors.
+                unsafe {
+                    self.launch_grid2(
+                        "attn_flash_mma",
+                        a.n_head as u32,
+                        n_split as u32,
+                        128,
+                        mshared,
+                        &margs,
+                    )?
+                };
+            } else {
             // SAFETY: parameters match `attn_flash`; the grid is one block per
             // (query head, chunk) so no block sees an empty range, and `shared`
             // is head_dim + 2 * FD_CHUNK floats, which is what it indexes.
@@ -2148,6 +2220,7 @@ impl Cuda {
                     &args,
                 )?
             };
+            }
         }
 
         {
@@ -2156,6 +2229,7 @@ impl Cuda {
                 KArg::I32(a.head_dim as i32),
                 KArg::I32(a.n_head as i32),
                 KArg::I32(n_split as i32),
+                KArg::I32(chunk as i32),
                 KArg::Ptr(pa),
                 KArg::Ptr(pm),
                 KArg::Ptr(pl),

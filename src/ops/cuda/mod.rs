@@ -151,6 +151,8 @@ pub struct Cuda {
     moe_ungrouped: Cell<bool>,
     /// Walk the whole KV in one block for a batch, instead of splitting it.
     attn_fused: Cell<bool>,
+    /// Score matrix on the tensor cores. A precision change: Q converts to f16.
+    attn_mma: Cell<bool>,
     /// Query rows per attention launch; 1 is the old one-row-per-launch path.
     qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
@@ -638,6 +640,11 @@ struct KvMirror {
 // driver handles, not references into our address space.
 unsafe impl Send for Cuda {}
 
+/// An experimental switch read from the environment: set and non-zero is on.
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+
 impl Cuda {
     /// Initialize the driver, take device `ordinal`, and load the kernels.
     pub fn new(ordinal: i32) -> Result<Self> {
@@ -758,7 +765,16 @@ impl Cuda {
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
                 qgroup: Cell::new(8),
-                attn_fused: Cell::new(false),
+                attn_fused: Cell::new(env_flag("INFERRED_ATTN_FUSED")),
+                // **Read here rather than plumbed through each command.**
+                // `serve` configures the backend at a different site from
+                // `generate` and only ever set `rms_serial` and the expert
+                // budget, so a `generate`-only flag meant a real session
+                // silently ran a different kernel -- which is how the MMA
+                // matmuls were measured on the bench and absent in `serve`.
+                // An env toggle reaches every entry point, including ones
+                // added later.
+                attn_mma: Cell::new(env_flag("INFERRED_ATTN_MMA")),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

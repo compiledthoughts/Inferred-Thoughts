@@ -513,7 +513,7 @@ __global__ void attn_flash(int n_pos_first, int kv_dim, int head_dim, int n_head
 // rescaling by exp(m_chunk - m_global) puts them all on one reference before
 // they are added.
 __global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
-                                   int part_stride,
+                                   int part_stride, int chunk,
                                    const float *__restrict__ part_acc,
                                    const float *__restrict__ part_m,
                                    const float *__restrict__ part_l,
@@ -525,7 +525,7 @@ __global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
     // has its own split count because it has its own causal window.
     const int hq = blockIdx.x % n_head;
     const int r = blockIdx.x / n_head;
-    const int n_split = (n_pos_first + r + FD_CHUNK - 1) / FD_CHUNK;
+    const int n_split = (n_pos_first + r + chunk - 1) / chunk;
     const size_t row = ((size_t)r * n_head + hq) * part_stride;
     const float *pm = part_m + row;
     const float *pl = part_l + row;
@@ -688,6 +688,265 @@ __global__ void attn_flash_fused(int n_pos_first, int kv_dim, int head_dim,
         out[((size_t)r * n_head + hq) * head_dim + i] = acc[i] / run_l;
     }
 }
+
+
+
+// ---------------------------------------------------------------------------
+// Attention with the score matrix on the tensor cores
+// ---------------------------------------------------------------------------
+//
+// **Attention is 33% of a 15,000-token prefill and runs at ~5% of this card's
+// fp32 peak.** `attn_flash` computes `S = Q K^T` one element at a time: a warp
+// does a 256-long dot product per (query row, key position) pair, eight FMAs a
+// lane plus a five-step shuffle tree -- about thirteen warp-instructions for a
+// single output. One `mma.m16n8k16` produces a 16x8 tile of `S`, 128 elements,
+// so the same work is sixteen instructions rather than roughly seventeen
+// hundred.
+//
+// This is FlashAttention-2's shape, not FlashAttention-3's. FA-3's gains come
+// from WGMMA, TMA and warp-specialized producer/consumer pipelines, all sm_90a;
+// its own ablation puts that asynchrony at 570 -> 661 TFLOPs, about 16%. The
+// rest of FA-2's advantage over a scalar kernel is simply having the matmuls on
+// tensor cores, and `mma.sync` is available from sm_75 -- the same gate that
+// lets llama.cpp's `fattn-mma-f16` run on this card.
+//
+// # What it costs
+//
+// The GEMM operands must be f16. **K and V already are**, because the KV cache
+// stores them that way to match what llama.cpp computes attention over, so only
+// Q converts. Everything numerically load-bearing stays f32: the running max,
+// the running sum, the rescaling, and the output accumulator. That is the split
+// FlashAttention makes, and their measured RMSE against an fp64 reference is
+// 1.9e-4 for FP16 FlashAttention against 3.2e-4 for a standard implementation
+// -- better than the naive kernel, because the softmax stays in f32.
+//
+// It is still a precision change rather than a reordering, so this is off by
+// default and `attend_tolerance` does not cover it.
+
+// Query rows and key positions per block tile.
+//
+// 16 x 32 keeps shared memory near 26 KiB: an f16 query tile, one f16 staging
+// buffer reused for K and then V, and the f32 score tile. Four warps each own
+// one 16x8 quadrant of `S`, and `ATT_KC` equal to the warp size makes the
+// per-row softmax a single warp reduction.
+#define ATT_QT 16
+#define ATT_KC 32
+
+// Head dimensions each thread carries an accumulator for, one per query row.
+#define ATT_DPER 2
+
+__device__ __forceinline__ unsigned short f2h(float x) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(x));
+    return h;
+}
+
+// D = A * B + C over f16 with an f32 accumulator, 16x8x16. sm_75 and later.
+__device__ __forceinline__ void mma_m16n8k16_f16(
+        float (&d)[4], const unsigned (&a)[4], const unsigned (&b)[2],
+        const float (&c)[4]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
+        : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]),
+          "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+}
+
+// The score matrix on the tensor cores, keeping the KV-sequence split.
+//
+// **Both halves of that sentence are measured decisions.** The tensor cores are
+// there because attention runs at ~5% of fp32 peak with a scalar dot product
+// per (query, key) pair. The split stays because removing it -- which
+// `attn_flash_fused` did, taking the partial buffers with it -- was worth
+// 0.96x: 537 MiB per layer of partial traffic costs nothing on a kernel using
+// 4% of this card's bandwidth, while the parallelism it buys is everything. A
+// first version of this kernel dropped the split and fell to 0.57x at n_pos
+// 32768, running 128 blocks against the split path's tens of thousands.
+//
+// # Why a block owns 128 positions but tiles them 32 at a time
+//
+// Two limits pull opposite ways. The MMA tile wants K staged in shared memory,
+// and 128 positions x 256 head dims of f16 is 64 KiB -- too much. The partial
+// buffers want *few* splits, because they cost
+// `rows * n_head * n_split * head_dim` floats: at 20k context a 32-position
+// split is 671 MiB where a 128-position one is 168.
+//
+// So the block owns a `FD_CHUNK` chunk, as the split path does, and walks it as
+// four `ATT_KC` sub-tiles with the online-softmax merge held in registers --
+// emitting a single partial. `attn_flash_combine` is unchanged apart from
+// taking the chunk width, since the two paths now use different ones.
+__global__ void attn_flash_mma(int n_pos_first, int n_rows, int kv_dim,
+                               int head_dim, int n_head, int n_head_kv,
+                               int part_stride, float scale,
+                               const float *__restrict__ q,
+                               const unsigned short *__restrict__ k,
+                               const unsigned short *__restrict__ v,
+                               float *__restrict__ part_acc,
+                               float *__restrict__ part_m,
+                               float *__restrict__ part_l) {
+    extern __shared__ char smem_raw[];
+    unsigned short *sq  = (unsigned short *)smem_raw;      // ATT_QT x head_dim
+    unsigned short *skv = sq + ATT_QT * head_dim;          // ATT_KC x head_dim
+    float *ss   = (float *)(skv + ATT_KC * head_dim);      // ATT_QT x ATT_KC
+    float *smax = ss + ATT_QT * ATT_KC;                    // running max
+    float *ssum = smax + ATT_QT;                           // running sum
+    float *sra  = ssum + ATT_QT;                           // rescale, running
+    float *srb  = sra + ATT_QT;                            // rescale, sub-tile
+
+    const int hq = blockIdx.x;
+    const int split = blockIdx.y;
+    const int base_lo = split * FD_CHUNK;
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+
+    // Row `r` attends over `n_pos_first + r` positions -- consecutive, as
+    // `Attn::n_pos_of` says -- so this is the widest window in the tile.
+    const int n_pos_max = n_pos_first + n_rows - 1;
+    if (base_lo >= n_pos_max) return;
+
+    for (int i = threadIdx.x; i < ATT_QT * head_dim; i += blockDim.x) {
+        const int r = i / head_dim, d = i % head_dim;
+        const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
+        sq[i] = f2h(q[((size_t)rr * n_head + hq) * head_dim + d]);
+    }
+    if (threadIdx.x < ATT_QT) {
+        smax[threadIdx.x] = -INFINITY;
+        ssum[threadIdx.x] = 0.0f;
+    }
+    // This thread's output accumulators: head dimensions
+    // `threadIdx.x + i * blockDim.x`, one float per query row each.
+    float acc[ATT_DPER][ATT_QT];
+#pragma unroll
+    for (int di = 0; di < ATT_DPER; ++di) {
+#pragma unroll
+        for (int r = 0; r < ATT_QT; ++r) acc[di][r] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int sub = 0; sub < FD_CHUNK / ATT_KC; ++sub) {
+        const int lo = base_lo + sub * ATT_KC;
+        // Block-uniform, so the barriers below are not divergent.
+        if (lo >= n_pos_max) break;
+
+        for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
+            const int p = i / head_dim, d = i % head_dim;
+            skv[i] = (lo + p < n_pos_max) ? k[(size_t)(lo + p) * kv_dim + off + d] : 0;
+        }
+        __syncthreads();
+
+        // --- S = Q K^T. Warp `w` owns columns [8w, 8w+8) of the 16x32 tile.
+        {
+            float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            const int col = warp * 8 + g;
+            for (int k0 = 0; k0 < head_dim; k0 += 16) {
+                unsigned a[4], b[2];
+                a[0] = *(const unsigned *)&sq[(size_t)g * head_dim + k0 + 2 * t];
+                a[1] = *(const unsigned *)&sq[(size_t)(g + 8) * head_dim + k0 + 2 * t];
+                a[2] = *(const unsigned *)&sq[(size_t)g * head_dim + k0 + 2 * t + 8];
+                a[3] = *(const unsigned *)&sq[(size_t)(g + 8) * head_dim + k0 + 2 * t + 8];
+                b[0] = *(const unsigned *)&skv[(size_t)col * head_dim + k0 + 2 * t];
+                b[1] = *(const unsigned *)&skv[(size_t)col * head_dim + k0 + 2 * t + 8];
+                float dd[4];
+                mma_m16n8k16_f16(dd, a, b, c);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) c[i] = dd[i];
+            }
+            const int c0 = warp * 8 + 2 * t;
+            ss[(size_t)g * ATT_KC + c0]           = c[0];
+            ss[(size_t)g * ATT_KC + c0 + 1]       = c[1];
+            ss[(size_t)(g + 8) * ATT_KC + c0]     = c[2];
+            ss[(size_t)(g + 8) * ATT_KC + c0 + 1] = c[3];
+        }
+        __syncthreads();
+
+        // --- softmax over the sub-tile, and the merge into the running total.
+        // Warp `w` owns rows [4w, 4w+4); `ATT_KC` is the warp size, so one warp
+        // reduction covers a row.
+        for (int rr = 0; rr < ATT_QT / 4; ++rr) {
+            const int r = warp * (ATT_QT / 4) + rr;
+            const int n_pos_r = n_pos_first + r;
+            const bool live = (r < n_rows) && (lo + lane < n_pos_r);
+            float s = live ? ss[(size_t)r * ATT_KC + lane] * scale : -INFINITY;
+            float m = s;
+#pragma unroll
+            for (int sh = 16; sh > 0; sh >>= 1)
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, sh));
+            const float e = live ? expf(s - m) : 0.0f;
+            float l = e;
+#pragma unroll
+            for (int sh = 16; sh > 0; sh >>= 1)
+                l += __shfl_xor_sync(0xffffffff, l, sh);
+            ss[(size_t)r * ATT_KC + lane] = e;
+            if (lane == 0) {
+                // `m` is -INFINITY when the sub-tile is entirely past this
+                // row's window; then `rb` is 0 and nothing is contributed.
+                const float om = smax[r], ol = ssum[r];
+                const float nm = fmaxf(om, m);
+                const float a = expf(om - nm);
+                const float b = (m == -INFINITY) ? 0.0f : expf(m - nm);
+                smax[r] = nm;
+                ssum[r] = ol * a + l * b;
+                sra[r] = a;
+                srb[r] = b;
+            }
+        }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
+            const int p = i / head_dim, d = i % head_dim;
+            skv[i] = (lo + p < n_pos_max) ? v[(size_t)(lo + p) * kv_dim + off + d] : 0;
+        }
+        __syncthreads();
+
+        // --- O += P V, still scalar. The second GEMM needs V transposed in
+        // shared to meet the k-major operand layout, which is the next step;
+        // this isolates what the score GEMM is worth with parallelism intact.
+#pragma unroll
+        for (int di = 0; di < ATT_DPER; ++di) {
+            const int d = threadIdx.x + di * blockDim.x;
+            if (d >= head_dim) continue;
+#pragma unroll
+            for (int r = 0; r < ATT_QT; ++r) {
+                float chunk = 0.0f;
+                for (int p = 0; p < ATT_KC; ++p) {
+                    chunk += ss[(size_t)r * ATT_KC + p] * h2f(skv[(size_t)p * head_dim + d]);
+                }
+                acc[di][r] = acc[di][r] * sra[r] + chunk * srb[r];
+            }
+        }
+        __syncthreads();
+    }
+
+    // One partial per (row, head, chunk), in the layout `attn_flash_combine`
+    // already reads.
+#pragma unroll
+    for (int di = 0; di < ATT_DPER; ++di) {
+        const int d = threadIdx.x + di * blockDim.x;
+        if (d >= head_dim) continue;
+        // Fully unrolled with a predicate: a runtime bound makes `r` a
+        // non-constant index and ptxas puts `acc` in local memory -- 128 bytes
+        // of stack frame, which it does not report as a spill. Same trap the
+        // grouped MoE kernels hit this morning.
+#pragma unroll
+        for (int r = 0; r < ATT_QT; ++r) {
+            if (r >= n_rows) continue;
+            part_acc[(((size_t)r * n_head + hq) * part_stride + split) * head_dim + d] =
+                acc[di][r];
+        }
+    }
+    if (threadIdx.x < n_rows) {
+        const size_t base = ((size_t)threadIdx.x * n_head + hq) * part_stride + split;
+        part_m[base] = smax[threadIdx.x];
+        part_l[base] = ssum[threadIdx.x];
+    }
+}
+
+
 
 
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.
