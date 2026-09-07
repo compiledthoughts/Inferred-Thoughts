@@ -149,6 +149,8 @@ pub struct Cuda {
     iq4_untiled: Cell<bool>,
     /// Force the per-pair routed FFN even for a batch, for the A/B.
     moe_ungrouped: Cell<bool>,
+    /// Query rows per attention launch; 1 is the old one-row-per-launch path.
+    qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
     ///
     /// **On by default**, because it is bit-identical to the oracle and 1.72x
@@ -753,6 +755,7 @@ impl Cuda {
                 iq4_untiled: Cell::new(false),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
+                qgroup: Cell::new(8),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

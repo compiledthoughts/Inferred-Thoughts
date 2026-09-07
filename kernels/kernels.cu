@@ -378,8 +378,8 @@ __global__ void softmax_rows(int n, int n_rows, float *__restrict__ x) {
 //
 // Shared memory: head_dim floats for the query, FD_CHUNK for the exponentials,
 // FD_CHUNK for the reduction scratch.
-__global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
-                           int n_head_kv, int use_warp, float scale,
+__global__ void attn_flash(int n_pos_first, int kv_dim, int head_dim, int n_head,
+                           int n_head_kv, int use_warp, int part_stride, float scale,
                            const float *__restrict__ q,
                            const unsigned short *__restrict__ k,
                            const unsigned short *__restrict__ v,
@@ -391,14 +391,29 @@ __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
     float *se = sq + head_dim;        // [FD_CHUNK]  exp(score - m) per position
     float *red = se + FD_CHUNK;       // [FD_CHUNK]  reduction scratch
 
-    const int hq = blockIdx.x;
+    // **The query row is a grid dimension now, folded into `blockIdx.x`.**
+    //
+    // One launch per row read the whole K/V window from DRAM for that row
+    // alone: 29,390 launches on a 2,936-token prefill, and a measured 3.01 TB
+    // of re-reads on a 5,369-token turn at depth 27,410. Rows of one group run
+    // concurrently here, so the blocks sharing a chunk hit L2 rather than DRAM.
+    //
+    // Row `r` of the group attends over `n_pos_first + r` positions -- rows are
+    // consecutive, which is `Attn::n_pos_of`. Nothing about one row's
+    // arithmetic changes, so this is bit-identical rather than merely within
+    // the derived tolerance.
+    const int hq = blockIdx.x % n_head;
+    const int r = blockIdx.x / n_head;
+    const int n_pos = n_pos_first + r;
     const int split = blockIdx.y;
     const int lo = split * FD_CHUNK;
+    // Chunks past this row's causal window: its combine never reads them.
+    if (lo >= n_pos) return;
     const int len = min(FD_CHUNK, n_pos - lo);
     const int off = (hq / (n_head / n_head_kv)) * head_dim;
 
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        sq[i] = q[(size_t)hq * head_dim + i];
+        sq[i] = q[((size_t)r * n_head + hq) * head_dim + i];
     }
     __syncthreads();
 
@@ -478,7 +493,7 @@ __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
 
     // Weighted sum of this chunk's values. Adjacent threads hold adjacent
     // elements and read adjacent halves of V, so the reads coalesce.
-    const size_t base = (size_t)hq * gridDim.y + split;
+    const size_t base = ((size_t)r * n_head + hq) * part_stride + split;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float acc = 0.0f;
         for (int t = 0; t < len; ++t) {
@@ -497,7 +512,8 @@ __global__ void attn_flash(int n_pos, int kv_dim, int head_dim, int n_head,
 // The algebra is exact: a chunk's numbers are relative to its own max, so
 // rescaling by exp(m_chunk - m_global) puts them all on one reference before
 // they are added.
-__global__ void attn_flash_combine(int n_split, int head_dim,
+__global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
+                                   int part_stride,
                                    const float *__restrict__ part_acc,
                                    const float *__restrict__ part_m,
                                    const float *__restrict__ part_l,
@@ -505,9 +521,14 @@ __global__ void attn_flash_combine(int n_split, int head_dim,
     extern __shared__ float w[];   // [n_split] rescaling weights
     __shared__ float total;
 
-    const int hq = blockIdx.x;
-    const float *pm = part_m + (size_t)hq * n_split;
-    const float *pl = part_l + (size_t)hq * n_split;
+    // As `attn_flash`: the query row is folded into `blockIdx.x`, and each row
+    // has its own split count because it has its own causal window.
+    const int hq = blockIdx.x % n_head;
+    const int r = blockIdx.x / n_head;
+    const int n_split = (n_pos_first + r + FD_CHUNK - 1) / FD_CHUNK;
+    const size_t row = ((size_t)r * n_head + hq) * part_stride;
+    const float *pm = part_m + row;
+    const float *pl = part_l + row;
 
     if (threadIdx.x == 0) {
         float m = -INFINITY;
@@ -521,11 +542,11 @@ __global__ void attn_flash_combine(int n_split, int head_dim,
     }
     __syncthreads();
 
-    const float *pa = part_acc + (size_t)hq * n_split * head_dim;
+    const float *pa = part_acc + row * head_dim;
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
         float acc = 0.0f;
         for (int s = 0; s < n_split; ++s) acc += pa[(size_t)s * head_dim + i] * w[s];
-        out[(size_t)hq * head_dim + i] = acc / total;
+        out[((size_t)r * n_head + hq) * head_dim + i] = acc / total;
     }
 }
 

@@ -826,6 +826,17 @@ impl Cuda {
         self.iq4_mma.set(on);
     }
 
+    /// Query rows per attention launch.
+    ///
+    /// **Grouping is a cache effect, not a fusion**: each row keeps its own
+    /// blocks and its own arithmetic, but the blocks covering one K/V chunk run
+    /// together rather than a whole launch apart, so the chunk is read from
+    /// DRAM once instead of once per row. `1` is exactly the old path, which is
+    /// what makes this an A/B switch rather than a tuning knob.
+    pub fn set_qgroup(&self, n: usize) {
+        self.qgroup.set(n.max(1));
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -1020,10 +1031,10 @@ impl Cuda {
             return unsafe {
                 self.launch_grid2(
                     mma,
-                    w.n_out.div_ceil(64) as u32,
+                    w.n_out.div_ceil(128) as u32,
                     // 8 tokens per MMA times MMA_NTILE tiles per weight load.
                     n_tok.div_ceil(32) as u32,
-                    128,
+                    256,
                     0,
                     &margs,
                 )
@@ -1540,7 +1551,7 @@ impl Cuda {
                 "matmul_iq4_xs_q8_k_moe_grouped"
             };
             let grid_rows = if mma {
-                w.n_out.div_ceil(64) as u32
+                w.n_out.div_ceil(128) as u32
             } else {
                 w.n_out.div_ceil(rows_per_block) as u32
             };
@@ -1562,7 +1573,7 @@ impl Cuda {
             // the device-side count return before touching a pointer, and the
             // kernel uses no dynamic shared memory.
             return unsafe {
-                self.launch_grid2(name, grid_rows, n_tile_max, block, 0, &args)
+                self.launch_grid2(name, grid_rows, n_tile_max, if mma { 256 } else { block }, 0, &args)
             };
         }
 
@@ -1656,7 +1667,7 @@ impl Cuda {
                 "matmul_iq4_xs_q8_k_moe_glu_grouped"
             };
             let grid_rows = if mma {
-                gate.n_out.div_ceil(64) as u32
+                gate.n_out.div_ceil(128) as u32
             } else {
                 gate.n_out.div_ceil(rows_per_block) as u32
             };
@@ -1680,7 +1691,7 @@ impl Cuda {
             // past the device-side count return before touching a pointer, and
             // the kernel uses no dynamic shared memory.
             return unsafe {
-                self.launch_grid2(name, grid_rows, n_tile_max, block, 0, &args)
+                self.launch_grid2(name, grid_rows, n_tile_max, if mma { 256 } else { block }, 0, &args)
             };
         }
 
@@ -1996,9 +2007,11 @@ impl Cuda {
 
         // Per-chunk partials: an output vector, plus the max and sum that let
         // chunks be combined without ever materializing the scores.
-        let pa = self.pooled(slot::SCORES, a.n_head * n_split * a.head_dim * 4)?;
-        let pm = self.pooled(slot::PART_M, a.n_head * n_split * 4)?;
-        let pl = self.pooled(slot::PART_L, a.n_head * n_split * 4)?;
+        // Sized for a whole group of query rows, at the widest window in it.
+        let g = self.qgroup.get().max(1).min(a.n_q());
+        let pa = self.pooled(slot::SCORES, g * a.n_head * n_split * a.head_dim * 4)?;
+        let pm = self.pooled(slot::PART_M, g * a.n_head * n_split * 4)?;
+        let pl = self.pooled(slot::PART_L, g * a.n_head * n_split * 4)?;
 
         // **Query rows are launched one at a time, by device pointer offset.**
         // Every row has a different causal window, so they cannot share a grid
@@ -2010,21 +2023,27 @@ impl Cuda {
         let (n_q, per_row) = (a.n_q(), a.n_head * a.head_dim);
         // Counted per `attend`, not per query row: one call is one layer.
         self.attn_calls.set(self.attn_calls.get() + 1);
-        for t in 0..n_q {
-            let n_pos = a.n_pos_of(t);
-            let qd = qd + (t * per_row * 4) as u64;
-            let od = od + (t * per_row * 4) as u64;
-            self.attend_row(a, n_pos, CHUNK, qd, kd, vd, od, pa, pm, pl)?;
+        // **Query rows go up in groups now.** One launch per row read that
+        // row's whole K/V window from DRAM by itself; rows of a group run
+        // concurrently, so the blocks sharing a chunk find it in L2. Decode is
+        // a group of one and reaches the identical kernels.
+        let qg = self.qgroup.get().max(1);
+        for t0 in (0..n_q).step_by(qg) {
+            let rows = qg.min(n_q - t0);
+            let qd = qd + (t0 * per_row * 4) as u64;
+            let od = od + (t0 * per_row * 4) as u64;
+            self.attend_rows(a, t0, rows, CHUNK, qd, kd, vd, od, pa, pm, pl)?;
         }
         Ok(())
     }
 
-    /// One query row against `n_pos` cached positions — the flash-decoding pair.
+    /// A group of query rows against the cache — the flash-decoding pair.
     #[allow(clippy::too_many_arguments)]
-    fn attend_row(
+    fn attend_rows(
         &self,
         a: &Attn<'_>,
-        n_pos: usize,
+        t0: usize,
+        rows: usize,
         chunk: usize,
         qd: ffi::CUdeviceptr,
         kd: ffi::CUdeviceptr,
@@ -2034,10 +2053,14 @@ impl Cuda {
         pm: ffi::CUdeviceptr,
         pl: ffi::CUdeviceptr,
     ) -> Result<()> {
-        let n_split = n_pos.div_ceil(chunk);
+        // Row `t0 + i` attends over `n_pos_first + i` positions, and the grid
+        // is sized by the widest window in the group; blocks past a row's own
+        // window return before touching anything.
+        let n_pos_first = a.n_pos_of(t0);
+        let n_split = a.n_pos_of(t0 + rows - 1).div_ceil(chunk);
         {
             let args = [
-                KArg::I32(n_pos as i32),
+                KArg::I32(n_pos_first as i32),
                 KArg::I32(a.kv_dim as i32),
                 KArg::I32(a.head_dim as i32),
                 KArg::I32(a.n_head as i32),
@@ -2047,6 +2070,7 @@ impl Cuda {
                 // mid-generation and a graph cannot express a changing
                 // sequence. See `attn_flash`.
                 KArg::I32(i32::from(self.warp_scores(a.n_pos))),
+                KArg::I32(n_split as i32),
                 KArg::F32(a.scale),
                 KArg::Ptr(qd),
                 KArg::Ptr(kd),
@@ -2068,7 +2092,7 @@ impl Cuda {
             unsafe {
                 self.launch_grid2(
                     "attn_flash",
-                    a.n_head as u32,
+                    (a.n_head * rows) as u32,
                     n_split as u32,
                     chunk as u32,
                     shared,
@@ -2079,8 +2103,10 @@ impl Cuda {
 
         {
             let args = [
-                KArg::I32(n_split as i32),
+                KArg::I32(n_pos_first as i32),
                 KArg::I32(a.head_dim as i32),
+                KArg::I32(a.n_head as i32),
+                KArg::I32(n_split as i32),
                 KArg::Ptr(pa),
                 KArg::Ptr(pm),
                 KArg::Ptr(pl),
@@ -2092,7 +2118,7 @@ impl Cuda {
             unsafe {
                 self.launch_shared(
                     "attn_flash_combine",
-                    a.n_head as u32,
+                    (a.n_head * rows) as u32,
                     chunk as u32,
                     shared,
                     &args,
