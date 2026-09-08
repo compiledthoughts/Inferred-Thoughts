@@ -160,6 +160,43 @@ impl Mark {
     }
 }
 
+/// What this turn cost, as JSON, so a **client** sees the decomposition the
+/// terminal prints instead of inferring it from wall time.
+///
+/// This exists because inferring it does not work, and that was measured the
+/// hard way on 09-09: a 12.2 s turn returning 120 tokens reads as 10 tok/s of
+/// decode, and was actually 8.7 s of re-prefill after a checkpoint restore plus
+/// 3.4 s of decode at 35 tok/s. Every quantity needed to tell those apart was
+/// already computed and went only to stderr.
+///
+/// `prompt_*` and `predicted_*` follow llama.cpp's `timings` object so tooling
+/// that reads theirs reads ours. The rest is ours: `setup_ms` is the one-time
+/// backend cost that lands inside whichever turn pays it, and `cache_*` say how
+/// much of the conversation was reused rather than re-run -- the field that
+/// would have made the above self-evident.
+fn timings_json<O: Ops>(engine: &Engine<'_, O>, before: Mark, how: Resume) -> Value {
+    let now = Mark::take(engine);
+    let setup_ns = now.setup_ns.saturating_sub(before.setup_ns);
+    let prompt_n = now.prefill_tokens - before.prefill_tokens;
+    let prompt_ns = (now.prefill_ns - before.prefill_ns).saturating_sub(setup_ns);
+    let predicted_n = now.decode_tokens - before.decode_tokens;
+    let predicted_ns = now.decode_ns - before.decode_ns;
+    let per_s = |n: u64, ns: u64| if ns == 0 { 0.0 } else { n as f64 / (ns as f64 / 1e9) };
+    json!({
+        "prompt_n": prompt_n,
+        "prompt_ms": prompt_ns as f64 / 1e6,
+        "prompt_per_second": per_s(prompt_n, prompt_ns),
+        "predicted_n": predicted_n,
+        "predicted_ms": predicted_ns as f64 / 1e6,
+        "predicted_per_second": per_s(predicted_n, predicted_ns),
+        "setup_ms": setup_ns as f64 / 1e6,
+        "cache_reuse": how.at(),
+        "cache_label": how.label(),
+        "position": engine.pos(),
+        "n_ctx": engine.n_ctx(),
+    })
+}
+
 /// Print what this turn cost, in the shape `inferred generate` prints.
 fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
     let now = Mark::take(engine);
@@ -675,9 +712,9 @@ fn chat_completions<O: Ops>(
     );
 
     let r = if req.stream {
-        stream_completion(session, stream, logits, budget, opts)
+        stream_completion(session, stream, logits, budget, opts, mark, how)
     } else {
-        whole_completion(session, stream, logits, budget, opts)
+        whole_completion(session, stream, logits, budget, opts, mark, how)
     };
     // Reported even when the client hung up mid-stream: the work still
     // happened, and a disconnect is exactly when it is useful to see what it
@@ -761,6 +798,8 @@ fn stream_completion<O: Ops>(
     logits: Vec<f32>,
     budget: usize,
     opts: &ServeOpts,
+    mark: Mark,
+    how: Resume,
 ) -> Result<()> {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
     write_all(stream, head.as_bytes())?;
@@ -787,7 +826,13 @@ fn stream_completion<O: Ops>(
         return Ok(());
     }
 
-    let last = chunk(&id, created, &model, json!({}), Some(reason));
+    // The final chunk carries the same `timings` the whole-completion body
+    // does. A streaming client would otherwise have only wall time, which is
+    // exactly the measurement that misleads.
+    let mut last = chunk(&id, created, &model, json!({}), Some(reason));
+    if let Value::Object(ref mut m) = last {
+        m.insert("timings".to_string(), timings_json(&session.engine, mark, how));
+    }
     sse(stream, &last)?;
     write_all(stream, b"data: [DONE]\n\n")?;
     Ok(())
@@ -799,6 +844,8 @@ fn whole_completion<O: Ops>(
     logits: Vec<f32>,
     budget: usize,
     opts: &ServeOpts,
+    mark: Mark,
+    how: Resume,
 ) -> Result<()> {
     let prompt_tokens = session.consumed;
     // **A non-streaming request writes nothing until it is finished**, so
@@ -830,6 +877,9 @@ fn whole_completion<O: Ops>(
             "completion_tokens": n,
             "total_tokens": prompt_tokens + n,
         },
+        // Not part of the OpenAI schema, and clients that do not know the field
+        // ignore it. The ones that matter here are ours.
+        "timings": timings_json(&session.engine, mark, how),
     });
     send_json(stream, 200, &body)
 }
