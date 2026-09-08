@@ -190,6 +190,14 @@ pub const DEFAULT_RESERVE: usize = 3 << 30;
 
 /// Page-locked host memory the overflow tier may claim, in bytes.
 ///
+/// **The premise below is false and this constant has not been re-derived.**
+/// It says `.wslconfig` gives WSL 22 GiB; `free` reports **15,996 MB**, so the
+/// guest is at the 50% default and `CLAUDE.md` records that separately. 6 GiB
+/// of *unevictable* pinned memory out of 16 GB, beside a 17.5 GiB mmap, works
+/// for one process and cannot work for two — which is the whole content of the
+/// 06-09 hang, and was reproduced again on 09-09 by running a benchmark while
+/// a `serve` was live. Check for a running `inferred` before starting either.
+///
 /// Sized against this machine rather than discovered: `.wslconfig` gives WSL
 /// 22 GiB, the 35B's mmap is 17.5 GiB of which ~11.8 GiB is also resident in
 /// VRAM and therefore evictable from the page cache, and pinned pages are not

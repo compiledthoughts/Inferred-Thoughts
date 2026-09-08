@@ -775,6 +775,14 @@ impl Cuda {
         self.iq4_untiled.set(on);
     }
 
+    /// Force the one-token Q6_K matmul, so the token-tiled one can be priced
+    /// against it **in the same process on the same request**. Whole-model
+    /// prefill numbers taken from separate runs cannot separate the kernel from
+    /// the conversation, the depth or the routing.
+    pub fn q6k_scalar(&self, on: bool) {
+        self.q6k_scalar.set(on);
+    }
+
     /// Tiles the last grouped routed FFN cut its chunk into, or `None` if no
     /// grouped launch has happened.
     ///
@@ -1130,7 +1138,7 @@ impl Cuda {
         // the identical kernel it always has and a recorded graph never sees
         // this name.
         const Q6K_TOK: usize = 8;
-        if n_tok > 1 && matches!(w.ty, GgmlType::Q6K) {
+        if n_tok > 1 && !self.q6k_scalar.get() && matches!(w.ty, GgmlType::Q6K) {
             let tiled = "matmul_q6_k_q8_k_tok";
             let targs = [
                 KArg::I32(w.n_in as i32),

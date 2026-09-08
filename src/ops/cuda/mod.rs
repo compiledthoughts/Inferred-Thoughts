@@ -147,6 +147,12 @@ pub struct Cuda {
     attn_warp: Cell<Option<bool>>,
     /// Force the untiled IQ4_XS matmul even for a batch, for the A/B.
     iq4_untiled: Cell<bool>,
+    /// Force the one-token Q6_K matmul, for the prefill A/B.
+    ///
+    /// Read from the environment in the constructor, not set from a CLI flag,
+    /// so that `serve` honours it too. A `generate`-only switch is how the MMA
+    /// matmuls once ran on the bench and not in a real session for half a day.
+    q6k_scalar: Cell<bool>,
     /// Force the per-pair routed FFN even for a batch, for the A/B.
     moe_ungrouped: Cell<bool>,
     /// Walk the whole KV in one block for a batch, instead of splitting it.
@@ -765,6 +771,7 @@ impl Cuda {
                 f32t_pair: RefCell::new(HashMap::new()),
                 attn_warp: Cell::new(None),
                 iq4_untiled: Cell::new(false),
+                q6k_scalar: Cell::new(env_flag("INFERRED_Q6K_SCALAR")),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
                 qgroup: Cell::new(8),
