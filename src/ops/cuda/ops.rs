@@ -3831,10 +3831,47 @@ impl Cuda {
         let shared = (2 * d.head_k_dim * 4) as u32;
         let threads = d.head_v_dim.min(256) as u32;
 
-        // **The one op with no batched form.** Token `t`'s rank-1 correction is
-        // token `t+1`'s stored state, so these launches are ordered and cannot
-        // be collapsed into a grid. Offsets go on the device pointers for the
-        // same reason as in `ssm_conv_impl`.
+        // **The token order is sequential; the heads are not.** Token `t`'s
+        // rank-1 correction is token `t+1`'s stored state, which is why this
+        // ran one launch per token. But `state` is per value head and no block
+        // reads another block's, so the ordering belongs *inside* a block and
+        // the heads stay a grid dimension. `delta_rule_batch` moves the loop
+        // into the kernel and issues one launch for the whole batch.
+        //
+        // Measured on the 35B at 11,237 tokens: 337,140 launches, 30 GDN layers
+        // times every token, ~14% of prefill in kernel time and ~8% more in
+        // launch overhead alone. Gated on `n_tokens > 1` like every other
+        // prefill-only path here, so decode runs the identical kernel it always
+        // has and a recorded graph never sees this name.
+        if d.n_tokens() > 1 && !self.delta_seq.get() {
+            let args = [
+                KArg::I32(d.head_k_dim as i32),
+                KArg::I32(d.head_v_dim as i32),
+                KArg::I32(d.n_k_heads as i32),
+                KArg::I32(d.n_tokens() as i32),
+                KArg::F32(d.scale()),
+                KArg::Ptr(q),
+                KArg::Ptr(k),
+                KArg::Ptr(v),
+                KArg::Ptr(alpha),
+                KArg::Ptr(beta),
+                KArg::Ptr(ssm_a),
+                KArg::Ptr(dt),
+                KArg::Ptr(sd),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `delta_rule_batch` in kernels.cu; one
+            // block per value head, `shared` is the two staged vectors, and the
+            // kernel derives every per-token offset from buffers the model
+            // sized for `n_tokens`.
+            unsafe {
+                self.launch_shared("delta_rule_batch", d.n_v_heads as u32, threads, shared, &args)?
+            };
+            return Ok(());
+        }
+
+        // Decode, unchanged: one token, one launch. Offsets go on the device
+        // pointers for the same reason as in `ssm_conv_impl`.
         let kper = d.n_k_heads * d.head_k_dim;
         let vper = d.n_v_heads * d.head_v_dim;
         let heads = d.n_v_heads;

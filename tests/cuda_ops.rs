@@ -2762,3 +2762,146 @@ fn the_tiled_q6_k_matmul_is_bit_identical() {
     }
     println!("  {checked} outputs compared, all bit-identical");
 }
+
+/// **The batched delta rule against the per-token one, bit for bit.**
+///
+/// `the_gdn_ops_agree_with_the_oracle` drives one token, which is the decode
+/// shape — it cannot reach `delta_rule_batch` at all, since that path is gated
+/// on `n_tokens > 1`.
+///
+/// # Why this compares the device against itself
+///
+/// Comparing the batch against `Naive` bounds nothing useful: the gate goes
+/// through `expf` and `logf`, CUDA is not obliged to round them as glibc does,
+/// and the recurrence **compounds that difference once per token**. At two
+/// tokens the state already sits at 6.7e-6 against 4.8e-6 for one, which is the
+/// library disagreeing twice, not a defect — and at 129 tokens no honest fixed
+/// tolerance separates the two cases.
+///
+/// Running both arms on the device removes the library from the comparison
+/// entirely. Same `expf`, same order, same arithmetic; the only difference is
+/// whether the token loop lives on the host or inside the kernel. That is a
+/// claim about **equal bits**, and it is the claim actually being made.
+///
+/// # What it catches
+///
+/// - **the per-token strides**, which the host used to apply to the device
+///   pointers and the kernel now derives itself. A wrong stride reads the wrong
+///   token and still produces plausible numbers.
+/// - **the state carry**, which used to be a launch boundary and is now a
+///   `__syncthreads()`. Getting it wrong corrupts token `t+1`, not token `t`.
+/// - **the staging barrier.** `qs`, `ks`, `g` and `beta` are rewritten every
+///   iteration, so without the trailing sync a thread racing ahead overwrites
+///   them while a slower one still reads. That is a race, so it fails
+///   intermittently — hence a token count large enough to give it many chances.
+///
+/// The state is compared as well as the output: a kernel that returns the right
+/// activations and leaves the wrong state behind passes any check of the output
+/// alone, and then looks like drift several turns later.
+///
+/// Every per-token buffer is allocated up front and held. `Cuda` keys its
+/// mirrors and its recurrent states on the **host address**, so a buffer
+/// dropped between iterations hands the next one a recycled address and the
+/// previous token's device data — the bug this repo has now found four times.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_batched_delta_rule_matches_the_per_token_one() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // The 9B's real shapes.
+    let (hk, hv, nk, nv) = (128usize, 128, 16, 32);
+    let (kdim, vdim) = (hk * nk, hv * nv);
+
+    for n_tok in [2usize, 7, 64] {
+        let q = noise(kdim * n_tok, 41 + n_tok as u64);
+        let k = noise(kdim * n_tok, 42 + n_tok as u64);
+        let v = noise(vdim * n_tok, 43 + n_tok as u64);
+        let alpha = noise(nv * n_tok, 44 + n_tok as u64);
+        let beta = noise(nv * n_tok, 45 + n_tok as u64);
+        // ssm_a is -exp(A_log) upstream, so it is negative and the gate lands
+        // inside (0, 1). A positive value would make the state explode and the
+        // test would pass on garbage.
+        let ssm_a: Vec<f32> = noise(nv, 46).iter().map(|x| -x.abs()).collect();
+        let dt = noise(nv, 47);
+        let s0 = noise(nv * hk * hv, 48);
+
+        // --- arm A: one launch per token, the path this replaced. Owned
+        // per-token buffers at distinct, stable addresses.
+        let qs: Vec<Vec<f32>> = (0..n_tok).map(|t| q[t * kdim..(t + 1) * kdim].to_vec()).collect();
+        let ks: Vec<Vec<f32>> = (0..n_tok).map(|t| k[t * kdim..(t + 1) * kdim].to_vec()).collect();
+        let vs: Vec<Vec<f32>> = (0..n_tok).map(|t| v[t * vdim..(t + 1) * vdim].to_vec()).collect();
+        let als: Vec<Vec<f32>> = (0..n_tok).map(|t| alpha[t * nv..(t + 1) * nv].to_vec()).collect();
+        let bes: Vec<Vec<f32>> = (0..n_tok).map(|t| beta[t * nv..(t + 1) * nv].to_vec()).collect();
+        let mut outs: Vec<Vec<f32>> = (0..n_tok).map(|_| vec![0.0f32; vdim]).collect();
+        let mut s_seq = s0.clone();
+
+        for t in 0..n_tok {
+            let d1 = Delta {
+                q: &qs[t], k: &ks[t], v: &vs[t],
+                alpha: &als[t], beta: &bes[t], ssm_a: &ssm_a, dt_bias: &dt,
+                head_k_dim: hk, head_v_dim: hv, n_k_heads: nk, n_v_heads: nv,
+            };
+            assert_eq!(d1.n_tokens(), 1, "arm A must take the single-token path");
+            gpu.begin_pass(1);
+            gpu.delta_rule(&d1, &mut s_seq, &mut outs[t]);
+            gpu.host_needs(&mut outs[t]);
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+        // --- arm B: one launch for the batch. A distinct state buffer, so it
+        // gets its own device state rather than continuing arm A's.
+        let d = Delta {
+            q: &q, k: &k, v: &v,
+            alpha: &alpha, beta: &beta, ssm_a: &ssm_a, dt_bias: &dt,
+            head_k_dim: hk, head_v_dim: hv, n_k_heads: nk, n_v_heads: nv,
+        };
+        assert_eq!(d.n_tokens(), n_tok, "the seam derives the batch from v.len()");
+        let mut s_bat = s0.clone();
+        let mut o_bat = vec![0.0f32; vdim * n_tok];
+        gpu.begin_pass(n_tok);
+        gpu.delta_rule(&d, &mut s_bat, &mut o_bat);
+        gpu.host_needs(&mut o_bat);
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+        let seq: Vec<f32> = outs.concat();
+        let differing = seq
+            .iter()
+            .zip(&o_bat)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let worst = seq
+            .iter()
+            .zip(&o_bat)
+            .fold(0.0f32, |m: f32, (a, b)| m.max((a - b).abs()));
+        println!(
+            "  delta batch vs per-token  n_tok {n_tok:<4} {differing} of {} differ, worst {worst:e}",
+            seq.len()
+        );
+        assert_eq!(
+            differing, 0,
+            "{differing} of {} outputs differ between the batched delta rule and the \
+             per-token one, worst {worst:e}. These must be equal bits: the batch runs \
+             the same arithmetic on the same thread in the same order, and only moves \
+             the token loop into the kernel. Suspect the per-token strides the kernel \
+             now derives (kper, vper, and alpha/beta indexed by t * n_v_heads), or the \
+             trailing __syncthreads() that the launch boundary used to provide.",
+            seq.len()
+        );
+
+        gpu.read_state_into(&mut s_seq).expect("read arm A state back");
+        gpu.read_state_into(&mut s_bat).expect("read arm B state back");
+        let sdiff = s_seq
+            .iter()
+            .zip(&s_bat)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            sdiff, 0,
+            "{sdiff} of {} recurrent state values differ. The output matched, so the \
+             batch is reading the right tokens; what it leaves behind is wrong, which \
+             would surface as drift several turns later rather than as a failure here.",
+            s_seq.len()
+        );
+    }
+}
