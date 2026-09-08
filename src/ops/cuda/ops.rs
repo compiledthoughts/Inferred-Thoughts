@@ -1113,6 +1113,50 @@ impl Cuda {
             };
         }
 
+        // **Q6_K, the same reuse and the same gate.** `matmul_q6_k_q8_k` takes
+        // the token as `blockIdx.y`, so it re-reads *and re-unpacks* every
+        // weight row once per token — and Q6_K's unpack is a four-way branch on
+        // the sub-block over a split nibble/bit-pair, a dozen instructions per
+        // weight. Measured at **18.4% of an 11,237-token prefill**, the largest
+        // matmul in the profile and second only to attention.
+        //
+        // `matmul_q6_k_q8_k_tok` holds the unpacked weight across `Q6K_TOK`
+        // tokens. It is **bit-identical by construction**: each output keeps
+        // the oracle's eight interleaved f32 accumulators, in the same lane and
+        // the same ascending order. Only how many outputs one weight load
+        // serves changes.
+        //
+        // Gated on `n_tok > 1` like the IQ4_XS variant above, so decode runs
+        // the identical kernel it always has and a recorded graph never sees
+        // this name.
+        const Q6K_TOK: usize = 8;
+        if n_tok > 1 && matches!(w.ty, GgmlType::Q6K) {
+            let tiled = "matmul_q6_k_q8_k_tok";
+            let targs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(tiled, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_q6_k_q8_k_tok`; the grid covers
+            // `n_out` rows by ceil(n_tok / Q6K_TOK) token tiles, the kernel
+            // clamps its own tail tile, and it uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(
+                    tiled,
+                    grid_rows,
+                    n_tok.div_ceil(Q6K_TOK) as u32,
+                    block,
+                    0,
+                    &targs,
+                )
+            };
+        }
+
         self.note_shape(name, w.n_in, w.n_out);
         // SAFETY: parameters match the named kernel; the grid covers exactly
         // `n_out` rows by `n_tok` tokens, and the kernels use no dynamic

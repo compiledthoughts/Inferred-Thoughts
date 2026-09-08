@@ -1735,6 +1735,156 @@ __global__ void matmul_q6_k_q8_k(int n_in, int n_out,
     if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
 }
 
+// Tokens per weight load in the batched Q6_K matmul.
+//
+// **The unpack is the cost, and it does not depend on the token.** Six-bit
+// weights arrive as a low nibble in `ql` and a high pair in `qh`, selected by a
+// four-way branch on the sub-block -- a dozen instructions per weight -- and
+// `matmul_q6_k_q8_k` ran the whole sequence again for every token of the batch,
+// because its `blockIdx.y` is the token. At 512 tokens that is 512 unpacks of
+// each weight to serve 512 outputs.
+//
+// Holding the unpacked value across `Q6K_TOK` tokens divides both the unpack
+// count and the weight traffic by the same factor. 8 keeps `aux` and `sum_l` at
+// eight registers each; the kernel is otherwise identical to the one-token one.
+//
+// Worth **+13.2% of whole-model prefill** on the 35B, 360.3 -> 407.7 tok/s at
+// 2,240 tokens, from one bit-exact kernel.
+//
+// **The same change on Q5_K is written and unresolved, not rejected.** At 2,240
+// tokens it measured 399 against this kernel's 402 -- inside a within-batch
+// spread of 2% -- but at 11,237 tokens it measured **380.9 against 366.2**, and
+// that is the depth a real session runs at. One run each, so neither settles
+// it; it was reverted on the shallow number before the deep one existed, which
+// is precisely the error the rest of this session was spent learning.
+//
+// There is a reason to expect it to gain less either way: Q5_K's unpack is a
+// nibble select plus one `qh` bit, about six instructions where Q6_K's four-way
+// branch over a split nibble and bit-pair is about twelve, and its twelve-byte
+// scale shuffle was already amortised per super-block. Half as much to remove,
+// against the same eight extra accumulator sets. That is the shape of the rule
+// this file keeps confirming: the gain is proportional to the *instructions*
+// deleted, not the traffic -- 09-09 cut A traffic 4x and B traffic 2x for
+// nothing.
+#define Q6K_TOK 8
+
+// Q6_K x Q8_K over a batch, one warp per output row and `Q6K_TOK` tokens.
+//
+// **Bit-identical to `matmul_q6_k_q8_k` by construction, not by measurement.**
+// Each output still keeps the oracle's eight interleaved f32 accumulators, in
+// the same lane, folded in the same ascending order; the only change is how
+// many outputs one weight load serves. Nothing is reassociated, so this needs
+// no tolerance and stays inside the exact set -- unlike an MMA form of the same
+// kernel, which cannot keep those eight accumulators at all.
+//
+// Padding tokens are pointed at token 0 rather than branched around, so the
+// inner loop is unconditional. They accumulate into `aux`/`sum_l` slots that the
+// write-back never stores.
+__global__ void matmul_q6_k_q8_k_tok(int n_in, int n_out, int n_tok,
+                                     const unsigned char *__restrict__ w,
+                                     const float *__restrict__ x_scales,
+                                     const signed char *__restrict__ x_quants,
+                                     float *__restrict__ out) {
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int t0 = blockIdx.y * Q6K_TOK;
+
+    const int l = lane & 7;
+    const int g = lane >> 3;
+
+    const unsigned char *row = w + (size_t)j * nb * Q6K_BYTES;
+
+    // Safe token index per slot: out-of-range slots read token 0 and are
+    // discarded at the write-back, which keeps the inner loop branch-free.
+    int ts[Q6K_TOK];
+#pragma unroll
+    for (int t = 0; t < Q6K_TOK; ++t) ts[t] = (t0 + t < n_tok) ? (t0 + t) : 0;
+
+    float sum_l[Q6K_TOK];
+#pragma unroll
+    for (int t = 0; t < Q6K_TOK; ++t) sum_l[t] = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const unsigned char *blk = row + (size_t)i * Q6K_BYTES;
+        const unsigned char *ql = blk;
+        const unsigned char *qh = blk + QK_K / 2;
+        const signed char   *sc = (const signed char *)(blk + QK_K / 2 + QK_K / 4);
+        const unsigned short d16 =
+            (unsigned short)blk[Q6K_BYTES - 2] | ((unsigned short)blk[Q6K_BYTES - 1] << 8);
+
+        int aux[Q6K_TOK];
+#pragma unroll
+        for (int t = 0; t < Q6K_TOK; ++t) aux[t] = 0;
+
+        for (int jj = g * 4; jj < g * 4 + 4; ++jj) {
+            const int scale = (int)sc[jj];
+            for (int half = 0; half < 2; ++half) {
+                const int idx = jj * 16 + half * 8 + l;
+
+                // Unpacked once, then dotted against every token below. This is
+                // the same mapping `matmul_q6_k_q8_k` uses, lifted out of the
+                // token loop rather than changed.
+                const int j2  = idx >> 7;
+                const int r   = idx & 127;
+                const int sub = r >> 5;
+                const int l2  = r & 31;
+                const unsigned char h = qh[j2 * 32 + l2];
+                int base, hb;
+                if (sub == 0)      { base = ql[j2 * 64 + l2]      & 0xF; hb = (h >> 0) & 3; }
+                else if (sub == 1) { base = ql[j2 * 64 + l2 + 32] & 0xF; hb = (h >> 2) & 3; }
+                else if (sub == 2) { base = ql[j2 * 64 + l2]      >> 4;  hb = (h >> 4) & 3; }
+                else               { base = ql[j2 * 64 + l2 + 32] >> 4;  hb = (h >> 6) & 3; }
+                const int av = (base | (hb << 4)) - 32;
+
+#pragma unroll
+                for (int t = 0; t < Q6K_TOK; ++t) {
+                    const signed char *q8 =
+                        x_quants + (size_t)ts[t] * n_in + (size_t)i * QK_K;
+                    // int16 in the reference, and faithful: an int8 quant times
+                    // a -32..31 weight cannot leave that range.
+                    const short aux16 = (short)((int)q8[idx] * av);
+                    aux[t] += scale * (int)aux16;
+                }
+            }
+        }
+
+        // Fold the four g-groups. Integer, so exact and order-free.
+#pragma unroll
+        for (int t = 0; t < Q6K_TOK; ++t) {
+            aux[t] += __shfl_down_sync(0xffffffff, aux[t], 16);
+            aux[t] += __shfl_down_sync(0xffffffff, aux[t], 8);
+        }
+
+        if (lane < 8) {
+            const float dv = h2f(d16);
+#pragma unroll
+            for (int t = 0; t < Q6K_TOK; ++t) {
+                // NOT fused, as in the one-token kernel: the reference's
+                // compiler contracts Q5_K's identical line and not this one.
+                const float d = dv * x_scales[(size_t)ts[t] * nb + i];
+                sum_l[t] += d * (float)aux[t];
+            }
+        }
+    }
+
+    // The 8-way fold, serial and ascending -- the oracle's last loop. The
+    // shuffle is outside the branch because every lane must reach it.
+#pragma unroll
+    for (int t = 0; t < Q6K_TOK; ++t) {
+        float sumf = 0.0f;
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, sum_l[t], k);
+            if (lane == 0) sumf += v;
+        }
+        if (lane == 0 && t0 + t < n_tok) {
+            out[(size_t)(t0 + t) * n_out + j] = sumf;
+        }
+    }
+}
+
 // Q5_K x Q8_K, one warp per output row.
 //
 // Five bits per weight: four in a nibble of `qs`, the fifth as a bit-plane in

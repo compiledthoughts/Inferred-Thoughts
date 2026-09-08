@@ -2647,3 +2647,118 @@ fn what_the_dense_iq4_matmul_costs() {
     }
     gpu.iq4_mma(false);
 }
+
+/// **The token-tiled Q6_K matmul, against the oracle, bit for bit.**
+///
+/// `matmul_q6_k_q8_k_tok` holds an unpacked weight across `Q6K_TOK` tokens
+/// where `matmul_q6_k_q8_k` re-unpacked it for each one. That is a claim about
+/// *equal bits*, not a tolerance: each output still keeps the oracle's eight
+/// interleaved f32 accumulators, in the same lane, folded in the same ascending
+/// order. Only how many outputs one weight load serves changes.
+///
+/// Which is exactly why it is worth testing rather than asserting. The eight
+/// accumulators are the reason Q6_K cannot go to the tensor cores bit-exactly,
+/// and a tiling that quietly disturbed them would look like a small numeric
+/// drift rather than a failure.
+///
+/// `n_tok` includes 13 and 21, which are not multiples of the 8-token tile,
+/// because the tail is where this class of change goes wrong quietly: a padding
+/// slot must contribute nothing and must not be written back. The kernel points
+/// padding slots at token 0 rather than branching, so a write-back that forgot
+/// its bound would produce a *plausible* duplicate row rather than a crash.
+///
+/// Every weight buffer is held for the whole test: `Cuda` keys its device
+/// copies on the host address, so a per-shape buffer that is dropped hands the
+/// next shape a recycled address and the previous shape's weights.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_tiled_q6_k_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // Q6_K: 210 bytes per 256-weight superblock -- ql[128], qh[64],
+    // scales[16] as int8, then d as f16. Transcribed from `block_q6_K` in
+    // ggml-common.h, which is what `src/quant/kquant.rs` reads.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 210];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 210;
+                // Scales are int8 and multiply an int16 product; keeping them
+                // small keeps the int32 accumulation well clear of overflow, on
+                // both sides of the comparison.
+                for s in 0..16 {
+                    w[at + 192 + s] = ((w[at + 192 + s] & 0x0f) as i8 - 8) as u8;
+                }
+                // d = 0.5 in f16, so the f32 fold stays in a sane range.
+                w[at + 208] = 0x00;
+                w[at + 209] = 0x38;
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> = vec![(2048, 2048), (2048, 4096), (512, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x6b17 + n_out as u64))
+        .collect();
+
+    let mut checked = 0usize;
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Q6K, n_in, n_out, pooled: false };
+
+        for n_tok in [2usize, 8, 13, 21, 32] {
+            let x = noise(n_in * n_tok, 0x33a1 + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let differing = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f32, |m: f32, (a, b)| m.max((a - b).abs()));
+            println!(
+                "  q6k tok {n_in:>5}x{n_out:<5} n_tok {n_tok:<3} \
+                 {differing:>7} of {:<7} differ   worst {worst:e}",
+                want.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "{differing} of {} outputs differ at {n_in}x{n_out}, n_tok {n_tok}, \
+                 worst {worst:e}. The tiled Q6_K path must equal the oracle bit for \
+                 bit: it reuses an unpacked weight across tokens and changes no \
+                 accumulation order. Suspect the padding slots (they read token 0 and \
+                 must not be written back), the per-token activation scale index, or \
+                 the eight-lane fold.",
+                want.len()
+            );
+            checked += want.len();
+        }
+    }
+    println!("  {checked} outputs compared, all bit-identical");
+}
