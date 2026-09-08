@@ -563,6 +563,11 @@ pub fn serve<O: Ops>(
     eprintln!("  base url   {base}          <- most clients want this");
     eprintln!("  or         {base}/v1       <- if the client adds /chat/completions itself");
     eprintln!("  either works; the router matches on the path suffix");
+    // What this process will actually run. A number taken from a server is only
+    // attributable if the arms that produced it are on the record beside it.
+    for (label, value) in engine.ops.config_report() {
+        eprintln!("  {label:<9}{value}");
+    }
 
     let mut session = Session {
         engine,

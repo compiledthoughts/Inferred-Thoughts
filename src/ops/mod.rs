@@ -907,6 +907,24 @@ pub trait Ops {
     /// to, since this runs in a server's hot path.
     fn device_report(&self) {}
 
+    /// Which code paths this backend will actually run, for a startup banner.
+    ///
+    /// **A hint like [`Ops::device_report`], and for the same reason**: `serve`
+    /// is generic over `Ops` while the paths worth naming belong to one backend.
+    ///
+    /// It exists because a configuration nobody can see is a configuration
+    /// nobody can attribute a measurement to. `INFERRED_ATTN_MMA` and its
+    /// siblings are read in the backend's constructor precisely so they reach
+    /// every entry point -- and that makes them invisible at the call site, so
+    /// a session can run a different kernel than the person reading its numbers
+    /// believes. This is the other half of that fix: say so, once, at startup.
+    ///
+    /// Returns `(label, value)` pairs. Empty by default, so no CPU backend has
+    /// to care.
+    fn config_report(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
     /// A one-time cost this backend charged to the forward pass, and its name.
     ///
     /// **Because a phase timer measures a wall clock, not a phase.** The CUDA

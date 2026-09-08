@@ -4201,6 +4201,68 @@ impl Ops for Cuda {
     /// that has to answer the next turn. For per-kernel timing use
     /// `generate --profile-device` with a long prompt, which runs the same
     /// prefill.
+    /// Which paths this process will actually run.
+    ///
+    /// Resolved state, not flags: what will execute, not what was asked for.
+    /// `attn_vmma` implies `attn_mma`, so the order of those arms matters.
+    fn config_report(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        out.push((
+            "kernels",
+            format!(
+                "q6k={} delta={} iq4={} attn={} rms={} graphs={}",
+                if self.q6k_scalar.get() { "per-token" } else { "tiled" },
+                if self.delta_seq.get() { "per-token" } else { "batched" },
+                if self.iq4_untiled.get() {
+                    "untiled"
+                } else if self.iq4_mma.get() {
+                    "mma"
+                } else {
+                    "tiled"
+                },
+                if self.attn_vmma.get() {
+                    "mma+vgemm"
+                } else if self.attn_mma.get() {
+                    "mma-score"
+                } else if self.attn_fused.get() {
+                    "fused"
+                } else {
+                    "split"
+                },
+                if self.rms_serial.get() { "serial" } else { "tree" },
+                if self.graphs_enabled.get() { "on" } else { "off" },
+            ),
+        ));
+        out.push((
+            "budgets",
+            format!(
+                "expert reserve {:.1} GiB | host tier {:.1} GiB | qgroup {}",
+                self.expert_reserve.get() as f64 / 1073741824.0,
+                self.expert_host_budget.get() as f64 / 1073741824.0,
+                self.qgroup.get(),
+            ),
+        ));
+        // Named explicitly when set. A resolved path alone does not say whether
+        // it came from a default or from the environment, and "why is this run
+        // different from the last one" is the question these answer.
+        let env: Vec<&str> = [
+            ("INFERRED_Q6K_SCALAR", self.q6k_scalar.get()),
+            ("INFERRED_DELTA_SEQ", self.delta_seq.get()),
+            ("INFERRED_ATTN_MMA", self.attn_mma.get()),
+            ("INFERRED_ATTN_VMMA", self.attn_vmma.get()),
+            ("INFERRED_ATTN_FUSED", self.attn_fused.get()),
+        ]
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(k, _)| *k)
+        .collect();
+        if !env.is_empty() {
+            out.push(("env", env.join(" ")));
+        }
+        out
+    }
+
+
     fn device_report(&self) {
         if !self.report_per_turn.get() {
             return;
@@ -4366,6 +4428,11 @@ impl Ops for &Cuda {
     // as it has existed. Twelfth instrument in this repo to fail by producing
     // no number at all. A forwarding impl that forwards *most* methods is the
     // same hazard as a counter that counts *most* allocations.
+    fn config_report(&self) -> Vec<(&'static str, String)> {
+        (*self).config_report()
+    }
+
+
     fn device_report(&self) {
         (*self).device_report()
     }
