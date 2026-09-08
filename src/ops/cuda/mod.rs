@@ -153,6 +153,9 @@ pub struct Cuda {
     attn_fused: Cell<bool>,
     /// Score matrix on the tensor cores. A precision change: Q converts to f16.
     attn_mma: Cell<bool>,
+    /// The **second** GEMM on the tensor cores too, with V read through
+    /// `ldmatrix.trans` rather than staged transposed. Implies `attn_mma`.
+    attn_vmma: Cell<bool>,
     /// Query rows per attention launch; 1 is the old one-row-per-launch path.
     qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
@@ -775,6 +778,7 @@ impl Cuda {
                 // An env toggle reaches every entry point, including ones
                 // added later.
                 attn_mma: Cell::new(env_flag("INFERRED_ATTN_MMA")),
+                attn_vmma: Cell::new(env_flag("INFERRED_ATTN_VMMA")),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

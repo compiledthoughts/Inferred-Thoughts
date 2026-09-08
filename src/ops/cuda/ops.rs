@@ -866,6 +866,21 @@ impl Cuda {
         self.attn_mma.set(on);
     }
 
+    /// Put `O += P V` on the tensor cores as well, and select the kernel that
+    /// does. Implies [`Cuda::set_attn_mma`], since the two GEMMs live in one
+    /// kernel; the score-only path stays available so the second GEMM can be
+    /// priced on its own.
+    ///
+    /// **The same precision statement as `set_attn_mma` plus one term**: the
+    /// probabilities also round to f16 on their way into the B operand. The
+    /// running max, running sum and output accumulator remain f32.
+    pub fn set_attn_vmma(&self, on: bool) {
+        self.attn_vmma.set(on);
+        if on {
+            self.attn_mma.set(true);
+        }
+    }
+
     pub fn attn_warp(&self, force: Option<bool>) {
         self.attn_warp.set(force);
     }
@@ -2182,8 +2197,16 @@ impl Cuda {
                     KArg::Ptr(pl),
                 ];
                 const ATT_KC: usize = 32;
+                // `attn_flash_mma_v` puts the second GEMM on the tensor cores
+                // too. It needs one more shared buffer -- an f16 copy of the
+                // probabilities, which is that GEMM's B operand -- and its
+                // accumulator is four 16-dim blocks per warp across four warps,
+                // so a head_dim past 256 would need registers it does not
+                // declare. Both conditions are checked here rather than assumed.
+                let vmma = self.attn_vmma.get() && a.head_dim <= 256;
                 let mshared = (ATT_QT * a.head_dim * 2
                     + ATT_KC * a.head_dim * 2
+                    + if vmma { ATT_QT * ATT_KC * 2 } else { 0 }
                     + ATT_QT * ATT_KC * 4
                     + 4 * ATT_QT * 4) as u32;
                 // SAFETY: parameters match `attn_flash_mma`; one block per
@@ -2192,7 +2215,7 @@ impl Cuda {
                 // buffer, the score tile and the four per-row vectors.
                 unsafe {
                     self.launch_grid2(
-                        "attn_flash_mma",
+                        if vmma { "attn_flash_mma_v" } else { "attn_flash_mma" },
                         a.n_head as u32,
                         n_split as u32,
                         128,
