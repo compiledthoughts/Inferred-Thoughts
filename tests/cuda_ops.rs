@@ -2395,11 +2395,14 @@ fn what_the_attention_variants_cost() {
     // One query buffer per batch shape, all held for the whole test: `Cuda`
     // keys its mirrors on host addresses, so a buffer dropped between cases
     // hands the next one a recycled address and the previous case's data.
-    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (64, 8192), (128, 8192), (128, 16384), (128, 32768), (256, 32768),
-             // Shapes the model actually runs that the bench never had: the
-             // 512-token prefill batch, and the early chunks where the causal
-             // window is barely longer than the batch itself.
-             (512, 8192), (512, 512), (512, 1024), (17, 17)];
+    // **n_q 512 is the shape the model actually runs.** `DEFAULT_MAX_BATCH` is
+    // 512, so a prefill attends at 512 query rows and never at 128 -- and the
+    // arms rank differently there, which cost a wrong conclusion on 09-09 when
+    // the MMA path was dismissed on the n_q 128 and 256 rows. The 512 sweep
+    // across depth is the one that decides anything; the rest is context.
+    let shapes: Vec<(usize, usize)> = vec![(64, 2048), (128, 16384), (256, 32768),
+             (512, 512), (512, 1024), (512, 2048), (512, 4096),
+             (512, 8192), (512, 16384), (512, 32768), (17, 17)];
     let held: Vec<Vec<f32>> = shapes
         .iter()
         .map(|&(n_q, _)| noise(n_q * N_HEAD * HEAD_DIM, 7 + n_q as u64))
