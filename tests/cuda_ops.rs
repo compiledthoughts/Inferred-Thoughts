@@ -2507,3 +2507,143 @@ fn what_the_attention_variants_cost() {
         );
     }
 }
+
+/// **What the dense IQ4_XS matmul costs, at prefill shapes, in seconds.**
+///
+/// `the_mma_iq4_matmul_is_bit_identical` proves the kernel right and says
+/// nothing about what it costs, and the only other instrument was a whole-model
+/// prefill: ~90 s per point against a 2-4% run-to-run spread. That is how an
+/// afternoon went into numbers too noisy to interpret, and it is the same gap
+/// `what_the_attention_variants_cost` was built to close on the other kernel.
+///
+/// The number to watch is **GB/s of weight bytes**, not ms. This kernel's tile
+/// decides how many times a weight row is re-read and re-unpacked across a
+/// batch -- a block covers `128 rows x 8*MMA_NTILE tokens`, so at `MMA_NTILE` 4
+/// every row crosses from global once per 32 tokens. Raising the token span
+/// divides that traffic by the same factor, and this reports whether the card
+/// notices.
+///
+/// # What it has already settled, all negative
+///
+/// Three changes were tried against it on 09-09 and none paid, which together
+/// say the kernel is bound by none of the things that are cheap to change:
+///
+/// | change | traffic effect | result at n_tok 512 |
+/// |---|---|---|
+/// | `MMA_NTILE` 4 -> 16, a 128x128 tile | A read 4x less | -8% to +10%, a wash |
+/// | `MMA_NROW` 2, one B fragment per two row blocks | B read 2x less | -6% to +13%, worse |
+/// | hoisting the n-invariant half of the f32 fold | none | -1 to -2.5% |
+///
+/// **Run-to-run spread here is 1-4% at the large shapes**, so read the first two
+/// rows as "no effect" rather than as small effects, and note the hoist is
+/// barely outside the noise as well as outside the exact set -- reassociating
+/// `(d * xs) * ls` into `(d * ls) * xs` changes the rounding.
+///
+/// The arithmetic that motivated the second row is worth keeping: at
+/// 2048x8192, n_tok 512, the kernel issues 2.1M MMAs and reads 8.9 MB of
+/// weights against **537 MB of activation fragments** -- the same 1 MB of
+/// activations once per 16-row tile, 512 times over. Halving that changed
+/// nothing, which leaves access *shape* rather than volume: both A and B arrive
+/// as 16 bytes per lane scattered over eight rows. That is what llama.cpp's
+/// shared-memory staging fixes, and it is not fixed by reducing volume.
+///
+/// Shapes are the 35B's real dense IQ4_XS widths against `n_embd` 2048, and the
+/// token counts bracket `DEFAULT_MAX_BATCH`. Every weight buffer is held for the
+/// whole test: `Cuda` keys its device copies on the host address, so a per-shape
+/// buffer that is dropped hands the next shape a recycled address and the
+/// previous shape's weights.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_dense_iq4_matmul_costs() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // IQ4_XS: 136 bytes per 256-weight superblock, as `build` in
+    // `the_mma_iq4_matmul_is_bit_identical`. The d/scale bytes are fixed so the
+    // values stay in range; the rest is noise, which is all a cost bench needs.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    let shapes: Vec<(usize, usize)> =
+        vec![(2048, 2048), (2048, 4096), (2048, 8192), (8192, 2048)];
+    let held: Vec<Vec<u8>> = shapes
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x9e37 + (n_out * n_in) as u64))
+        .collect();
+    // One activation buffer per token count, also held for the whole test.
+    let toks: Vec<usize> = vec![32, 128, 512];
+    let acts: Vec<Vec<f32>> = toks
+        .iter()
+        .map(|&t| noise(8192 * t, 0x51c7 + t as u64))
+        .collect();
+
+    println!("\ndense IQ4_XS matmul, prefill shapes");
+    println!(
+        "  {:>6} {:>6} {:>6}  {:>10}  {:>10}  {:>10}",
+        "n_in", "n_out", "n_tok", "ms", "GB/s wt", "Gout/s"
+    );
+
+    gpu.iq4_mma(true);
+    for (&(n_in, n_out), bytes) in shapes.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
+        for (&n_tok, act) in toks.iter().zip(&acts) {
+            let x = &act[..n_in * n_tok];
+            let mut out = vec![0.0f32; n_out * n_tok];
+
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                for _ in 0..2 {
+                    gpu.begin_pass(n_tok);
+                    gpu.host_wrote(x);
+                    gpu.matmul(&w, x, &mut out);
+                    gpu.host_needs(&mut out);
+                    gpu.end_pass();
+                }
+                let t = std::time::Instant::now();
+                const REPS: u32 = 10;
+                for _ in 0..REPS {
+                    gpu.begin_pass(n_tok);
+                    gpu.host_wrote(x);
+                    gpu.matmul(&w, x, &mut out);
+                    gpu.host_needs(&mut out);
+                    gpu.end_pass();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+                if ms < best {
+                    best = ms;
+                }
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            // Weight bytes read once through, which is the floor. The kernel
+            // reads them once per token tile, so the rate this reports rises
+            // when the tile spans more tokens even though the floor does not.
+            let wt = (n_out * (n_in / 256) * 136) as f64;
+            let gbs = wt / (best * 1e-3) / 1e9;
+            let gout = (n_out * n_tok) as f64 / (best * 1e-3) / 1e9;
+            println!(
+                "  {n_in:>6} {n_out:>6} {n_tok:>6}  {best:>10.4}  {gbs:>10.1}  {gout:>10.3}"
+            );
+        }
+    }
+    gpu.iq4_mma(false);
+}
