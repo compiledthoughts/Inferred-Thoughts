@@ -49,9 +49,27 @@
 
 #![cfg(feature = "cuda")]
 
-use inferred_thoughts::ops::{Attn, Delta, Ops, Weights};
+use inferred_thoughts::ops::{Attn, Delta, Experts, Ops, Weights};
 use inferred_thoughts::quant::half::f32_to_f16;
 use inferred_thoughts::{Cuda, Engine, GgufFile, Naive, Qwen3, Tokenizer};
+
+/// **This card's tensor-core ceilings, measured rather than quoted.**
+///
+/// The memory side has had a number since the beginning — 448 GB/s, and every
+/// bandwidth claim in `BENCHMARKS.md` is a fraction of it. The compute side had
+/// none, so "this kernel is slow" was never quantified against anything, and a
+/// whole session went into traffic experiments on kernels that turned out to be
+/// using ~1% of the arithmetic.
+///
+/// Both figures come from back-to-back `mma` instructions on eight independent
+/// accumulators, no memory in the loop, 1728 warps to fill all 48 slots on each
+/// of the 36 SMs. `BENCHMARKS.md`'s 09-09 (ceilings) entry has the method.
+///
+/// For scale: the FP32 CUDA cores are 24.0 TFLOP/s, so int8 tensor cores are
+/// **8x** the scalar path. That ratio is why the one architectural change that
+/// ever paid here was moving IQ4_XS onto `mma`.
+const MMA_S8_PEAK_TOPS: f64 = 197.4;
+const MMA_F16_PEAK_TFLOPS: f64 = 50.7;
 
 mod common;
 
@@ -2501,12 +2519,29 @@ fn what_the_attention_variants_cost() {
             .fold(0.0f32, |m: f32, (x, y)| m.max((x - y).abs()));
         let rel = worst / mag.max(1e-30);
 
+        // Causal, so row r attends over `n_pos - n_q + 1 + r` positions. Two
+        // MACs per (query, key, dim) — the score and the weighted sum — over
+        // every head, and two flops per MAC.
+        let n_pos_first = (n_pos + 1).saturating_sub(n_q) as f64;
+        let windows = n_q as f64 * n_pos_first + (n_q * (n_q - 1) / 2) as f64;
+        let flops = 4.0 * N_HEAD as f64 * windows * HEAD_DIM as f64;
+        let tf = |ms: f64| flops / (ms * 1e-3) / 1e12;
         println!(
             "  {n_q:>5} {n_pos:>7}  {:>9.3}ms {:>9.3}ms  {:>7.2}x  {per_tok:>11.3}                mma {mma_ms:>8.3}ms {:>6.2}x  rel {rel:.2e}",
             best[0],
             best[1],
             best[0] / best[1],
             best[0] / mma_ms
+        );
+        // **Against the fp16 tensor ceiling, which is what the MMA arm could
+        // reach; the split and fused arms run on the FP32 cores at 24 TFLOP/s.**
+        // Printed on its own line so the arm comparison above stays readable.
+        println!(
+            "        {:>7.2} TFLOP-s split, {:>6.2} fused, {:>6.2} mma   ({:.1}% of the {MMA_F16_PEAK_TFLOPS:.0} fp16 ceiling)",
+            tf(best[0]),
+            tf(best[1]),
+            tf(mma_ms),
+            100.0 * tf(mma_ms) / MMA_F16_PEAK_TFLOPS,
         );
     }
 }
@@ -2601,8 +2636,11 @@ fn what_the_dense_iq4_matmul_costs() {
 
     println!("\ndense IQ4_XS matmul, prefill shapes");
     println!(
-        "  {:>6} {:>6} {:>6}  {:>10}  {:>10}  {:>10}",
-        "n_in", "n_out", "n_tok", "ms", "GB/s wt", "Gout/s"
+        "  ceiling {MMA_S8_PEAK_TOPS:.0} TOPS int8 / {MMA_F16_PEAK_TFLOPS:.0} TFLOP-s fp16 / 448 GB-s"
+    );
+    println!(
+        "  {:>6} {:>6} {:>6}  {:>10}  {:>10}  {:>9}  {:>7}",
+        "n_in", "n_out", "n_tok", "ms", "GB/s wt", "TOPS", "of peak"
     );
 
     gpu.iq4_mma(true);
@@ -2642,9 +2680,13 @@ fn what_the_dense_iq4_matmul_costs() {
             // when the tile spans more tokens even though the floor does not.
             let wt = (n_out * (n_in / 256) * 136) as f64;
             let gbs = wt / (best * 1e-3) / 1e9;
-            let gout = (n_out * n_tok) as f64 / (best * 1e-3) / 1e9;
+            // **The number that says how much of the card is idle**, and the
+            // one this bench existed without. Two ops per MAC, against a
+            // ceiling that was measured rather than taken from a spec sheet.
+            let tops = 2.0 * (n_in * n_out * n_tok) as f64 / (best * 1e-3) / 1e12;
+            let frac = 100.0 * tops / MMA_S8_PEAK_TOPS;
             println!(
-                "  {n_in:>6} {n_out:>6} {n_tok:>6}  {best:>10.4}  {gbs:>10.1}  {gout:>10.3}"
+                "  {n_in:>6} {n_out:>6} {n_tok:>6}  {best:>10.4}  {gbs:>10.1}  {tops:>9.2}  {frac:>6.1}%"
             );
         }
     }
@@ -2906,5 +2948,274 @@ fn the_batched_delta_rule_matches_the_per_token_one() {
              would surface as drift several turns later rather than as a failure here.",
             s_seq.len()
         );
+    }
+}
+
+/// **What the routed MoE FFN costs, at prefill shapes.**
+///
+/// The gap this closes: the MoE path is the project's whole subject and had
+/// **no isolated bench at all**. Its share of prefill was known only from
+/// `--profile-kernels`, whose per-launch sync distorts exactly the kernels with
+/// many launches — and that profile has already misled this project twice.
+///
+/// # What makes MoE prefill hard, and why the shape matters
+///
+/// At batch 512 with top-8-of-256, each expert sees about **16 tokens**. So the
+/// work is 256 separate GEMMs of roughly `16 x n_in x n_out` — tall, thin, and
+/// with far too little reuse per weight byte to fill a tensor core. The
+/// interesting quantity is therefore not ms but **the fraction of the card's
+/// arithmetic reached**, which is why this reports TOPS against a measured
+/// ceiling rather than a rate against nothing.
+///
+/// `moe_group` sorts (token, expert) pairs by expert so a tile can share one
+/// weight load; the tile is `MOE_MMA_TOK` wide. Whether the tiles actually fill
+/// is a function of `n_tok`, and that is the thing to watch across the rows.
+///
+/// The expert slab is capped at 2 GiB here. Left to itself it sizes from free
+/// VRAM and would allocate ~11 GiB before doing any work, which a bench has no
+/// use for.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_moe_ffn_costs() {
+    use inferred_thoughts::gguf::GgmlType;
+    use inferred_thoughts::ops::Route;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.set_expert_budget(2 << 30);
+
+    // The 35B's routed FFN: n_embd 2048 in, expert FFN width 512 out, 256
+    // experts per layer, 8 used per token.
+    const N_IN: usize = 2048;
+    const N_OUT: usize = 512;
+    const N_EXPERT: usize = 256;
+    const N_USED: usize = 8;
+
+    // IQ4_XS: 136 bytes per 256-weight superblock, as elsewhere in this file.
+    let build = |seed: u64| -> Vec<u8> {
+        let sb = N_IN / 256;
+        let mut w = vec![0u8; N_EXPERT * N_OUT * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..N_EXPERT * N_OUT {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    // Held for the whole test: `Cuda` keys residency on the host address.
+    let gdata = build(0x9e37);
+    let udata = build(0x51c7);
+    let gate = Experts {
+        data: &gdata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT,
+    };
+    let up = Experts {
+        data: &udata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT,
+    };
+
+    println!("\nrouted MoE FFN (gate+up+silu), {N_EXPERT} experts, top-{N_USED}, {N_IN}x{N_OUT}");
+    println!("  ceiling {MMA_S8_PEAK_TOPS:.0} TOPS int8");
+    println!(
+        "  {:>6} {:>7} {:>8}  {:>10}  {:>9}  {:>7}",
+        "n_tok", "pairs", "tok/exp", "ms", "TOPS", "of peak"
+    );
+
+    let toks: Vec<usize> = vec![32, 128, 512, 1024];
+    let acts: Vec<Vec<f32>> = toks.iter().map(|&t| noise(N_IN * t, 7 + t as u64)).collect();
+
+    for (&n_tok, x) in toks.iter().zip(&acts) {
+        // Deterministic pseudo-random routing, descending order per token as
+        // the real router emits. Uniform, which is the *optimistic* case for
+        // tile packing: real routing is skewed and packs worse.
+        let mut ids = Vec::with_capacity(n_tok * N_USED);
+        let mut weights = Vec::with_capacity(n_tok * N_USED);
+        let mut r = 0x2545f491u64;
+        for _ in 0..n_tok {
+            let mut pick = Vec::new();
+            while pick.len() < N_USED {
+                r ^= r << 13;
+                r ^= r >> 7;
+                r ^= r << 17;
+                let e = (r % N_EXPERT as u64) as usize;
+                if !pick.contains(&e) {
+                    pick.push(e);
+                }
+            }
+            for (i, e) in pick.iter().enumerate() {
+                ids.push(*e);
+                weights.push(1.0 / (i + 1) as f32);
+            }
+        }
+        let route = Route::Host { ids, weights, n_used: N_USED };
+
+        let n_pair = n_tok * N_USED;
+        let mut out = vec![0.0f32; n_pair * N_OUT];
+        let mut scratch = vec![0.0f32; n_pair * N_OUT];
+
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            for _ in 0..2 {
+                gpu.begin_pass(n_tok);
+                gpu.host_wrote(x);
+                gpu.moe_glu(&gate, &up, &route, x, &mut out, &mut scratch);
+                gpu.host_needs(&mut out);
+                gpu.end_pass();
+            }
+            let t = std::time::Instant::now();
+            const REPS: u32 = 5;
+            for _ in 0..REPS {
+                gpu.begin_pass(n_tok);
+                gpu.host_wrote(x);
+                gpu.moe_glu(&gate, &up, &route, x, &mut out, &mut scratch);
+                gpu.host_needs(&mut out);
+                gpu.end_pass();
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+            if ms < best {
+                best = ms;
+            }
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+        // gate and up are each n_pair x n_in x n_out MACs, two flops per MAC.
+        let tops = 4.0 * (n_pair * N_IN * N_OUT) as f64 / (best * 1e-3) / 1e12;
+        let per_exp = n_pair as f64 / N_EXPERT as f64;
+        println!(
+            "  {n_tok:>6} {n_pair:>7} {per_exp:>8.1}  {best:>10.4}  {tops:>9.2}  {:>6.1}%",
+            100.0 * tops / MMA_S8_PEAK_TOPS
+        );
+    }
+}
+
+/// **What the scalar k-quant matmuls cost, at prefill shapes.**
+///
+/// Q6_K and Q5_K were ~22% of an 11k prefill and had no bench, so the only
+/// thing known about them was a share from a profiler that distorts shares.
+/// They are also the last matmuls still running one warp per output row with no
+/// tensor cores at all — `attn_q` and `attn_output` on every attention block,
+/// plus the LM head.
+///
+/// Read this against `what_the_dense_iq4_matmul_costs`. That kernel is on
+/// `mma.m16n8k32.s8` and reaches ~4.3% of the int8 ceiling. Whatever these
+/// reach is what a tile-loader rewrite would be starting from, and the ratio
+/// between them is the size of the prize.
+///
+/// Shapes are the 35B's: `attn_q` is 2048 -> 4096 in Q6_K, `attn_output` is
+/// 4096 -> 2048 in Q5_K, and `output.weight` is the 2048 -> 151936 LM head,
+/// included at n_tok 1 because prefill lifts only the last row.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_k_quant_matmuls_cost() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // Q6_K is 210 bytes per 256-weight superblock, Q5_K is 176. Both keep d
+    // (and dmin) at a sane f16 so the f32 chains stay in range; the rest is
+    // noise, which is all a cost bench needs.
+    let build = |ty: GgmlType, n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let (bytes, is_q6) = match ty {
+            GgmlType::Q6K => (210usize, true),
+            _ => (176usize, false),
+        };
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * bytes];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * bytes;
+                if is_q6 {
+                    for s in 0..16 {
+                        w[at + 192 + s] = ((w[at + 192 + s] & 0x0f) as i8 - 8) as u8;
+                    }
+                    w[at + 208] = 0x00;
+                    w[at + 209] = 0x38;
+                } else {
+                    w[at] = 0x00;
+                    w[at + 1] = 0x38;
+                    w[at + 2] = 0x00;
+                    w[at + 3] = 0x38;
+                }
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(GgmlType, usize, usize, &str)> = vec![
+        (GgmlType::Q6K, 2048, 4096, "attn_q"),
+        (GgmlType::Q5K, 4096, 2048, "attn_output"),
+        (GgmlType::Q6K, 2048, 151936, "lm head"),
+    ];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(ty, n_in, n_out, _)| build(ty, n_in, n_out, 0x6b17 + n_out as u64))
+        .collect();
+    let toks: Vec<usize> = vec![1, 128, 512];
+    let acts: Vec<Vec<f32>> = toks.iter().map(|&t| noise(4096 * t, 31 + t as u64)).collect();
+
+    println!("\nscalar k-quant matmuls, prefill shapes");
+    println!("  ceiling {MMA_S8_PEAK_TOPS:.0} TOPS int8 (what the MMA path is measured against)");
+    println!(
+        "  {:>12} {:>6} {:>7} {:>6}  {:>10}  {:>9}  {:>7}",
+        "what", "n_in", "n_out", "n_tok", "ms", "TOPS", "of peak"
+    );
+
+    for (&(ty, n_in, n_out, what), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty, n_in, n_out, pooled: false };
+        for (&n_tok, act) in toks.iter().zip(&acts) {
+            // The LM head only ever runs on the lifted last row in prefill.
+            if what == "lm head" && n_tok != 1 {
+                continue;
+            }
+            let x = &act[..n_in * n_tok];
+            let mut out = vec![0.0f32; n_out * n_tok];
+
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                for _ in 0..2 {
+                    gpu.begin_pass(n_tok);
+                    gpu.host_wrote(x);
+                    gpu.matmul(&w, x, &mut out);
+                    gpu.host_needs(&mut out);
+                    gpu.end_pass();
+                }
+                let t = std::time::Instant::now();
+                const REPS: u32 = 10;
+                for _ in 0..REPS {
+                    gpu.begin_pass(n_tok);
+                    gpu.host_wrote(x);
+                    gpu.matmul(&w, x, &mut out);
+                    gpu.host_needs(&mut out);
+                    gpu.end_pass();
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+                if ms < best {
+                    best = ms;
+                }
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let tops = 2.0 * (n_in * n_out * n_tok) as f64 / (best * 1e-3) / 1e12;
+            println!(
+                "  {what:>12} {n_in:>6} {n_out:>7} {n_tok:>6}  {best:>10.4}  {tops:>9.2}  {:>6.2}%",
+                100.0 * tops / MMA_S8_PEAK_TOPS
+            );
+        }
     }
 }
