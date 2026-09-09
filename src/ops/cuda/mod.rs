@@ -656,6 +656,13 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
 }
 
+/// Dynamic shared memory a kernel is permitted to request, in bytes.
+///
+/// This card reports 48 KiB per block by default and **99 KiB opt-in**, out of
+/// 100 KiB per SM. 96 KiB leaves the driver a little room and is a round number
+/// of pages; nothing here needs the last 3 KiB.
+pub(crate) const SHARED_OPT_IN_BYTES: std::ffi::c_int = 96 * 1024;
+
 impl Cuda {
     /// Initialize the driver, take device `ordinal`, and load the kernels.
     pub fn new(ordinal: i32) -> Result<Self> {
@@ -1585,6 +1592,25 @@ impl Cuda {
             return Ok(*f);
         }
         let f = self.function(name)?;
+        // **Opt every kernel into the larger shared-memory cap, once, here.**
+        // 48 KiB per block is the *default*, not the limit: this card reports
+        // 99 KiB opt-in out of 100 KiB per SM, and a kernel asking for more
+        // than 48 without permission simply fails to launch. Assuming the
+        // default was the limit closed off both a wider attention tile and the
+        // 128x128 staged tile on 09-09.
+        //
+        // Granting permission is not an allocation — a kernel that asks for
+        // nothing is unaffected, and occupancy is still decided by what is
+        // actually requested at launch. A driver that refuses is left alone:
+        // the kernels that need it will fail loudly at launch instead.
+        // SAFETY: `f` is a valid function handle just returned by the driver.
+        unsafe {
+            let _ = ffi::cuFuncSetAttribute(
+                f,
+                ffi::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                SHARED_OPT_IN_BYTES,
+            );
+        }
         map.insert(name, f);
         Ok(f)
     }

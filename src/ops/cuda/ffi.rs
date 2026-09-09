@@ -24,6 +24,9 @@ pub type CUdevice = c_int;
 pub type CUcontext = *mut c_void;
 pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
+
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`, from `cuda.h`.
+pub const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 pub type CUstream = *mut c_void;
 /// Device pointers are integers, not host pointers — 64-bit on every platform
 /// we care about.
@@ -119,6 +122,15 @@ unsafe extern "C" {
         p: *mut c_void,
         flags: c_uint,
     ) -> CUresult;
+
+    /// Raise a kernel's dynamic shared-memory cap above the 48 KiB default.
+    ///
+    /// **The default is not the limit, and assuming it was closed off two
+    /// directions on 09-09.** `cudaDeviceProp` on this card reports 48 KiB per
+    /// block by default and **99 KiB opt-in**, out of 100 KiB per SM. A kernel
+    /// asking for more than 48 KiB of dynamic shared fails to launch unless it
+    /// has been given permission first, which is what this does.
+    pub fn cuFuncSetAttribute(f: CUfunction, attrib: c_int, value: c_int) -> CUresult;
 
     pub fn cuLaunchKernel(
         f: CUfunction,

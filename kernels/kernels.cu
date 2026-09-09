@@ -4071,6 +4071,124 @@ extern "C" __global__ void delta_rule_batch(int head_k_dim, int head_v_dim,
     }
 }
 
+// The delta rule with the recurrent state held in shared memory.
+//
+// **This is the kernel's actual cost, and the 09-09 batching missed it.** The
+// state is `head_k_dim * head_v_dim` floats per head — 64 KiB at the 35B's
+// 128x128 — and the global-memory form reads *and writes* all of it once per
+// token. At 512 tokens a call that is 2.1 GB moved in 13.1 ms: **164 GB/s, 37%
+// of this card's 448.** Every other kernel here runs at 2-10% of bandwidth and
+// 1-5% of compute; this one was bandwidth-bound the whole time, and moving the
+// token loop into the kernel (which removed 337,140 launches) left it untouched.
+//
+// Staged once at entry and written back once at exit, the traffic becomes
+// `2 * per_head` floats for the whole batch instead of per token — 2.1 GB
+// becomes ~8 MiB.
+//
+// # Why this fits, and why we thought it did not
+//
+// 64 KiB exceeds the 48 KiB a block gets by default, and 09-09 recorded that as
+// a hard limit from memory. It is not: `cudaDeviceProp` reports **99 KiB
+// opt-in** out of 100 KiB per SM, and `cached_function` now asks for it.
+//
+// Occupancy is not the trade it appears to be. The grid is one block per value
+// head — **32 blocks on 36 SMs** — so an SM already holds at most one block and
+// 4 warps of its 48. Taking 65 KiB of its 100 KiB costs nothing that was being
+// used.
+//
+// # The +1 on the row stride
+//
+// Thread `j` walks row `j`. At a stride of `head_k_dim` = 128 floats, every
+// thread of a warp lands on the same bank — a 32-way conflict that would give
+// back what the staging saves. At `head_k_dim + 1` the bank is `(j + i) % 32`,
+// so a warp touches 32 distinct banks.
+//
+// **Bit-identical to `delta_rule_batch`.** Same arithmetic, same order, same
+// thread; only where the state lives changes.
+extern "C" __global__ void delta_rule_batch_shared(int head_k_dim, int head_v_dim,
+                                                   int n_k_heads, int n_tokens,
+                                                   float q_scale,
+                                                   const float *__restrict__ q,
+                                                   const float *__restrict__ k,
+                                                   const float *__restrict__ v,
+                                                   const float *__restrict__ alpha,
+                                                   const float *__restrict__ beta_raw,
+                                                   const float *__restrict__ ssm_a,
+                                                   const float *__restrict__ dt_bias,
+                                                   float *__restrict__ state,
+                                                   float *__restrict__ out) {
+    extern __shared__ float sh[];
+    float *qs = sh;                        // head_k_dim
+    float *ks = sh + head_k_dim;           // head_k_dim
+    float *st = sh + 2 * head_k_dim;       // head_v_dim x (head_k_dim + 1)
+    __shared__ float g, beta;
+
+    const int h = blockIdx.x;
+    const int kh = h % n_k_heads;
+    const int n_v_heads = gridDim.x;
+    const int stride = head_k_dim + 1;     // padded, see above
+
+    const size_t kper = (size_t)n_k_heads * head_k_dim;
+    const size_t vper = (size_t)n_v_heads * head_v_dim;
+    const size_t per_head = (size_t)head_k_dim * head_v_dim;
+    float *const head_state = state + (size_t)h * per_head;
+
+    // Linear in the global index so the reads coalesce; the scatter lands in
+    // shared, which tolerates it. Once per batch, not once per token.
+    for (size_t idx = threadIdx.x; idx < per_head; idx += blockDim.x) {
+        const size_t j = idx / (size_t)head_k_dim;
+        const size_t i = idx - j * (size_t)head_k_dim;
+        st[j * (size_t)stride + i] = head_state[idx];
+    }
+    __syncthreads();
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float *qt = q + (size_t)t * kper;
+        const float *kt = k + (size_t)t * kper;
+        const float *vt = v + (size_t)t * vper;
+        float *ot = out + (size_t)t * vper;
+
+        for (int i = threadIdx.x; i < head_k_dim; i += blockDim.x) {
+            qs[i] = qt[kh * head_k_dim + i];
+            ks[i] = kt[kh * head_k_dim + i];
+        }
+        if (threadIdx.x == 0) {
+            float a = alpha[(size_t)t * n_v_heads + h] + dt_bias[h];
+            // The 20.0 cutoff is the reference's (ggml_compute_softplus_f32).
+            float sp = (a > 20.0f) ? a : logf(1.0f + expf(a));
+            g = expf(sp * ssm_a[h]);
+            beta = 1.0f / (1.0f + expf(-beta_raw[(size_t)t * n_v_heads + h]));
+        }
+        __syncthreads();
+
+        for (int j = threadIdx.x; j < head_v_dim; j += blockDim.x) {
+            float *row = st + (size_t)j * stride;
+
+            float pred = 0.0f;
+            for (int i = 0; i < head_k_dim; ++i) pred += (row[i] * g) * ks[i];
+
+            const float d = beta * (vt[h * head_v_dim + j] - pred);
+
+            float o = 0.0f;
+            for (int i = 0; i < head_k_dim; ++i) {
+                float s = row[i] * g + ks[i] * d;
+                row[i] = s;
+                o += s * (qs[i] * q_scale);
+            }
+            ot[h * head_v_dim + j] = o;
+        }
+        // `qs`, `ks`, `g` and `beta` are about to be rewritten for token t+1.
+        __syncthreads();
+    }
+
+    __syncthreads();
+    for (size_t idx = threadIdx.x; idx < per_head; idx += blockDim.x) {
+        const size_t j = idx / (size_t)head_k_dim;
+        const size_t i = idx - j * (size_t)head_k_dim;
+        head_state[idx] = st[j * (size_t)stride + i];
+    }
+}
+
 // Pull one `chunk`-sized run out of every `stride` of `src`, starting at
 // `offset`. Generic, but it exists for one thing: qwen35's `attn_q` emits query
 // and gate interleaved per head, so the two are strided views of one matmul

@@ -31,7 +31,7 @@
 
 use std::ffi::c_void;
 
-use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, check, experts, ffi};
+use super::{Cuda, DeviceBuffer, KArg, KvMirror, Mirror, SHARED_OPT_IN_BYTES, check, experts, ffi};
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
 /// Tokens one warp of `matmul_q8_0_batch` holds in registers while it loads a
@@ -3843,6 +3843,51 @@ impl Cuda {
         // launch overhead alone. Gated on `n_tokens > 1` like every other
         // prefill-only path here, so decode runs the identical kernel it always
         // has and a recorded graph never sees this name.
+        // **The state, not the launch count, is what this kernel costs.** It
+        // is `head_k_dim * head_v_dim` floats per head, read *and written* once
+        // per token by the global-memory form: 2.1 GB in 13.1 ms at the 35B's
+        // 128x128 and a 512-token batch, which is 164 GB/s and 37% of the bus.
+        // Staged in shared it moves twice for the whole batch instead.
+        //
+        // Padded by one float per row so a warp walking rows hits 32 distinct
+        // banks rather than one. Needs more than the 48 KiB default, which
+        // `cached_function` opts into; the check is against what the driver
+        // actually grants, so a device that refuses falls through rather than
+        // failing to launch.
+        let padded = d.head_v_dim * (d.head_k_dim + 1) + 2 * d.head_k_dim;
+        let shared_state = (padded * 4) as u32;
+        if d.n_tokens() > 1 && !self.delta_seq.get() && shared_state <= SHARED_OPT_IN_BYTES as u32 {
+            let args = [
+                KArg::I32(d.head_k_dim as i32),
+                KArg::I32(d.head_v_dim as i32),
+                KArg::I32(d.n_k_heads as i32),
+                KArg::I32(d.n_tokens() as i32),
+                KArg::F32(d.scale()),
+                KArg::Ptr(q),
+                KArg::Ptr(k),
+                KArg::Ptr(v),
+                KArg::Ptr(alpha),
+                KArg::Ptr(beta),
+                KArg::Ptr(ssm_a),
+                KArg::Ptr(dt),
+                KArg::Ptr(sd),
+                KArg::Ptr(od),
+            ];
+            // SAFETY: parameters match `delta_rule_batch_shared`; one block per
+            // value head, and `shared_state` is the two staged vectors plus the
+            // padded per-head state, checked against the opt-in cap above.
+            unsafe {
+                self.launch_shared(
+                    "delta_rule_batch_shared",
+                    d.n_v_heads as u32,
+                    threads,
+                    shared_state,
+                    &args,
+                )?
+            };
+            return Ok(());
+        }
+
         if d.n_tokens() > 1 && !self.delta_seq.get() {
             let args = [
                 KArg::I32(d.head_k_dim as i32),
