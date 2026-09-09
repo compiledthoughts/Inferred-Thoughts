@@ -2115,21 +2115,41 @@ __global__ void matmul_q5_k_q8_k_tok(int n_in, int n_out, int n_tok,
                 sum_l[t] = __fmaf_rn(d, (float)aux[t], sum_l[t]);
             }
         }
-        if (lane == 0) {
+        // **The min chain, spread over sixteen lanes instead of one.**
+        //
+        // This was `if (lane == 0)` wrapping a 16-iteration loop per token:
+        // 128 serial steps a superblock with 31 lanes masked off, against 64
+        // MACs a lane in the main loop above. A warp runs at its slowest lane,
+        // so the whole warp was paying for it.
+        //
+        // **`sumi` is an integer sum of sixteen products, so any order gives
+        // the same integer** — a tree across lanes is exact rather than merely
+        // close, which is the same argument that lets the MMA path split a
+        // sub-block. The f32 chain it feeds is untouched: still
+        // `fma(-dmin, sumi, sumf)`, still on lane 0, still once per superblock
+        // in ascending order.
+        {
             const float dmv = h2f(dmin16);
+            const int k = lane & 15;
+            const int mk = k >> 1;
+            const unsigned int mu = (mk < 4) ? u2 : u3;
+            const int mn = (int)((mu >> ((mk & 3) * 8)) & 0xff);
 #pragma unroll
             for (int t = 0; t < Q5K_TOK; ++t) {
                 const short *bs =
                     x_bsums + (size_t)ts[t] * nb * (QK_K / 16) + (size_t)i * (QK_K / 16);
-                int sumi = 0;
-                for (int k = 0; k < QK_K / 16; ++k) {
-                    const int mk = k >> 1;
-                    const unsigned int mu = (mk < 4) ? u2 : u3;
-                    sumi += (int)bs[k] * (int)((mu >> ((mk & 3) * 8)) & 0xff);
+                // Lanes 16-31 contribute zero and exist only to keep the
+                // shuffles warp-synchronous.
+                int sumi = (lane < 16) ? (int)bs[k] * mn : 0;
+                sumi += __shfl_down_sync(0xffffffff, sumi, 8);
+                sumi += __shfl_down_sync(0xffffffff, sumi, 4);
+                sumi += __shfl_down_sync(0xffffffff, sumi, 2);
+                sumi += __shfl_down_sync(0xffffffff, sumi, 1);
+                if (lane == 0) {
+                    const float dmin = dmv * x_scales[(size_t)ts[t] * nb + i];
+                    // FUSED, and inside the loop, before the lanes are folded in.
+                    sumf[t] = __fmaf_rn(-dmin, (float)sumi, sumf[t]);
                 }
-                const float dmin = dmv * x_scales[(size_t)ts[t] * nb + i];
-                // FUSED, and inside the loop, before the lanes are folded in.
-                sumf[t] = __fmaf_rn(-dmin, (float)sumi, sumf[t]);
             }
         }
     }
