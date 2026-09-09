@@ -1713,6 +1713,7 @@ impl Cuda {
         // Nothing here reads the router's output, which is what lets this
         // launch live in a graph.
         let table = self.expert_table(w)?;
+        self.stage_route_ids(route)?;
         let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, route.n_tok(), slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
 
@@ -1838,6 +1839,8 @@ impl Cuda {
         // need not share a residency tier.
         let gtab = self.expert_table(gate)?;
         let utab = self.expert_table(up)?;
+        // Before either gather, and once for both: they read the same slot.
+        self.stage_route_ids(route)?;
         let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, route.n_tok(), slot::PTR_GATE)?;
         let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, route.n_tok(), slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
@@ -2631,6 +2634,50 @@ impl Cuda {
     /// Also the only place the expert cache can still be observed. With the
     /// picks living on the device the host never sees a read, so the kernel
     /// counts them; `key` finds this tensor's slice of the global counters.
+    /// Put a host-chosen route's picks where the device gather expects them.
+    ///
+    /// **`gather_ptrs` reads `slot::ROUTE_IDS` and nothing else.** That slot is
+    /// written by exactly one thing, `moe_topk` inside `route_impl`, and
+    /// [`Ops::route`] here always returns `Route::Device`, so in the engine the
+    /// ids are always fresh and always the size the gather will ask for.
+    ///
+    /// A caller that builds a `Route::Host` by hand — every MoE bench does —
+    /// got neither. `moe_topk` never ran, so the gather read whatever the slot
+    /// happened to hold: in-range leftovers from an earlier pass, so the *wrong
+    /// experts* and no failure, until a larger batch made `pooled` grow the
+    /// slot and hand back an uninitialised block, at which point `table[id]`
+    /// went out of bounds. That was the illegal address blocking this branch,
+    /// and for as long as it did not fault it was quietly producing numbers
+    /// from the wrong weights.
+    ///
+    /// So: honour the variant, or refuse it. Silently disregarding it is what
+    /// this backend must not do — `host_picks` already refuses the mirror case,
+    /// and this is the symmetric guard that was never written.
+    ///
+    /// Sized exactly as `gather_ptrs` will size it, so its own `pooled` call
+    /// cannot reallocate what this just wrote — the same invariant `moe_groups`
+    /// depends on.
+    fn stage_route_ids(&self, route: &Route) -> Result<()> {
+        // `Route::Device` means `moe_topk` has already written the slot.
+        let Some(ids) = route.ids() else { return Ok(()) };
+        let n = route.n_tok() * route.n_used();
+        if ids.len() != n {
+            return Err(Error::Cuda {
+                what: "stage_route_ids",
+                detail: format!(
+                    "{} ids for {n} picks ({} tokens x {})",
+                    ids.len(),
+                    route.n_tok(),
+                    route.n_used()
+                ),
+            });
+        }
+        let idd = self.pooled(slot::ROUTE_IDS, n * 4)?;
+        // The kernel takes `int`; `Route` carries `usize`.
+        let as_i32: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+        self.h2d(idd, &as_i32)
+    }
+
     fn gather_ptrs(
         &self,
         key: usize,

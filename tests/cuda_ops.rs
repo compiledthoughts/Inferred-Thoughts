@@ -3286,26 +3286,20 @@ fn what_the_moe_ffn_costs() {
 /// kernel rather than one read, which is the quantity a placement policy should
 /// be tuned against. Never tune residency by hit rate; see the residency cliff.
 ///
-/// # It stops at n_tok 512, and that is a bug being worked around
+/// # It used to stop at n_tok 512, and that was a bug being worked around
 ///
-/// Adding 1024 to `TOKS` here reproduces the **`CUDA_ERROR_ILLEGAL_ADDRESS`
-/// that blocks the merge**, deterministically, in one process and one CUDA
-/// context:
+/// n_tok 1024 with a host-resident pool reproduced the
+/// `CUDA_ERROR_ILLEGAL_ADDRESS` that blocked this branch. The cause was in the
+/// backend, not here: `moe_glu_impl` ignored `route.ids()` and `gather_ptrs`
+/// read `slot::ROUTE_IDS`, which only `moe_topk` ever wrote — so this bench,
+/// which builds a `Route::Host` by hand, was routing to whatever the slot held.
+/// In range below 1024, hence the wrong experts and no failure; a fresh
+/// uninitialised block once `pooled` had to grow it, hence the fault.
 ///
-///     n_tok 1024, n_pair 8192
-///     slots 176 VRAM | host_slots 336, host_bytes 268 MB | degraded false
+/// `stage_route_ids` fixes that, and the shape is back. **Every number this
+/// bench produced before that fix was taken with degenerate routing**, which
+/// packs tiles and fills the cache far better than the real thing.
 ///
-/// The same shape passes with an all-VRAM slab, and n_pair 4096 passes with
-/// this one, so it needs both the host tier and a batch above 4096 pairs.
-/// **That retires the recorded lead** — the handoff blamed parallel CUDA
-/// contexts under `--nocapture`, and this is serial and single-context. It also
-/// says why a server never sees it: `DEFAULT_MAX_BATCH` 512 caps production at
-/// 4096 pairs, one factor of two below.
-///
-/// The worrying reading, untested: a slot index out of range lands *inside* a
-/// full-size slab and silently reads the wrong expert, and only a small slab
-/// turns it into a fault. If so the defect is in the all-VRAM path too and this
-/// configuration is merely the one that can see it.
 #[test]
 #[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
 fn what_the_moe_ffn_costs_from_the_host_tier() {
@@ -3370,10 +3364,7 @@ fn moe_ffn_cost_table(gpu: &Cuda) {
         "n_tok", "pairs", "tok/exp", "with bus", "bare", "TOPS", "of peak", "host"
     );
 
-    // 1024 is deliberately absent: with a host-resident pool it faults. See
-    // `what_the_moe_ffn_costs_from_the_host_tier`, which documents the
-    // reproduction and what it retires.
-    let toks: Vec<usize> = vec![32, 128, 512];
+    let toks: Vec<usize> = vec![32, 128, 512, 1024];
     let acts: Vec<Vec<f32>> = toks.iter().map(|&t| noise(N_IN * t, 7 + t as u64)).collect();
 
     for (&n_tok, x) in toks.iter().zip(&acts) {
