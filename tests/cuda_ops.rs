@@ -3258,12 +3258,72 @@ fn the_batched_delta_rule_matches_the_per_token_one() {
 #[test]
 #[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
 fn what_the_moe_ffn_costs() {
-    use inferred_thoughts::gguf::GgmlType;
-    use inferred_thoughts::ops::Route;
-
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // 2 GiB against a 272 MiB pool, so nothing spills and every read is a VRAM
+    // read. The optimistic arm; see `what_the_moe_ffn_costs_from_the_host_tier`
+    // for the other end of the bracket.
     gpu.set_expert_budget(2 << 30);
+    moe_ffn_cost_table(&gpu);
+}
+
+/// **The same table with the pool spilling to the host tier.**
+///
+/// `what_the_moe_ffn_costs` gives every expert a 2 GiB budget against a 272 MiB
+/// pool, so every read is a VRAM read and the host tier is priced at **zero**.
+/// That is the optimistic case and it is not the one the engine runs: a real
+/// 5,679-token prefill resolves **5.5% of expert reads across PCIe**, inside
+/// the kernel, at 28.2 MiB/token.
+///
+/// Here the slab is capped below the pool so placement has to spill, and the
+/// `host` column says what fraction actually did. Read the two tests as a
+/// bracket: the other is 0% host, this is well above the real 5.5%, and the
+/// engine sits between them.
+///
+/// `bench_expert_residency` prices a single read from each tier — 190.8 GB/s
+/// from VRAM against 16.7 in-kernel from the host, **11.4x** — and warns that
+/// the cost is *not* linear in the host fraction. This measures the whole
+/// kernel rather than one read, which is the quantity a placement policy should
+/// be tuned against. Never tune residency by hit rate; see the residency cliff.
+///
+/// # It stops at n_tok 512, and that is a bug being worked around
+///
+/// Adding 1024 to `TOKS` here reproduces the **`CUDA_ERROR_ILLEGAL_ADDRESS`
+/// that blocks the merge**, deterministically, in one process and one CUDA
+/// context:
+///
+///     n_tok 1024, n_pair 8192
+///     slots 176 VRAM | host_slots 336, host_bytes 268 MB | degraded false
+///
+/// The same shape passes with an all-VRAM slab, and n_pair 4096 passes with
+/// this one, so it needs both the host tier and a batch above 4096 pairs.
+/// **That retires the recorded lead** — the handoff blamed parallel CUDA
+/// contexts under `--nocapture`, and this is serial and single-context. It also
+/// says why a server never sees it: `DEFAULT_MAX_BATCH` 512 caps production at
+/// 4096 pairs, one factor of two below.
+///
+/// The worrying reading, untested: a slot index out of range lands *inside* a
+/// full-size slab and silently reads the wrong expert, and only a small slab
+/// turns it into a fault. If so the defect is in the all-VRAM path too and this
+/// configuration is merely the one that can see it.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_moe_ffn_costs_from_the_host_tier() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    // Both budgets must be set before the first pooled tensor: the cache reads
+    // them once, at construction. 96 MiB of slab against a 272 MiB pool leaves
+    // roughly two thirds of it on the host tier.
+    gpu.set_expert_host_budget(1 << 30);
+    gpu.set_expert_budget(96 << 20);
+    moe_ffn_cost_table(&gpu);
+}
+
+/// The shared body: the 35B routed FFN at prefill shapes, whatever tier its
+/// experts landed on.
+fn moe_ffn_cost_table(gpu: &Cuda) {
+    use inferred_thoughts::gguf::GgmlType;
+    use inferred_thoughts::ops::Route;
 
     // The 35B's routed FFN: n_embd 2048 in, expert FFN width 512 out, 256
     // experts per layer, 8 used per token.
@@ -3306,11 +3366,14 @@ fn what_the_moe_ffn_costs() {
     println!("\nrouted MoE FFN (gate+up+silu), {N_EXPERT} experts, top-{N_USED}, {N_IN}x{N_OUT}");
     println!("  ceiling {MMA_S8_PEAK_TOPS:.0} TOPS int8");
     println!(
-        "  {:>6} {:>7} {:>8}  {:>10}  {:>9}  {:>7}",
-        "n_tok", "pairs", "tok/exp", "ms", "TOPS", "of peak"
+        "  {:>6} {:>7} {:>8}  {:>9}  {:>9}  {:>8}  {:>7}  {:>6}",
+        "n_tok", "pairs", "tok/exp", "with bus", "bare", "TOPS", "of peak", "host"
     );
 
-    let toks: Vec<usize> = vec![32, 128, 512, 1024];
+    // 1024 is deliberately absent: with a host-resident pool it faults. See
+    // `what_the_moe_ffn_costs_from_the_host_tier`, which documents the
+    // reproduction and what it retires.
+    let toks: Vec<usize> = vec![32, 128, 512];
     let acts: Vec<Vec<f32>> = toks.iter().map(|&t| noise(N_IN * t, 7 + t as u64)).collect();
 
     for (&n_tok, x) in toks.iter().zip(&acts) {
@@ -3342,36 +3405,75 @@ fn what_the_moe_ffn_costs() {
         let mut out = vec![0.0f32; n_pair * N_OUT];
         let mut scratch = vec![0.0f32; n_pair * N_OUT];
 
-        let mut best = f64::MAX;
-        for _ in 0..3 {
-            for _ in 0..2 {
+        // Two arms. `bus` keeps the `host_wrote` / `host_needs` pair; `!bus`
+        // drops both and syncs instead.
+        //
+        // **The pair is a harness artifact, not this engine's PCIe cost.** The
+        // model never ships activations across the bus — a 5,679-token prefill
+        // does 592 uploads and 37 downloads in total — while at these shapes
+        // `x` and `out` are megabytes a rep. On the dense IQ4_XS bench that pair
+        // was **57% of the measurement**, which is why seven kernel experiments
+        // there all read ~1.00x.
+        //
+        // What *is* architectural is on the other side of the table: expert
+        // reads that resolve to the host tier, which the `host` column reports
+        // and `what_the_moe_ffn_costs_from_the_host_tier` exercises.
+        let mut timed = |bus: bool| -> f64 {
+            let run = |out: &mut [f32], scratch: &mut [f32]| {
+                gpu.begin_pass(n_tok);
+                if bus {
+                    gpu.host_wrote(x);
+                }
+                gpu.moe_glu(&gate, &up, &route, x, out, scratch);
+                if bus {
+                    gpu.host_needs(out);
+                }
+                gpu.end_pass();
+                if !bus {
+                    let _ = gpu.sync();
+                }
+            };
+            if !bus {
                 gpu.begin_pass(n_tok);
                 gpu.host_wrote(x);
-                gpu.moe_glu(&gate, &up, &route, x, &mut out, &mut scratch);
-                gpu.host_needs(&mut out);
                 gpu.end_pass();
             }
-            let t = std::time::Instant::now();
-            const REPS: u32 = 5;
-            for _ in 0..REPS {
-                gpu.begin_pass(n_tok);
-                gpu.host_wrote(x);
-                gpu.moe_glu(&gate, &up, &route, x, &mut out, &mut scratch);
-                gpu.host_needs(&mut out);
-                gpu.end_pass();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                for _ in 0..2 {
+                    run(&mut out, &mut scratch);
+                }
+                let t = std::time::Instant::now();
+                const REPS: u32 = 5;
+                for _ in 0..REPS {
+                    run(&mut out, &mut scratch);
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+                if ms < best {
+                    best = ms;
+                }
             }
-            let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
-            if ms < best {
-                best = ms;
-            }
+            best
+        };
+        let with_bus = timed(true);
+        let bare = timed(false);
+        if let Some(e) = gpu.take_error() {
+            let st = gpu.expert_stats();
+            panic!(
+                "a CUDA op reported a driver error at n_tok {n_tok}, n_pair {n_pair}: {e}\n\
+                 expert cache: {st:?}"
+            );
         }
-        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 
         // gate and up are each n_pair x n_in x n_out MACs, two flops per MAC.
-        let tops = 4.0 * (n_pair * N_IN * N_OUT) as f64 / (best * 1e-3) / 1e12;
+        let tops = 4.0 * (n_pair * N_IN * N_OUT) as f64 / (bare * 1e-3) / 1e12;
         let per_exp = n_pair as f64 / N_EXPERT as f64;
+        // **Which tier the reads came from**, so a row cannot be read as the
+        // kernel's cost when it is really the kernel's cost at 100% residency.
+        let host_pct = gpu.expert_stats().map_or(0.0, |s| 100.0 * s.host_read_rate());
         println!(
-            "  {n_tok:>6} {n_pair:>7} {per_exp:>8.1}  {best:>10.4}  {tops:>9.2}  {:>6.1}%",
+            "  {n_tok:>6} {n_pair:>7} {per_exp:>8.1}  {with_bus:>9.4}  {bare:>9.4}  \
+             {tops:>8.2}  {:>6.1}%  {host_pct:>5.1}%",
             100.0 * tops / MMA_S8_PEAK_TOPS
         );
     }
