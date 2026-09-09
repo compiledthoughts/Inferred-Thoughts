@@ -3319,3 +3319,111 @@ fn the_tiled_q5_k_matmul_is_bit_identical() {
     }
     println!("  {checked} outputs compared, all bit-identical");
 }
+
+/// **What the server'''s slice-and-checkpoint prefill costs: nothing.**
+///
+/// `serve` prefills in slices of `CHECKPOINT_EVERY` = 2048 and takes a
+/// checkpoint after each — 60 device reads of the recurrent state, per slice —
+/// where `generate` makes one `prefill` call and takes none. That looked like
+/// an obvious suspect when a server turn measured 144.8 tok/s against
+/// `generate`'''s 331.6 on byte-identical input.
+///
+/// **It was not the cause, and neither was anything in this repository.** The
+/// machine had degraded: the same commit that measured 2.03 ms on the dense
+/// IQ4_XS bench measured 6.6, llama.cpp fell 1042 -> 397 tok/s on the same
+/// file, and a Windows restart restored both. A whole investigation ran against
+/// a moving baseline because the comparison spanned it.
+///
+/// The result is kept because it is the answer to a question that will be asked
+/// again — slicing 1.02x, checkpoints 0.94x, together 0.96x — and because a
+/// cross-time comparison of two binaries is exactly the shape of measurement
+/// this project keeps having to disown. Both arms here run in one process,
+/// minutes apart, on one engine.
+///
+/// So this drives **one engine** three ways over the same tokens:
+///
+/// - one `prefill` of everything, which is what `generate` does
+/// - 2048-token slices, which isolates slicing from checkpointing
+/// - slices plus a checkpoint after each, which is what `serve` does
+///
+/// One engine rather than three, and `reset` between arms, for the reason
+/// `the_grouped_routed_ffn_is_bit_identical` records: `Cuda` keys its mirrors on
+/// host addresses, so a dropped engine hands the next one recycled addresses.
+#[test]
+#[ignore = "needs an sm_120 device and the real 35B"]
+fn what_the_server_prefill_pattern_costs() {
+    use inferred_thoughts::Model;
+
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+
+    // Real content, as `prompt_real.txt` is: word salad routes to a handful of
+    // experts and would flatter every arm equally but unrealistically.
+    let doc = std::fs::read_to_string("measurements/prompt_real.txt")
+        .expect("measurements/prompt_real.txt");
+    let tokens = tk.encode(&doc, true, true);
+    let n = tokens.len();
+    assert!(n > 8192, "{n} tokens; this needs several 2048-token slices");
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.set_model_path(&f.path);
+    gpu.set_map_base(f.map_base());
+    let m = Model::load(&f).expect("load the 35B");
+    let mut e = Engine::new(m, &gpu, 32768, false);
+    e.set_max_batch(512);
+    // **Both binaries call this and the first version of this test did not.**
+    // The expert slab sizes itself from free VRAM at the first expert, which is
+    // inside the first forward pass; the KV slabs are allocated later, at the
+    // first attention layer. Without the reservation the slab takes VRAM the KV
+    // cache then needs, and WDDM demand-pages the difference - the 4.76x cliff
+    // in BENCHMARKS.md, which no counter in this engine can see.
+    gpu.reserve_for_kv((e.kv_capacity_bytes() + e.recurrent_capacity_bytes()) as usize);
+
+    const SLICE: usize = 2048;
+
+    // Warm-up, and it pays the ~24 s of expert placement so no arm carries it.
+    let _ = e.prefill(&tokens[..SLICE]).expect("warm-up");
+    e.reset();
+
+    let mut time = |label: &str, slice: Option<usize>, ckpt: bool| {
+        e.reset();
+        let t = std::time::Instant::now();
+        match slice {
+            None => {
+                e.prefill(&tokens).expect("prefill");
+            }
+            Some(s) => {
+                let mut done = 0;
+                while done < n {
+                    let take = s.min(n - done);
+                    e.prefill(&tokens[done..done + take]).expect("prefill slice");
+                    done += take;
+                    if ckpt {
+                        // Exactly what `Session::advance` does between slices.
+                        let _ = e.checkpoint();
+                    }
+                }
+            }
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!("  {label:<28} {ms:>9.1} ms   {:>7.2} tok/s", n as f64 / (ms * 1e-3));
+        ms
+    };
+
+    println!("\nserver prefill pattern, {n} tokens of real content, ctx 32768");
+    let whole = time("one prefill (generate)", None, false);
+    let sliced = time("2048 slices, no checkpoint", Some(SLICE), false);
+    let served = time("2048 slices + checkpoint", Some(SLICE), true);
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    println!(
+        "\n  slicing alone      {:.2}x\n  checkpoints add    {:.2}x\n  together           {:.2}x",
+        sliced / whole,
+        served / sliced,
+        served / whole,
+    );
+}
