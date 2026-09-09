@@ -388,6 +388,9 @@ pub(super) struct ExpertCache {
     /// The model file and the address its mapping starts at. See
     /// `ExpertCache::set_source`.
     source: Option<(std::path::PathBuf, usize)>,
+    /// Reused across tensors so placement does not allocate and zero 142 MiB a
+    /// hundred and twenty times. Held rather than local for that reason alone.
+    stage: Vec<u8>,
     stats: ExpertStats,
 }
 
@@ -450,6 +453,7 @@ impl ExpertCache {
             migrated: 0,
             since_migration: 0,
             source: None,
+            stage: Vec::new(),
             stats: ExpertStats {
                 slots: slots as u64,
                 slot_bytes: stride as u64,
@@ -635,6 +639,61 @@ impl ExpertCache {
                 ),
             });
         }
+        // **Read the tensor with `pread` rather than faulting it out of the
+        // mmap.** Measured on this machine, same file, both cold: demand
+        // faulting the mapping gives **0.83 GB/s** and a sequential `pread`
+        // gives **2.00 GB/s** — 2.4x, and the whole of what open item 0b has
+        // left to give.
+        //
+        // `9a7cbcb` established that placement is bound by getting the bytes
+        // out of the file, not by the bus or the copy granularity: the device
+        // copy ran at 0.80 GB/s and a plain CPU memcpy at 0.85, and those have
+        // no reason to agree unless the shared source binds them.
+        //
+        // `MADV_WILLNEED` was tried first and does nothing — 0.82 against 0.86
+        // GB/s on cold disjoint ranges. It appeared to give 14.7x only because
+        // the arms shared pages, which `posix_fadvise` cannot evict while a
+        // live mapping holds them; that is the same distinction `drop_file_cache`
+        // documents, walked into from the other side.
+        //
+        // The keys stay the **mmap** addresses. `map`, `owner` and every table
+        // are keyed on where the tensor lives in the mapping, so only the bytes
+        // come from the staging buffer.
+        let mut stage = std::mem::take(&mut self.stage);
+        // **Off by default, because it trades 6% of every prefill for 20 s of
+        // start-up.** Measured, interleaved, one sitting, both pairs agreeing:
+        //
+        //   pread   setup 5.0 / 4.8 s    prefill 311.8 / 311.2
+        //   mmap    setup 24.5 / 24.7 s  prefill 331.2 / 331.6
+        //
+        // A start-up path has no business moving a steady-state number and the
+        // cause is not yet known — the staging buffer is 142 MiB of anonymous
+        // memory held for the life of the process, beside a multi-GiB pinned
+        // host tier, and physical fragmentation of those pinned blocks is the
+        // leading suspect rather than a demonstrated cause.
+        //
+        // A server starts once and runs for hours, so the default keeps the
+        // prefill. `INFERRED_PREAD=1` takes the fast start-up instead, which is
+        // the better trade for one-shot `generate` runs and for iterating on
+        // anything that is not prefill throughput.
+        let use_pread = std::env::var("INFERRED_PREAD").is_ok();
+        let staged = match self.source.as_ref().filter(|_| use_pread) {
+            Some((path, base)) => {
+                use std::os::unix::fs::FileExt;
+                let offset = (data.as_ptr() as usize).saturating_sub(*base) as u64;
+                if stage.len() < data.len() {
+                    stage.resize(data.len(), 0);
+                }
+                std::fs::File::open(path)
+                    .and_then(|f| f.read_exact_at(&mut stage[..data.len()], offset))
+                    .is_ok()
+            }
+            None => false,
+        };
+        // Falls back to the mapping if anything about the read did not hold,
+        // which keeps this an optimisation rather than a new failure mode.
+        let src_all: &[u8] = if staged { &stage[..data.len()] } else { data };
+
         let mut addrs = Vec::with_capacity(n_expert);
         let mut vram = Vec::with_capacity(n_expert);
         let mut e = 0;
@@ -666,8 +725,8 @@ impl ExpertCache {
                 // Not a fresh-slot case: already placed, or the slab is full
                 // and this belongs to the host tier or an eviction. One at a
                 // time, exactly as before.
-                let src = &data[e * stride..(e + 1) * stride];
-                let k = src.as_ptr() as usize;
+                let src = &src_all[e * stride..(e + 1) * stride];
+                let k = data[e * stride..].as_ptr() as usize;
                 addrs.push(self.place(k, src)?);
                 vram.push(i32::from(self.map.get(&k).and_then(|x| x.slot).is_some()));
                 e += 1;
@@ -675,7 +734,7 @@ impl ExpertCache {
             }
 
             let first = self.next_slot;
-            let src = &data[e * stride..(e + run) * stride];
+            let src = &src_all[e * stride..(e + run) * stride];
             let t = std::time::Instant::now();
             self.slab.write_at(first * stride, src)?;
             self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
@@ -694,6 +753,8 @@ impl ExpertCache {
             self.next_slot += run;
             e += run;
         }
+        self.stage = stage;
+
         let buf = DeviceBuffer::from_slice(&addrs)?;
         let ptr = buf.ptr;
         self.tables.insert(key, buf);
