@@ -3483,6 +3483,282 @@ __global__ void matmul_iq4_xs_q8_k_staged(int n_in, int n_out, int n_tok,
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Q5_K x Q8_K on the int8 tensor cores
+// ---------------------------------------------------------------------------
+//
+// **The one matmul here deliberately outside the bit-exact set**, and the reason
+// is worth stating before the code.
+//
+// Q5_K and Q6_K were the last matmuls running one warp per output row with no
+// tensor cores at all: 16.0% of a prefill at **0.5% of the int8 ceiling**
+// against 6-10% for the kernels on `mma`. A 12-20x gap on the same card, and the
+// largest unexploited headroom in the engine.
+//
+// # What maps cleanly, and it is more than expected
+//
+// Q5_K carries **one scale per 32 weights**, which is exactly the MMA's k width,
+// so one `mma.m16n8k32` covers one sub-block and one scale. And the reference
+// already folds to f32 only **once per superblock** --
+// `sums[l] = fma(d, aux32[l], sums[l])` after the eight sub-blocks have
+// accumulated in int32. So the fold structure is reproduced fma for fma.
+//
+// Unpacked values are 0..31, so they fit a *signed* int8 operand and
+// `mma_m16n8k32_s8` is used unchanged. A 0..31 weight against an int8 activation
+// is at most 3937, inside the `i16` the reference casts to, and 32 of those are
+// nowhere near int32.
+//
+// # What does not map, which is the whole cost of the decision
+//
+// The reference keeps **eight int32 lanes** -- `aux32[l]`, lane `l` owning the
+// positions congruent to `l` mod 8 -- each feeding its own f32 chain across
+// superblocks, the eight summed only at the very end. An `mma.m16n8k32`
+// contracts all 32 k-elements into one int32 and cannot hand back per-lane
+// partials, so this computes
+//
+//     sumf = sum_i d_i * (sum_l aux32[l,i])      one rounding per superblock
+//
+// where the reference computes
+//
+//     sumf = sum_l (sum_i d_i * aux32[l,i])      eight
+//
+// Same real number, different f32. **The integers are exact on both sides**, so
+// the gap is a fold-order change of the same family as the RMSNorm tree -- and
+// as there, this side rounds eight times less often and is the *more* accurate
+// of the two. What is given up is determinism, not accuracy.
+//
+// `INFERRED_Q5K_SCALAR` keeps the scalar kernel and with it bit equality, and
+// `q5k_scalar_restores_bit_equality` tests that the flag really buys it back
+// rather than merely claiming to.
+//
+// # Two places Q5_K differs from IQ4_XS and the layout has to follow
+//
+// **The two k-halves come from different bytes.** IQ4_XS puts element `k` in the
+// low nibble and `k + 16` in the high nibble of one byte, so a single 4-byte
+// load fills two A registers. Q5_K puts element `t` of sub-block `sb` in nibble
+// `sb & 1` of `qs[(sb >> 1) * 32 + t]`, so `t` and `t + 16` are sixteen bytes
+// apart and each A register needs its own load.
+//
+// **The fifth bit lives in `qh`,** one bit per element position and one bit
+// plane per sub-block: element `t` of sub-block `sb` takes bit `sb` of `qh[t]`.
+//
+// # The mins term stays scalar, and that is a measurement not an oversight
+//
+// The offset is `fma(-dmin, sumi, sumf)` with `sumi = sum_k bsum[k] * mins[k/2]`,
+// which pairs to `sum_j mins[j] * (bsum[2j] + bsum[2j+1])` -- eight products per
+// output per superblock, so 32 integer MACs a superblock against eight MMAs.
+// That sounds ruinous and is not: the unpack and the f32 fold around those eight
+// MMAs are a few hundred operations, so the mins term is roughly a tenth of the
+// loop. It is also **exact**, which keeps the error bound to the one reordering
+// named above. Moving it onto the tensor cores would mean splitting `bsum` into
+// two int8 planes; do that only if it measures as the bound.
+
+// Token tiles per weight load, as `MMA_NTILE` is for IQ4_XS. Four is 32 tokens
+// per load of a weight row that costs four unpacks instead of two.
+#define Q5K_MMA_NTILE 4
+
+// Four elements of one sub-block, from one `qs` quad and one `qh` quad.
+//
+// `sh` is `4 * (sb & 1)`, selecting the nibble; `sb` selects the `qh` bit plane.
+// Byte `b` of each quad is element `4q + b` of the sub-block, so the `qh` bit is
+// at `8 * b + sb`.
+__device__ __forceinline__ int unpack_q5_quad(int qs4, int qh4, int sh, int sb) {
+    const unsigned int u = (unsigned int)qs4;
+    const unsigned int h = (unsigned int)qh4;
+    const int v0 = (int)((u >> sh) & 0xfu) | (int)(((h >> sb) & 1u) << 4);
+    const int v1 = (int)((u >> (8 + sh)) & 0xfu) | (int)(((h >> (8 + sb)) & 1u) << 4);
+    const int v2 = (int)((u >> (16 + sh)) & 0xfu) | (int)(((h >> (16 + sb)) & 1u) << 4);
+    const int v3 = (int)((u >> (24 + sh)) & 0xfu) | (int)(((h >> (24 + sb)) & 1u) << 4);
+    return pack_s8x4(v0, v1, v2, v3);
+}
+
+__global__ void matmul_q5_k_q8_k_mma(int n_in, int n_out, int n_tok,
+                                     const unsigned char *__restrict__ w,
+                                     const float *__restrict__ x_scales,
+                                     const signed char *__restrict__ x_quants,
+                                     const short *__restrict__ x_bsums,
+                                     float *__restrict__ out) {
+    const unsigned int KMASK1 = 0x3f3f3f3fu;
+    const unsigned int KMASK2 = 0x0f0f0f0fu;
+    const unsigned int KMASK3 = 0x03030303u;
+
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    const int t0 = blockIdx.y * (8 * Q5K_MMA_NTILE);
+    if (j0 >= n_out) return;
+
+    const int g = lane >> 2;
+    const int q = lane & 3;
+
+    // Rows g and g+8 of the tile, clamped so a partial tile reads in bounds and
+    // is dropped at write-back instead.
+    const int row_a = j0 + g;
+    const int row_b = j0 + g + 8;
+    const unsigned char *pa = w + (size_t)min(row_a, n_out - 1) * nb * Q5K_BYTES;
+    const unsigned char *pb = w + (size_t)min(row_b, n_out - 1) * nb * Q5K_BYTES;
+
+    // `acc` is the reference's `sums` chain collapsed to one lane; `off` is the
+    // dmin chain, which stays exactly as the reference has it.
+    float acc[Q5K_MMA_NTILE][4], off[Q5K_MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { acc[n][k] = 0.0f; off[n][k] = 0.0f; }
+    }
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const unsigned char *ba = pa + (size_t)ibl * Q5K_BYTES;
+        const unsigned char *bb = pb + (size_t)ibl * Q5K_BYTES;
+
+        const float da = h2f((unsigned short)ba[0] | ((unsigned short)ba[1] << 8));
+        const float db = h2f((unsigned short)bb[0] | ((unsigned short)bb[1] << 8));
+        const float ma = h2f((unsigned short)ba[2] | ((unsigned short)ba[3] << 8));
+        const float mb = h2f((unsigned short)bb[2] | ((unsigned short)bb[3] << 8));
+
+        // The twelve-byte scale/min shuffle, transcribed from the scalar kernel
+        // and through it from `ggml_vec_dot_q5_K_q8_K_generic`.
+        unsigned int a0 = *(const unsigned int *)(ba + 4);
+        unsigned int a1 = *(const unsigned int *)(ba + 8);
+        unsigned int a2 = *(const unsigned int *)(ba + 12);
+        const unsigned int a3 = ((a2 >> 4) & KMASK2) | (((a1 >> 6) & KMASK3) << 4);
+        const unsigned int aaux = a1 & KMASK1;
+        a1 = (a2 & KMASK2) | (((a0 >> 6) & KMASK3) << 4);
+        a2 = aaux;
+        a0 &= KMASK1;
+
+        unsigned int c0v = *(const unsigned int *)(bb + 4);
+        unsigned int c1v = *(const unsigned int *)(bb + 8);
+        unsigned int c2v = *(const unsigned int *)(bb + 12);
+        const unsigned int c3v = ((c2v >> 4) & KMASK2) | (((c1v >> 6) & KMASK3) << 4);
+        const unsigned int caux = c1v & KMASK1;
+        c1v = (c2v & KMASK2) | (((c0v >> 6) & KMASK3) << 4);
+        c2v = caux;
+        c0v &= KMASK1;
+
+        const unsigned char *qha = ba + 16;
+        const unsigned char *qhb = bb + 16;
+        const unsigned char *qsa = ba + 16 + QK_K / 8;
+        const unsigned char *qsb = bb + 16 + QK_K / 8;
+
+        // Per (token, superblock), so hoisted out of the sub-block loop exactly
+        // as the IQ4_XS kernel hoists its own.
+        float xs[Q5K_MMA_NTILE][2];
+#pragma unroll
+        for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+            const int t_0 = t0 + n * 8 + 2 * q, t_1 = t_0 + 1;
+            xs[n][0] = (t_0 < n_tok) ? x_scales[(size_t)t_0 * nb + ibl] : 0.0f;
+            xs[n][1] = (t_1 < n_tok) ? x_scales[(size_t)t_1 * nb + ibl] : 0.0f;
+        }
+
+        // The superblock's scaled products, in int32 and therefore exact.
+        int acci[Q5K_MMA_NTILE][4];
+#pragma unroll
+        for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+#pragma unroll
+            for (int k = 0; k < 4; ++k) acci[n][k] = 0;
+        }
+
+        for (int sb = 0; sb < QK_K / 32; ++sb) {
+            const unsigned int sua = (sb < 4) ? a0 : a1;
+            const unsigned int sub = (sb < 4) ? c0v : c1v;
+            const int sca = (int)((sua >> ((sb & 3) * 8)) & 0xff);
+            const int scb = (int)((sub >> ((sb & 3) * 8)) & 0xff);
+
+            const int qoff = (sb >> 1) * 32 + q * 4;
+            const int hoff = q * 4;
+            const int sh = 4 * (sb & 1);
+
+            // a[0]/a[2] are row_a's low and high k-halves, a[1]/a[3] row_b's --
+            // the m16n8k32 fragment order. Four loads, not two, because Q5_K's
+            // halves are sixteen bytes apart.
+            int a[4];
+            a[0] = unpack_q5_quad(*(const int *)(qsa + qoff),
+                                  *(const int *)(qha + hoff), sh, sb);
+            a[2] = unpack_q5_quad(*(const int *)(qsa + qoff + 16),
+                                  *(const int *)(qha + hoff + 16), sh, sb);
+            a[1] = unpack_q5_quad(*(const int *)(qsb + qoff),
+                                  *(const int *)(qhb + hoff), sh, sb);
+            a[3] = unpack_q5_quad(*(const int *)(qsb + qoff + 16),
+                                  *(const int *)(qhb + hoff + 16), sh, sb);
+
+#pragma unroll
+            for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+                const int tb = t0 + n * 8 + g;
+                int bfrag[2] = {0, 0};
+                if (tb < n_tok) {
+                    const signed char *q8 =
+                        x_quants + (size_t)tb * n_in + (size_t)ibl * QK_K + sb * 32;
+                    bfrag[0] = *(const int *)(q8 + q * 4);
+                    bfrag[1] = *(const int *)(q8 + 16 + q * 4);
+                }
+                // Zeroed per sub-block: one scale per 32 weights means an int32
+                // accumulator cannot span two of them without the scale.
+                const int zero[4] = {0, 0, 0, 0};
+                int s[4];
+                mma_m16n8k32_s8(s, a, bfrag, zero);
+                acci[n][0] += sca * s[0];
+                acci[n][1] += sca * s[1];
+                acci[n][2] += scb * s[2];
+                acci[n][3] += scb * s[3];
+            }
+        }
+
+        // One fma per superblock, as the reference does -- only the eight lanes
+        // it would have kept are collapsed into one. This is the departure.
+#pragma unroll
+        for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+            acc[n][0] = __fmaf_rn(da * xs[n][0], (float)acci[n][0], acc[n][0]);
+            acc[n][1] = __fmaf_rn(da * xs[n][1], (float)acci[n][1], acc[n][1]);
+            acc[n][2] = __fmaf_rn(db * xs[n][0], (float)acci[n][2], acc[n][2]);
+            acc[n][3] = __fmaf_rn(db * xs[n][1], (float)acci[n][3], acc[n][3]);
+        }
+
+        // The mins chain, exact and in the reference's order: `sumi` is an
+        // integer sum, and `fma(-dmin, sumi, off)` lands inside the superblock
+        // loop before anything is folded, as `dot_q5_k` has it.
+#pragma unroll
+        for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+#pragma unroll
+            for (int e = 0; e < 2; ++e) {
+                const int c = t0 + n * 8 + 2 * q + e;
+                if (c >= n_tok) continue;
+                const short *bs =
+                    x_bsums + (size_t)c * nb * (QK_K / 16) + (size_t)ibl * (QK_K / 16);
+                int sia = 0, sib = 0;
+#pragma unroll
+                for (int mk = 0; mk < 8; ++mk) {
+                    const unsigned int mua = (mk < 4) ? a2 : a3;
+                    const unsigned int mub = (mk < 4) ? c2v : c3v;
+                    // `mins[k >> 1]` is constant over each pair of bsums, so the
+                    // reference's sixteen products pair into eight. Integer, so
+                    // the pairing is exact.
+                    const int pair = (int)bs[2 * mk] + (int)bs[2 * mk + 1];
+                    sia += (int)((mua >> ((mk & 3) * 8)) & 0xff) * pair;
+                    sib += (int)((mub >> ((mk & 3) * 8)) & 0xff) * pair;
+                }
+                off[n][e] = __fmaf_rn(-(ma * xs[n][e]), (float)sia, off[n][e]);
+                off[n][2 + e] = __fmaf_rn(-(mb * xs[n][e]), (float)sib, off[n][2 + e]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int n = 0; n < Q5K_MMA_NTILE; ++n) {
+        const int t_0 = t0 + n * 8 + 2 * q, t_1 = t_0 + 1;
+        if (t_0 < n_tok) {
+            if (row_a < n_out) out[(size_t)t_0 * n_out + row_a] = off[n][0] + acc[n][0];
+            if (row_b < n_out) out[(size_t)t_0 * n_out + row_b] = off[n][2] + acc[n][2];
+        }
+        if (t_1 < n_tok) {
+            if (row_a < n_out) out[(size_t)t_1 * n_out + row_a] = off[n][1] + acc[n][1];
+            if (row_b < n_out) out[(size_t)t_1 * n_out + row_b] = off[n][3] + acc[n][3];
+        }
+    }
+}
+
 // Gate, up and the SiLU gating for one expert tile, on the tensor cores.
 //
 // The tile is `MOE_MMA_TOK` pairs sharing one expert, cut into `MOE_MMA_NTILE`

@@ -867,6 +867,15 @@ impl Cuda {
         self.iq4_fold_once.set(on);
     }
 
+    /// Route batched Q5_K matmuls through the int8 tensor cores.
+    ///
+    /// On by default. **Not bit-exact** — see `matmul_q5_k_q8_k_mma` — so
+    /// `false` here, like `INFERRED_Q5K_SCALAR`, restores the scalar kernel and
+    /// with it equal bits. `q5k_scalar_restores_bit_equality` tests that it does.
+    pub fn q5k_mma(&self, on: bool) {
+        self.q5k_mma.set(on);
+    }
+
     /// Query rows per attention launch.
     ///
     /// **Grouping is a cache effect, not a fusion**: each row keeps its own
@@ -1216,6 +1225,53 @@ impl Cuda {
         // kernel in the engine. Both of its f32 chains are preserved per token
         // and in order, so it is bit-identical rather than within a tolerance.
         const Q5K_TOK: usize = 8;
+
+        // **Q5_K on the tensor cores, and the one matmul here outside the
+        // bit-exact set.** One `mma.m16n8k32` covers one 32-weight sub-block and
+        // one scale, and the reference already folds to f32 once per superblock,
+        // so everything reproduces except the eight int32 lanes it keeps — which
+        // an MMA cannot hand back. That collapses eight roundings per superblock
+        // into one: more accurate, and different. `INFERRED_Q5K_SCALAR` restores
+        // the scalar path and with it equal bits.
+        //
+        // Gated on `n_tok > 1` like every other prefill-only arm, so decode runs
+        // the kernel it always has and a recorded graph never sees this name.
+        // `n_out % 16 == 0` because a warp owns a 16-row tile; `attn_output` is
+        // 4096x2048, so every Q5_K width in the 35B qualifies.
+        if n_tok > 1
+            && self.q5k_mma.get()
+            && !self.q5k_scalar.get()
+            && matches!(w.ty, GgmlType::Q5K)
+            && w.n_out % 16 == 0
+        {
+            const Q5K_MMA_NTILE: usize = 4;
+            let mma = "matmul_q5_k_q8_k_mma";
+            let margs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(bd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(mma, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_q5_k_q8_k_mma`; 256 threads is
+            // eight warps covering 128 rows, the kernel clamps both tails, and
+            // it uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(
+                    mma,
+                    w.n_out.div_ceil(128) as u32,
+                    n_tok.div_ceil(8 * Q5K_MMA_NTILE) as u32,
+                    256,
+                    0,
+                    &margs,
+                )
+            };
+        }
+
         if n_tok > 1 && !self.q5k_scalar.get() && matches!(w.ty, GgmlType::Q5K) {
             let tiled = "matmul_q5_k_q8_k_tok";
             let targs = [
@@ -4406,8 +4462,15 @@ impl Ops for Cuda {
                 if self.q6k_scalar.get() { "per-token" } else { "tiled" },
                 // Was missing entirely, though `q5k_scalar` has been a flag
                 // since the tiling landed: the banner could not tell a Q5_K
-                // A/B's two arms apart.
-                if self.q5k_scalar.get() { "per-token" } else { "tiled" },
+                // A/B's two arms apart. Three states now, and `mma` is the one
+                // that is **not bit-exact** — a run's banner has to say so.
+                if self.q5k_scalar.get() {
+                    "per-token"
+                } else if self.q5k_mma.get() {
+                    "mma"
+                } else {
+                    "tiled"
+                },
                 if self.delta_seq.get() { "per-token" } else { "batched" },
                 // `iq4_staged` wins the dispatch, so it is reported first.
                 if self.iq4_untiled.get() {

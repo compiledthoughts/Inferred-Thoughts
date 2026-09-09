@@ -2617,6 +2617,203 @@ fn the_deferred_fold_stays_inside_its_derived_bound() {
     );
 }
 
+/// **Q5_K on the tensor cores, against the oracle, inside a derived bound.**
+///
+/// This is the first matmul in this project that is *not* bit-identical, so it
+/// needs the opposite kind of test from every other one here: proof that it
+/// computes the intended quantity and differs only by the reordering it was
+/// meant to introduce. "12x faster" and "12x faster because it is reading the
+/// wrong bytes" are indistinguishable to a cost bench — `dbg_iq4_mma_foldonce`
+/// measured a 1.11x speedup while dropping `+ t * 32` from its activation
+/// pointer, and only a bound like this one caught it.
+///
+/// # The bound, derived rather than fitted
+///
+/// The reference keeps eight int32 lanes and feeds each its own f32 chain across
+/// superblocks; this collapses them to one. **The integers are identical on both
+/// sides** — an int32 sum of int8 products cannot round — so the difference is
+/// entirely how many times the f32 running total is rounded: `8 * nb` against
+/// `nb`. The gap is therefore bounded by about `8 * nb` units in the last place
+/// of that total.
+///
+/// At n_in 4096, nb is 16, so the bound is `128 * 2^-24` ~ **7.6e-6** relative.
+/// Ten times that is allowed here, because the comparison is against the final
+/// f32 whose magnitude can be far smaller than the partial sums that made it —
+/// cancellation inflates relative error without either side being wrong.
+///
+/// **Note the direction**: this rounds eight times *less* often than the
+/// reference, so where they differ it is the more accurate of the two. Same
+/// shape of argument as the RMSNorm tree, and the same reason it is a decision
+/// rather than an obvious improvement — what is given up is determinism.
+///
+/// `attn_output` is 4096x2048 in the 35B, which is the first shape; the others
+/// exercise a narrower `n_in` and a partial 128-row grid. `n_tok` 13, 21 and 100
+/// are not multiples of the 32-token tile, and a padded column must contribute
+/// nothing that survives to a written-back output.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_q5_k_mma_matmul_stays_inside_its_derived_bound() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // Q5_K is 176 bytes per 256-weight superblock: f16 d, f16 dmin, 12 scale
+    // bytes, 32 of qh, 128 of qs. d and dmin are pinned to a sane half so the
+    // f32 chains stay in range; the rest is noise, which is what a differential
+    // needs.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 176];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out * sb {
+            let at = r * 176;
+            w[at] = 0x00;
+            w[at + 1] = 0x38;
+            w[at + 2] = 0x00;
+            w[at + 3] = 0x34;
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> = vec![(4096, 2048), (2048, 2048), (512, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x9e37 + n_out as u64))
+        .collect();
+
+    let mut worst_rel = 0.0f64;
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Q5K, n_in, n_out, pooled: false };
+        let nb = n_in / 256;
+        // 8 * nb roundings, one f32 ulp each, times ten for cancellation.
+        let bound = 10.0 * (8 * nb) as f64 * f64::from(f32::EPSILON);
+
+        for n_tok in [2usize, 8, 13, 21, 32, 100] {
+            let x = noise(n_in * n_tok, 0x51c7 + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut differing = 0usize;
+            let mut here = 0.0f64;
+            for (a, b) in want.iter().zip(&got) {
+                if a.to_bits() != b.to_bits() {
+                    differing += 1;
+                }
+                here = here.max(f64::from((a - b).abs()) / f64::from(scale));
+            }
+            worst_rel = worst_rel.max(here);
+            println!(
+                "  q5k mma {n_in:>5}x{n_out:<5} n_tok {n_tok:<4} \
+                 {differing:>7} of {:<7} differ   worst rel {here:e}   bound {bound:e}",
+                want.len()
+            );
+            assert!(
+                here <= bound,
+                "Q5_K on the tensor cores is outside its derived bound at \
+                 {n_in}x{n_out}, n_tok {n_tok}: {here:e} against {bound:e}. The integer \
+                 part is exact and order-free, so a miss here is not a rounding \
+                 difference. Suspect the five-bit unpack (element t of sub-block sb is \
+                 nibble sb&1 of qs[(sb>>1)*32 + t], lifted by bit sb of qh[t]), the \
+                 m16n8k32 fragment order (a0/a2 are row g's k-halves, a1/a3 row g+8's, \
+                 and Q5_K's halves are sixteen bytes apart rather than two nibbles of \
+                 one byte), the twelve-byte scale/min shuffle, or the mins term, which \
+                 is supposed to stay exact."
+            );
+        }
+    }
+    println!("  worst relative difference {worst_rel:e}, and it is the *more* accurate side");
+}
+
+/// **`INFERRED_Q5K_SCALAR` really buys bit equality back.**
+///
+/// The MMA path above is a deliberate departure from the oracle, and the whole
+/// argument for taking it is that it is reversible. A flag that is documented to
+/// restore determinism but does not is worse than no flag, so this asserts the
+/// scalar arm is still bit-identical rather than trusting that nothing drifted
+/// into it. Same test the RMSNorm tree carries for `--rms-serial`.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn q5k_scalar_restores_bit_equality() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.q5k_mma(false);
+    let cpu = Naive;
+
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 176];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out * sb {
+            let at = r * 176;
+            w[at] = 0x00;
+            w[at + 1] = 0x38;
+            w[at + 2] = 0x00;
+            w[at + 3] = 0x34;
+        }
+        w
+    };
+
+    let bytes = build(4096, 2048, 0x9e37 + 2048);
+    let w = Weights { data: &bytes, ty: GgmlType::Q5K, n_in: 4096, n_out: 2048, pooled: false };
+    let mut checked = 0usize;
+    for n_tok in [2usize, 13, 32] {
+        let x = noise(4096 * n_tok, 0x51c7 + n_tok as u64);
+        let mut want = vec![0.0f32; 2048 * n_tok];
+        cpu.matmul(&w, &x, &mut want);
+
+        let mut got = vec![0.0f32; 2048 * n_tok];
+        gpu.begin_pass(n_tok);
+        gpu.host_wrote(&x);
+        gpu.matmul(&w, &x, &mut got);
+        gpu.host_needs(&mut got);
+        gpu.end_pass();
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+        let differing = want
+            .iter()
+            .zip(&got)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("  q5k scalar 4096x2048 n_tok {n_tok:<3} {differing} of {} differ", want.len());
+        assert_eq!(
+            differing, 0,
+            "{differing} of {} outputs differ with the MMA path off. The flag exists so \
+             the tensor-core kernel's departure from the oracle is reversible, and a flag \
+             that does not restore determinism is worse than no flag at all.",
+            want.len()
+        );
+        checked += want.len();
+    }
+    gpu.q5k_mma(true);
+    println!("  {checked} outputs compared with the scalar arm, all bit-identical");
+}
+
 /// **What each attention variant costs, at prefill shapes, in seconds.**
 ///
 /// `what_attention_costs_as_context_grows` drives one query row, which is the
@@ -3613,6 +3810,11 @@ fn the_tiled_q5_k_matmul_is_bit_identical() {
 
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // **Select the tiled arm explicitly.** `matmul_q5_k_q8_k_mma` is on by
+    // default and takes this shape, and it is deliberately *not* bit-exact — so
+    // without this the test would fail, and worse, silently stop covering the
+    // kernel its name is about. The MMA path has its own derived-bound test.
+    gpu.q5k_mma(false);
     let cpu = Naive;
 
     // Q5_K: 176 bytes per 256-weight superblock — d and dmin as f16, then 12

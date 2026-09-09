@@ -186,6 +186,15 @@ pub struct Cuda {
     /// superblock where the reference rounds once per sub-block — so it is off
     /// by default and outside the exact set.
     iq4_fold_once: Cell<bool>,
+    /// Route batched Q5_K matmuls through the int8 tensor cores.
+    ///
+    /// **Not bit-exact**, and the only kernel here that is not: the reference
+    /// keeps eight int32 lanes each feeding its own f32 chain, and an MMA
+    /// contracts all 32 k-elements into one. The integers are exact on both
+    /// sides, so the difference is a fold order that rounds eight times less
+    /// often — more accurate, and different. `INFERRED_Q5K_SCALAR` restores the
+    /// scalar kernel and with it bit equality.
+    q5k_mma: Cell<bool>,
     /// Diagnostic: enable the warp score phase for one `attend` call only.
     ///
     /// **A bisector that needs no host reads.** `Ctx::trace` hands out host
@@ -802,6 +811,7 @@ impl Cuda {
                 iq4_mma: Cell::new(true),
                 iq4_staged: Cell::new(env_flag("INFERRED_IQ4_STAGED")),
                 iq4_fold_once: Cell::new(env_flag("INFERRED_IQ4_FOLD_ONCE")),
+                q5k_mma: Cell::new(!env_flag("INFERRED_Q5K_SCALAR")),
                 qgroup: Cell::new(8),
                 attn_fused: Cell::new(env_flag("INFERRED_ATTN_FUSED")),
                 // **Read here rather than plumbed through each command.**
