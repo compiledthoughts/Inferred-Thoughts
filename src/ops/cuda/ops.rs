@@ -783,6 +783,15 @@ impl Cuda {
         self.q6k_scalar.set(on);
     }
 
+    /// Force the one-token Q5_K matmul, so the tiled one can be priced against
+    /// it in the same process. **This one needs the toggle more than Q6_K did**:
+    /// it was reverted on 09-09 on a 2,240-token reading of 399 against 402,
+    /// inside a 2% spread, minutes before an 11,237-token reading of 380.9
+    /// against 366.2 said the opposite.
+    pub fn q5k_scalar(&self, on: bool) {
+        self.q5k_scalar.set(on);
+    }
+
     /// Tiles the last grouped routed FFN cut its chunk into, or `None` if no
     /// grouped launch has happened.
     ///
@@ -1137,6 +1146,33 @@ impl Cuda {
         // Gated on `n_tok > 1` like the IQ4_XS variant above, so decode runs
         // the identical kernel it always has and a recorded graph never sees
         // this name.
+        // Q5_K, the same reuse and the same gate. Its twelve-byte scale/min
+        // shuffle and its five-bit unpack are both token-independent, and it is
+        // **9.7% of prefill at 0.26% of the int8 ceiling** — the worst-utilised
+        // kernel in the engine. Both of its f32 chains are preserved per token
+        // and in order, so it is bit-identical rather than within a tolerance.
+        const Q5K_TOK: usize = 8;
+        if n_tok > 1 && !self.q5k_scalar.get() && matches!(w.ty, GgmlType::Q5K) {
+            let tiled = "matmul_q5_k_q8_k_tok";
+            let targs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(bd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(tiled, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_q5_k_q8_k_tok`; the grid covers
+            // `n_out` rows by ceil(n_tok / Q5K_TOK) token tiles, the kernel
+            // clamps its own tail, and it uses no dynamic shared memory.
+            return unsafe {
+                self.launch_grid2(tiled, grid_rows, n_tok.div_ceil(Q5K_TOK) as u32, block, 0, &targs)
+            };
+        }
+
         const Q6K_TOK: usize = 8;
         if n_tok > 1 && !self.q6k_scalar.get() && matches!(w.ty, GgmlType::Q6K) {
             let tiled = "matmul_q6_k_q8_k_tok";

@@ -3219,3 +3219,103 @@ fn what_the_k_quant_matmuls_cost() {
         }
     }
 }
+
+/// **The token-tiled Q5_K matmul, against the oracle, bit for bit.**
+///
+/// The sibling of `the_tiled_q6_k_matmul_is_bit_identical`, and the harder of
+/// the two: Q5_K carries **two** f32 chains, not one. The eight interleaved
+/// `sums[l]` accumulate the scaled products, while a separate `dmin` chain
+/// accumulates `-dmin * sumi` inside the super-block loop, *before* the eight
+/// lanes are folded in — and both updates are fused where Q6_K's are not.
+/// Tiling has to keep all of that per token and in order.
+///
+/// So the failure this guards against is specific: getting the `dmin` chain
+/// right for token 0 and wrong for the rest, which a single-token test cannot
+/// see and which shows up as a small bias rather than as garbage.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_tiled_q5_k_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // Q5_K: 176 bytes per 256-weight superblock — d and dmin as f16, then 12
+    // packed six-bit scale/min bytes, qh[32] as the fifth bit-plane, qs[128] as
+    // nibbles. Transcribed from `block_q5_K` in ggml-common.h.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 176];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 176;
+                // d and dmin = 0.5 in f16, so the two f32 chains stay in range.
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+                w[at + 2] = 0x00;
+                w[at + 3] = 0x38;
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> = vec![(2048, 2048), (2048, 4096), (512, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x5c19 + n_out as u64))
+        .collect();
+
+    let mut checked = 0usize;
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Q5K, n_in, n_out, pooled: false };
+
+        for n_tok in [2usize, 8, 13, 21, 32] {
+            let x = noise(n_in * n_tok, 0x7d0b + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let differing = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f32, |m: f32, (a, b)| m.max((a - b).abs()));
+            println!(
+                "  q5k tok {n_in:>5}x{n_out:<5} n_tok {n_tok:<3} \
+                 {differing:>7} of {:<7} differ   worst {worst:e}",
+                want.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "{differing} of {} outputs differ at {n_in}x{n_out}, n_tok {n_tok}, \
+                 worst {worst:e}. The tiled Q5_K path must equal the oracle bit for \
+                 bit. Suspect the per-token `dmin` chain (it must accumulate inside \
+                 the super-block loop, fused, ahead of the eight-lane fold), the \
+                 per-token `bsums` offset, or the padding slots.",
+                want.len()
+            );
+            checked += want.len();
+        }
+    }
+    println!("  {checked} outputs compared, all bit-identical");
+}

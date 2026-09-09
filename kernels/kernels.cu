@@ -1998,6 +1998,154 @@ __global__ void matmul_q5_k_q8_k(int n_in, int n_out,
     if (lane == 0) out[(size_t)tok * n_out + j] = sumf;
 }
 
+// Tokens per weight load in the batched Q5_K matmul. Same reasoning and the
+// same figure as `Q6K_TOK`: the five-bit unpack and the twelve-byte scale/min
+// shuffle both depend only on the weight, and `matmul_q5_k_q8_k` ran them again
+// for every token because its `blockIdx.y` is the token.
+#define Q5K_TOK 8
+
+// Q5_K x Q8_K over a batch, one warp per output row and `Q5K_TOK` tokens.
+//
+// **Bit-identical to `matmul_q5_k_q8_k` by construction.** Both of its f32
+// chains are preserved per token and in order: the `dmin` chain accumulates
+// into `sumf` inside the super-block loop, ahead of the eight-lane fold, and
+// both of its updates stay fused. The eight interleaved `sums[l]` accumulators
+// keep their lane and their ascending order. Only how many outputs one weight
+// load serves changes.
+//
+// The token-independent work hoisted out of the token loop is the whole point:
+// the `u0..u3` shuffle -- a dozen integer ops that turn 12 bytes into 8 scales
+// and 8 mins -- and the per-index `av`, which reads a nibble of `qs` and a bit
+// of `qh`. The mins are token-independent too, but `sumi` folds them against
+// the token's own `bsums`, so that stays per token.
+//
+// Padding tokens read token 0 and are discarded at the write-back, as in
+// `matmul_q6_k_q8_k_tok`, so the inner loop carries no branch.
+__global__ void matmul_q5_k_q8_k_tok(int n_in, int n_out, int n_tok,
+                                     const unsigned char *__restrict__ w,
+                                     const float *__restrict__ x_scales,
+                                     const signed char *__restrict__ x_quants,
+                                     const short *__restrict__ x_bsums,
+                                     float *__restrict__ out) {
+    const unsigned int KMASK1 = 0x3f3f3f3fu;
+    const unsigned int KMASK2 = 0x0f0f0f0fu;
+    const unsigned int KMASK3 = 0x03030303u;
+
+    const int nb   = n_in / QK_K;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j    = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (j >= n_out) return;
+    const int t0 = blockIdx.y * Q5K_TOK;
+
+    const int l = lane & 7;
+    const int g = lane >> 3;
+
+    int ts[Q5K_TOK];
+#pragma unroll
+    for (int t = 0; t < Q5K_TOK; ++t) ts[t] = (t0 + t < n_tok) ? (t0 + t) : 0;
+
+    const unsigned char *row = w + (size_t)j * nb * Q5K_BYTES;
+
+    float sum_l[Q5K_TOK];   // sums[l], per token
+    float sumf[Q5K_TOK];    // the dmin chain, lane 0's, per token
+#pragma unroll
+    for (int t = 0; t < Q5K_TOK; ++t) {
+        sum_l[t] = 0.0f;
+        sumf[t]  = 0.0f;
+    }
+
+    for (int i = 0; i < nb; ++i) {
+        const unsigned char *blk = row + (size_t)i * Q5K_BYTES;
+        const unsigned short d16    = (unsigned short)blk[0] | ((unsigned short)blk[1] << 8);
+        const unsigned short dmin16 = (unsigned short)blk[2] | ((unsigned short)blk[3] << 8);
+        const unsigned char *qh = blk + 16;
+        const unsigned char *qs = blk + 16 + QK_K / 8;
+
+        // Token-independent, and this is what used to run once per token.
+        unsigned int u0 = *(const unsigned int *)(blk + 4);
+        unsigned int u1 = *(const unsigned int *)(blk + 8);
+        unsigned int u2 = *(const unsigned int *)(blk + 12);
+        const unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+        const unsigned int uaux = u1 & KMASK1;
+        u1 = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+        u2 = uaux;
+        u0 &= KMASK1;
+
+        int aux[Q5K_TOK];
+#pragma unroll
+        for (int t = 0; t < Q5K_TOK; ++t) aux[t] = 0;
+
+        for (int jj = g * 2; jj < g * 2 + 2; ++jj) {
+            const unsigned int su = (jj < 4) ? u0 : u1;
+            const int scale = (int)((su >> ((jj & 3) * 8)) & 0xff);
+            for (int q = 0; q < 4; ++q) {
+                const int idx = jj * 32 + q * 8 + l;
+
+                const int jj4  = idx >> 6;
+                const int r    = idx & 63;
+                const int half = r >> 5;
+                const int l2   = r & 31;
+                const unsigned char q4 = qs[jj4 * 32 + l2];
+                const int base = (half == 0) ? (q4 & 0xF) : (q4 >> 4);
+                const int av = base + (((qh[l2] >> (jj4 * 2 + half)) & 1) ? 16 : 0);
+
+#pragma unroll
+                for (int t = 0; t < Q5K_TOK; ++t) {
+                    const signed char *q8 =
+                        x_quants + (size_t)ts[t] * n_in + (size_t)i * QK_K;
+                    const short aux16 = (short)((int)q8[idx] * av);
+                    aux[t] += scale * (int)aux16;
+                }
+            }
+        }
+
+#pragma unroll
+        for (int t = 0; t < Q5K_TOK; ++t) {
+            aux[t] += __shfl_down_sync(0xffffffff, aux[t], 16);
+            aux[t] += __shfl_down_sync(0xffffffff, aux[t], 8);
+        }
+
+        if (lane < 8) {
+            const float dv = h2f(d16);
+#pragma unroll
+            for (int t = 0; t < Q5K_TOK; ++t) {
+                const float d = dv * x_scales[(size_t)ts[t] * nb + i];
+                // FUSED, as in the one-token kernel.
+                sum_l[t] = __fmaf_rn(d, (float)aux[t], sum_l[t]);
+            }
+        }
+        if (lane == 0) {
+            const float dmv = h2f(dmin16);
+#pragma unroll
+            for (int t = 0; t < Q5K_TOK; ++t) {
+                const short *bs =
+                    x_bsums + (size_t)ts[t] * nb * (QK_K / 16) + (size_t)i * (QK_K / 16);
+                int sumi = 0;
+                for (int k = 0; k < QK_K / 16; ++k) {
+                    const int mk = k >> 1;
+                    const unsigned int mu = (mk < 4) ? u2 : u3;
+                    sumi += (int)bs[k] * (int)((mu >> ((mk & 3) * 8)) & 0xff);
+                }
+                const float dmin = dmv * x_scales[(size_t)ts[t] * nb + i];
+                // FUSED, and inside the loop, before the lanes are folded in.
+                sumf[t] = __fmaf_rn(-dmin, (float)sumi, sumf[t]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < Q5K_TOK; ++t) {
+        for (int k = 0; k < 8; ++k) {
+            const float v = __shfl_sync(0xffffffff, sum_l[t], k);
+            if (lane == 0) sumf[t] += v;
+        }
+        if (lane == 0 && t0 + t < n_tok) {
+            out[(size_t)(t0 + t) * n_out + j] = sumf[t];
+        }
+    }
+}
+
 // IQ4_XS x Q8_K, one warp per output row.
 //
 // The odd one of the three. Its accumulation is a **single** `sumf`, not eight
