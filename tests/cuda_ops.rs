@@ -2380,6 +2380,243 @@ fn the_mma_iq4_matmul_is_bit_identical() {
     println!("  {checked} outputs compared, all bit-identical");
 }
 
+/// **The staged tile against the oracle, bit for bit.**
+///
+/// `matmul_iq4_xs_q8_k_staged` computes the same products in the same order as
+/// `matmul_iq4_xs_q8_k_mma`; only where the operands come from changes. So this
+/// is not a hopeful tolerance test — it is the assertion that a pure
+/// data-movement change moved no bits, which is the only thing that makes the
+/// cost A/B beside it interpretable.
+///
+/// Storing `d` and `ls` separately in shared, rather than pre-folding
+/// `d * (ls - 32)` as `load_tiles_iq4_xs` does, is what this depends on:
+/// `c8131e5` measured that reassociation as outside the exact set.
+///
+/// The shapes exercise both tails. `n_out` 512, 1024 and 2048 are whole
+/// multiples of the 64-row tile; 2048x1024 is not a multiple of 128, so a
+/// grid whose last block is half empty gets covered. `n_tok` 13 and 21 are not
+/// multiples of the 64-token tile, and a clamped token column must contribute
+/// nothing that survives to a written-back output — the load clamps to
+/// `n_tok - 1` rather than skipping, so a write-back that forgot its bound
+/// would produce a *plausible duplicate* row rather than a crash.
+///
+/// Every weight buffer is held for the whole test: `Cuda` keys its device
+/// copies on the host address, so a per-shape buffer that is dropped hands the
+/// next shape a recycled address and the previous shape's weights.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_staged_iq4_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // IQ4_XS: 136 bytes per 256-weight superblock, as `build` in
+    // `the_mma_iq4_matmul_is_bit_identical`. The d bytes are fixed so the
+    // values stay in range; the rest is noise.
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> =
+        vec![(2048, 512), (2048, 2048), (512, 2048), (2048, 1024)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x9e37 + n_out as u64))
+        .collect();
+
+    let mut checked = 0usize;
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
+
+        for n_tok in [2usize, 8, 13, 21, 32, 64, 100] {
+            let x = noise(n_in * n_tok, 0x51c7 + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            gpu.iq4_staged(true);
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            gpu.iq4_staged(false);
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let differing = want
+                .iter()
+                .zip(&got)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let worst = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f32, |m: f32, (a, b)| m.max((a - b).abs()));
+            println!(
+                "  staged {n_in:>5}x{n_out:<5} n_tok {n_tok:<4} \
+                 {differing:>7} of {:<7} differ   worst {worst:e}",
+                want.len()
+            );
+            assert_eq!(
+                differing, 0,
+                "{differing} of {} outputs differ at {n_in}x{n_out}, n_tok {n_tok}, \
+                 worst {worst:e}. Staging is a data-movement change and must move no \
+                 bits. Suspect the shared row stride (68 ints, so row g starts at bank \
+                 4g), the staged nibble mapping (lane i takes qs + 4i, giving sub-block \
+                 i>>2 and quad i&3, low nibbles k<16 and high nibbles k>=16 of the same \
+                 four bytes), the clamped row or token tail, or a missing __syncthreads \
+                 between the write of one superblock's stage and the read of the next.",
+                want.len()
+            );
+            checked += want.len();
+        }
+    }
+    println!("  {checked} outputs compared, all bit-identical");
+}
+
+/// **The deferred fold, against the oracle, inside a derived bound.**
+///
+/// `dbg_iq4_mma_foldonce` is the one IQ4_XS variant here that is *not*
+/// bit-identical, so it needs the opposite kind of test: proof that it computes
+/// the intended quantity and differs only by the rounding it was meant to
+/// change. Without this, "1.11x for a fold reorder" is indistinguishable from
+/// "1.11x for doing less work incorrectly".
+///
+/// # The bound, derived rather than fitted
+///
+/// Both kernels accumulate `(ls - 32) * s` — an integer product, exact — and
+/// differ only in when they convert and fold. The reference does
+/// `acc += (d * xs) * (ls_t - 32) * s_t` once per sub-block, so `8 * nb`
+/// roundings; this does it once per superblock, so `nb`. The two sums are the
+/// same real number, so the gap is bounded by the roundings neither shares:
+/// about `8 * nb` units in the last place of the running total, relative.
+///
+/// At n_in 2048, nb is 8, so the bound is `64 * 2^-24`, about **3.8e-6**
+/// relative. Ten times that is allowed here, because the comparison is against
+/// the *final* f32 result whose own magnitude can be much smaller than the
+/// partial sums that produced it — cancellation inflates relative error without
+/// either kernel being wrong.
+///
+/// **Note the direction**: this kernel rounds eight times less often than the
+/// reference, so where they differ it is the more accurate of the two. Same
+/// shape of argument as the RMSNorm tree, and the same reason it is still a
+/// decision rather than an obvious improvement — determinism is what is given
+/// up, not accuracy.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_deferred_fold_stays_inside_its_derived_bound() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    let build = |n_in: usize, n_out: usize, seed: u64| -> Vec<u8> {
+        let sb = n_in / 256;
+        let mut w = vec![0u8; n_out * sb * 136];
+        let mut x = seed | 1;
+        for b in w.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = (x & 0xff) as u8;
+        }
+        for r in 0..n_out {
+            for k in 0..sb {
+                let at = (r * sb + k) * 136;
+                w[at] = 0x00;
+                w[at + 1] = 0x38;
+            }
+        }
+        w
+    };
+
+    let cases: Vec<(usize, usize)> = vec![(2048, 2048), (512, 2048)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| build(n_in, n_out, 0x9e37 + n_out as u64))
+        .collect();
+
+    let mut worst_rel = 0.0f64;
+    let mut worst_where = (0usize, 0usize, 0usize);
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
+        let nb = n_in / 256;
+        // 8 * nb roundings, one f32 ulp each, times ten for cancellation.
+        let bound = 10.0 * (8 * nb) as f64 * f64::from(f32::EPSILON);
+
+        for n_tok in [8usize, 32, 64] {
+            let x = noise(n_in * n_tok, 0x51c7 + n_tok as u64);
+
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            gpu.iq4_mma(true);
+            gpu.iq4_fold_once(true);
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            gpu.iq4_fold_once(false);
+            gpu.iq4_mma(false);
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            // Scaled by the row's magnitude, not by each element, so an output
+            // that cancels to near zero does not read as a huge relative error.
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let mut differing = 0usize;
+            for (a, b) in want.iter().zip(&got) {
+                if a.to_bits() != b.to_bits() {
+                    differing += 1;
+                }
+                let rel = f64::from((a - b).abs()) / f64::from(scale);
+                if rel > worst_rel {
+                    worst_rel = rel;
+                    worst_where = (n_in, n_out, n_tok);
+                }
+            }
+            println!(
+                "  foldonce {n_in:>5}x{n_out:<5} n_tok {n_tok:<3} \
+                 {differing:>7} of {:<7} differ   worst rel {worst_rel:e}   bound {bound:e}",
+                want.len()
+            );
+            assert!(
+                worst_rel <= bound,
+                "deferred fold is outside its derived bound at {n_in}x{n_out}, n_tok {n_tok}: \
+                 {worst_rel:e} against {bound:e}. The integer part is exact and order-free, so a \
+                 miss here is not a rounding difference — suspect int32 overflow in `acci` \
+                 (bounded by 8 * 31 * 32 * 127 * 127, well inside), the `ls - 32` bias having \
+                 moved, or `xs` being read for the wrong token."
+            );
+        }
+    }
+    println!(
+        "  worst relative difference {worst_rel:e} at {worst_where:?}, \
+         and it is the *more* accurate side"
+    );
+}
+
 /// **What each attention variant costs, at prefill shapes, in seconds.**
 ///
 /// `what_attention_costs_as_context_grows` drives one query row, which is the
@@ -2639,58 +2876,102 @@ fn what_the_dense_iq4_matmul_costs() {
         "  ceiling {MMA_S8_PEAK_TOPS:.0} TOPS int8 / {MMA_F16_PEAK_TFLOPS:.0} TFLOP-s fp16 / 448 GB-s"
     );
     println!(
-        "  {:>6} {:>6} {:>6}  {:>10}  {:>10}  {:>9}  {:>7}",
-        "n_in", "n_out", "n_tok", "ms", "GB/s wt", "TOPS", "of peak"
+        "  {:>6} {:>6} {:>6}  {:>8}  {:>8}  {:>8}  {:>8}   {:>6} {:>6}  {:>7}",
+        "n_in", "n_out", "n_tok", "with bus", "bare", "staged", "fold1x", "stg", "fold", "bare pk"
     );
 
-    gpu.iq4_mma(true);
+    // **Both arms inside one shape loop, alternating**, because every result
+    // this project retracted came from comparing runs an hour apart and every
+    // one that survived came from interleaved arms. A drifting machine cancels
+    // out of a difference taken this way and does not cancel out of two runs.
+    //
+    // The `mma ms` column is the canary: 2048x8192 at n_tok 512 reads ~2.0 ms
+    // on a healthy machine and read 6.6 during the 09-09 fault.
+    // `bus`: keep the `host_wrote` / `host_needs` pair, which is what the
+    // caller does. `!bus`: drop both, so the timing is the launch and the
+    // kernel with an explicit sync instead.
+    //
+    // **The two columns exist because seven kernel changes in a row measured
+    // ~1.0x here**, and at these shapes `x` and `out` are each up to 16.8 MB a
+    // rep. A bench whose fixed cost is larger than the thing it varies reports
+    // 1.00x whatever the kernel does, and says nothing about why.
+    let time_one = |w: &Weights, x: &[f32], out: &mut [f32], n_tok: usize, bus: bool| -> f64 {
+        let run = |out: &mut [f32]| {
+            gpu.begin_pass(n_tok);
+            if bus {
+                gpu.host_wrote(x);
+            }
+            gpu.matmul(w, x, out);
+            if bus {
+                gpu.host_needs(out);
+            }
+            gpu.end_pass();
+            if !bus {
+                let _ = gpu.sync();
+            }
+        };
+        // Upload `x` once when the timed loop will not.
+        if !bus {
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(x);
+            gpu.end_pass();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            for _ in 0..2 {
+                run(out);
+            }
+            let t = std::time::Instant::now();
+            const REPS: u32 = 10;
+            for _ in 0..REPS {
+                run(out);
+            }
+            let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
+            if ms < best {
+                best = ms;
+            }
+        }
+        best
+    };
+
     for (&(n_in, n_out), bytes) in shapes.iter().zip(&held) {
         let w = Weights { data: bytes, ty: GgmlType::Iq4Xs, n_in, n_out, pooled: false };
         for (&n_tok, act) in toks.iter().zip(&acts) {
             let x = &act[..n_in * n_tok];
             let mut out = vec![0.0f32; n_out * n_tok];
 
-            let mut best = f64::MAX;
-            for _ in 0..3 {
-                for _ in 0..2 {
-                    gpu.begin_pass(n_tok);
-                    gpu.host_wrote(x);
-                    gpu.matmul(&w, x, &mut out);
-                    gpu.host_needs(&mut out);
-                    gpu.end_pass();
-                }
-                let t = std::time::Instant::now();
-                const REPS: u32 = 10;
-                for _ in 0..REPS {
-                    gpu.begin_pass(n_tok);
-                    gpu.host_wrote(x);
-                    gpu.matmul(&w, x, &mut out);
-                    gpu.host_needs(&mut out);
-                    gpu.end_pass();
-                }
-                let ms = t.elapsed().as_secs_f64() * 1e3 / REPS as f64;
-                if ms < best {
-                    best = ms;
-                }
-            }
+            gpu.iq4_staged(false);
+            gpu.iq4_mma(true);
+            let mma = time_one(&w, x, &mut out, n_tok, true);
+            let bare = time_one(&w, x, &mut out, n_tok, false);
+
+            gpu.iq4_staged(true);
+            let staged = time_one(&w, x, &mut out, n_tok, false);
+            gpu.iq4_staged(false);
+
+            // The third arm removes nothing from memory and everything but one
+            // fold from between the MMAs. If the two above are washes and this
+            // is not, the bound was never data movement.
+            gpu.iq4_fold_once(true);
+            let folded = time_one(&w, x, &mut out, n_tok, false);
+            gpu.iq4_fold_once(false);
+            gpu.iq4_mma(false);
             assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 
-            // Weight bytes read once through, which is the floor. The kernel
-            // reads them once per token tile, so the rate this reports rises
-            // when the tile spans more tokens even though the floor does not.
-            let wt = (n_out * (n_in / 256) * 136) as f64;
-            let gbs = wt / (best * 1e-3) / 1e9;
             // **The number that says how much of the card is idle**, and the
             // one this bench existed without. Two ops per MAC, against a
             // ceiling that was measured rather than taken from a spec sheet.
-            let tops = 2.0 * (n_in * n_out * n_tok) as f64 / (best * 1e-3) / 1e12;
-            let frac = 100.0 * tops / MMA_S8_PEAK_TOPS;
+            let ops = 2.0 * (n_in * n_out * n_tok) as f64;
+            let pk = |ms: f64| 100.0 * (ops / (ms * 1e-3) / 1e12) / MMA_S8_PEAK_TOPS;
             println!(
-                "  {n_in:>6} {n_out:>6} {n_tok:>6}  {best:>10.4}  {gbs:>10.1}  {tops:>9.2}  {frac:>6.1}%"
+                "  {n_in:>6} {n_out:>6} {n_tok:>6}  {mma:>8.4}  {bare:>8.4}  {staged:>8.4}  \
+                 {folded:>8.4}   {:>5.2}x  {:>5.2}x  {:>6.1}%",
+                bare / staged,
+                bare / folded,
+                pk(bare)
             );
         }
     }
-    gpu.iq4_mma(false);
 }
 
 /// **The token-tiled Q6_K matmul, against the oracle, bit for bit.**

@@ -173,6 +173,19 @@ pub struct Cuda {
     /// **On by default**, because it is bit-identical to the oracle and 1.72x
     /// on prefill. `--iq4-scalar` restores the warp dot for the A/B.
     iq4_mma: Cell<bool>,
+    /// Route batched IQ4_XS matmuls through the shared-memory staged tile.
+    ///
+    /// Off by default while it is measured. `INFERRED_IQ4_STAGED=1` selects it
+    /// in place of the register-tiled MMA kernel; both are bit-identical to the
+    /// oracle, so this is a cost A/B and not a correctness one.
+    iq4_staged: Cell<bool>,
+    /// Defer the IQ4_XS f32 fold to once per superblock.
+    ///
+    /// A cost probe for what sits between the MMAs, and the candidate that
+    /// would follow if it is the bound. **Not bit-exact** — it rounds once per
+    /// superblock where the reference rounds once per sub-block — so it is off
+    /// by default and outside the exact set.
+    iq4_fold_once: Cell<bool>,
     /// Diagnostic: enable the warp score phase for one `attend` call only.
     ///
     /// **A bisector that needs no host reads.** `Ctx::trace` hands out host
@@ -787,6 +800,8 @@ impl Cuda {
                 delta_seq: Cell::new(env_flag("INFERRED_DELTA_SEQ")),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
+                iq4_staged: Cell::new(env_flag("INFERRED_IQ4_STAGED")),
+                iq4_fold_once: Cell::new(env_flag("INFERRED_IQ4_FOLD_ONCE")),
                 qgroup: Cell::new(8),
                 attn_fused: Cell::new(env_flag("INFERRED_ATTN_FUSED")),
                 // **Read here rather than plumbed through each command.**

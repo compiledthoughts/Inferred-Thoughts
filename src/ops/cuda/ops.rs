@@ -847,6 +847,26 @@ impl Cuda {
         self.iq4_mma.set(on);
     }
 
+    /// Select the shared-memory staged tile in place of the register-tiled MMA.
+    ///
+    /// Both kernels compute the same bits in the same order; they differ only
+    /// in where the operands come from, so this is an A/B over access shape.
+    /// `INFERRED_IQ4_STAGED=1` sets it for a whole process, which is what makes
+    /// `serve` measurable without a rebuild.
+    pub fn iq4_staged(&self, on: bool) {
+        self.iq4_staged.set(on);
+    }
+
+    /// Defer the IQ4_XS f32 fold to once per superblock.
+    ///
+    /// A probe for what sits between the MMAs. **Not bit-exact** — the
+    /// integer part is exact and order-free, but folding once per superblock
+    /// rounds eight times less often than the reference does, which is a
+    /// different f32 answer. Off unless a caller asks.
+    pub fn iq4_fold_once(&self, on: bool) {
+        self.iq4_fold_once.set(on);
+    }
+
     /// Query rows per attention launch.
     ///
     /// **Grouping is a cache effect, not a fusion**: each row keeps its own
@@ -1070,12 +1090,56 @@ impl Cuda {
         // be a whole number of 16-row tiles — every IQ4_XS width the 35B uses
         // is (512, 1024, 2048, 4096, 8192), and anything else falls through to
         // the kernels above rather than reading past a row.
+        // The staged tile, ahead of the register-tiled MMA because it is the
+        // same arithmetic in the same order and differs only in where the
+        // operands come from. `ST_TILE_M` is 64, so the row guard is the same
+        // 16-row multiple the kernel below needs and a partial tile is clamped
+        // on load and dropped on write-back.
+        if n_tok > 1
+            && self.iq4_staged.get()
+            && matches!(w.ty, GgmlType::Iq4Xs)
+            && w.n_out % 16 == 0
+        {
+            const ST_TILE_M: usize = 64;
+            const ST_TILE_N: usize = 64;
+            let staged = "matmul_iq4_xs_q8_k_staged";
+            let sargs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(wd),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape(staged, w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_iq4_xs_q8_k_staged`; the block is
+            // `ST_TILE_M / 16` warps, the kernel declares its shared memory
+            // statically, and both tails are clamped inside it.
+            return unsafe {
+                self.launch_grid2(
+                    staged,
+                    w.n_out.div_ceil(ST_TILE_M) as u32,
+                    n_tok.div_ceil(ST_TILE_N) as u32,
+                    (ST_TILE_M / 16 * 32) as u32,
+                    0,
+                    &sargs,
+                )
+            };
+        }
+
         if n_tok > 1
             && self.iq4_mma.get()
             && matches!(w.ty, GgmlType::Iq4Xs)
             && w.n_out % 16 == 0
         {
-            let mma = "matmul_iq4_xs_q8_k_mma";
+            // Same geometry and same arguments as the real kernel, so the A/B
+            // differs in nothing but what happens between the MMAs.
+            let mma = if self.iq4_fold_once.get() {
+                "dbg_iq4_mma_foldonce"
+            } else {
+                "matmul_iq4_xs_q8_k_mma"
+            };
             let margs = [
                 KArg::I32(w.n_in as i32),
                 KArg::I32(w.n_out as i32),
@@ -4291,11 +4355,18 @@ impl Ops for Cuda {
         out.push((
             "kernels",
             format!(
-                "q6k={} delta={} iq4={} attn={} rms={} graphs={}",
+                "q6k={} q5k={} delta={} iq4={} attn={} rms={} graphs={}",
                 if self.q6k_scalar.get() { "per-token" } else { "tiled" },
+                // Was missing entirely, though `q5k_scalar` has been a flag
+                // since the tiling landed: the banner could not tell a Q5_K
+                // A/B's two arms apart.
+                if self.q5k_scalar.get() { "per-token" } else { "tiled" },
                 if self.delta_seq.get() { "per-token" } else { "batched" },
+                // `iq4_staged` wins the dispatch, so it is reported first.
                 if self.iq4_untiled.get() {
                     "untiled"
+                } else if self.iq4_staged.get() {
+                    "staged"
                 } else if self.iq4_mma.get() {
                     "mma"
                 } else {
@@ -4328,6 +4399,8 @@ impl Ops for Cuda {
         // different from the last one" is the question these answer.
         let env: Vec<&str> = [
             ("INFERRED_Q6K_SCALAR", self.q6k_scalar.get()),
+            ("INFERRED_Q5K_SCALAR", self.q5k_scalar.get()),
+            ("INFERRED_IQ4_STAGED", self.iq4_staged.get()),
             ("INFERRED_DELTA_SEQ", self.delta_seq.get()),
             ("INFERRED_ATTN_MMA", self.attn_mma.get()),
             ("INFERRED_ATTN_VMMA", self.attn_vmma.get()),
