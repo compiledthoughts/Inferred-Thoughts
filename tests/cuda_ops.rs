@@ -1225,8 +1225,14 @@ fn what_attention_costs_as_context_grows() {
             gpu.host_needs(&mut out);
             t0.elapsed().as_secs_f64() * 1e6 / f64::from(REPS)
         };
+        // The scalar arms are forced off the tensor cores, which decode takes
+        // past its threshold by default.
+        gpu.attn_decode_mma(Some(false));
         let us = timed(false);
         let warp_us = timed(true);
+        gpu.attn_decode_mma(Some(true));
+        let mma_us = timed(true);
+        gpu.attn_decode_mma(None);
         gpu.attn_warp(None);
 
         // K and V, both f16, over the live window.
@@ -1246,6 +1252,11 @@ fn what_attention_costs_as_context_grows() {
             slope,
         );
         prev = Some((d, warp_us));
+        println!(
+            "  {:>7}  tensor cores {mma_us:>9.1} us, {:.2}x the warp phase",
+            "",
+            warp_us / mma_us
+        );
     }
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
 }
@@ -1410,6 +1421,183 @@ fn which_buffer_bends_attention_at_depth() {
         "\n  slope: ms of {LAYERS} layers per prompt token, per position; the whole-model fit \
          is 1.038e-4 shallow and 1.301e-4 deep\n"
     );
+}
+
+/// **Decode attention on the tensor cores, against the oracle, inside the same
+/// derived bound as prefill's.**
+///
+/// `attn_decode`'s tensor-core mode fills the tile's slots with the query heads
+/// that share a kv head, in one row -- a different slot map from prefill's rows
+/// of one query head, so it is checked on its own, at n_q 1 and forced on at
+/// every depth, including ones below where it would be chosen. The bound and its
+/// derivation are those of `the_tensor_core_attention_stays_inside_its_derived_bound`.
+///
+/// A forced mode that silently fell back to the scalar path would pass a bound
+/// test, so each case also runs the scalar mode and asserts the two differ: the
+/// tensor-core mode rounds Q through f16, and matching bits would mean it never
+/// ran.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // (head_dim, n_head, n_head_kv, depths): the 35B, the 0.6B, and one query
+    // head per kv head so a single slot is live.
+    let shapes: [(usize, usize, usize, &[usize]); 3] = [
+        (256, 16, 2, &[1, 40, 129, 4096, 32769]),
+        (128, 16, 8, &[1, 40, 4096]),
+        (128, 16, 16, &[40, 4096]),
+    ];
+
+    // Held for the whole test: mirrors key on host addresses.
+    struct Held {
+        kf: Vec<f32>,
+        vf: Vec<f32>,
+        k: Vec<u16>,
+        v: Vec<u16>,
+        q: Vec<f32>,
+        mma: Vec<f32>,
+        scalar: Vec<f32>,
+    }
+    let mut held: Vec<Held> = shapes
+        .iter()
+        .enumerate()
+        .map(|(si, &(head_dim, n_head, n_head_kv, depths))| {
+            let kv_dim = n_head_kv * head_dim;
+            let max_pos = depths.iter().copied().max().unwrap_or(0);
+            let kf = noise(max_pos * kv_dim, 0x6c00 + si as u64);
+            let vf = noise(max_pos * kv_dim, 0x7700 + si as u64);
+            let k = kf.iter().map(|&x| f32_to_f16(x)).collect();
+            let v = vf.iter().map(|&x| f32_to_f16(x)).collect();
+            let q = noise(n_head * head_dim, 0x7200 + si as u64);
+            Held { kf, vf, k, v, mma: vec![0.0; q.len()], scalar: vec![0.0; q.len()], q }
+        })
+        .collect();
+
+    let f16_slack = 1.0 + 2f64.powi(-10);
+    let norm = |r: &[f32]| r.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt();
+    let mut worst_ratio = 0.0f64;
+    for (si, &(head_dim, n_head, n_head_kv, depths)) in shapes.iter().enumerate() {
+        let kv_dim = n_head_kv * head_dim;
+        let Held { kf, vf, k, v, q, mma, scalar } = &mut held[si];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q2 = q.chunks_exact(head_dim).map(norm).fold(0.0, f64::max) * f16_slack;
+
+        for &n_pos in depths {
+            let a = Attn { q: &q[..], k: &k[..], v: &v[..], kv_dim, n_pos, head_dim, n_head, n_head_kv, scale };
+            let mut want = vec![0.0f32; q.len()];
+            Naive.attend(&a, &mut want);
+
+            for (force, into) in [(true, &mut *mma), (false, &mut *scalar)] {
+                gpu.attn_decode_mma(Some(force));
+                gpu.begin_pass(1);
+                gpu.attend(&a, &mut into[..]);
+                gpu.host_needs(&mut into[..]);
+                gpu.end_pass();
+            }
+            gpu.attn_decode_mma(None);
+            if let Some(e) = gpu.take_error() {
+                panic!("cuda error at hd{head_dim} kv{n_head_kv} d{n_pos}: {e}");
+            }
+
+            let k2 = kf[..n_pos * kv_dim].chunks_exact(head_dim).map(norm).fold(0.0, f64::max) * f16_slack;
+            let vmax =
+                vf[..n_pos * kv_dim].iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs())) * f16_slack;
+            let d = 2f64.powi(-11) * f64::from(scale) * q2 * k2;
+            let bound = vmax * ((2.0 * d).exp_m1() + 2f64.powi(-11) + n_pos as f64 * 2f64.powi(-25))
+                + f64::from(attend_tolerance(n_pos, &want));
+            let worst = want
+                .iter()
+                .zip(mma.iter())
+                .fold(0.0f64, |m, (x, y)| m.max((f64::from(*x) - f64::from(*y)).abs()));
+            let (_, from_scalar) = compare(&scalar[..], &mma[..]);
+            worst_ratio = worst_ratio.max(worst / bound);
+            println!(
+                "  hd{head_dim} kv{n_head_kv} decode d{n_pos:<6} worst {worst:.3e}  bound {bound:.3e}  \
+                 {from_scalar} of {} differ from the scalar mode",
+                want.len()
+            );
+            assert!(
+                worst <= bound,
+                "decode attention on the tensor cores is outside its derived bound at hd{head_dim} \
+                 kv{n_head_kv} d{n_pos}: {worst:e} against {bound:e}. Suspect the slot map -- slot c \
+                 of kv head hk is query head hk * gqa + c -- the kv offset, or a padded slot marked live."
+            );
+            // Not at one position: the only softmax weight is exactly 1 in both
+            // modes, so both return `v[0]` exactly and equal bits are correct.
+            assert!(
+                n_pos == 1 || from_scalar > 0,
+                "hd{head_dim} kv{n_head_kv} d{n_pos}: the forced tensor-core mode matched the scalar \
+                 mode bit for bit, so it never ran"
+            );
+        }
+    }
+    println!("  worst error is {worst_ratio:.2e} of its bound");
+}
+
+/// **Decode attention changes mode under a CUDA graph without changing the
+/// answer.**
+///
+/// `attn_decode` switches between its scalar and tensor-core modes by an
+/// argument, and that is only sound if graph replay really updates the grid,
+/// the shared size and the arguments in place. A replay that kept the recorded
+/// ones would attend with stale values -- the word salad `attn_flash_mma` once
+/// produced at decode. So the same fixed tokens are decoded with graphs on and
+/// off, with the switch landing mid-decode and a 128-position chunk boundary
+/// crossed after it, and the logits must be **bit-identical**: a graph changes
+/// how launches are issued, never what they compute.
+///
+/// A third run never switches, and must differ, so the test cannot pass with
+/// the tensor-core mode never having run.
+#[test]
+#[ignore = "needs the 0.6B and an sm_120 device"]
+fn decode_attention_changes_mode_under_a_graph_without_changing_the_answer() {
+    common::model_or_skip!(path);
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+
+    let tokens = tk.encode(&"The capital of France is Paris. ".repeat(16), true, true);
+    let steps = tk.encode(&" and the capital of Japan is Tokyo,".repeat(4), false, true);
+    let switch_at = tokens.len() + 6;
+    assert!(
+        tokens.len() < 128 && tokens.len() + steps.len() > 128 + 4,
+        "{} prompt and {} decode tokens: the decode has to cross position 128 after the switch",
+        tokens.len(),
+        steps.len()
+    );
+
+    let run = |graphs: bool, from: usize| -> Vec<f32> {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(graphs);
+        gpu.set_attn_decode_mma_from(from);
+        let m = Qwen3::load(&f).expect("load model");
+        let mut e = Engine::new(m, &gpu, tokens.len() + steps.len() + 4, false);
+        let mut l = e.prefill(&tokens).expect("prefill");
+        for &t in &steps {
+            l = e.decode(t).expect("decode");
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        l
+    };
+
+    let graphed = run(true, switch_at);
+    let eager = run(false, switch_at);
+    let never = run(true, usize::MAX);
+
+    let (worst, differing) = compare(&eager, &graphed);
+    let (_, from_never) = compare(&never, &graphed);
+    println!(
+        "  graphs on vs off   {differing} of {} logits differ, worst {worst:e}\n  \
+         switched vs never  {from_never} differ",
+        graphed.len()
+    );
+    assert_eq!(
+        differing, 0,
+        "decoding across the mode switch gives different logits with graphs on and off: replay \
+         did not carry the new grid, shared size or arguments into a node"
+    );
+    assert!(from_never > 0, "the run that switched matches the one that never did, so it never switched");
 }
 
 /// **The restaged tensor-core attention kernel is bit-identical to its old

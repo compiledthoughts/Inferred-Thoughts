@@ -1025,6 +1025,66 @@ impl Cuda {
         })
     }
 
+    /// Positions from which decode attention takes the tensor cores, unless
+    /// forced.
+    ///
+    /// **Measured 11-09** by `what_attention_costs_as_context_grows` at the
+    /// 35B's shape: the tensor-core mode is 0.74-0.83x the warp phase up to
+    /// d1024, parity at d1536-2048, 1.78x at d4096 and 1.6-1.9x from there to
+    /// d65536. Below the crossover a call is tens of microseconds and the
+    /// tile's fixed cost dominates. llama.cpp switches at 8192 for this shape.
+    const ATTN_DECODE_MMA_MIN_POS: usize = 2048;
+
+    /// Force decode attention onto the tensor cores (`Some(true)`), off them
+    /// (`Some(false)`), or let depth decide (`None`).
+    pub fn attn_decode_mma(&self, force: Option<bool>) {
+        self.attn_decode_mma.set(force);
+    }
+
+    /// Move the depth at which decode attention takes the tensor cores; 0
+    /// restores [`Cuda::ATTN_DECODE_MMA_MIN_POS`]. For tests that need the
+    /// switch to land in the middle of a generation.
+    pub fn set_attn_decode_mma_from(&self, n_pos: usize) {
+        self.attn_decode_mma_from.set(n_pos);
+    }
+
+    /// Whether this decode step's attention runs on the tensor cores.
+    ///
+    /// The shape has to fit the tile first: `head_dim` a multiple of 16 and at
+    /// most 256, and no more query heads per kv head than its 16 slots.
+    fn decode_mma(&self, a: &Attn<'_>) -> bool {
+        let fits = a.head_dim % 16 == 0
+            && a.head_dim <= 256
+            && a.n_head_kv > 0
+            && a.n_head % a.n_head_kv == 0
+            && a.n_head / a.n_head_kv <= ATT_QT;
+        if !fits {
+            return false;
+        }
+        match self.attn_decode_mma.get() {
+            Some(force) => force,
+            None => {
+                let from = match self.attn_decode_mma_from.get() {
+                    0 => Self::ATTN_DECODE_MMA_MIN_POS,
+                    p => p,
+                };
+                self.attn_vmma.get() && a.n_pos >= from
+            }
+        }
+    }
+
+    /// Shared memory the `attn_flash_mma_v` body indexes: the f16 query tile,
+    /// the K/V staging buffer, the f16 probabilities, the score tile, and four
+    /// per-slot vectors.
+    fn vmma_shared_bytes(head_dim: usize) -> u32 {
+        const ATT_KC: usize = 32;
+        (ATT_QT * head_dim * 2
+            + ATT_KC * head_dim * 2
+            + ATT_QT * ATT_KC * 2
+            + ATT_QT * ATT_KC * 4
+            + 4 * ATT_QT * 4) as u32
+    }
+
     /// Use the staged F32 matmul. Off by default; see `matmul_f32`.
     pub fn f32_staged(&self, on: bool) {
         self.f32_staged.set(on);
@@ -2484,7 +2544,37 @@ impl Cuda {
             // its position-dependent arguments baked in and every step after
             // the first attends with stale ones. That produced fluent-looking
             // nonsense in a real session while prefill was correct and faster.
-            if self.attn_mma.get() && a.n_q() > 1 && a.head_dim % 16 == 0 {
+            // **Decode launches one kernel whatever the depth.** Decode is a
+            // CUDA graph and a graph cannot change kernels mid-generation, so
+            // the tensor-core mode is an argument of `attn_decode`. The modes'
+            // grids and shared sizes differ, and replay updates both in place.
+            if a.n_q() == 1 && self.attn_dbg.get().is_none() {
+                let use_mma = self.decode_mma(a);
+                let (grid_x, dshared) = if use_mma {
+                    (a.n_head_kv as u32, Self::vmma_shared_bytes(a.head_dim))
+                } else {
+                    ((a.n_head * rows) as u32, shared)
+                };
+                let [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] = args;
+                let dargs = [
+                    KArg::I32(i32::from(use_mma)),
+                    a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13,
+                ];
+                // SAFETY: parameters match `attn_decode`: `attn_flash`'s plus the
+                // mode. One block per (query head, chunk) in the scalar mode and
+                // per (kv head, chunk) in the tensor-core mode, 128 threads either
+                // way, and `dshared` is what the chosen mode indexes.
+                unsafe {
+                    self.launch_grid2(
+                        "attn_decode",
+                        grid_x,
+                        n_split as u32,
+                        chunk as u32,
+                        dshared,
+                        &dargs,
+                    )?
+                };
+            } else if self.attn_mma.get() && a.n_q() > 1 && a.head_dim % 16 == 0 {
                 let margs = [
                     KArg::I32(n_pos_first as i32),
                     KArg::I32(rows as i32),

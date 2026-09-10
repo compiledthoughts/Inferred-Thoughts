@@ -585,7 +585,7 @@ __global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
 }  // extern "C" -- a template cannot have C linkage; reopened for the instances.
 
 template <int S>
-__device__ __forceinline__ void dbg_attn_flash_body(
+__device__ __forceinline__ void attn_flash_body(
         float *sq, float *se, float *red,
         int n_pos_first, int kv_dim, int head_dim, int n_head,
         int n_head_kv, int use_warp, int part_stride, float scale,
@@ -753,7 +753,7 @@ extern "C" __global__ void dbg_attn_flash_##S(                                  
         const unsigned short *__restrict__ v, float *__restrict__ part_acc,       \
         float *__restrict__ part_m, float *__restrict__ part_l) {                 \
     extern __shared__ float smem[];                                               \
-    dbg_attn_flash_body<S>(smem, smem + head_dim, smem + head_dim + FD_CHUNK,     \
+    attn_flash_body<S>(smem, smem + head_dim, smem + head_dim + FD_CHUNK,     \
         n_pos_first, kv_dim, head_dim, n_head, n_head_kv, use_warp, part_stride,  \
         scale, q, k, v, part_acc, part_m, part_l);                                \
 }
@@ -1477,6 +1477,9 @@ __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
 #define DBG_VMMA_FAST_KSTAGE 64   // K staged sixteen bytes per instruction, no division
 #define DBG_VMMA_FAST_VSTAGE 128  // V staged the same way
 #define DBG_VMMA_FAST_QSTAGE 256  // query staged by stride rather than by per-element division
+// Not a removal either: a tile's slots are the query heads that share one kv head, in
+// one row -- decode's layout. Requires DBG_VMMA_FAST_QSTAGE.
+#define DBG_VMMA_GQA_COLS    512
 
 // Stage `ATT_KC` positions of one kv head into shared memory, sixteen bytes per
 // instruction -- what llama.cpp's `flash_attn_ext_f16_load_tile` does.
@@ -1514,7 +1517,7 @@ __device__ __forceinline__ void vmma_stage16(
 }  // extern "C" -- a template cannot have C linkage; reopened for the instances.
 
 template <int S>
-__device__ __forceinline__ void dbg_attn_mma_v_body(
+__device__ __forceinline__ void attn_mma_v_body(
         char *smem_raw,
         int n_pos_first, int n_rows, int kv_dim, int head_dim, int n_head, int n_head_kv,
         int part_stride, float scale,
@@ -1535,7 +1538,13 @@ __device__ __forceinline__ void dbg_attn_mma_v_body(
     const int hq = blockIdx.x;
     const int split = blockIdx.y;
     const int base_lo = split * FD_CHUNK;
-    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+    // Blocks and slots. Normally a block is a query head and its tile's slots
+    // are rows of it. With `DBG_VMMA_GQA_COLS` a block is a kv head and its
+    // slots are the query heads that share it, all in one row -- decode, where
+    // there is only one row to fill a tile with.
+    const int gqa = n_head / n_head_kv;
+    const int off = (S & DBG_VMMA_GQA_COLS) ? blockIdx.x * head_dim : (hq / gqa) * head_dim;
+    const int n_live = (S & DBG_VMMA_GQA_COLS) ? gqa : n_rows;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int g = lane >> 2;
@@ -1554,8 +1563,10 @@ __device__ __forceinline__ void dbg_attn_mma_v_body(
         const int d8 = lane * 8;
         if (d8 < head_dim) {
             for (int r = warp; r < ATT_QT; r += nwarps) {
-                const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
-                const float *src = q + ((size_t)rr * n_head + hq) * head_dim + d8;
+                const int rr = (r < n_live) ? r : 0;   // padding slots, masked below
+                const size_t vec = (S & DBG_VMMA_GQA_COLS) ? (size_t)(blockIdx.x * gqa + rr)
+                                                           : (size_t)rr * n_head + hq;
+                const float *src = q + vec * head_dim + d8;
                 unsigned short *dst = sq + (size_t)r * head_dim + d8;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) dst[j] = f2h(src[j]);
@@ -1645,8 +1656,8 @@ __device__ __forceinline__ void dbg_attn_mma_v_body(
                 }
                 sp[(size_t)r * ATT_KC + lane] = (unsigned short)0x3400;
             } else {
-                const int n_pos_r = n_pos_first + r;
-                const bool live = (r < n_rows) && (lo + lane < n_pos_r);
+                const int n_pos_r = (S & DBG_VMMA_GQA_COLS) ? n_pos_first : n_pos_first + r;
+                const bool live = (r < n_live) && (lo + lane < n_pos_r);
                 float s = live ? ss[(size_t)r * ATT_KC + lane] * scale : -INFINITY;
                 float m = s;
 #pragma unroll
@@ -1733,14 +1744,18 @@ __device__ __forceinline__ void dbg_attn_mma_v_body(
             for (int i = 0; i < 4; ++i) {
                 const int d = db * 16 + ((i < 2) ? g : g + 8);
                 const int r = rg * 8 + 2 * t + (i & 1);
-                if (r >= n_rows) continue;
-                part_acc[(((size_t)r * n_head + hq) * part_stride + split) * head_dim + d] =
+                if (r >= n_live) continue;
+                const size_t vec = (S & DBG_VMMA_GQA_COLS) ? (size_t)(blockIdx.x * gqa + r)
+                                                           : (size_t)r * n_head + hq;
+                part_acc[(vec * part_stride + split) * head_dim + d] =
                     acc[j][rg][i];
             }
         }
     }
-    if (threadIdx.x < n_rows) {
-        const size_t base = ((size_t)threadIdx.x * n_head + hq) * part_stride + split;
+    if (threadIdx.x < n_live) {
+        const size_t vec = (S & DBG_VMMA_GQA_COLS) ? (size_t)(blockIdx.x * gqa + threadIdx.x)
+                                                   : (size_t)threadIdx.x * n_head + hq;
+        const size_t base = vec * part_stride + split;
         part_m[base] = smax[threadIdx.x];
         part_l[base] = ssum[threadIdx.x];
     }
@@ -1756,7 +1771,7 @@ extern "C" __global__ void dbg_attn_mma_v_##S(                                  
         const unsigned short *__restrict__ v, float *__restrict__ part_acc,       \
         float *__restrict__ part_m, float *__restrict__ part_l) {                 \
     extern __shared__ char smem_raw[];                                            \
-    dbg_attn_mma_v_body<S>(smem_raw, n_pos_first, n_rows, kv_dim, head_dim,       \
+    attn_mma_v_body<S>(smem_raw, n_pos_first, n_rows, kv_dim, head_dim,       \
         n_head, n_head_kv, part_stride, scale, q, k, v, part_acc, part_m, part_l); \
 }
 
@@ -1772,6 +1787,46 @@ DBG_ATTN_MMA_V_INSTANCE(36)
 DBG_ATTN_MMA_V_INSTANCE(63)
 DBG_ATTN_MMA_V_INSTANCE(192)
 DBG_ATTN_MMA_V_INSTANCE(448)
+
+// ---------------------------------------------------------------------------
+// Decode attention: one kernel, two modes
+// ---------------------------------------------------------------------------
+//
+// **Decode is a CUDA graph, and a graph replays a fixed kernel sequence**, so
+// decode cannot switch kernels partway through a generation -- the warp score
+// phase became an argument for the same reason. So the tensor-core mode is an
+// argument too: `attn_flash`'s arithmetic below the depth where it pays, and
+// `attn_flash_mma_v`'s above it, with the tile's slots holding the query heads
+// that share a kv head. That is grouped-query attention as tile columns, which
+// is what llama.cpp's MMA kernel does for decode at `gqa_ratio > 4 && KV >= 8192`.
+//
+// The modes want different grids -- (query head, chunk) against (kv head,
+// chunk) -- and different shared memory, and graph replay updates both in
+// place, so the sequence stays this launch and `attn_flash_combine` after it.
+// Both modes write the same partials, so the combine does not change.
+#define ATT_DECODE_MMA_S (DBG_VMMA_FAST_KSTAGE | DBG_VMMA_FAST_VSTAGE | \
+                          DBG_VMMA_FAST_QSTAGE | DBG_VMMA_GQA_COLS)
+
+__global__ void attn_decode(int use_mma, int n_pos_first, int kv_dim, int head_dim,
+                            int n_head, int n_head_kv, int use_warp, int part_stride,
+                            float scale,
+                            const float *__restrict__ q,
+                            const unsigned short *__restrict__ k,
+                            const unsigned short *__restrict__ v,
+                            float *__restrict__ part_acc,
+                            float *__restrict__ part_m,
+                            float *__restrict__ part_l) {
+    extern __shared__ char smem_raw[];
+    if (use_mma) {
+        attn_mma_v_body<ATT_DECODE_MMA_S>(smem_raw, n_pos_first, 1, kv_dim, head_dim,
+            n_head, n_head_kv, part_stride, scale, q, k, v, part_acc, part_m, part_l);
+    } else {
+        float *sf = (float *)smem_raw;
+        attn_flash_body<0>(sf, sf + head_dim, sf + head_dim + FD_CHUNK,
+            n_pos_first, kv_dim, head_dim, n_head, n_head_kv, use_warp, part_stride,
+            scale, q, k, v, part_acc, part_m, part_l);
+    }
+}
 
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.
 __global__ void silu_mul(int n, float *__restrict__ gate,

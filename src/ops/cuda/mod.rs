@@ -173,6 +173,11 @@ pub struct Cuda {
     /// Route the tensor-core attention path through a `dbg_attn_mma_v_*`
     /// variant, named by its skip mask. Bench-only; see [`Cuda::attn_vmma_dbg`].
     attn_vdbg: Cell<Option<i32>>,
+    /// Force decode attention's mode: `Some(true)` the tensor cores, `Some(false)`
+    /// the scalar path, `None` by depth. See [`Cuda::attn_decode_mma`].
+    attn_decode_mma: Cell<Option<bool>>,
+    /// Positions from which decode attention takes the tensor cores.
+    attn_decode_mma_from: Cell<usize>,
     /// Query rows per attention launch; 1 is the old one-row-per-launch path.
     qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
@@ -840,6 +845,9 @@ impl Cuda {
                 attn_vmma: Cell::new(!env_flag("INFERRED_ATTN_F32")),
                 attn_dbg: Cell::new(None),
                 attn_vdbg: Cell::new(None),
+                attn_decode_mma: Cell::new(None),
+                // 0 means `Cuda::ATTN_DECODE_MMA_MIN_POS`.
+                attn_decode_mma_from: Cell::new(0),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),
