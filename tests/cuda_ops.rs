@@ -1309,6 +1309,10 @@ fn which_buffer_bends_attention_at_depth() {
 
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The f32 `attn_flash` path is what this is about; the tensor-core
+    // kernel is the prefill default.
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
 
     // Every slab and buffer is held for the whole test: mirrors key on the host
     // address, so a dropped buffer hands the next arm a recycled one. The
@@ -1605,8 +1609,8 @@ fn the_tensor_core_attention_stays_inside_its_derived_bound() {
             Naive.attend(&a, &mut want);
 
             gpu.begin_pass(N_Q);
-            gpu.attend(&a, &mut got);
-            gpu.host_needs(&mut got);
+            gpu.attend(&a, &mut got[..]);
+            gpu.host_needs(&mut got[..]);
             gpu.end_pass();
             if let Some(e) = gpu.take_error() {
                 panic!("cuda error at hd{head_dim} d{n_pos}: {e}");
@@ -1617,7 +1621,7 @@ fn the_tensor_core_attention_stays_inside_its_derived_bound() {
                 + f64::from(attend_tolerance(n_pos, &want));
             let worst = want
                 .iter()
-                .zip(&got)
+                .zip(got.iter())
                 .fold(0.0f64, |m, (x, y)| m.max((f64::from(*x) - f64::from(*y)).abs()));
             worst_ratio = worst_ratio.max(worst / bound);
             println!(
@@ -1936,6 +1940,10 @@ fn the_attention_agrees_with_the_oracle_past_32k() {
 
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The f32 `attn_flash` path is what this is about; the tensor-core
+    // kernel is the prefill default.
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
 
     let f16s = |n: usize, seed: u64| -> Vec<u16> { noise(n, seed).iter().map(|&x| f32_to_f16(x)).collect() };
     let k2 = f16s(MAX_POS * 2 * HEAD_DIM, 41);
@@ -2068,6 +2076,10 @@ fn the_staged_f32_matmul_is_bit_identical() {
 fn the_warp_attention_agrees_with_the_oracle() {
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The f32 `attn_flash` path is what this is about; the tensor-core
+    // kernel is the prefill default.
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
 
     // **One slab for every shape and depth, allocated once.**
     //
@@ -2442,6 +2454,10 @@ fn which_layer_does_the_warp_attention_break() {
         gpu.use_graphs(false);
         gpu.attn_warp(force);
         gpu.attn_warp_only(only);
+        // The f32 `attn_flash` path is what this is about; the tensor-core
+        // kernel is the prefill default.
+        gpu.set_attn_vmma(false);
+        gpu.set_attn_mma(false);
         let m = Qwen3::load(&f).expect("load model");
         let mut e = Engine::new(m, &gpu, tokens.len() + 4, false);
         let l = e.prefill(&tokens).expect("prefill");
@@ -2507,6 +2523,10 @@ fn what_the_warp_attention_needs_to_fail() {
         let gpu = Cuda::new(0).expect("cuda device");
         gpu.use_graphs(graphs);
         gpu.attn_warp(Some(warp));
+        // The f32 `attn_flash` path is what this is about; the tensor-core
+        // kernel is the prefill default.
+        gpu.set_attn_vmma(false);
+        gpu.set_attn_mma(false);
         let m = Qwen3::load(&f).expect("load model");
         let mut e = Engine::new(m, &gpu, tokens.len() + steps + 4, false);
         let mut l = e.prefill(&tokens).expect("prefill");
@@ -2571,6 +2591,10 @@ fn the_warp_attention_agrees_when_both_runs_decode_the_same_tokens() {
     let run = |warp: bool| -> Vec<f32> {
         let gpu = Cuda::new(0).expect("cuda device");
         gpu.attn_warp(Some(warp));
+        // The f32 `attn_flash` path is what this is about; the tensor-core
+        // kernel is the prefill default.
+        gpu.set_attn_vmma(false);
+        gpu.set_attn_mma(false);
         let m = Qwen3::load(&f).expect("load model");
         let mut e = Engine::new(m, &gpu, tokens.len() + fixed.len() + 4, false);
         let mut l = e.prefill(&tokens).expect("prefill");
@@ -3590,6 +3614,10 @@ fn what_the_attention_variants_cost() {
 
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The f32 `attn_flash` path is what this is about; the tensor-core
+    // kernel is the prefill default.
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
 
     let max_pos = 32768usize;
     let k: Vec<u16> = (0..max_pos * KV_DIM)

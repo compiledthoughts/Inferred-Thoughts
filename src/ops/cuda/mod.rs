@@ -829,8 +829,15 @@ impl Cuda {
                 // matmuls were measured on the bench and absent in `serve`.
                 // An env toggle reaches every entry point, including ones
                 // added later.
-                attn_mma: Cell::new(env_flag("INFERRED_ATTN_MMA")),
-                attn_vmma: Cell::new(env_flag("INFERRED_ATTN_VMMA")),
+                // **Prefill attention runs on the tensor cores by default as of
+                // 11-09.** `attn_flash_mma_v` is 4.3x `attn_flash` at n_q 512
+                // once its staging stopped dividing per element. It is a
+                // precision change -- Q and the probabilities pass through f16
+                // -- bounded by `the_tensor_core_attention_stays_inside_its_
+                // derived_bound`. `INFERRED_ATTN_F32=1` restores `attn_flash`.
+                // Decode never takes this path: it is gated on n_q > 1.
+                attn_mma: Cell::new(!env_flag("INFERRED_ATTN_F32")),
+                attn_vmma: Cell::new(!env_flag("INFERRED_ATTN_F32")),
                 attn_dbg: Cell::new(None),
                 attn_vdbg: Cell::new(None),
                 attn_warp_only: Cell::new(None),

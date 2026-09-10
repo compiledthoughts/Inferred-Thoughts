@@ -1382,10 +1382,7 @@ __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
         }
         __syncthreads();
 
-        for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
-            const int p = i / head_dim, d = i % head_dim;
-            skv[i] = (lo + p < n_pos_max) ? v[(size_t)(lo + p) * kv_dim + off + d] : 0;
-        }
+        vmma_stage16(skv, v, lo, n_pos_max, kv_dim, off, head_dim);
         __syncthreads();
 
         // --- O^T += V^T P^T on the tensor cores. The A fragment depends on the
