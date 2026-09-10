@@ -5,12 +5,24 @@ MoE model whose weights do not fit in VRAM.
 
 | | |
 |---|---|
+| [`HANDOFF-v2.md`](HANDOFF-v2.md) | why the project exists, where it stands, and what is open |
+| [`BENCHMARKS-v2.md`](BENCHMARKS-v2.md) | current numbers, each with its method |
+| [`SCOREBOARD.md`](SCOREBOARD.md) | one row per standard run |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | the shape — module map, the `Ops` seam, where exactness stops |
-| [`BENCHMARKS.md`](BENCHMARKS.md) | every number in sequence, with the method to reproduce it |
-| [`HANDOFF.md`](HANDOFF.md) | why the project exists, and what did not survive contact |
-| [`CLAUDE.md`](CLAUDE.md) | the rules and the current state |
+| [`CLAUDE.md`](CLAUDE.md) | the rules, the environment and the current state |
+| [`docs/v1/`](docs/v1/) | the full history to v0.3.0, frozen |
 
-**Status: v0.1.** Stages 1–6 complete, the `qwen35` architecture decoded, and
+**Status: v0.3.0.** Runs Qwen3-0.6B, Qwen3.5-9B and Qwen3.6-35B-A3B — IQ4_XS,
+17.5 GiB against a 16 GB card — on the CPU and on CUDA. On the 35B, prefill is
+**521.6 tok/s** on the standard 19,706-token run and ~313 tok/s at 41-46k depth;
+decode is 36.6 tok/s at ~19.7k and 32.4 at ~50k, against llama.cpp's ~965 and
+~52 on the same file and card. Experts live in a bounded two-tier cache — a VRAM
+slab and a host tier the kernels read directly — decode replays as a CUDA graph,
+and attention runs on the tensor cores. See [`BENCHMARKS-v2.md`](BENCHMARKS-v2.md).
+
+Everything below is the v0.1-v0.2 story on Qwen3-0.6B, kept as it was written.
+
+**Status at v0.1.** Stages 1–6 complete, the `qwen35` architecture decoded, and
 the forward pass running on **both CPU and GPU**. Loads a GGUF, tokenizes
 exactly like llama.cpp, and generates coherent text on Qwen3-0.6B at **~59
 tok/s** decode on the CPU — within **1.09–1.15x** of llama.cpp on the same
