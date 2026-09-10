@@ -1649,7 +1649,16 @@ impl Cuda {
     fn resident_f32_t(&self, w: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
         let key = w.data.as_ptr() as usize;
         if let Some(b) = self.f32t.borrow().get(&key) {
-            return Ok(b.ptr);
+            // **An address alone is not an identity.** Weights from the model's
+            // mmap never move, but a caller that frees a buffer and allocates
+            // another can be handed the same address for a different shape, and
+            // a cached copy that is too small becomes a device read past its
+            // end. `the_staged_f32_matmul_is_bit_identical` hit exactly that as
+            // a sticky CUDA_ERROR_ILLEGAL_ADDRESS once a heap layout change
+            // recycled the address. A size that does not match is re-uploaded.
+            if b.len_bytes() == w.n_in * w.n_out * std::mem::size_of::<f32>() {
+                return Ok(b.ptr);
+            }
         }
         let mut t = vec![0.0f32; w.n_in * w.n_out];
         for j in 0..w.n_out {
@@ -4002,19 +4011,30 @@ impl Cuda {
         let epoch = self.state_gen.get();
         // Read the entry out before any copy, so the `RefCell` borrow is not
         // held across `h2d`.
-        let found = self.states.borrow().get(&key).map(|(b, filled)| (b.ptr, *filled));
-        if let Some((ptr, filled)) = found {
-            // The allocation is right; only its contents may be stale. This is
-            // the checkpoint-restore path, and re-uploading into the buffer
-            // that already exists is what makes it cheap.
-            if filled == epoch {
+        let found = self
+            .states
+            .borrow()
+            .get(&key)
+            .map(|(b, filled)| (b.ptr, b.len_bytes(), *filled));
+        if let Some((ptr, bytes, filled)) = found {
+            // **Only if it is the same size.** An address alone is not an
+            // identity: a slab freed and reallocated at the same address with a
+            // different size is a different slab, and re-uploading it into the
+            // old allocation would write past its end. Such a slab falls
+            // through and gets its own buffer.
+            if bytes == std::mem::size_of_val(host) {
+                // The allocation is right; only its contents may be stale. This
+                // is the checkpoint-restore path, and re-uploading into the
+                // buffer that already exists is what makes it cheap.
+                if filled == epoch {
+                    return Ok(ptr);
+                }
+                self.h2d(ptr, host)?;
+                if let Some(e) = self.states.borrow_mut().get_mut(&key) {
+                    e.1 = epoch;
+                }
                 return Ok(ptr);
             }
-            self.h2d(ptr, host)?;
-            if let Some(e) = self.states.borrow_mut().get_mut(&key) {
-                e.1 = epoch;
-            }
-            return Ok(ptr);
         }
         let buf = DeviceBuffer::from_slice(host)?;
         let ptr = buf.ptr;

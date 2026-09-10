@@ -44,7 +44,9 @@ fn main() {
     }
 
     let src = "kernels/kernels.cu";
-    println!("cargo:rerun-if-changed={src}");
+    // The whole directory, not just the entry point: kernels.cu includes the
+    // per-family `.cuh` files, and cargo scans a directory for any change.
+    println!("cargo:rerun-if-changed=kernels");
 
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is always set by cargo");
     let ptx = format!("{out_dir}/kernels.ptx");

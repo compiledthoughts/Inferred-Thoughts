@@ -2220,10 +2220,20 @@ fn the_staged_f32_matmul_is_bit_identical() {
     gpu.use_graphs(false);
     let cpu = Naive;
 
-    for (n_in, n_out) in [(2048usize, 1usize), (2048, 32), (2048, 256), (2048, 257), (256, 8)] {
-        let wf = noise(n_in * n_out, 0x51ed + n_out as u64);
-        let bytes: Vec<u8> = wf.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let w = Weights { data: &bytes, ty: inferred_thoughts::gguf::GgmlType::F32, n_in, n_out, pooled: false };
+    // Every weight buffer is held for the whole test. The backend caches its
+    // transposed copy by host address, so a buffer dropped per shape can hand
+    // the next shape a recycled address -- and until the cache checked sizes,
+    // the previous shape's smaller upload, read past its end.
+    let shapes = [(2048usize, 1usize), (2048, 32), (2048, 256), (2048, 257), (256, 8)];
+    let held: Vec<Vec<u8>> = shapes
+        .iter()
+        .map(|&(n_in, n_out)| {
+            let wf = noise(n_in * n_out, 0x51ed + n_out as u64);
+            wf.iter().flat_map(|v| v.to_le_bytes()).collect()
+        })
+        .collect();
+    for (&(n_in, n_out), bytes) in shapes.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: inferred_thoughts::gguf::GgmlType::F32, n_in, n_out, pooled: false };
 
         for n_tok in [1usize, 3] {
             let x = noise(n_in * n_tok, 0xbeef + n_tok as u64);
@@ -4319,6 +4329,14 @@ fn the_batched_delta_rule_matches_the_per_token_one() {
     let (kdim, vdim) = (hk * nk, hv * nv);
 
     for n_tok in [2usize, 7, 64] {
+        // **`forget_state` first, as the ssm_conv batch test does.** Both state
+        // slabs are fresh allocations of the same size every iteration, and
+        // the backend keeps recurrent state on the device keyed by host
+        // address, authoritative after its first upload. A slab that lands on
+        // a recycled address would silently continue the previous iteration's
+        // state instead of starting from `s0` -- which is what happened once
+        // unrelated tests shifted the heap, as 28,672 outputs of garbage.
+        gpu.forget_state();
         let q = noise(kdim * n_tok, 41 + n_tok as u64);
         let k = noise(kdim * n_tok, 42 + n_tok as u64);
         let v = noise(vdim * n_tok, 43 + n_tok as u64);
