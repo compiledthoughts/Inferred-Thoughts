@@ -60,7 +60,7 @@ const MIN_POS: usize = 32;
 /// question rather than a conclusion.
 ///
 /// Note the contrast with the GPU, where the same idea is the whole win:
-/// `MM_TOK` in `ops/cuda/ops.rs` moved the 9B's prefill 52.6 -> 105.2 tok/s
+/// `MM_TOK` in `ops/cuda/ops/matmul.rs` moved the 9B's prefill 52.6 -> 105.2 tok/s
 /// going from 1 to 4. Register reuse across a batch is decisive on a card
 /// limited by weight bandwidth and nearly free on a CPU that is limited by
 /// something else.
