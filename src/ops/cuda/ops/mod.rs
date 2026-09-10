@@ -52,17 +52,11 @@ use crate::ops::{Attn, Delta, Experts, Ops, Route, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
 mod slot {
-    pub const X: usize = 0;
-    pub const OUT: usize = 1;
-    pub const AUX: usize = 2;
-    pub const QSCALES: usize = 3;
-    pub const QUANTS: usize = 4;
     pub const SCORES: usize = 5;
     pub const PART_M: usize = 9;
     pub const PART_L: usize = 10;
     pub const COS: usize = 6;
     pub const SIN: usize = 7;
-    pub const Q: usize = 8;
     /// Device-side routing scratch: the ids and weights `moe_topk` writes, and
     /// the expert addresses `moe_gather_ptrs` resolves for gate, up and down.
     ///
@@ -188,17 +182,6 @@ impl Ops for Cuda {
         self.note(self.add_assign_impl(a, b));
     }
 
-    // GatedDeltaNet has no CUDA path yet, and says so rather than quietly
-    // falling back to the host.
-    //
-    // A host fallback would work, and would be a trap: each of these sits
-    // inside a GDN layer, so running one on the CPU drags the whole activation
-    // home and back, undoing the residency the seam exists for -- and it would
-    // read as a mysterious slowdown rather than a missing kernel. It would also
-    // break graph capture, which needs an identical launch sequence every pass.
-    //
-    // The sticky error is the same mechanism `matmul` uses for a quant type it
-    // has no kernel for.
     fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
         self.note(self.l2_norm_heads_impl(x, head_dim, eps));
     }

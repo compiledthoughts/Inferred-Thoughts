@@ -18,7 +18,7 @@ impl Cuda {
     }
 
     /// Diagnostic: run the warp score phase for the `n`-th `attend` call of
-    /// each pass and the thread path for every other. See `attn_warp_only`.
+    /// each pass and the thread path for every other. See `warp_scores`.
     pub fn attn_warp_only(&self, n: Option<usize>) {
         self.attn_warp_only.set(n);
     }
@@ -336,13 +336,11 @@ impl Cuda {
         let pm = self.pooled(slot::PART_M, g * a.n_head * n_split * 4)?;
         let pl = self.pooled(slot::PART_L, g * a.n_head * n_split * 4)?;
 
-        // **Query rows are launched one at a time, by device pointer offset.**
-        // Every row has a different causal window, so they cannot share a grid
-        // without masking most of it away; and the offsets are applied to the
-        // device pointers rather than by sub-slicing `a.q` on the host, because
-        // this backend keys its mirrors on host addresses -- a sub-slice would
-        // look like an unmirrored buffer and be uploaded from a stale host copy,
-        // which is the bug `Ops::rope_neox` already carries a note about.
+        // **Query rows are addressed by device pointer offset**, not by
+        // sub-slicing `a.q` on the host, because this backend keys its mirrors
+        // on host addresses -- a sub-slice would look like an unmirrored buffer
+        // and be uploaded from a stale host copy, which is the bug
+        // `Ops::rope_neox` already carries a note about.
         let (n_q, per_row) = (a.n_q(), a.n_head * a.head_dim);
         // Counted per `attend`, not per query row: one call is one layer.
         self.attn_calls.set(self.attn_calls.get() + 1);
@@ -537,12 +535,12 @@ impl Cuda {
             // SAFETY: parameters match `attn_flash`; the grid is one block per
             // (query head, chunk) so no block sees an empty range, and `shared`
             // is head_dim + 2 * FD_CHUNK floats, which is what it indexes.
-            // `attn_flash` reads K transposed -- one thread per position, so
-            // adjacent threads are `kv_dim` apart and a warp's load touches 32
-            // cache lines. `attn_flash_warp` gives a whole warp to each position
-            // so lanes read consecutive keys. Same grid, same shared memory;
-            // only the score phase differs. Behind a flag until measured across
-            // depth, which is the lesson `f32_staged` cost.
+            // `attn_flash` has two score phases. The thread phase reads K
+            // transposed -- one thread per position, so adjacent threads are
+            // `kv_dim` apart and a warp's load touches 32 cache lines; the warp
+            // phase gives a whole warp to each position so lanes read
+            // consecutive keys. Same grid, same shared memory, and the phase is
+            // the `use_warp` argument above rather than a kernel name.
             // The decomposed copies share this kernel's signature exactly, so
             // routing to one is a name and nothing else.
             let (flash, _) = self.attn_kernel_names()?;

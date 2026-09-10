@@ -527,8 +527,8 @@ impl Cuda {
     /// Choose this token's experts on the device.
     ///
     /// The router's probabilities stay on the card, which is the whole point:
-    /// the host read they replace is the reason CUDA graphs are off for this
-    /// model. `moe_topk` reproduces [`Ops::route`]'s default exactly — see
+    /// the host read they replace would turn CUDA graphs off for this model.
+    /// `moe_topk` reproduces [`Ops::route`]'s default exactly — see
     /// `device_topk_reproduces_the_host_selection`.
     pub(super) fn route_impl(&self, probs: &[f32], n_expert: usize, n_used: usize) -> Result<()> {
         let n_tok = probs.len() / n_expert.max(1);
@@ -566,8 +566,7 @@ impl Cuda {
     /// from the wrong weights.
     ///
     /// So: honour the variant, or refuse it. Silently disregarding it is what
-    /// this backend must not do — `host_picks` already refuses the mirror case,
-    /// and this is the symmetric guard that was never written.
+    /// this backend must not do.
     ///
     /// Sized exactly as `gather_ptrs` will size it, so its own `pooled` call
     /// cannot reallocate what this just wrote — the same invariant `moe_groups`
@@ -644,36 +643,5 @@ impl Cuda {
             )?
         };
         Ok(out)
-    }
-
-    /// The host-side picks a `Route` carries, or an error naming the caller.
-    ///
-    /// **A deliberate error rather than a fallback.** `Route::Device` means the
-    /// ids never came home, so an op that needs them on the host cannot proceed
-    /// — and silently doing nothing, or routing to expert 0, would produce
-    /// fluent text from the wrong weights. Until the device pointer table is
-    /// complete this backend's `route` only returns `Host`, so this is a guard
-    /// against a future half-wired state, not a live path.
-    fn host_picks(&self, route: &Route, what: &'static str) -> Result<Vec<usize>> {
-        match route.ids() {
-            Some(ids) => Ok(ids.to_vec()),
-            None => Err(Error::Cuda {
-                what,
-                detail: "device routing, but this op still resolves picks on the host"
-                    .to_string(),
-            }),
-        }
-    }
-
-    /// As [`Cuda::host_picks`], for the normalized expert weights.
-    fn host_weights(&self, route: &Route, what: &'static str) -> Result<Vec<f32>> {
-        match route.weights() {
-            Some(w) => Ok(w.to_vec()),
-            None => Err(Error::Cuda {
-                what,
-                detail: "device routing, but this op still reads weights on the host"
-                    .to_string(),
-            }),
-        }
     }
 }

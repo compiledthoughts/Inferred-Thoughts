@@ -462,10 +462,6 @@ impl ExpertCache {
         })
     }
 
-    pub fn stride(&self) -> usize {
-        self.stride
-    }
-
     pub fn stats(&self) -> ExpertStats {
         let mut s = self.stats;
         s.migrated = self.migrated;

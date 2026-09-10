@@ -1,7 +1,7 @@
 //! GatedDeltaNet: the causal convolution and the delta rule, per token and
 //! batched.
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::ops::Delta;
 use crate::ops::cuda::{Cuda, KArg, SHARED_OPT_IN_BYTES};
 
@@ -216,18 +216,5 @@ impl Cuda {
             };
         }
         Ok(())
-    }
-}
-
-/// The error every GatedDeltaNet primitive returns until it has a kernel.
-///
-/// Named rather than inlined so the three call sites cannot drift, and so that
-/// deleting it is the obvious signal that the CUDA path landed.
-fn no_gdn_kernel(what: &'static str) -> Error {
-    Error::Cuda {
-        what,
-        detail: "GatedDeltaNet has no CUDA kernel yet; run the qwen35 \
-                 architectures on --backend spin until one exists"
-            .to_string(),
     }
 }
