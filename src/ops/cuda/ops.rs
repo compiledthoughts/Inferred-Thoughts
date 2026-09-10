@@ -931,6 +931,100 @@ impl Cuda {
         self.attn_warp.set(force);
     }
 
+    /// Run the split attention path through a decomposed copy of its kernels,
+    /// `None` for production.
+    ///
+    /// The mask names what is left out -- the `DBG_ATT_*` bits in
+    /// `kernels.cu` -- and only the combinations instantiated there exist;
+    /// anything else fails the launch loudly rather than timing the wrong
+    /// kernel. `Some(0)` is the production arithmetic through the copy, which
+    /// is what lets a bench prove the copy is the kernel it decomposes.
+    ///
+    /// **The output is wrong by design for any other mask.** It prices work;
+    /// it does not compute attention.
+    pub fn attn_dbg(&self, skip: Option<i32>) {
+        self.attn_dbg.set(skip);
+    }
+
+    /// The attention kernel pair to launch: production, or the decomposed
+    /// copies [`Cuda::attn_dbg`] selects.
+    ///
+    /// Only the masks `kernels.cu` instantiates have kernels, and any other is
+    /// an error rather than a fallback: a bench that silently timed production
+    /// under a decomposed label is the failure this exists to prevent.
+    fn attn_kernel_names(&self) -> Result<(&'static str, &'static str)> {
+        let Some(skip) = self.attn_dbg.get() else {
+            return Ok(("attn_flash", "attn_flash_combine"));
+        };
+        let flash = match skip & 127 {
+            0 => "dbg_attn_flash_0",
+            1 => "dbg_attn_flash_1",
+            2 => "dbg_attn_flash_2",
+            4 => "dbg_attn_flash_4",
+            8 => "dbg_attn_flash_8",
+            16 => "dbg_attn_flash_16",
+            32 => "dbg_attn_flash_32",
+            64 => "dbg_attn_flash_64",
+            119 => "dbg_attn_flash_119",
+            _ => "",
+        };
+        let combine = match skip & 384 {
+            0 => "dbg_attn_flash_combine_0",
+            128 => "dbg_attn_flash_combine_128",
+            256 => "dbg_attn_flash_combine_256",
+            384 => "dbg_attn_flash_combine_384",
+            _ => "",
+        };
+        if flash.is_empty() || combine.is_empty() || skip & !511 != 0 {
+            return Err(Error::Cuda {
+                what: "attn_dbg",
+                detail: format!("no decomposed attention kernel is instantiated for mask {skip}"),
+            });
+        }
+        Ok((flash, combine))
+    }
+
+    /// Run the tensor-core attention path through a decomposed copy of
+    /// `attn_flash_mma_v`, `None` for the real kernel. `Some` also selects that
+    /// path, so a mask can never be set and then silently not used.
+    ///
+    /// The mask is the `DBG_VMMA_*` bits in `kernels.cu`; only instantiated
+    /// combinations exist and any other fails the launch. `Some(0)` is the
+    /// kernel's own arithmetic through the copy.
+    pub fn attn_vmma_dbg(&self, skip: Option<i32>) {
+        self.attn_vdbg.set(skip);
+        if skip.is_some() {
+            self.set_attn_vmma(true);
+        }
+    }
+
+    /// The tensor-core kernel with both GEMMs, or its decomposed copy.
+    fn vmma_kernel_name(&self) -> Result<&'static str> {
+        let Some(skip) = self.attn_vdbg.get() else {
+            return Ok("attn_flash_mma_v");
+        };
+        Ok(match skip {
+            0 => "dbg_attn_mma_v_0",
+            1 => "dbg_attn_mma_v_1",
+            2 => "dbg_attn_mma_v_2",
+            4 => "dbg_attn_mma_v_4",
+            8 => "dbg_attn_mma_v_8",
+            16 => "dbg_attn_mma_v_16",
+            32 => "dbg_attn_mma_v_32",
+            18 => "dbg_attn_mma_v_18",
+            36 => "dbg_attn_mma_v_36",
+            63 => "dbg_attn_mma_v_63",
+            192 => "dbg_attn_mma_v_192",
+            448 => "dbg_attn_mma_v_448",
+            _ => {
+                return Err(Error::Cuda {
+                    what: "attn_vmma_dbg",
+                    detail: format!("no decomposed mma_v kernel is instantiated for mask {skip}"),
+                });
+            }
+        })
+    }
+
     /// Use the staged F32 matmul. Off by default; see `matmul_f32`.
     pub fn f32_staged(&self, on: bool) {
         self.f32_staged.set(on);
@@ -2424,9 +2518,10 @@ impl Cuda {
                 // (head, chunk), 128 threads as its four-warp score tile
                 // assumes, and `mshared` is the query tile, the K/V staging
                 // buffer, the score tile and the four per-row vectors.
+                let mname = if vmma { self.vmma_kernel_name()? } else { "attn_flash_mma" };
                 unsafe {
                     self.launch_grid2(
-                        if vmma { "attn_flash_mma_v" } else { "attn_flash_mma" },
+                        mname,
                         a.n_head as u32,
                         n_split as u32,
                         128,
@@ -2444,9 +2539,12 @@ impl Cuda {
             // so lanes read consecutive keys. Same grid, same shared memory;
             // only the score phase differs. Behind a flag until measured across
             // depth, which is the lesson `f32_staged` cost.
+            // The decomposed copies share this kernel's signature exactly, so
+            // routing to one is a name and nothing else.
+            let (flash, _) = self.attn_kernel_names()?;
             unsafe {
                 self.launch_grid2(
-                    "attn_flash",
+                    flash,
                     (a.n_head * rows) as u32,
                     n_split as u32,
                     chunk as u32,
@@ -2470,11 +2568,12 @@ impl Cuda {
                 KArg::Ptr(od),
             ];
             let shared = (n_split * 4) as u32;
+            let (_, combine) = self.attn_kernel_names()?;
             // SAFETY: parameters match `attn_flash_combine`; one block per
             // query head, and `shared` is `n_split` floats.
             unsafe {
                 self.launch_shared(
-                    "attn_flash_combine",
+                    combine,
                     (a.n_head * rows) as u32,
                     chunk as u32,
                     shared,

@@ -550,6 +550,239 @@ __global__ void attn_flash_combine(int n_pos_first, int head_dim, int n_head,
     }
 }
 
+// ---------------------------------------------------------------------------
+// `attn_flash` and its combine, decomposed
+// ---------------------------------------------------------------------------
+//
+// **Copies of the two production attention kernels, each able to leave one
+// piece out**, so a bench can price the pieces rather than a session guessing
+// at them. Attention is linear in depth from d8192 to d65536 at 4.6% of the
+// fp32 cores, and a one-kv-head arm reading half the bytes costs the same, so
+// it is bound by work. Reading the kernel ranks its pieces by instruction count
+// -- the same kind of reading that sent two IQ4_XS attempts after parts worth
+// 2 us of 144, where a decomposition found 72% in one pass.
+//
+// **The mask is a template parameter, not a kernel argument.** A runtime branch
+// around something as small as an `expf` or a load can be if-converted, and an
+// arm that still paid for the work it claims to remove would report that work
+// as free -- a defect presenting as a finding. Instances fold every branch at
+// compile time. `S == 0` is production's arithmetic statement for statement,
+// and `what_attention_is_made_of` asserts its bits equal production's before
+// timing anything.
+//
+// A removed piece leaves values that are finite and of ordinary size, so no arm
+// can be timing an exceptional path instead of an absence of work.
+#define DBG_ATT_NO_QLOAD     1    // query constant: no load from global; stores and barrier kept
+#define DBG_ATT_NO_SCORE     2    // no K loads, no dot, no shuffle tree, and its barrier
+#define DBG_ATT_NO_MAX       4    // no max tree and none of its eight barriers
+#define DBG_ATT_MAX_BARRIERS 8    // the max tree's barriers, one private store between each
+#define DBG_ATT_NO_EXP       16   // no expf
+#define DBG_ATT_NO_SUM       32   // no sum tree and none of its seven barriers
+#define DBG_ATT_NO_V         64   // no weighted sum over V
+#define DBG_ATT_NO_CLOOP     128  // combine: no lane-0 max and expf loop over the chunks
+#define DBG_ATT_NO_CV        256  // combine: no weighted sum over the partials
+
+}  // extern "C" -- a template cannot have C linkage; reopened for the instances.
+
+template <int S>
+__device__ __forceinline__ void dbg_attn_flash_body(
+        float *sq, float *se, float *red,
+        int n_pos_first, int kv_dim, int head_dim, int n_head,
+        int n_head_kv, int use_warp, int part_stride, float scale,
+        const float *__restrict__ q,
+        const unsigned short *__restrict__ k,
+        const unsigned short *__restrict__ v,
+        float *__restrict__ part_acc,
+        float *__restrict__ part_m,
+        float *__restrict__ part_l) {
+    const int hq = blockIdx.x % n_head;
+    const int r = blockIdx.x / n_head;
+    const int n_pos = n_pos_first + r;
+    const int split = blockIdx.y;
+    const int lo = split * FD_CHUNK;
+    if (lo >= n_pos) return;
+    const int len = min(FD_CHUNK, n_pos - lo);
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        if (S & DBG_ATT_NO_QLOAD) {
+            sq[i] = 0.25f;
+        } else {
+            sq[i] = q[((size_t)r * n_head + hq) * head_dim + i];
+        }
+    }
+    __syncthreads();
+
+    float score = -INFINITY;
+    if (S & DBG_ATT_NO_SCORE) {
+        // A small ramp rather than a constant, so the max and the sum still see
+        // distinct values of ordinary size.
+        if (threadIdx.x < len) score = (float)(threadIdx.x & 15) * 0.125f;
+        red[threadIdx.x] = score;
+    } else if (use_warp) {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int nwarps = blockDim.x >> 5;
+        for (int p = warp; p < FD_CHUNK; p += nwarps) {
+            float dot = 0.0f;
+            if (p < len) {
+                const unsigned short *key = k + (size_t)(lo + p) * kv_dim + off;
+                for (int i = lane; i < head_dim; i += 32) dot += sq[i] * h2f(key[i]);
+#pragma unroll
+                for (int sh = 16; sh > 0; sh >>= 1)
+                    dot += __shfl_down_sync(0xffffffff, dot, sh);
+            }
+            if (lane == 0) red[p] = (p < len) ? dot * scale : -INFINITY;
+        }
+        __syncthreads();
+        score = red[threadIdx.x];
+    } else {
+        if (threadIdx.x < len) {
+            const unsigned short *key =
+                k + (size_t)(lo + threadIdx.x) * kv_dim + off;
+            float dot = 0.0f;
+            for (int i = 0; i < head_dim; ++i) dot += sq[i] * h2f(key[i]);
+            score = dot * scale;
+        }
+        red[threadIdx.x] = score;
+    }
+
+    __syncthreads();
+    float m = 0.0f;
+    if (!(S & DBG_ATT_NO_MAX)) {
+        for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+            if (S & DBG_ATT_MAX_BARRIERS) {
+                // One real store per level, so the barriers cannot be merged
+                // away as having nothing between them. `se` is rewritten below
+                // before anything reads it.
+                se[threadIdx.x] = (float)s;
+            } else if (threadIdx.x < s) {
+                red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+            }
+            __syncthreads();
+        }
+        if (!(S & DBG_ATT_MAX_BARRIERS)) m = red[0];
+        __syncthreads();
+    }
+
+    float e;
+    if (S & DBG_ATT_NO_EXP) {
+        e = (threadIdx.x < len) ? 0.5f : 0.0f;
+    } else {
+        e = (threadIdx.x < len) ? expf(score - m) : 0.0f;
+    }
+    se[threadIdx.x] = e;
+    red[threadIdx.x] = e;
+    __syncthreads();
+    float l = 1.0f;
+    if (!(S & DBG_ATT_NO_SUM)) {
+        for (int s = FD_CHUNK / 2; s > 0; s >>= 1) {
+            if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+            __syncthreads();
+        }
+        l = red[0];
+    }
+
+    const size_t base = ((size_t)r * n_head + hq) * part_stride + split;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        if (!(S & DBG_ATT_NO_V)) {
+            for (int t = 0; t < len; ++t) {
+                acc += se[t] * h2f(v[(size_t)(lo + t) * kv_dim + off + i]);
+            }
+        }
+        part_acc[base * head_dim + i] = acc;
+    }
+    if (threadIdx.x == 0) {
+        part_m[base] = m;
+        part_l[base] = l;
+    }
+}
+
+template <int S>
+__device__ __forceinline__ void dbg_attn_flash_combine_body(
+        float *w, float *total,
+        int n_pos_first, int head_dim, int n_head, int part_stride, int chunk,
+        const float *__restrict__ part_acc,
+        const float *__restrict__ part_m,
+        const float *__restrict__ part_l,
+        float *__restrict__ out) {
+    const int hq = blockIdx.x % n_head;
+    const int r = blockIdx.x / n_head;
+    const int n_split = (n_pos_first + r + chunk - 1) / chunk;
+    const size_t row = ((size_t)r * n_head + hq) * part_stride;
+    const float *pm = part_m + row;
+    const float *pl = part_l + row;
+
+    if (S & DBG_ATT_NO_CLOOP) {
+        // Every chunk weighted 1, stored in parallel, so the sum below still
+        // reads a shared array of the same length.
+        for (int s = threadIdx.x; s < n_split; s += blockDim.x) w[s] = 1.0f;
+        if (threadIdx.x == 0) *total = 1.0f;
+    } else if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (int s = 0; s < n_split; ++s) m = fmaxf(m, pm[s]);
+        float l = 0.0f;
+        for (int s = 0; s < n_split; ++s) {
+            w[s] = expf(pm[s] - m);
+            l += pl[s] * w[s];
+        }
+        *total = l;
+    }
+    __syncthreads();
+
+    const float *pa = part_acc + row * head_dim;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float acc = 0.0f;
+        if (!(S & DBG_ATT_NO_CV)) {
+            for (int s = 0; s < n_split; ++s) acc += pa[(size_t)s * head_dim + i] * w[s];
+        }
+        out[((size_t)r * n_head + hq) * head_dim + i] = acc / *total;
+    }
+}
+
+extern "C" {
+
+// The instances `Cuda::attn_dbg` can name. Same signatures as production, so
+// routing to one changes a kernel name and nothing else.
+#define DBG_ATTN_FLASH_INSTANCE(S)                                                  \
+extern "C" __global__ void dbg_attn_flash_##S(                                      \
+        int n_pos_first, int kv_dim, int head_dim, int n_head, int n_head_kv,     \
+        int use_warp, int part_stride, float scale,                               \
+        const float *__restrict__ q, const unsigned short *__restrict__ k,        \
+        const unsigned short *__restrict__ v, float *__restrict__ part_acc,       \
+        float *__restrict__ part_m, float *__restrict__ part_l) {                 \
+    extern __shared__ float smem[];                                               \
+    dbg_attn_flash_body<S>(smem, smem + head_dim, smem + head_dim + FD_CHUNK,     \
+        n_pos_first, kv_dim, head_dim, n_head, n_head_kv, use_warp, part_stride,  \
+        scale, q, k, v, part_acc, part_m, part_l);                                \
+}
+
+#define DBG_ATTN_COMBINE_INSTANCE(S)                                                \
+extern "C" __global__ void dbg_attn_flash_combine_##S(                              \
+        int n_pos_first, int head_dim, int n_head, int part_stride, int chunk,    \
+        const float *__restrict__ part_acc, const float *__restrict__ part_m,      \
+        const float *__restrict__ part_l, float *__restrict__ out) {              \
+    extern __shared__ float w[];                                                  \
+    __shared__ float total;                                                       \
+    dbg_attn_flash_combine_body<S>(w, &total, n_pos_first, head_dim, n_head,      \
+        part_stride, chunk, part_acc, part_m, part_l, out);                       \
+}
+
+DBG_ATTN_FLASH_INSTANCE(0)
+DBG_ATTN_FLASH_INSTANCE(1)
+DBG_ATTN_FLASH_INSTANCE(2)
+DBG_ATTN_FLASH_INSTANCE(4)
+DBG_ATTN_FLASH_INSTANCE(8)
+DBG_ATTN_FLASH_INSTANCE(16)
+DBG_ATTN_FLASH_INSTANCE(32)
+DBG_ATTN_FLASH_INSTANCE(64)
+DBG_ATTN_FLASH_INSTANCE(119)
+DBG_ATTN_COMBINE_INSTANCE(0)
+DBG_ATTN_COMBINE_INSTANCE(128)
+DBG_ATTN_COMBINE_INSTANCE(256)
+DBG_ATTN_COMBINE_INSTANCE(384)
+
 
 // Attention for a batch: the whole KV walk in one block, per (query row, head).
 //
@@ -1002,6 +1235,12 @@ __device__ __forceinline__ void ldmatrix_x4_trans(
 // The running-sum rescale folds into P before the f16 cast rather than
 // multiplying the accumulator afterwards -- one rounding instead of two, and it
 // takes a per-element multiply out of the inner loop.
+// Sixteen-byte K and V staging. Defined further down beside the decomposed copy
+// of this kernel, whose `S == 0` instance keeps the old staging as the control.
+__device__ __forceinline__ void vmma_stage16(
+        unsigned short *__restrict__ dst_tile, const unsigned short *__restrict__ src,
+        int lo, int n_pos_max, int kv_dim, int off, int head_dim);
+
 __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
                                  int head_dim, int n_head, int n_head_kv,
                                  int part_stride, float scale,
@@ -1033,10 +1272,31 @@ __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
     const int n_pos_max = n_pos_first + n_rows - 1;
     if (base_lo >= n_pos_max) return;
 
-    for (int i = threadIdx.x; i < ATT_QT * head_dim; i += blockDim.x) {
-        const int r = i / head_dim, d = i % head_dim;
-        const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
-        sq[i] = f2h(q[((size_t)rr * n_head + hq) * head_dim + d]);
+    // **Staged by stride, not by division -- here, and for K and V below.**
+    //
+    // The first version computed `i / head_dim` and `i % head_dim` for every
+    // element it staged, and decomposed at n_q 512 that was the kernel: K and V
+    // staging ~43% each, the two GEMMs 5%. With all three moved to strided
+    // copies a call went 255 -> 58 ms at d32768 and 49 -> 13 at d8192, **4.3x
+    // `attn_flash`** where it had been parity. Bit-identical, because the same
+    // bytes move; `dbg_attn_mma_v_0` keeps the old staging and
+    // `the_restaged_tensor_core_attention_is_bit_identical` holds the two equal.
+    //
+    // Lane `l` casts head dimensions [8l, 8l + 8) of the rows its warp owns.
+    // Each element still needs its own f32 -> f16 cast; only the division and
+    // the scatter are gone.
+    {
+        const int nwarps = blockDim.x >> 5;
+        const int d8 = lane * 8;
+        if (d8 < head_dim) {
+            for (int r = warp; r < ATT_QT; r += nwarps) {
+                const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
+                const float *src = q + ((size_t)rr * n_head + hq) * head_dim + d8;
+                unsigned short *dst = sq + (size_t)r * head_dim + d8;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) dst[j] = f2h(src[j]);
+            }
+        }
     }
     if (threadIdx.x < ATT_QT) {
         smax[threadIdx.x] = -INFINITY;
@@ -1059,10 +1319,7 @@ __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
         const int lo = base_lo + sub * ATT_KC;
         if (lo >= n_pos_max) break;
 
-        for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
-            const int p = i / head_dim, d = i % head_dim;
-            skv[i] = (lo + p < n_pos_max) ? k[(size_t)(lo + p) * kv_dim + off + d] : 0;
-        }
+        vmma_stage16(skv, k, lo, n_pos_max, kv_dim, off, head_dim);
         __syncthreads();
 
         // --- S = Q K^T, exactly as `attn_flash_mma` computes it.
@@ -1196,6 +1453,328 @@ __global__ void attn_flash_mma_v(int n_pos_first, int n_rows, int kv_dim,
 
 
 
+
+// ---------------------------------------------------------------------------
+// `attn_flash_mma_v`, decomposed
+// ---------------------------------------------------------------------------
+//
+// **Why the tensor-core kernel does not pay.** It stages K once per 16 query
+// vectors where `attn_flash` walks K once per vector, and it issues a fraction
+// of the instructions -- yet at d32768 both cost ~117 ns per (row, head, chunk)
+// of work. Something other than load count or instruction count binds it, and
+// llama.cpp's MMA kernel names four candidates it had to fix: bank conflicts on
+// consecutive 4-byte shared loads, synchronous staging, scalar fragment loads in
+// place of `ldmatrix`, and narrow tiles. Reading cannot say which; this prices
+// the pieces. Same method, and the same reason for template instances, as the
+// `attn_flash` decomposition above.
+//
+// Staged constants are f16 0.25 (`0x3400`) so every arm computes over ordinary
+// finite values.
+#define DBG_VMMA_NO_QSTAGE  1   // query staged as a constant: no global load, no f16 cast
+#define DBG_VMMA_NO_KSTAGE  2   // K staged as a constant: no global loads, stores kept
+#define DBG_VMMA_NO_SCORE   4   // no score GEMM: no fragment loads, no MMAs
+#define DBG_VMMA_NO_SOFTMAX 8   // no max, expf, sum, merge or broadcast
+#define DBG_VMMA_NO_VSTAGE  16  // V staged as a constant: no global loads, stores kept
+#define DBG_VMMA_NO_VGEMM   32  // no V GEMM: no rescale, no ldmatrix, no fragment loads, no MMAs
+// Not removals: the same bytes moved a faster way, held to bit-equality with `mma_v`.
+#define DBG_VMMA_FAST_KSTAGE 64   // K staged sixteen bytes per instruction, no division
+#define DBG_VMMA_FAST_VSTAGE 128  // V staged the same way
+#define DBG_VMMA_FAST_QSTAGE 256  // query staged by stride rather than by per-element division
+
+// Stage `ATT_KC` positions of one kv head into shared memory, sixteen bytes per
+// instruction -- what llama.cpp's `flash_attn_ext_f16_load_tile` does.
+//
+// **The kernel this replaces spent ~43% of its time on each of K and V here**,
+// because for every f16 it divided and took a remainder by a runtime `head_dim`,
+// compared, selected, and moved two bytes. Lane `l` now moves head dimensions
+// [8l, 8l + 8) of the positions its warp owns, so a warp's lanes read one
+// contiguous row per iteration and nothing is computed per element.
+//
+// Positions at or past `n_pos_max` are zeroed rather than loaded, exactly as the
+// original stages them: near the end of the cache they lie outside the slab.
+// The branch is warp-uniform, since `p` is the warp's and `lo` the block's.
+__device__ __forceinline__ void vmma_stage16(
+        unsigned short *__restrict__ dst_tile, const unsigned short *__restrict__ src,
+        int lo, int n_pos_max, int kv_dim, int off, int head_dim) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int d8 = lane * 8;
+    if (d8 >= head_dim) return;
+    for (int p = warp; p < ATT_KC; p += nwarps) {
+        int *dst = (int *)(dst_tile + (size_t)p * head_dim + d8);
+        if (lo + p < n_pos_max) {
+            *(int4 *)dst = *(const int4 *)(src + (size_t)(lo + p) * kv_dim + off + d8);
+        } else {
+            dst[0] = 0;
+            dst[1] = 0;
+            dst[2] = 0;
+            dst[3] = 0;
+        }
+    }
+}
+
+}  // extern "C" -- a template cannot have C linkage; reopened for the instances.
+
+template <int S>
+__device__ __forceinline__ void dbg_attn_mma_v_body(
+        char *smem_raw,
+        int n_pos_first, int n_rows, int kv_dim, int head_dim, int n_head, int n_head_kv,
+        int part_stride, float scale,
+        const float *__restrict__ q,
+        const unsigned short *__restrict__ k,
+        const unsigned short *__restrict__ v,
+        float *__restrict__ part_acc,
+        float *__restrict__ part_m,
+        float *__restrict__ part_l) {
+    unsigned short *sq  = (unsigned short *)smem_raw;      // ATT_QT x head_dim
+    unsigned short *skv = sq + ATT_QT * head_dim;          // ATT_KC x head_dim
+    unsigned short *sp  = skv + ATT_KC * head_dim;         // ATT_QT x ATT_KC, f16 P
+    float *ss   = (float *)(sp + ATT_QT * ATT_KC);         // ATT_QT x ATT_KC
+    float *smax = ss + ATT_QT * ATT_KC;                    // running max
+    float *ssum = smax + ATT_QT;                           // running sum
+    float *sra  = ssum + ATT_QT;                           // rescale, running
+
+    const int hq = blockIdx.x;
+    const int split = blockIdx.y;
+    const int base_lo = split * FD_CHUNK;
+    const int off = (hq / (n_head / n_head_kv)) * head_dim;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int n_dblk = head_dim >> 4;
+
+    const int n_pos_max = n_pos_first + n_rows - 1;
+    if (base_lo >= n_pos_max) return;
+
+    if (S & DBG_VMMA_FAST_QSTAGE) {
+        // The same elements as the loop below, addressed by stride: lane `l`
+        // casts head dimensions [8l, 8l + 8) of the rows its warp owns. Each
+        // element still needs its own f32 -> f16 cast, so only the division and
+        // the scatter go.
+        const int nwarps = blockDim.x >> 5;
+        const int d8 = lane * 8;
+        if (d8 < head_dim) {
+            for (int r = warp; r < ATT_QT; r += nwarps) {
+                const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
+                const float *src = q + ((size_t)rr * n_head + hq) * head_dim + d8;
+                unsigned short *dst = sq + (size_t)r * head_dim + d8;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) dst[j] = f2h(src[j]);
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < ATT_QT * head_dim; i += blockDim.x) {
+            if (S & DBG_VMMA_NO_QSTAGE) {
+                sq[i] = (unsigned short)0x3400;
+            } else {
+                const int r = i / head_dim, d = i % head_dim;
+                const int rr = (r < n_rows) ? r : 0;   // padding rows, masked below
+                sq[i] = f2h(q[((size_t)rr * n_head + hq) * head_dim + d]);
+            }
+        }
+    }
+    if (threadIdx.x < ATT_QT) {
+        smax[threadIdx.x] = -INFINITY;
+        ssum[threadIdx.x] = 0.0f;
+    }
+
+    float acc[ATT_DBLK][2][4];
+#pragma unroll
+    for (int j = 0; j < ATT_DBLK; ++j)
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[j][rg][i] = 0.0f;
+    __syncthreads();
+
+    for (int sub = 0; sub < FD_CHUNK / ATT_KC; ++sub) {
+        const int lo = base_lo + sub * ATT_KC;
+        if (lo >= n_pos_max) break;
+
+        if (S & DBG_VMMA_FAST_KSTAGE) {
+            vmma_stage16(skv, k, lo, n_pos_max, kv_dim, off, head_dim);
+        } else {
+            for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
+                if (S & DBG_VMMA_NO_KSTAGE) {
+                    skv[i] = (unsigned short)0x3400;
+                } else {
+                    const int p = i / head_dim, d = i % head_dim;
+                    skv[i] = (lo + p < n_pos_max) ? k[(size_t)(lo + p) * kv_dim + off + d] : 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        {
+            float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (S & DBG_VMMA_NO_SCORE) {
+                c[0] = 0.5f;
+                c[1] = 0.25f;
+                c[2] = 0.125f;
+                c[3] = 0.375f;
+            } else {
+                const int col = warp * 8 + g;
+                for (int k0 = 0; k0 < head_dim; k0 += 16) {
+                    unsigned a[4], b[2];
+                    a[0] = *(const unsigned *)&sq[(size_t)g * head_dim + k0 + 2 * t];
+                    a[1] = *(const unsigned *)&sq[(size_t)(g + 8) * head_dim + k0 + 2 * t];
+                    a[2] = *(const unsigned *)&sq[(size_t)g * head_dim + k0 + 2 * t + 8];
+                    a[3] = *(const unsigned *)&sq[(size_t)(g + 8) * head_dim + k0 + 2 * t + 8];
+                    b[0] = *(const unsigned *)&skv[(size_t)col * head_dim + k0 + 2 * t];
+                    b[1] = *(const unsigned *)&skv[(size_t)col * head_dim + k0 + 2 * t + 8];
+                    float dd[4];
+                    mma_m16n8k16_f16(dd, a, b, c);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) c[i] = dd[i];
+                }
+            }
+            const int c0 = warp * 8 + 2 * t;
+            ss[(size_t)g * ATT_KC + c0]           = c[0];
+            ss[(size_t)g * ATT_KC + c0 + 1]       = c[1];
+            ss[(size_t)(g + 8) * ATT_KC + c0]     = c[2];
+            ss[(size_t)(g + 8) * ATT_KC + c0 + 1] = c[3];
+        }
+        __syncthreads();
+
+        for (int rr = 0; rr < ATT_QT / 4; ++rr) {
+            const int r = warp * (ATT_QT / 4) + rr;
+            if (S & DBG_VMMA_NO_SOFTMAX) {
+                if (lane == 0) {
+                    smax[r] = 0.0f;
+                    ssum[r] = 1.0f;
+                    sra[r] = 1.0f;
+                }
+                sp[(size_t)r * ATT_KC + lane] = (unsigned short)0x3400;
+            } else {
+                const int n_pos_r = n_pos_first + r;
+                const bool live = (r < n_rows) && (lo + lane < n_pos_r);
+                float s = live ? ss[(size_t)r * ATT_KC + lane] * scale : -INFINITY;
+                float m = s;
+#pragma unroll
+                for (int sh = 16; sh > 0; sh >>= 1)
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, sh));
+                const float e = live ? expf(s - m) : 0.0f;
+                float l = e;
+#pragma unroll
+                for (int sh = 16; sh > 0; sh >>= 1)
+                    l += __shfl_xor_sync(0xffffffff, l, sh);
+                float b = 0.0f;
+                if (lane == 0) {
+                    const float om = smax[r], ol = ssum[r];
+                    const float nm = fmaxf(om, m);
+                    const float a = expf(om - nm);
+                    b = (m == -INFINITY) ? 0.0f : expf(m - nm);
+                    smax[r] = nm;
+                    ssum[r] = ol * a + l * b;
+                    sra[r] = a;
+                }
+                const float bb = __shfl_sync(0xffffffff, b, 0);
+                sp[(size_t)r * ATT_KC + lane] = f2h(e * bb);
+            }
+        }
+        __syncthreads();
+
+        if (S & DBG_VMMA_FAST_VSTAGE) {
+            vmma_stage16(skv, v, lo, n_pos_max, kv_dim, off, head_dim);
+        } else {
+            for (int i = threadIdx.x; i < ATT_KC * head_dim; i += blockDim.x) {
+                if (S & DBG_VMMA_NO_VSTAGE) {
+                    skv[i] = (unsigned short)0x3400;
+                } else {
+                    const int p = i / head_dim, d = i % head_dim;
+                    skv[i] = (lo + p < n_pos_max) ? v[(size_t)(lo + p) * kv_dim + off + d] : 0;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (!(S & DBG_VMMA_NO_VGEMM)) {
+            const float ra0 = sra[2 * t],     ra1 = sra[2 * t + 1];
+            const float rb0 = sra[8 + 2 * t], rb1 = sra[8 + 2 * t + 1];
+#pragma unroll
+            for (int j = 0; j < ATT_DBLK; ++j) {
+                acc[j][0][0] *= ra0; acc[j][0][1] *= ra1;
+                acc[j][0][2] *= ra0; acc[j][0][3] *= ra1;
+                acc[j][1][0] *= rb0; acc[j][1][1] *= rb1;
+                acc[j][1][2] *= rb0; acc[j][1][3] *= rb1;
+            }
+#pragma unroll
+            for (int j = 0; j < ATT_DBLK; ++j) {
+                const int db = warp + j * 4;
+                if (db >= n_dblk) continue;
+#pragma unroll
+                for (int ks = 0; ks < ATT_KC / 16; ++ks) {
+                    unsigned a[4];
+                    ldmatrix_x4_trans(a, skv + (size_t)(ks * 16) * head_dim + db * 16, head_dim);
+#pragma unroll
+                    for (int rg = 0; rg < 2; ++rg) {
+                        const unsigned short *pr =
+                            sp + (size_t)(rg * 8 + g) * ATT_KC + ks * 16 + 2 * t;
+                        unsigned b[2];
+                        b[0] = *(const unsigned *)pr;
+                        b[1] = *(const unsigned *)(pr + 8);
+                        float dd[4];
+                        mma_m16n8k16_f16(dd, a, b, acc[j][rg]);
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) acc[j][rg][i] = dd[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < ATT_DBLK; ++j) {
+        const int db = warp + j * 4;
+        if (db >= n_dblk) continue;
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int d = db * 16 + ((i < 2) ? g : g + 8);
+                const int r = rg * 8 + 2 * t + (i & 1);
+                if (r >= n_rows) continue;
+                part_acc[(((size_t)r * n_head + hq) * part_stride + split) * head_dim + d] =
+                    acc[j][rg][i];
+            }
+        }
+    }
+    if (threadIdx.x < n_rows) {
+        const size_t base = ((size_t)threadIdx.x * n_head + hq) * part_stride + split;
+        part_m[base] = smax[threadIdx.x];
+        part_l[base] = ssum[threadIdx.x];
+    }
+}
+
+extern "C" {
+
+#define DBG_ATTN_MMA_V_INSTANCE(S)                                                   \
+extern "C" __global__ void dbg_attn_mma_v_##S(                                      \
+        int n_pos_first, int n_rows, int kv_dim, int head_dim, int n_head,        \
+        int n_head_kv, int part_stride, float scale,                              \
+        const float *__restrict__ q, const unsigned short *__restrict__ k,        \
+        const unsigned short *__restrict__ v, float *__restrict__ part_acc,       \
+        float *__restrict__ part_m, float *__restrict__ part_l) {                 \
+    extern __shared__ char smem_raw[];                                            \
+    dbg_attn_mma_v_body<S>(smem_raw, n_pos_first, n_rows, kv_dim, head_dim,       \
+        n_head, n_head_kv, part_stride, scale, q, k, v, part_acc, part_m, part_l); \
+}
+
+DBG_ATTN_MMA_V_INSTANCE(0)
+DBG_ATTN_MMA_V_INSTANCE(1)
+DBG_ATTN_MMA_V_INSTANCE(2)
+DBG_ATTN_MMA_V_INSTANCE(4)
+DBG_ATTN_MMA_V_INSTANCE(8)
+DBG_ATTN_MMA_V_INSTANCE(16)
+DBG_ATTN_MMA_V_INSTANCE(32)
+DBG_ATTN_MMA_V_INSTANCE(18)
+DBG_ATTN_MMA_V_INSTANCE(36)
+DBG_ATTN_MMA_V_INSTANCE(63)
+DBG_ATTN_MMA_V_INSTANCE(192)
+DBG_ATTN_MMA_V_INSTANCE(448)
 
 // SwiGLU: gate = silu(gate) * up, in place. Not bit-exact: expf.
 __global__ void silu_mul(int n, float *__restrict__ gate,

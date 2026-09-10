@@ -166,6 +166,13 @@ pub struct Cuda {
     /// The **second** GEMM on the tensor cores too, with V read through
     /// `ldmatrix.trans` rather than staged transposed. Implies `attn_mma`.
     attn_vmma: Cell<bool>,
+    /// Route the split attention path through a `dbg_attn_flash_*` variant
+    /// that leaves pieces out, named by its skip mask. Bench-only; see
+    /// [`Cuda::attn_dbg`].
+    attn_dbg: Cell<Option<i32>>,
+    /// Route the tensor-core attention path through a `dbg_attn_mma_v_*`
+    /// variant, named by its skip mask. Bench-only; see [`Cuda::attn_vmma_dbg`].
+    attn_vdbg: Cell<Option<i32>>,
     /// Query rows per attention launch; 1 is the old one-row-per-launch path.
     qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
@@ -824,6 +831,8 @@ impl Cuda {
                 // added later.
                 attn_mma: Cell::new(env_flag("INFERRED_ATTN_MMA")),
                 attn_vmma: Cell::new(env_flag("INFERRED_ATTN_VMMA")),
+                attn_dbg: Cell::new(None),
+                attn_vdbg: Cell::new(None),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

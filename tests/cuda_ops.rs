@@ -1160,10 +1160,17 @@ fn what_attention_costs_as_context_grows() {
     let gpu = Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
 
-    let depths = [256usize, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384, 19942, 32768];
+    // **Past d32768 as of 10-09.** Prefill and decode both bend into a steeper
+    // second regime somewhere between the shallow and deep measurements, and
+    // this sweep stopping at 32768 is why nothing could say where. The points
+    // either side of 32768 are there to resolve a knee, not to fill the axis.
+    let depths = [
+        256usize, 512, 768, 1024, 1536, 2048, 4096, 8192, 16384, 19942, 24576, 28160, 32768,
+        36864, 40960, 49152, 57856, 65536,
+    ];
     let max = depths.iter().copied().max().unwrap_or(0);
 
-    // f16 bits, as the cache stores them. 32768 x 512 x 2 bytes = 32 MiB each.
+    // f16 bits, as the cache stores them. 65536 x 512 x 2 bytes = 64 MiB each.
     let k: Vec<u16> = (0..max * KV_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
     let v: Vec<u16> = (0..max * KV_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
     let q = noise(N_HEAD * HEAD_DIM, 7);
@@ -1171,9 +1178,12 @@ fn what_attention_costs_as_context_grows() {
 
     println!("\nattn_flash, one query row, {N_HEAD}q/{N_HEAD_KV}kv x {HEAD_DIM}");
     println!(
-        "  {:>7}  {:>9}  {:>9}  {:>7}  {:>9}  {:>9}  {:>11}",
-        "n_pos", "thread", "warp", "speedup", "GB/s thr", "GB/s warp", "ms/tok warp"
+        "  {:>7}  {:>9}  {:>9}  {:>7}  {:>9}  {:>9}  {:>11}  {:>13}",
+        "n_pos", "thread", "warp", "speedup", "GB/s thr", "GB/s warp", "ms/tok warp", "us/1k pos warp"
     );
+    // The previous row's depth and warp time, for the incremental slope. A knee
+    // is a change in slope, and a column of totals hides one inside a trend.
+    let mut prev: Option<(usize, f64)> = None;
     for d in depths {
         let a = Attn {
             q: &q,
@@ -1221,8 +1231,11 @@ fn what_attention_costs_as_context_grows() {
 
         // K and V, both f16, over the live window.
         let bytes = (d * KV_DIM * 2 * 2) as f64;
+        let slope = prev.map_or(String::from("-"), |(pd, pus)| {
+            format!("{:.2}", (warp_us - pus) * 1000.0 / (d - pd) as f64)
+        });
         println!(
-            "  {:>7}  {:>9.1}  {:>9.1}  {:>7.2}  {:>9.1}  {:>9.1}  {:>11.2}",
+            "  {:>7}  {:>9.1}  {:>9.1}  {:>7.2}  {:>9.1}  {:>9.1}  {:>11.2}  {:>14}",
             d,
             us,
             warp_us,
@@ -1230,9 +1243,751 @@ fn what_attention_costs_as_context_grows() {
             bytes / (us * 1e3),
             bytes / (warp_us * 1e3),
             warp_us * LAYERS as f64 / 1000.0,
+            slope,
         );
+        prev = Some((d, warp_us));
     }
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
+}
+
+/// **Where attention changes regime with depth, and which buffer does it.**
+///
+/// Prefill at depth fits two lines rather than one (`BENCHMARKS.md`, 10-09
+/// late): `1.907 + 1.038e-4 * D` shallow and `2.897 + 1.301e-4 * D` deep, and
+/// decode bends the same way. Both attention sweeps stopped at d32768, so
+/// nothing could say where the second regime starts or what starts it.
+///
+/// Two buffers on the production prefill path reach 32 MiB at exactly d32768,
+/// and `CLAUDE.md` puts this card's L2 at 32 MB:
+///
+/// | buffer, per attending layer | bytes | 32 MiB at |
+/// |---|---|---|
+/// | the K window the score phase reads | `n_pos * kv_dim * 2` | 32,768 at `kv_dim` 512 |
+/// | the partials `attn_flash` writes for the combine | `qgroup * n_head * n_split * head_dim * 4` | 32,768 at `qgroup` 8 |
+///
+/// That is a coincidence of this model's shapes, and it means a knee at 32768
+/// cannot name either one. So each arm moves one crossing and leaves the other
+/// where it is, with no kernel changed:
+///
+/// | arm | K crossing | partials crossing |
+/// |---|---|---|
+/// | `qgroup` 8, `n_head_kv` 2 -- production | 32,768 | 32,768 |
+/// | `qgroup` 4 | 32,768 | 65,536 |
+/// | `qgroup` 16 | 32,768 | 16,384 |
+/// | `n_head_kv` 1 | 65,536 | 32,768 |
+///
+/// A knee that follows the `qgroup` arms is the partials; one that follows the
+/// `n_head_kv` arm is K; one that follows neither says the working-set story is
+/// wrong, which is also a result. **A hypothesis under test, not a finding** --
+/// the 32 MB figure is the least established thing in it.
+///
+/// The slope column is in the whole-model fit's units -- ms of ten attending
+/// layers per prompt token, per position of depth -- taken between this depth
+/// and the previous one, so it reads directly against 1.038e-4 and 1.301e-4.
+///
+/// Bare of the activation bus but for one thing: `begin_pass` invalidates every
+/// mirror, so the timed pass re-uploads the 12.5 MiB query once. ~0.45 ms
+/// against ~20 ms calls at d4096 and far less deeper, identical on every arm.
+/// The output comes home once, after the timed calls.
+///
+/// `the_attention_agrees_with_the_oracle_past_32k` checks every construction
+/// timed here against `naive`, including the one-kv-head shape and the
+/// non-production `qgroup` values, none of which the 35B runs.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn which_buffer_bends_attention_at_depth() {
+    const HEAD_DIM: usize = 256;
+    const N_HEAD: usize = 16;
+    const N_Q: usize = 512;
+    const LAYERS: usize = 10;
+    const MAX_POS: usize = 65536;
+    /// The FP32 CUDA cores this path runs on, from the ceiling table in
+    /// `CLAUDE.md`'s 09-09 section.
+    const FP32_PEAK_TFLOPS: f64 = 24.0;
+    /// `CLAUDE.md`'s figure for this card, and the premise being tested.
+    const L2_BYTES: usize = 32 << 20;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // Every slab and buffer is held for the whole test: mirrors key on the host
+    // address, so a dropped buffer hands the next arm a recycled one. The
+    // one-kv-head slabs are separate allocations for the same reason rather
+    // than sub-slices of the two-head ones.
+    let k2: Vec<u16> =
+        (0..MAX_POS * 2 * HEAD_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
+    let v2: Vec<u16> = (0..MAX_POS * 2 * HEAD_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
+    let k1: Vec<u16> = k2[..MAX_POS * HEAD_DIM].to_vec();
+    let v1: Vec<u16> = v2[..MAX_POS * HEAD_DIM].to_vec();
+    let q = noise(N_Q * N_HEAD * HEAD_DIM, 7);
+    let mut out = vec![0.0f32; N_Q * N_HEAD * HEAD_DIM];
+
+    // (label, qgroup, n_head_kv)
+    let arms: [(&str, usize, usize); 4] =
+        [("g8 kv2", 8, 2), ("g4 kv2", 4, 2), ("g16 kv2", 16, 2), ("g8 kv1", 8, 1)];
+    let depths = [4096usize, 8192, 16384, 24576, 32768, 40960, 49152, 57856, 65536];
+
+    println!("\nattention at depth, prefill shape: n_q {N_Q}, {N_HEAD}q x {HEAD_DIM}, x{LAYERS} layers");
+    for (label, g, kv) in arms {
+        let k_at = L2_BYTES / (kv * HEAD_DIM * 2);
+        let p_at = L2_BYTES / (g * N_HEAD * HEAD_DIM * 4) * 128;
+        println!("  {label:<8} K window reaches 32 MiB at {k_at:>6}, partials at {p_at:>6}");
+    }
+
+    let mut best = vec![[f64::MAX; 4]; depths.len()];
+    for (di, &n_pos) in depths.iter().enumerate() {
+        // Arms interleaved inside each round, so drift lands on all four.
+        for _ in 0..3 {
+            for (ai, &(_, g, kv)) in arms.iter().enumerate() {
+                let (k, v) = if kv == 2 { (&k2, &v2) } else { (&k1, &v1) };
+                let a = Attn {
+                    q: &q,
+                    k,
+                    v,
+                    kv_dim: kv * HEAD_DIM,
+                    n_pos,
+                    head_dim: HEAD_DIM,
+                    n_head: N_HEAD,
+                    n_head_kv: kv,
+                    scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                };
+                gpu.set_qgroup(g);
+                // Warm-up: uploads the new KV positions and grows the pooled
+                // partials to this arm's size, neither of which is attention.
+                gpu.begin_pass(N_Q);
+                gpu.attend(&a, &mut out);
+                gpu.host_needs(&mut out);
+                gpu.end_pass();
+
+                const REPS: u32 = 2;
+                let t = std::time::Instant::now();
+                gpu.begin_pass(N_Q);
+                for _ in 0..REPS {
+                    gpu.attend(&a, &mut out);
+                }
+                gpu.end_pass();
+                gpu.host_needs(&mut out);
+                let ms = t.elapsed().as_secs_f64() * 1e3 / f64::from(REPS);
+                best[di][ai] = best[di][ai].min(ms);
+            }
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error at n_pos {n_pos}");
+    }
+    gpu.set_qgroup(8);
+
+    // ms of ten layers per prompt token, as the whole-model fit counts it.
+    let per_tok = |ms: f64| ms * LAYERS as f64 / N_Q as f64;
+    print!("\n  {:>6}", "n_pos");
+    for (label, _, _) in arms {
+        print!("  {label:>9} {:>10}", "slope");
+    }
+    println!("  {:>7}", "of fp32");
+    for (di, &n_pos) in depths.iter().enumerate() {
+        print!("  {n_pos:>6}");
+        for ai in 0..arms.len() {
+            let ms = best[di][ai];
+            let slope = if di == 0 {
+                String::from("-")
+            } else {
+                let dd = (n_pos - depths[di - 1]) as f64;
+                format!("{:.3e}", (per_tok(ms) - per_tok(best[di - 1][ai])) / dd)
+            };
+            print!("  {ms:>7.1}ms {slope:>10}");
+        }
+        // Production arm against the cores it runs on. Two MACs per (query,
+        // key, dim), over every head and every row's causal window.
+        let n_pos_first = (n_pos + 1 - N_Q) as f64;
+        let windows = N_Q as f64 * n_pos_first + (N_Q * (N_Q - 1) / 2) as f64;
+        let flops = 4.0 * N_HEAD as f64 * windows * HEAD_DIM as f64;
+        let tf = flops / (best[di][0] * 1e-3) / 1e12;
+        println!("  {:>6.2}%", 100.0 * tf / FP32_PEAK_TFLOPS);
+    }
+    println!(
+        "\n  slope: ms of {LAYERS} layers per prompt token, per position; the whole-model fit \
+         is 1.038e-4 shallow and 1.301e-4 deep\n"
+    );
+}
+
+/// **The restaged tensor-core attention kernel is bit-identical to its old
+/// staging, at every shape the rewrite could get wrong.**
+///
+/// `attn_flash_mma_v` now stages K and V sixteen bytes per instruction and the
+/// query by stride, where it divided and took a remainder for every element --
+/// ~80% of the kernel at d32768. The same bytes move, so the answer must be the
+/// same bits, and `dbg_attn_mma_v_0` keeps the old staging to prove it. This is
+/// the exact guard; `the_tensor_core_attention_stays_inside_its_derived_bound`
+/// is the one against the oracle.
+///
+/// The shapes are chosen for what a strided copy can get wrong: n_q that is not
+/// a multiple of the 16-row tile (padding rows), windows ending mid-chunk and
+/// mid-sub-tile, n_pos either side of 32768, head_dim 128 where lanes 16-31
+/// stage nothing, and **a KV slab exactly n_pos long**, so the zeroed tail of
+/// the last chunk lies outside the allocation and a wrong guard reads past it.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_restaged_tensor_core_attention_is_bit_identical() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // One slab pair per kv width, held for the whole test: the backend keys its
+    // KV mirror on the host address and counts uploaded *positions*, so reusing
+    // one slab at a different kv_dim would upload the wrong bytes.
+    let slab = |n: usize, mul: usize, shift: u32| -> Vec<u16> {
+        (0..n).map(|i| ((i * mul) >> shift) as u16 & 0x3bff).collect()
+    };
+    // (head_dim, n_head, n_head_kv, positions in the slab)
+    let shapes: [(usize, usize, usize, usize); 4] =
+        [(256, 16, 2, 32769), (128, 16, 8, 4097), (128, 16, 16, 4097), (256, 16, 2, 1000)];
+    let slabs: Vec<(Vec<u16>, Vec<u16>)> = shapes
+        .iter()
+        .map(|&(hd, _, kv, pos)| (slab(pos * kv * hd, 2654435761, 13), slab(pos * kv * hd, 40503, 11)))
+        .collect();
+
+    let rows = [2usize, 17, 33, 512];
+    // One query and two outputs per (rows, head_dim): a shorter slice of a
+    // longer buffer shares its address and would share its mirror.
+    let held_q: Vec<Vec<f32>> = [256usize, 128]
+        .iter()
+        .flat_map(|&hd| rows.iter().map(move |&n| noise(n * 16 * hd, 0x7a00 + (n * hd) as u64)))
+        .collect();
+    let mut held_new: Vec<Vec<f32>> = held_q.iter().map(|q| vec![0.0; q.len()]).collect();
+    let mut held_old: Vec<Vec<f32>> = held_q.iter().map(|q| vec![0.0; q.len()]).collect();
+
+    let mut checked = 0usize;
+    for (si, &(head_dim, n_head, n_head_kv, slab_pos)) in shapes.iter().enumerate() {
+        let depths: Vec<usize> = if slab_pos == 32769 {
+            vec![127, 128, 129, 1000, 4095, 32767, 32768, 32769]
+        } else if slab_pos == 1000 {
+            vec![1000]
+        } else {
+            vec![129, 1000, 4097]
+        };
+        let (k, v) = &slabs[si];
+        for (ri, &n_q) in rows.iter().enumerate() {
+            let at = if head_dim == 256 { ri } else { rows.len() + ri };
+            for &n_pos in depths.iter().chain(std::iter::once(&n_q.max(2))) {
+                if n_pos < n_q || n_pos > slab_pos {
+                    continue;
+                }
+                let a = Attn {
+                    q: &held_q[at],
+                    k,
+                    v,
+                    kv_dim: n_head_kv * head_dim,
+                    n_pos,
+                    head_dim,
+                    n_head,
+                    n_head_kv,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                };
+                for (mask, into) in [(None, &mut held_new[at]), (Some(0), &mut held_old[at])] {
+                    gpu.attn_vmma_dbg(None);
+                    gpu.set_attn_vmma(true);
+                    gpu.attn_vmma_dbg(mask);
+                    gpu.begin_pass(n_q);
+                    gpu.attend(&a, &mut into[..]);
+                    gpu.host_needs(&mut into[..]);
+                    gpu.end_pass();
+                }
+                if let Some(e) = gpu.take_error() {
+                    panic!("cuda error at hd{head_dim} kv{n_head_kv} n_q {n_q} d{n_pos}: {e}");
+                }
+                let (worst, differing) = compare(&held_old[at], &held_new[at]);
+                assert_eq!(
+                    differing, 0,
+                    "hd{head_dim} kv{n_head_kv} slab {slab_pos} n_q {n_q} d{n_pos}: {differing} of \
+                     {} outputs differ from the old staging, worst {worst:e}. The same bytes are \
+                     supposed to move. Suspect the lane-to-dimension map (lane l stages [8l, 8l+8)), \
+                     the warp's position stride, the zeroed tail past n_pos_max, or the padded rows.",
+                    held_new[at].len()
+                );
+                checked += held_new[at].len();
+            }
+        }
+    }
+    gpu.attn_vmma_dbg(None);
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
+    println!("  {checked} outputs compared with the old staging, all bit-identical");
+}
+
+/// **The tensor-core attention kernel against the oracle, inside a derived
+/// bound.**
+///
+/// `attn_flash_mma_v` is a precision change, not a reordering: Q is cast to f16
+/// before the score GEMM and the rescaled probabilities are cast to f16 before
+/// the V GEMM. `HANDOFF.md` 08-09 settled that this is acceptable (1.3e-6 to
+/// 3.4e-5 against the f32 path, and FlashAttention-3 finds FP16 attention *more*
+/// accurate than a naive f32 one). This bounds it, in units of `max|v|` because
+/// the output is a convex combination of values:
+///
+/// - **Q to f16** moves each element by at most half an f16 ulp, 2^-11 of
+///   itself, so a score by at most `d = 2^-11 * scale * |q|_2 * |k|_2`
+///   (Cauchy-Schwarz). Scores all moving by at most `d` move every softmax
+///   weight by a factor inside `e^(+-2d)`, so the output by `(e^(2d) - 1)`.
+/// - **P to f16** rounds a weight by at most 2^-11 of itself, or by half the
+///   smallest subnormal step, 2^-25, once it falls below f16's normal range.
+///   Over `n_pos` weights against a normaliser of at least 1 (the maximum
+///   term), at most `2^-11 + n_pos * 2^-25`.
+/// - The f32 accumulation both sides still do: `attend_tolerance`.
+///
+/// **A bound, and a loose one.** Measured error sits orders of magnitude under
+/// it. It exists to catch defects that move outputs by a large fraction of
+/// `max|v|` -- a wrong row, a wrong kv head, an unmasked window. It cannot see a
+/// one-position slip in a deep, near-uniform softmax, which is why the staging
+/// rewrite is guarded by bit-equality instead.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_tensor_core_attention_stays_inside_its_derived_bound() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.set_attn_vmma(true);
+
+    const N_Q: usize = 17;
+    // (head_dim, n_head, n_head_kv, depths)
+    let shapes: [(usize, usize, usize, &[usize]); 2] =
+        [(256, 16, 2, &[40, 300, 4096, 32769]), (128, 16, 8, &[40, 300, 4096])];
+
+    // Every buffer for every shape is built up front and held to the end: the
+    // backend keys its mirrors on host addresses, so a per-shape allocation
+    // freed and recycled at a different kv_dim would be uploaded as the wrong
+    // bytes -- the trap `the_warp_attention_agrees_with_the_oracle` records.
+    struct Held {
+        kf: Vec<f32>,
+        vf: Vec<f32>,
+        k: Vec<u16>,
+        v: Vec<u16>,
+        q: Vec<f32>,
+        got: Vec<f32>,
+    }
+    let mut held: Vec<Held> = shapes
+        .iter()
+        .enumerate()
+        .map(|(si, &(head_dim, n_head, n_head_kv, depths))| {
+            let kv_dim = n_head_kv * head_dim;
+            let max_pos = depths.iter().copied().max().unwrap_or(0);
+            let kf = noise(max_pos * kv_dim, 0x6b00 + si as u64);
+            let vf = noise(max_pos * kv_dim, 0x7600 + si as u64);
+            let k = kf.iter().map(|&x| f32_to_f16(x)).collect();
+            let v = vf.iter().map(|&x| f32_to_f16(x)).collect();
+            let q = noise(N_Q * n_head * head_dim, 0x7100 + si as u64);
+            let got = vec![0.0f32; q.len()];
+            Held { kf, vf, k, v, q, got }
+        })
+        .collect();
+
+    let mut worst_ratio = 0.0f64;
+    for (si, &(head_dim, n_head, n_head_kv, depths)) in shapes.iter().enumerate() {
+        let kv_dim = n_head_kv * head_dim;
+        let Held { kf, vf, k, v, q, got } = &mut held[si];
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Largest query and key norms, and the largest value, allowing each the
+        // f16 rounding the kernel's inputs carry.
+        let f16_slack = 1.0 + 2f64.powi(-10);
+        let q2 = q
+            .chunks_exact(head_dim)
+            .map(|r| r.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt())
+            .fold(0.0, f64::max)
+            * f16_slack;
+
+        for &n_pos in depths {
+            let k2 = kf[..n_pos * kv_dim]
+                .chunks_exact(head_dim)
+                .map(|r| r.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt())
+                .fold(0.0, f64::max)
+                * f16_slack;
+            let vmax = vf[..n_pos * kv_dim].iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()))
+                * f16_slack;
+
+            let a = Attn { q: &q, k: &k, v: &v, kv_dim, n_pos, head_dim, n_head, n_head_kv, scale };
+            let mut want = vec![0.0f32; q.len()];
+            Naive.attend(&a, &mut want);
+
+            gpu.begin_pass(N_Q);
+            gpu.attend(&a, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            if let Some(e) = gpu.take_error() {
+                panic!("cuda error at hd{head_dim} d{n_pos}: {e}");
+            }
+
+            let d = 2f64.powi(-11) * f64::from(scale) * q2 * k2;
+            let bound = vmax * ((2.0 * d).exp_m1() + 2f64.powi(-11) + n_pos as f64 * 2f64.powi(-25))
+                + f64::from(attend_tolerance(n_pos, &want));
+            let worst = want
+                .iter()
+                .zip(&got)
+                .fold(0.0f64, |m, (x, y)| m.max((f64::from(*x) - f64::from(*y)).abs()));
+            worst_ratio = worst_ratio.max(worst / bound);
+            println!(
+                "  hd{head_dim} kv{n_head_kv} n_q {N_Q} d{n_pos:<6} worst {worst:.3e}  bound {bound:.3e}  ({:.1e} of it)",
+                worst / bound
+            );
+            assert!(
+                worst <= bound,
+                "the tensor-core attention kernel is outside its derived bound at hd{head_dim} \
+                 kv{n_head_kv} d{n_pos}: {worst:e} against {bound:e}. Precision alone cannot put it \
+                 there; suspect the row a query tile reads, the kv head offset, the causal window \
+                 of a padded row, or the sub-tile rescale."
+            );
+        }
+    }
+    gpu.set_attn_vmma(false);
+    gpu.set_attn_mma(false);
+    println!("  worst error is {worst_ratio:.2e} of its bound");
+}
+
+/// **What the tensor-core attention kernel is made of.**
+///
+/// `attn_flash_mma_v` stages K once per 16 query vectors where `attn_flash`
+/// walks it once per vector, and issues a fraction of the instructions -- yet at
+/// d32768 the two cost the same per (row, head, chunk) of work, ~117 ns. So the
+/// kernel that should have been the fast one is stalled on something that is
+/// neither load count nor instruction count, and anything built on its structure
+/// would inherit the stall. This prices its pieces, the same way
+/// `what_attention_is_made_of` priced `attn_flash`.
+///
+/// `saves` is against the real `mma_v`, and the nothing-removed copy is asserted
+/// bit-identical to it before anything is timed. `attn_flash` is timed alongside
+/// as the production reference.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_tensor_core_attention_is_made_of() {
+    const HEAD_DIM: usize = 256;
+    const N_HEAD: usize = 16;
+    const N_HEAD_KV: usize = 2;
+    const KV_DIM: usize = N_HEAD_KV * HEAD_DIM;
+    const N_Q: usize = 512;
+    const LAYERS: usize = 10;
+    const MAX_POS: usize = 32768;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let k: Vec<u16> = (0..MAX_POS * KV_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
+    let v: Vec<u16> = (0..MAX_POS * KV_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
+    let q = noise(N_Q * N_HEAD * HEAD_DIM, 7);
+    let mut out = vec![0.0f32; N_Q * N_HEAD * HEAD_DIM];
+    let mut reference = vec![0.0f32; N_Q * N_HEAD * HEAD_DIM];
+
+    // (label, decomposed mma_v mask, tensor cores: 0 = attn_flash, 2 = mma_v)
+    // The last two are not removals: they move the same bytes a faster way, so
+    // they are held to bit-equality with `mma_v` like the nothing-removed copy.
+    let arms: [(&str, Option<i32>, u8); 14] = [
+        ("mma_v", None, 2),
+        ("attn_flash (production)", None, 0),
+        ("dbg copy, nothing removed", Some(0), 2),
+        ("no query staging", Some(1), 2),
+        ("no K staging", Some(2), 2),
+        ("no score GEMM", Some(4), 2),
+        ("no softmax", Some(8), 2),
+        ("no V staging", Some(16), 2),
+        ("no V GEMM", Some(32), 2),
+        ("no K or V staging", Some(18), 2),
+        ("no GEMMs", Some(36), 2),
+        ("floor: all removed", Some(63), 2),
+        ("16-byte K and V staging", Some(192), 2),
+        ("16-byte K/V + divless query", Some(448), 2),
+    ];
+    let configure = |vdbg: Option<i32>, cores: u8| {
+        gpu.attn_vmma_dbg(None);
+        gpu.set_attn_vmma(cores == 2);
+        gpu.set_attn_mma(cores >= 1);
+        gpu.attn_vmma_dbg(vdbg);
+    };
+
+    for n_pos in [8192usize, 32768] {
+        let a = Attn {
+            q: &q,
+            k: &k,
+            v: &v,
+            kv_dim: KV_DIM,
+            n_pos,
+            head_dim: HEAD_DIM,
+            n_head: N_HEAD,
+            n_head_kv: N_HEAD_KV,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        };
+        let run = |vdbg: Option<i32>, cores: u8, into: &mut Vec<f32>| {
+            configure(vdbg, cores);
+            gpu.begin_pass(N_Q);
+            gpu.attend(&a, into);
+            gpu.host_needs(into);
+            gpu.end_pass();
+        };
+        run(None, 2, &mut reference);
+        for mask in [0, 192, 448] {
+            run(Some(mask), 2, &mut out);
+            let differing =
+                reference.iter().zip(&out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            assert_eq!(
+                differing, 0,
+                "d{n_pos}: mask {mask} differs from mma_v in {differing} outputs; it is meant \
+                 to move the same bytes, so this is a staging bug"
+            );
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error at d{n_pos}");
+
+        let mut best = [f64::MAX; 14];
+        for _ in 0..3 {
+            for (ai, &(_, vdbg, cores)) in arms.iter().enumerate() {
+                run(vdbg, cores, &mut out);
+                const REPS: u32 = 2;
+                let t = std::time::Instant::now();
+                gpu.begin_pass(N_Q);
+                for _ in 0..REPS {
+                    gpu.attend(&a, &mut out);
+                }
+                gpu.end_pass();
+                gpu.host_needs(&mut out);
+                best[ai] = best[ai].min(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPS));
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error at d{n_pos}");
+        }
+        configure(None, 0);
+
+        let base = best[0];
+        println!(
+            "\nattn_flash_mma_v decomposed, n_q {N_Q}, d{n_pos}: mma_v {base:.1} ms/call, \
+             {:.3} ms/token over {LAYERS} layers",
+            base * LAYERS as f64 / N_Q as f64
+        );
+        println!("  {:<30} {:>10} {:>10} {:>7}", "arm", "ms/call", "saves", "share");
+        for (ai, &(label, _, _)) in arms.iter().enumerate() {
+            let saves = base - best[ai];
+            println!("  {label:<30} {:>10.2} {:>+10.2} {:>6.1}%", best[ai], saves, 100.0 * saves / base);
+        }
+    }
+}
+
+/// **What `attn_flash` is made of: each piece priced by leaving it out.**
+///
+/// Attention is linear in depth from d8192 to d65536 on every arm of
+/// `which_buffer_bends_attention_at_depth`, at 4.6% of the fp32 cores, and the
+/// one-kv-head arm reads half the bytes for the same cost -- so it is bound by
+/// work, not traffic. Reading the kernel ranks its pieces by instruction count,
+/// and that is exactly the kind of reading that sent two IQ4_XS attempts at
+/// parts worth 2 us of 144. This prices them instead.
+///
+/// Each `dbg_attn_flash_*` kernel is a compile-time instance of one template
+/// with one piece left out, so no arm can be quietly paying for work its branch
+/// was supposed to remove. **The nothing-left-out instance is asserted
+/// bit-identical to production** before anything is timed: an arm that differs
+/// from the kernel it claims to decompose is measuring something else.
+///
+/// Read the `saves` column, not the times: it is production minus the arm, i.e.
+/// what that piece costs. The pieces need not sum to the whole -- removing one
+/// can change what the SMs do with the rest -- and the floor arm, with every
+/// piece gone but the launch, the grid, the barriers between phases and the
+/// partial stores, says how much is structure rather than arithmetic.
+///
+/// The last two arms are the tensor-core kernels, which rewrite the GEMMs
+/// rather than removing anything. `attn_flash_mma_v` puts both on the tensor
+/// cores and had never been measured; both round Q (and `mma_v` the
+/// probabilities) to f16, so they carry a relative error rather than a bit check.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_attention_is_made_of() {
+    const HEAD_DIM: usize = 256;
+    const N_HEAD: usize = 16;
+    const N_HEAD_KV: usize = 2;
+    const KV_DIM: usize = N_HEAD_KV * HEAD_DIM;
+    const N_Q: usize = 512;
+    const LAYERS: usize = 10;
+    const MAX_POS: usize = 32768;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // Held for the whole test: mirrors key on the host address.
+    let k: Vec<u16> = (0..MAX_POS * KV_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
+    let v: Vec<u16> = (0..MAX_POS * KV_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
+    let q = noise(N_Q * N_HEAD * HEAD_DIM, 7);
+    let mut out = vec![0.0f32; N_Q * N_HEAD * HEAD_DIM];
+    let mut reference = vec![0.0f32; N_Q * N_HEAD * HEAD_DIM];
+
+    // (label, decomposed-kernel mask, tensor cores: 0 none, 1 score, 2 both)
+    let arms: [(&str, Option<i32>, u8); 14] = [
+        ("production", None, 0),
+        ("dbg copy, nothing left out", Some(0), 0),
+        ("no query load", Some(1), 0),
+        ("no score phase", Some(2), 0),
+        ("no max tree", Some(4), 0),
+        ("max tree barriers only", Some(8), 0),
+        ("no expf", Some(16), 0),
+        ("no sum tree", Some(32), 0),
+        ("no V phase", Some(64), 0),
+        ("no combine lane-0 loop", Some(128), 0),
+        ("no combine V sum", Some(256), 0),
+        ("floor: all but barriers", Some(119 | 384), 0),
+        ("mma: score GEMM", None, 1),
+        ("mma_v: both GEMMs", None, 2),
+    ];
+    let configure = |dbg: Option<i32>, cores: u8| {
+        gpu.attn_dbg(dbg);
+        // `set_attn_vmma(true)` implies the score kernel, so it goes first.
+        gpu.set_attn_vmma(cores == 2);
+        gpu.set_attn_mma(cores >= 1);
+    };
+
+    for n_pos in [8192usize, 32768] {
+        let a = Attn {
+            q: &q,
+            k: &k,
+            v: &v,
+            kv_dim: KV_DIM,
+            n_pos,
+            head_dim: HEAD_DIM,
+            n_head: N_HEAD,
+            n_head_kv: N_HEAD_KV,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+        };
+
+        // The construction check, before any time is taken.
+        let run = |dbg: Option<i32>, cores: u8, into: &mut Vec<f32>| {
+            configure(dbg, cores);
+            gpu.begin_pass(N_Q);
+            gpu.attend(&a, into);
+            gpu.host_needs(into);
+            gpu.end_pass();
+        };
+        run(None, 0, &mut reference);
+        run(Some(0), 0, &mut out);
+        let differing = reference.iter().zip(&out).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        assert_eq!(
+            differing, 0,
+            "d{n_pos}: the nothing-left-out copy differs from production in {differing} outputs, \
+             so every decomposed arm would be timing a different kernel"
+        );
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error at d{n_pos}");
+        let mag = reference.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let mut rel = [0.0f32; 3];
+        for cores in [1u8, 2] {
+            run(None, cores, &mut out);
+            let worst = reference.iter().zip(&out).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+            rel[cores as usize] = worst / mag.max(1e-30);
+        }
+
+        // Interleaved inside each round, so drift lands on every arm.
+        let mut best = [f64::MAX; 14];
+        for _ in 0..3 {
+            for (ai, &(_, dbg, cores)) in arms.iter().enumerate() {
+                run(dbg, cores, &mut out);
+                const REPS: u32 = 2;
+                let t = std::time::Instant::now();
+                gpu.begin_pass(N_Q);
+                for _ in 0..REPS {
+                    gpu.attend(&a, &mut out);
+                }
+                gpu.end_pass();
+                gpu.host_needs(&mut out);
+                best[ai] = best[ai].min(t.elapsed().as_secs_f64() * 1e3 / f64::from(REPS));
+            }
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error at d{n_pos}");
+        }
+        configure(None, 0);
+
+        let prod = best[0];
+        println!(
+            "\nattn_flash decomposed, n_q {N_Q}, d{n_pos}: production {prod:.1} ms/call, \
+             {:.3} ms/token over {LAYERS} layers",
+            prod * LAYERS as f64 / N_Q as f64
+        );
+        println!("  {:<30} {:>10} {:>10} {:>7}", "arm", "ms/call", "saves", "share");
+        for (ai, &(label, _, cores)) in arms.iter().enumerate() {
+            let saves = prod - best[ai];
+            let tail = if cores > 0 {
+                format!("   {:.2}x, rel {:.2e}", prod / best[ai], rel[cores as usize])
+            } else {
+                String::new()
+            };
+            println!(
+                "  {label:<30} {:>10.2} {:>+10.2} {:>6.1}%{tail}",
+                best[ai],
+                saves,
+                100.0 * saves / prod
+            );
+        }
+    }
+}
+
+/// Flash-decoding attention agrees with the oracle past d32768, on every
+/// construction `which_buffer_bends_attention_at_depth` times.
+///
+/// **A cost bench that builds its own inputs needs a correctness check on the
+/// same construction** -- `what_the_moe_ffn_costs` timed the wrong experts for
+/// its whole life while the oracle test beside it used a different path.
+/// `the_warp_attention_agrees_with_the_oracle` stops at d5000; this covers the
+/// depths, the `qgroup` values and the one-kv-head shape the sweep uses.
+///
+/// The depths straddle what changes at 32768: `n_split` goes 256 -> 257 inside
+/// a group of rows at 32769, and 65536 is the deepest the sweep reaches.
+/// Seventeen query rows leave every `qgroup` a partial last group.
+///
+/// Real f16s of noise in [-1, 1) rather than the sweep's hashed bits, because
+/// the derived tolerance only means something over values of sane magnitude.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_attention_agrees_with_the_oracle_past_32k() {
+    const HEAD_DIM: usize = 256;
+    const N_HEAD: usize = 16;
+    const MAX_POS: usize = 65536;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let f16s = |n: usize, seed: u64| -> Vec<u16> { noise(n, seed).iter().map(|&x| f32_to_f16(x)).collect() };
+    let k2 = f16s(MAX_POS * 2 * HEAD_DIM, 41);
+    let v2 = f16s(MAX_POS * 2 * HEAD_DIM, 42);
+    let k1 = f16s(MAX_POS * HEAD_DIM, 43);
+    let v1 = f16s(MAX_POS * HEAD_DIM, 44);
+    // One held query and one held output per row count: a shorter slice of a
+    // longer buffer shares its address, and so would share its mirror.
+    let q1 = noise(N_HEAD * HEAD_DIM, 45);
+    let q17 = noise(17 * N_HEAD * HEAD_DIM, 46);
+    let mut got1 = vec![0.0f32; q1.len()];
+    let mut got17 = vec![0.0f32; q17.len()];
+
+    let mut checked = 0usize;
+    for n_pos in [32767usize, 32768, 32769, 65536] {
+        for kv in [2usize, 1] {
+            let (k, v) = if kv == 2 { (&k2, &v2) } else { (&k1, &v1) };
+            for n_q in [1usize, 17] {
+                let (q, got) = if n_q == 1 { (&q1, &mut got1) } else { (&q17, &mut got17) };
+                let a = Attn {
+                    q,
+                    k,
+                    v,
+                    kv_dim: kv * HEAD_DIM,
+                    n_pos,
+                    head_dim: HEAD_DIM,
+                    n_head: N_HEAD,
+                    n_head_kv: kv,
+                    scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+                };
+                let mut want = vec![0.0f32; got.len()];
+                Naive.attend(&a, &mut want);
+                let tol = attend_tolerance(n_pos, &want);
+                // Decode is a group of one whatever `qgroup` says.
+                let groups: &[usize] = if n_q == 1 { &[8] } else { &[4, 8, 16] };
+                for &g in groups {
+                    gpu.set_qgroup(g);
+                    gpu.begin_pass(n_q);
+                    gpu.attend(&a, &mut got[..]);
+                    gpu.host_needs(&mut got[..]);
+                    gpu.end_pass();
+                    close(&format!("attend d{n_pos} kv{kv} nq{n_q} g{g}"), &want, &got[..], tol);
+                    checked += want.len();
+                }
+            }
+        }
+    }
+    gpu.set_qgroup(8);
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error: {e}");
+    }
+    println!("  {checked} outputs within the derived tolerance past d32768");
 }
 
 /// The staged F32 matmul is bit-identical to the oracle at every shape the
