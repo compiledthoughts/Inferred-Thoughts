@@ -178,6 +178,9 @@ pub struct Cuda {
     attn_decode_mma: Cell<Option<bool>>,
     /// Positions from which decode attention takes the tensor cores.
     attn_decode_mma_from: Cell<usize>,
+    /// Use the 16-slot decode tile even where the 8-slot one fits. For the A/B
+    /// and for keeping the 16-slot mode tested.
+    attn_decode_tile16: Cell<bool>,
     /// Query rows per attention launch; 1 is the old one-row-per-launch path.
     qgroup: Cell<usize>,
     /// Route batched IQ4_XS matmuls through the int8 tensor cores.
@@ -848,6 +851,7 @@ impl Cuda {
                 attn_decode_mma: Cell::new(None),
                 // 0 means `Cuda::ATTN_DECODE_MMA_MIN_POS`.
                 attn_decode_mma_from: Cell::new(0),
+                attn_decode_tile16: Cell::new(false),
                 attn_warp_only: Cell::new(None),
                 attn_calls: Cell::new(0),
                 report_per_turn: Cell::new(false),

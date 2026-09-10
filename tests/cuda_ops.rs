@@ -1232,6 +1232,9 @@ fn what_attention_costs_as_context_grows() {
         let warp_us = timed(true);
         gpu.attn_decode_mma(Some(true));
         let mma_us = timed(true);
+        gpu.attn_decode_tile16(true);
+        let mma16_us = timed(true);
+        gpu.attn_decode_tile16(false);
         gpu.attn_decode_mma(None);
         gpu.attn_warp(None);
 
@@ -1253,9 +1256,10 @@ fn what_attention_costs_as_context_grows() {
         );
         prev = Some((d, warp_us));
         println!(
-            "  {:>7}  tensor cores {mma_us:>9.1} us, {:.2}x the warp phase",
+            "  {:>7}  tensor cores {mma_us:>9.1} us ({:.2}x warp), 16-slot tile {mma16_us:>9.1} us ({:.2}x warp)",
             "",
-            warp_us / mma_us
+            warp_us / mma_us,
+            warp_us / mma16_us
         );
     }
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
@@ -1458,6 +1462,7 @@ fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
         v: Vec<u16>,
         q: Vec<f32>,
         mma: Vec<f32>,
+        mma16: Vec<f32>,
         scalar: Vec<f32>,
     }
     let mut held: Vec<Held> = shapes
@@ -1471,7 +1476,7 @@ fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
             let k = kf.iter().map(|&x| f32_to_f16(x)).collect();
             let v = vf.iter().map(|&x| f32_to_f16(x)).collect();
             let q = noise(n_head * head_dim, 0x7200 + si as u64);
-            Held { kf, vf, k, v, mma: vec![0.0; q.len()], scalar: vec![0.0; q.len()], q }
+            Held { kf, vf, k, v, mma: vec![0.0; q.len()], mma16: vec![0.0; q.len()], scalar: vec![0.0; q.len()], q }
         })
         .collect();
 
@@ -1480,7 +1485,7 @@ fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
     let mut worst_ratio = 0.0f64;
     for (si, &(head_dim, n_head, n_head_kv, depths)) in shapes.iter().enumerate() {
         let kv_dim = n_head_kv * head_dim;
-        let Held { kf, vf, k, v, q, mma, scalar } = &mut held[si];
+        let Held { kf, vf, k, v, q, mma, mma16, scalar } = &mut held[si];
         let scale = 1.0 / (head_dim as f32).sqrt();
         let q2 = q.chunks_exact(head_dim).map(norm).fold(0.0, f64::max) * f16_slack;
 
@@ -1489,14 +1494,20 @@ fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
             let mut want = vec![0.0f32; q.len()];
             Naive.attend(&a, &mut want);
 
-            for (force, into) in [(true, &mut *mma), (false, &mut *scalar)] {
+            // The 8-slot tile is the default wherever it fits; the 16-slot one
+            // is still reached for wider groups, so both are held to the bound.
+            for (force, tile16, into) in
+                [(true, false, &mut *mma), (true, true, &mut *mma16), (false, false, &mut *scalar)]
+            {
                 gpu.attn_decode_mma(Some(force));
+                gpu.attn_decode_tile16(tile16);
                 gpu.begin_pass(1);
                 gpu.attend(&a, &mut into[..]);
                 gpu.host_needs(&mut into[..]);
                 gpu.end_pass();
             }
             gpu.attn_decode_mma(None);
+            gpu.attn_decode_tile16(false);
             if let Some(e) = gpu.take_error() {
                 panic!("cuda error at hd{head_dim} kv{n_head_kv} d{n_pos}: {e}");
             }
@@ -1507,10 +1518,10 @@ fn the_tensor_core_decode_attention_stays_inside_its_derived_bound() {
             let d = 2f64.powi(-11) * f64::from(scale) * q2 * k2;
             let bound = vmax * ((2.0 * d).exp_m1() + 2f64.powi(-11) + n_pos as f64 * 2f64.powi(-25))
                 + f64::from(attend_tolerance(n_pos, &want));
-            let worst = want
-                .iter()
-                .zip(mma.iter())
-                .fold(0.0f64, |m, (x, y)| m.max((f64::from(*x) - f64::from(*y)).abs()));
+            let worst_of = |got: &[f32]| {
+                want.iter().zip(got).fold(0.0f64, |m, (x, y)| m.max((f64::from(*x) - f64::from(*y)).abs()))
+            };
+            let worst = worst_of(&mma[..]).max(worst_of(&mma16[..]));
             let (_, from_scalar) = compare(&scalar[..], &mma[..]);
             worst_ratio = worst_ratio.max(worst / bound);
             println!(

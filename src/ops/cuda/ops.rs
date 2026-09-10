@@ -1048,20 +1048,30 @@ impl Cuda {
         self.attn_decode_mma_from.set(n_pos);
     }
 
-    /// Whether this decode step's attention runs on the tensor cores.
+    /// Use the 16-slot decode tile even where the 8-slot one fits.
+    pub fn attn_decode_tile16(&self, on: bool) {
+        self.attn_decode_tile16.set(on);
+    }
+
+    /// This decode step's attention mode, as `attn_decode` takes it: 0 the
+    /// scalar path, 1 the tensor cores with the 16-slot tile, 2 with the 8-slot
+    /// tile.
     ///
-    /// The shape has to fit the tile first: `head_dim` a multiple of 16 and at
-    /// most 256, and no more query heads per kv head than its 16 slots.
-    fn decode_mma(&self, a: &Attn<'_>) -> bool {
+    /// The shape has to fit a tile first: `head_dim` a multiple of 16 and at
+    /// most 256, and no more query heads per kv head than its slots. **The
+    /// 8-slot tile is taken wherever it fits**: at a grouped-query ratio of 8 it
+    /// has no empty slots, which is what the 16-slot tile wasted in decode.
+    fn decode_mode(&self, a: &Attn<'_>) -> i32 {
+        const D8_QT: usize = 8;
         let fits = a.head_dim % 16 == 0
             && a.head_dim <= 256
             && a.n_head_kv > 0
             && a.n_head % a.n_head_kv == 0
             && a.n_head / a.n_head_kv <= ATT_QT;
         if !fits {
-            return false;
+            return 0;
         }
-        match self.attn_decode_mma.get() {
+        let on = match self.attn_decode_mma.get() {
             Some(force) => force,
             None => {
                 let from = match self.attn_decode_mma_from.get() {
@@ -1070,7 +1080,27 @@ impl Cuda {
                 };
                 self.attn_vmma.get() && a.n_pos >= from
             }
+        };
+        if !on {
+            0
+        } else if a.n_head / a.n_head_kv <= D8_QT && !self.attn_decode_tile16.get() {
+            2
+        } else {
+            1
         }
+    }
+
+    /// Shared memory the 8-slot decode body indexes: the f16 query tile, the
+    /// 64-position K/V staging buffer, the f16 probabilities, the score tile,
+    /// and three per-slot vectors.
+    fn d8_shared_bytes(head_dim: usize) -> u32 {
+        const D8_QT: usize = 8;
+        const D8_KC: usize = 64;
+        (D8_QT * head_dim * 2
+            + D8_KC * head_dim * 2
+            + D8_QT * D8_KC * 2
+            + D8_QT * D8_KC * 4
+            + 3 * D8_QT * 4) as u32
     }
 
     /// Shared memory the `attn_flash_mma_v` body indexes: the f16 query tile,
@@ -2549,15 +2579,15 @@ impl Cuda {
             // the tensor-core mode is an argument of `attn_decode`. The modes'
             // grids and shared sizes differ, and replay updates both in place.
             if a.n_q() == 1 && self.attn_dbg.get().is_none() {
-                let use_mma = self.decode_mma(a);
-                let (grid_x, dshared) = if use_mma {
-                    (a.n_head_kv as u32, Self::vmma_shared_bytes(a.head_dim))
-                } else {
-                    ((a.n_head * rows) as u32, shared)
+                let mode = self.decode_mode(a);
+                let (grid_x, dshared) = match mode {
+                    2 => (a.n_head_kv as u32, Self::d8_shared_bytes(a.head_dim)),
+                    1 => (a.n_head_kv as u32, Self::vmma_shared_bytes(a.head_dim)),
+                    _ => ((a.n_head * rows) as u32, shared),
                 };
                 let [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13] = args;
                 let dargs = [
-                    KArg::I32(i32::from(use_mma)),
+                    KArg::I32(mode),
                     a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13,
                 ];
                 // SAFETY: parameters match `attn_decode`: `attn_flash`'s plus the
