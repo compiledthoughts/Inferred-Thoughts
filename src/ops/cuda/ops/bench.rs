@@ -1056,4 +1056,54 @@ impl Cuda {
         self.pass_graph.set(was);
         us
     }
+
+    /// Time one of the `bench_mma_ceiling_*` kernels: `iters` back-to-back `mma`
+    /// per thread, over at least `warps` warps, `reps` launches against one
+    /// synchronize. Returns device microseconds per launch, the warps actually
+    /// launched, and every thread's four final accumulators as raw bits, so the
+    /// caller can prove the timed loop did its work before believing the time.
+    ///
+    /// The caller turns that into a ceiling: `warps * iters * 16 * 8 * k`
+    /// element products per launch, over the time. See the kernels in
+    /// `kernels/diagnostics.cuh` for why the accumulators are stored.
+    pub fn bench_mma_ceiling(
+        &self,
+        kernel: &'static str,
+        iters: i32,
+        warps: u32,
+        reps: u32,
+    ) -> Result<(f64, u32, Vec<u32>)> {
+        const WARPS_PER_BLOCK: u32 = 8;
+        let grid = warps.div_ceil(WARPS_PER_BLOCK);
+        let threads = (grid * WARPS_PER_BLOCK * 32) as usize;
+        let out = DeviceBuffer::new(threads * 4 * 4)?;
+        let args = vec![KArg::I32(iters), KArg::Ptr(out.ptr)];
+        let (gpu_us, _) =
+            self.time_launches_2d(kernel, grid, 1, 32 * WARPS_PER_BLOCK, 0, &[args], reps)?;
+        let mut finals = vec![0u32; threads * 4];
+        out.read(&mut finals)?;
+        Ok((gpu_us, grid * WARPS_PER_BLOCK, finals))
+    }
+
+    /// Run `check_mma_nvfp4` once over a single warp and bring its 32 x 4
+    /// accumulators home, in lane order.
+    ///
+    /// **For `the_nvfp4_block_scaled_mma_follows_the_isa`**, which rebuilds the
+    /// operands from the PTX ISA's fragment tables and checks every value. The
+    /// output buffer is local to this call, so nothing is keyed on a host
+    /// address a test could recycle.
+    pub fn check_mma_nvfp4(&self) -> Result<Vec<f32>> {
+        let out = DeviceBuffer::new(32 * 4 * 4)?;
+        let args = [KArg::Ptr(out.ptr)];
+        let was = self.pass_graph.replace(false);
+        // SAFETY: parameters match `check_mma_nvfp4`: one block of 32 threads,
+        // each writing its four accumulators at `lane * 4`, inside 128 floats.
+        let launched = unsafe { self.launch_shared("check_mma_nvfp4", 1, 32, 0, &args) };
+        self.pass_graph.set(was);
+        launched?;
+        self.sync()?;
+        let mut got = vec![0.0f32; 32 * 4];
+        out.read(&mut got)?;
+        Ok(got)
+    }
 }

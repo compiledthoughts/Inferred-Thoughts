@@ -739,4 +739,137 @@ extern "C" __global__ void bench_mm_packed_tree(int n_in, int n_out,
     if (lane == 0) out[j] = acc;
 }
 
+// ---------------------------------------------------- tensor-core ceilings
+//
+// The tensor-core ceilings, measured rather than quoted: `mma` back to back on
+// constant register operands, with no memory in the loop. `BENCHMARKS.md`'s
+// 09-09 (ceilings) took int8 and fp16 this way with a harness that was never
+// committed; these re-take both beside the NVFP4 form, so all three come from
+// one sitting and one method. Each thread accumulates in place and never stores:
+// the instruction is the only work, and its time is the point.
+//
+// One instruction is 16 x 8 x k element products -- 4,096 for int8 `m16n8k32`,
+// 2,048 for fp16 `m16n8k16`, 8,192 for NVFP4 `m16n8k64` -- which is the unit
+// `what_the_fp4_tensor_cores_can_do` divides by. Operands are small and nonzero,
+// so no accumulator overflows at any iteration count the caller uses and no
+// all-zero shortcut is available that a real kernel would not get.
+
+// **Every ceiling kernel stores its accumulators once, at the end.** The first
+// version stored nothing and timed 1.5M int8 iterations over 1,728 warps in
+// 7.6 us -- 7,353x the recorded ceiling -- so its loop cannot have run. The store
+// makes the work observable, and `what_the_fp4_tensor_cores_can_do` checks every
+// accumulator is exactly `iters` times what one iteration leaves before it
+// reports a rate.
+__global__ void bench_mma_ceiling_s8(int iters, int *__restrict__ out) {
+    // s8 1 and 2, four to a register.
+    const int a[4] = {0x02010201, 0x01020102, 0x02010201, 0x01020102};
+    const int b[2] = {0x01020102, 0x02010201};
+    int d[4] = {0, 0, 0, 0};
+    for (int n = 0; n < iters; ++n) {
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = 0; i < 4; ++i) out[t * 4 + i] = d[i];
+}
+
+__global__ void bench_mma_ceiling_f16(int iters, float *__restrict__ out) {
+    // f16 0.5 (0x3800), two to a register.
+    const unsigned a[4] = {0x38003800u, 0x38003800u, 0x38003800u, 0x38003800u};
+    const unsigned b[2] = {0x38003800u, 0x38003800u};
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int n = 0; n < iters; ++n) {
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = 0; i < 4; ++i) out[t * 4 + i] = d[i];
+}
+
+// The NVFP4 block-scaled form, as llama.cpp's `mma_block_scaled_fp4` issues it
+// (`ggml-cuda/mma.cuh`), which matches the PTX ISA 9.4 grammar in 9.7.16.3:
+// `d, a, b, c, scale-a-data, {byte-id-a, thread-id-a}, scale-b-data,
+// {byte-id-b, thread-id-b}`, byte-ids 0 as `scale_vec::4X` requires.
+//
+// **Built only for `sm_120a`.** `sm_120` is the forwards-compatible target and
+// leaves this instruction out: CUDA 12.8's `ptxas -arch=sm_120` rejects it --
+// "Instruction 'mma with block scale' not supported on .target 'sm_120'", and
+// the same for `.kind::mxf4nvf4`, `.block_scale` and `.scale_vec::4X` -- and the
+// driver then refuses the whole module, not just these kernels. PTX ISA 9.4
+// lists `.kind::mxf4nvf4` for `sm_120a` and `sm_121a`; `ptxas -arch=sm_120a`
+// accepts it, and this card's driver loads the result. `build.rs` defines
+// `INFERRED_NVFP4_BLOCK_SCALE` when built with `INFERRED_SM_ARCH=sm_120a`.
+#ifdef INFERRED_NVFP4_BLOCK_SCALE
+__device__ __forceinline__ void mma_nvfp4_inplace(
+        float (&d)[4], const unsigned (&a)[4], const unsigned (&b)[2],
+        unsigned sa, unsigned sb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(sa), "r"(sb));
+}
+
+__global__ void bench_mma_ceiling_nvfp4(int iters, float *__restrict__ out) {
+    // E2M1 0.5 (code 1) in every nibble; every UE4M3 scale 1.0 (0x38).
+    const unsigned a[4] = {0x11111111u, 0x11111111u, 0x11111111u, 0x11111111u};
+    const unsigned b[2] = {0x11111111u, 0x11111111u};
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int n = 0; n < iters; ++n) {
+        mma_nvfp4_inplace(d, a, b, 0x38383838u, 0x38383838u);
+    }
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = 0; i < 4; ++i) out[t * 4 + i] = d[i];
+}
+
+// Operands `check_mma_nvfp4` derives from a lane and an element index, mirrored
+// exactly by `the_nvfp4_block_scaled_mma_follows_the_isa`. E2M1 codes 1..15, so
+// every sign and magnitude appears; UE4M3 scales 0x30/0x38/0x40/0x48 (0.5, 1, 2,
+// 4), permuted per lane and per chunk so that a wrong byte-to-chunk or
+// thread-to-row mapping cannot cancel.
+__device__ __forceinline__ unsigned fp4_check_a(int lane, int i) {
+    return 1u + (unsigned)((lane * 7 + i * 3) % 15);
+}
+
+__device__ __forceinline__ unsigned fp4_check_b(int lane, int i) {
+    return 1u + (unsigned)((lane * 5 + i * 11) % 15);
+}
+
+__device__ __forceinline__ unsigned fp4_check_scales(int lane, int mul, int add) {
+    unsigned v = 0;
+    for (int c = 0; c < 4; ++c) {
+        v |= (0x30u + 8u * (unsigned)((lane * mul + c + add) % 4)) << (8 * c);
+    }
+    return v;
+}
+
+// One NVFP4 `mma` over a single warp, each lane storing its four accumulators
+// at `lane * 4`. A test instrument: see `Cuda::check_mma_nvfp4`.
+__global__ void check_mma_nvfp4(float *__restrict__ out) {
+    const int lane = threadIdx.x & 31;
+    unsigned a[4], b[2];
+    for (int r = 0; r < 4; ++r) {
+        unsigned v = 0;
+        for (int i = 0; i < 8; ++i) v |= fp4_check_a(lane, r * 8 + i) << (4 * i);
+        a[r] = v;
+    }
+    for (int r = 0; r < 2; ++r) {
+        unsigned v = 0;
+        for (int i = 0; i < 8; ++i) v |= fp4_check_b(lane, r * 8 + i) << (4 * i);
+        b[r] = v;
+    }
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    mma_nvfp4_inplace(d, a, b, fp4_check_scales(lane, 1, 0), fp4_check_scales(lane, 3, 1));
+    for (int i = 0; i < 4; ++i) out[lane * 4 + i] = d[i];
+}
+#endif  // INFERRED_NVFP4_BLOCK_SCALE
+
 }  // extern "C"

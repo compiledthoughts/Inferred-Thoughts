@@ -5071,3 +5071,207 @@ fn what_the_server_prefill_pattern_costs() {
         served / whole,
     );
 }
+
+/// The operands `check_mma_nvfp4` derives on the device, mirrored exactly. See
+/// `fp4_check_a`, `fp4_check_b` and `fp4_check_scales` in
+/// `kernels/diagnostics.cuh`.
+fn fp4_check_a(lane: u32, i: u32) -> u32 {
+    1 + (lane * 7 + i * 3) % 15
+}
+
+fn fp4_check_b(lane: u32, i: u32) -> u32 {
+    1 + (lane * 5 + i * 11) % 15
+}
+
+fn fp4_check_scales(lane: u32, mul: u32, add: u32) -> u32 {
+    (0..4).fold(0, |v, c| v | ((0x30 + 8 * ((lane * mul + c + add) % 4)) << (8 * c)))
+}
+
+/// **The NVFP4 block-scaled `mma` computes what the PTX ISA says it does.**
+///
+/// Before a ceiling for this instruction means anything, and before a kernel is
+/// built on it, the operand layout has to be right. PTX ISA 9.4 defines it: the
+/// arithmetic `D = (A * scale_A) * (B * scale_B) + C` and the selectors in
+/// 9.7.16.3, the `m16n8k64` fragments in 9.7.16.5.11, E2M1 and UE4M3 in 5.2.3.
+/// One detail -- which thread of the scale-A pair supplies row `g` and which
+/// row `g + 8` -- is only in a figure, so it is taken from llama.cpp's
+/// `vec_dot_fp4_fp4_mma`, which reads row `g` from lane `4g` and `g + 8` from
+/// `4g + 1`.
+///
+/// `check_mma_nvfp4` runs one instruction over a warp on operands each lane
+/// derives from its index. This rebuilds A (16x64), B (64x8) and both scale
+/// matrices from the fragment tables and evaluates every accumulator. E2M1
+/// values against power-of-two UE4M3 scales sum exactly in f32 at these
+/// magnitudes, so the comparison is equality. On a mismatch it reports whether
+/// either of two other readings -- the scale pair swapped, or scales carried
+/// with llama.cpp's CPU-side factor of one half -- would have matched instead.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_nvfp4_block_scaled_mma_follows_the_isa() {
+    // The kernel exists only in an `sm_120a` build; see `build.rs`.
+    if !cfg!(nvfp4_block_scale) {
+        println!("SKIPPED: built for sm_120; the NVFP4 mma needs INFERRED_SM_ARCH=sm_120a");
+        return;
+    }
+    // E2M1, ISA 5.2.3 and `cuda_fp4.hpp`: sign bit 3, magnitudes 0..6.
+    let e2m1 = |code: u32| -> f64 {
+        let m = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(code & 7) as usize];
+        if code & 8 != 0 { -m } else { m }
+    };
+    // UE4M3, ISA 5.2.3: 4 exponent bits, 3 mantissa bits. Only normal codes are
+    // used here, so the bias of 7 is the one reading the test depends on.
+    let ue4m3 = |code: u32| -> f64 {
+        let (e, m) = ((code >> 3) & 0xf, code & 7);
+        assert!(e != 0 && code != 0x7f, "check scales must be normal and not NaN");
+        (1.0 + f64::from(m) / 8.0) * 2f64.powi(e as i32 - 7)
+    };
+
+    // A and B from the fragment tables, 9.7.16.5.11.
+    let mut a = [[0.0f64; 64]; 16];
+    let mut b = [[0.0f64; 8]; 64];
+    for lane in 0..32u32 {
+        let (g, t) = ((lane >> 2) as usize, (lane % 4) as usize);
+        for i in 0..32u32 {
+            let iu = i as usize;
+            let row = if iu < 8 || (16..24).contains(&iu) { g } else { g + 8 };
+            let col = t * 8 + (iu & 7) + if iu >= 16 { 32 } else { 0 };
+            a[row][col] = e2m1(fp4_check_a(lane, i));
+        }
+        for i in 0..16u32 {
+            let iu = i as usize;
+            let row = t * 8 + (iu & 7) + if iu >= 8 { 32 } else { 0 };
+            b[row][g] = e2m1(fp4_check_b(lane, i));
+        }
+    }
+
+    // Expected accumulators, lane order, under one reading of the scale pair.
+    let expected = |swap_pair: bool, scale_factor: f64| -> Vec<f64> {
+        let byte = |v: u32, c: usize| (v >> (8 * c)) & 0xff;
+        let mut out = vec![0.0f64; 128];
+        for lane in 0..32u32 {
+            let (g, t) = ((lane >> 2) as usize, (lane % 4) as usize);
+            let lane_of = |g: usize, k: u32| (4 * g) as u32 + k;
+            for i in 0..4usize {
+                let upper = i >= 2;
+                let row = if upper { g + 8 } else { g };
+                let col = 2 * t + (i & 1);
+                // scale_A for this row: thread-id-a 0, lanes %4 in {0, 1}.
+                let pair = if upper != swap_pair { 1 } else { 0 };
+                let sa = fp4_check_scales(lane_of(g, pair), 1, 0);
+                // scale_B for this column: thread-id-b 0, lane 4 * col.
+                let sb = fp4_check_scales(lane_of(col, 0), 3, 1);
+                let mut acc = 0.0f64;
+                for k in 0..64usize {
+                    let fa = ue4m3(byte(sa, k / 16)) * scale_factor;
+                    let fb = ue4m3(byte(sb, k / 16)) * scale_factor;
+                    acc += (a[row][k] * fa) * (b[k][col] * fb);
+                }
+                out[lane as usize * 4 + i] = acc;
+            }
+        }
+        out
+    };
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    let got = gpu.check_mma_nvfp4().expect("check_mma_nvfp4");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+    let matches = |want: &[f64]| got.iter().zip(want).filter(|(g, w)| f64::from(**g) == **w).count();
+    let isa = expected(false, 1.0);
+    let n_isa = matches(&isa);
+    let n_swapped = matches(&expected(true, 1.0));
+    let n_halved = matches(&expected(false, 0.5));
+    println!(
+        "  accumulators matching: ISA reading {n_isa}/128, scale pair swapped {n_swapped}/128, \
+         scales halved {n_halved}/128"
+    );
+    for (idx, (g, w)) in got.iter().zip(&isa).enumerate().filter(|(_, (g, w))| f64::from(**g) != **w).take(8) {
+        println!("  lane {:>2} d{}  got {g:>12}  want {w:>12}", idx / 4, idx % 4);
+    }
+    assert_eq!(
+        n_isa, 128,
+        "the NVFP4 mma does not compute what the ISA reading says; see the counts above \
+         for which alternative reading matched"
+    );
+}
+
+/// **The tensor-core ceilings -- int8, fp16 and NVFP4 -- in one sitting.**
+///
+/// `MMA_S8_PEAK_TOPS` and `MMA_F16_PEAK_TFLOPS` came from a harness that was
+/// never committed; this re-takes both by the recorded method beside the NVFP4
+/// block-scaled form, so the new row is comparable by construction. Method as
+/// in BENCHMARKS-v1 09-09 (ceilings): `mma` back to back on constant register
+/// operands, no memory in the loop, over `sm_count * 48` warps (1,728 on 36
+/// SMs). Reported as trillions of element products per second, one instruction
+/// being 16 x 8 x k of them.
+///
+/// Each arm first times 1,000 iterations and sizes its real run to ~20 ms a
+/// launch, so an arm far slower than expected cannot hold the device long
+/// enough to trip the display driver's watchdog.
+///
+/// **And no rate is believed until the work is proven.** Every thread stores
+/// its accumulators; each arm runs one iteration first, and every accumulator
+/// of the timed run must be exactly `iters` times that value -- exact in s32 and
+/// f32 at these magnitudes. The first version of this bench had no such check
+/// and reported int8 at 7,353x its ceiling from a loop that cannot have run.
+#[test]
+#[ignore = "needs an sm_120 device; a measurement, not an assertion"]
+fn what_the_fp4_tensor_cores_can_do() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let warps = gpu.sm_count() as u32 * 48;
+
+    // (label, kernel, k, float accumulators, recorded ceiling)
+    let arms: [(&str, &'static str, u64, bool, Option<f64>); 3] = [
+        ("int8  m16n8k32.s8", "bench_mma_ceiling_s8", 32, false, Some(MMA_S8_PEAK_TOPS)),
+        ("fp16  m16n8k16", "bench_mma_ceiling_f16", 16, true, Some(MMA_F16_PEAK_TFLOPS)),
+        ("nvfp4 m16n8k64 block-scaled", "bench_mma_ceiling_nvfp4", 64, true, None),
+    ];
+
+    println!("\ntensor-core ceilings, {warps} warps requested on {} SMs", gpu.sm_count());
+    println!(
+        "  {:<30} {:>9} {:>11} {:>14} {:>10}",
+        "arm", "iters", "us/launch", "1e12 prod/s", "vs v1"
+    );
+    let mut rates = Vec::new();
+    for (label, kernel, k, float, reference) in arms {
+        if kernel.ends_with("nvfp4") && !cfg!(nvfp4_block_scale) {
+            println!("  {label:<30} SKIPPED: built for sm_120; needs INFERRED_SM_ARCH=sm_120a");
+            continue;
+        }
+        let value = |bits: u32| {
+            if float { f64::from(f32::from_bits(bits)) } else { f64::from(bits as i32) }
+        };
+        let (_, _, one) = gpu.bench_mma_ceiling(kernel, 1, warps, 1).expect("one iteration");
+        let (probe_us, _, _) = gpu.bench_mma_ceiling(kernel, 1_000, warps, 2).expect("probe");
+        let iters = ((1_000.0 * 20_000.0 / probe_us.max(1.0)) as i32).clamp(1_000, 4_000_000);
+        let (us, launched, finals) = gpu.bench_mma_ceiling(kernel, iters, warps, 4).expect("bench");
+
+        let wrong = finals
+            .iter()
+            .zip(&one)
+            .filter(|(f, o)| value(**f) != value(**o) * f64::from(iters))
+            .count();
+        assert!(
+            value(one[0]) != 0.0 && wrong == 0,
+            "{label}: {wrong} of {} accumulators are not {iters} x one iteration ({}), so the \
+             timed loop did not do the work and its time means nothing",
+            finals.len(),
+            value(one[0]),
+        );
+
+        let products = f64::from(launched) * f64::from(iters) * (16 * 8 * k) as f64;
+        let rate = products / (us * 1e-6) / 1e12;
+        let vs = reference.map_or("--".to_string(), |r| format!("{:.2}x", rate / r));
+        println!("  {label:<30} {iters:>9} {us:>11.1} {rate:>14.1} {vs:>10}");
+        rates.push(rate);
+    }
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+    if rates.len() == 3 {
+        println!(
+            "\n  NVFP4 against int8: {:.2}x products per second, {:.2}x instructions per second",
+            rates[2] / rates[0],
+            rates[2] / rates[0] / 2.0,
+        );
+    }
+}
