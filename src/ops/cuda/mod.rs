@@ -191,8 +191,12 @@ pub struct Cuda {
     /// NVFP4 matmuls as FP4 x FP4 on the tensor cores, against an activation
     /// quantized to FP4 as llama.cpp's CUDA backend does, rather than against
     /// Q8_0 as ggml-cpu does. **A precision departure**: the reference is
-    /// `ops::naive::{Fp4Row, dot_nvfp4_fp4}`, within the f32 chain bound. Only
-    /// in an `sm_120a` build; off until its tests pass.
+    /// `ops::naive::{Fp4Row, dot_nvfp4_fp4}`, within the f32 chain bound.
+    ///
+    /// **On by default in an `sm_120a` build**: the target models are NVFP4,
+    /// and this is what llama.cpp runs for them on Blackwell.
+    /// `INFERRED_NVFP4_Q8=1` restores the exact path for a whole process, and
+    /// the exact-path tests set it off to prove that it does.
     nvfp4_fp4: Cell<bool>,
     /// Route batched IQ4_XS matmuls through the shared-memory staged tile.
     ///
@@ -839,7 +843,7 @@ impl Cuda {
                 delta_seq: Cell::new(env_flag("INFERRED_DELTA_SEQ")),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
-                nvfp4_fp4: Cell::new(false),
+                nvfp4_fp4: Cell::new(cfg!(nvfp4_block_scale) && !env_flag("INFERRED_NVFP4_Q8")),
                 iq4_staged: Cell::new(env_flag("INFERRED_IQ4_STAGED")),
                 iq4_fold_once: Cell::new(env_flag("INFERRED_IQ4_FOLD_ONCE")),
                 q5k_mma: Cell::new(!env_flag("INFERRED_Q5K_SCALAR")),

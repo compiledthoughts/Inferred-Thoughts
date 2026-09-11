@@ -5319,6 +5319,9 @@ fn the_nvfp4_expert_kernels_match_the_oracle() {
 
     let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The exact path, which FP4 x FP4 replaces by default: this test is also
+    // the proof that `nvfp4_fp4(false)` restores bit-equality with the oracle.
+    gpu.nvfp4_fp4(false);
 
     // Tokens alternate between two overlapping expert sets, so the six tokens'
     // 48 pairs fall into tiles of up to six.

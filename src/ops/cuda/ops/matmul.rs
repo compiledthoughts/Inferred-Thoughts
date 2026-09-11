@@ -122,8 +122,9 @@ impl Cuda {
     /// which is also what keeps decode and prefill unable to disagree while the
     /// exactness claim is being established.
     /// NVFP4 matmuls as FP4 x FP4 on the tensor cores (`true`) or against a
-    /// Q8_0 activation (`false`, the exact path). Has no effect in an `sm_120`
-    /// build, which carries no FP4 kernels.
+    /// Q8_0 activation (`false`, the exact path). On by default in an `sm_120a`
+    /// build; `INFERRED_NVFP4_Q8=1` sets `false` for a whole process. Has no
+    /// effect in an `sm_120` build, which carries no FP4 kernels.
     pub fn nvfp4_fp4(&self, on: bool) {
         self.nvfp4_fp4.set(on);
     }

@@ -466,6 +466,10 @@ fn the_k_quant_matmuls_are_bit_identical_on_the_gpu() {
     // One op at a time, read straight back: a graph defers the whole pass to
     // `end_pass`, so it cannot serve this shape.
     gpu.use_graphs(false);
+    // NVFP4 on its exact path, against Q8_0 as the oracle is: FP4 x FP4, the
+    // default, answers to its own reference in the tests below. This is also
+    // the proof that the switch restores equal bits.
+    gpu.nvfp4_fp4(false);
     println!(
         "device {} sm_{}{}",
         gpu.name(),
