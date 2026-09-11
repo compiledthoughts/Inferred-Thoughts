@@ -778,8 +778,10 @@ impl Cuda {
                 return Err(Error::Cuda {
                     what: "cuModuleLoadData",
                     detail: format!(
-                        "{} — a JIT failure here usually means the PTX targets a \
-                         newer architecture than the driver understands",
+                        "{} — the driver could not compile the kernels for this device. \
+                         They are built for sm_120a by default, which needs a card and \
+                         driver with its FP4 tensor-core instructions; build with \
+                         INFERRED_SM_ARCH=sm_120 for the forwards-compatible kernels",
                         ffi::describe(load)
                     ),
                 });
