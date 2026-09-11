@@ -296,6 +296,45 @@ pub fn q8_0_blocks(x: &[f32]) -> Vec<u8> {
     crate::ops::naive::QuantizedRow::from_f32(x).to_blocks()
 }
 
+/// Dot one NVFP4 row against an f32 activation quantized to FP4 as llama.cpp's
+/// CUDA backend quantizes one: the FP4 x FP4 product, for tests.
+pub fn vec_dot_nvfp4_fp4(w: &[u8], x: &[f32]) -> f32 {
+    let qx = crate::ops::naive::Fp4Row::from_f32(x);
+    crate::ops::naive::dot_nvfp4_fp4(w, &qx)
+}
+
+/// `x` quantized to FP4 for FP4 x FP4: `(scales, codes)`, one UE4M3 code per 16
+/// elements and one E2M1 code per element, sign in bit 3.
+pub fn fp4_activation(x: &[f32]) -> (Vec<u8>, Vec<u8>) {
+    let r = crate::ops::naive::Fp4Row::from_f32(x);
+    (r.scales, r.codes)
+}
+
+/// CUDA's `__nv_fp8_e4m3(float)` (cuda_fp8.hpp: `__nv_cvt_float_to_fp8` with
+/// `__NV_SATFINITE`) for the positive case llama.cpp's `ggml_cuda_fp32_to_ue4m3`
+/// guards to: round to nearest with ties to the even code, saturating at 448;
+/// anything not positive, NaN included, is code 0.
+///
+/// **Not** ggml's CPU `ggml_fp32_to_ue4m3`, which rounds on one bit and so takes
+/// a midpoint up. FP4 activations exist only in the CUDA backend, and this is
+/// the seed it uses.
+pub(crate) fn fp32_to_ue4m3_rn(x: f32) -> u8 {
+    if !(x > 0.0) {
+        return 0;
+    }
+    if x >= 448.0 {
+        return 0x7e;
+    }
+    let v = x as f64;
+    // Codes ascend with value, so the answer is the last code at or below `v`
+    // or the one after it. Every value is exact in f64.
+    let value = |c: u8| 2.0 * ue4m3_to_f32(c) as f64;
+    let lo = (1..=0x7eu8).take_while(|&c| value(c) <= v).last().unwrap_or(0);
+    let hi = lo + 1;
+    let (below, above) = (v - value(lo), value(hi) - v);
+    if below < above || (below == above && lo & 1 == 0) { lo } else { hi }
+}
+
 /// `dequantize_row_nvfp4`.
 ///
 /// A 36-byte block is four UE4M3 scales `d`, then 32 bytes of nibbles. Byte
@@ -550,6 +589,133 @@ mod tests {
         }
         // The largest finite code, 448, halved.
         assert_eq!(ue4m3_to_f32(0x7e), 224.0);
+    }
+
+    /// CUDA's float-to-E4M3: every code's value maps back to that code, every
+    /// midpoint goes to the even code, and past 448 saturates.
+    #[test]
+    fn fp32_to_ue4m3_rounds_to_nearest_even_and_saturates() {
+        let value = |c: u8| 2.0 * ue4m3_to_f32(c) as f64;
+        for c in 1u8..=0x7e {
+            assert_eq!(fp32_to_ue4m3_rn(value(c) as f32), c, "the value of code {c:#04x}");
+        }
+        for c in 1u8..0x7e {
+            let mid = (value(c) + value(c + 1)) / 2.0;
+            // Both neighbours have at most four significant bits, so the
+            // midpoint needs five and is exact in f32.
+            assert_eq!((mid as f32) as f64, mid);
+            let even = if c & 1 == 0 { c } else { c + 1 };
+            assert_eq!(fp32_to_ue4m3_rn(mid as f32), even, "midpoint above {c:#04x}");
+        }
+        assert_eq!(fp32_to_ue4m3_rn(2f32.powi(-10)), 0, "half the smallest subnormal ties to 0");
+        assert_eq!(fp32_to_ue4m3_rn(448.0), 0x7e);
+        assert_eq!(fp32_to_ue4m3_rn(1.0e6), 0x7e);
+        assert_eq!(fp32_to_ue4m3_rn(0.0), 0);
+        assert_eq!(fp32_to_ue4m3_rn(-1.0), 0);
+        assert_eq!(fp32_to_ue4m3_rn(f32::NAN), 0);
+    }
+
+    /// A block that is exactly E2M1 values times a UE4M3 scale comes back as
+    /// those codes: `amax / 6` names the scale, its error is zero, and nothing
+    /// in the search can beat zero.
+    #[test]
+    fn fp4_activation_recovers_an_exact_block() {
+        // Scale 1.5 is UE4M3 0x3c: e = 7, m = 4, (1 + 4/8) * 2^0.
+        let x: Vec<f32> = [9.0, -6.0, 4.5, -3.0, 2.25, -1.5, 0.75, 0.0, -0.0, 9.0, -9.0, 6.0, 0.75, -0.75, 1.5, 3.0]
+            .to_vec();
+        let (scales, codes) = fp4_activation(&x);
+        assert_eq!(scales, vec![0x3c]);
+        // Magnitude index by x / 1.5 = {6, 4, 3, 2, 1.5, 1, 0.5, 0}; sign bit 3.
+        let want: Vec<u8> = vec![7, 8 | 6, 5, 8 | 4, 3, 8 | 2, 1, 0, 0, 7, 8 | 7, 6, 1, 8 | 1, 2, 4];
+        assert_eq!(codes, want);
+    }
+
+    /// The search can only improve on its seed, and only within two codes of
+    /// it — checked on blocks spanning four orders of magnitude, where the seed
+    /// is often not the best.
+    #[test]
+    fn the_fp4_scale_search_never_loses_to_its_seed() {
+        let err_at = |block: &[f32], code: u8| -> f32 {
+            let scale = ue4m3_to_f32(code);
+            let inv = if scale > 0.0 { 0.5 / scale } else { 0.0 };
+            let mut err = 0.0f32;
+            for &v in block {
+                // The same coding rule as the quantizer, through its public face.
+                let q = {
+                    const POS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+                    let ax = v.abs() * inv;
+                    let mut bi = 0;
+                    for i in 1..8 {
+                        if (ax - POS[i]).abs() < (ax - POS[bi]).abs() {
+                            bi = i;
+                        }
+                    }
+                    bi
+                };
+                let d = v.abs() - (KVALUES_MXFP4[q] as f32).abs() * scale;
+                err = d.mul_add(d, err);
+            }
+            err
+        };
+        let mut moved = 0;
+        for b in 0..2000u32 {
+            let block: Vec<f32> = (0..16u32)
+                .map(|i| {
+                    let t = ((b * 31 + i * 17) % 97) as f32 / 97.0 - 0.5;
+                    t * 10f32.powi(((b + i) % 5) as i32 - 2)
+                })
+                .collect();
+            let (scales, _) = fp4_activation(&block);
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let seed = fp32_to_ue4m3_rn(amax / 6.0);
+            assert!((scales[0] as i32 - seed as i32).abs() <= 2, "block {b}: code {} from seed {seed}", scales[0]);
+            assert!(err_at(&block, scales[0]) <= err_at(&block, seed), "block {b}: the search made it worse");
+            moved += (scales[0] != seed) as u32;
+        }
+        assert!(moved > 0, "the seed was always kept, so the search was never exercised");
+    }
+
+    /// FP4 x FP4 against the f64 product of the two dequantized rows. Every
+    /// sub-block term is exact in f32, so the only error is the f32 chain: at
+    /// most half an ulp of the running sum per addition, bounded here by
+    /// `n_sub * EPSILON * sum|terms|`.
+    #[test]
+    fn the_nvfp4_fp4_dot_is_the_dequantized_product() {
+        use crate::ops::naive::{Fp4Row, dot_nvfp4_fp4};
+        let (nb, n) = (4usize, 256usize);
+        let mut w = vec![0u8; nb * 36];
+        for ib in 0..nb {
+            let blk = &mut w[ib * 36..(ib + 1) * 36];
+            for s in 0..4 {
+                blk[s] = 0x20 + ((ib * 7 + s * 13) % 40) as u8;
+            }
+            for k in 0..32 {
+                blk[4 + k] = ((ib * 29 + k * 11) % 256) as u8;
+            }
+        }
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37).sin() * (1.0 + (i % 9) as f32)).collect();
+
+        let qx = Fp4Row::from_f32(&x);
+        let got = dot_nvfp4_fp4(&w, &qx) as f64;
+
+        let wd = dequantize(&w, GgmlType::Nvfp4, n).unwrap();
+        let (mut exact, mut sum_abs) = (0.0f64, 0.0f64);
+        for sub in 0..n / 16 {
+            let xs = 2.0 * ue4m3_to_f32(qx.scales[sub]) as f64;
+            let mut term = 0.0f64;
+            for e in sub * 16..(sub + 1) * 16 {
+                let xv = KVALUES_MXFP4[qx.codes[e] as usize] as f64 / 2.0 * xs;
+                term += wd[e] as f64 * xv;
+            }
+            exact += term;
+            sum_abs += term.abs();
+        }
+        let bound = (n / 16) as f64 * f32::EPSILON as f64 * sum_abs;
+        assert!(
+            (got - exact).abs() <= bound,
+            "FP4 x FP4 dot {got:e} vs dequantized {exact:e}: off by {:e}, bound {bound:e}",
+            (got - exact).abs()
+        );
     }
 
 }

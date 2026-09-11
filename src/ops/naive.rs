@@ -584,6 +584,109 @@ pub(crate) fn dot_nvfp4_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
     sumf
 }
 
+/// An activation quantized to FP4 the way llama.cpp's CUDA backend quantizes
+/// one for FP4 x FP4 on Blackwell: `quantize_mmq_nvfp4` (ggml-cuda/quantize.cu).
+///
+/// **The oracle for the tensor-core NVFP4 path**, transcribed rather than
+/// derived. Per 16 elements: a UE4M3 scale seeded from `amax / 6` by CUDA's FP8
+/// conversion ([`crate::quant::fp32_to_ue4m3_rn`]); then the codes
+/// `seed + {0, -1, 1, -2, 2}` that fall in `[0, 0x7e]`, tried in that order, each
+/// scored by the squared magnitude error accumulated with a fused multiply-add,
+/// the first strictly smallest kept; then every element coded E2M1 against the
+/// kept scale. No global scale: the checkpoint's `input_scale` is unused, as in
+/// llama.cpp (HANDOFF-v2 12-09 (activation quantization)).
+pub(crate) struct Fp4Row {
+    /// One UE4M3 code per 16 elements.
+    pub(crate) scales: Vec<u8>,
+    /// One E2M1 code per element, sign in bit 3.
+    pub(crate) codes: Vec<u8>,
+}
+
+impl Fp4Row {
+    pub(crate) fn from_f32(x: &[f32]) -> Self {
+        use crate::quant::{KVALUES_MXFP4, fp32_to_ue4m3_rn, ue4m3_to_f32};
+        let mut scales = Vec::with_capacity(x.len() / 16);
+        let mut codes = Vec::with_capacity(x.len());
+        for block in x.chunks_exact(16) {
+            // `fmaxf` in the reference, which skips a NaN as `f32::max` does.
+            let amax = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let seed = fp32_to_ue4m3_rn(amax / 6.0) as i32;
+            let (mut best_err, mut best_code, mut best_scale) = (f32::MAX, 0u8, 0.0f32);
+            for off in [0, -1, 1, -2, 2] {
+                let code = seed + off;
+                if !(0..=0x7e).contains(&code) {
+                    continue;
+                }
+                // Halved, so `0.5 / scale` is the true inverse and the doubled
+                // table times it is the true magnitude.
+                let scale = ue4m3_to_f32(code as u8);
+                let inv = if scale > 0.0 { 0.5 / scale } else { 0.0 };
+                let mut err = 0.0f32;
+                for &v in block {
+                    let q = e2m1_code(v, inv);
+                    let d = v.abs() - (KVALUES_MXFP4[(q & 7) as usize] as f32).abs() * scale;
+                    err = d.mul_add(d, err);
+                }
+                if err < best_err {
+                    (best_err, best_code, best_scale) = (err, code as u8, scale);
+                }
+            }
+            let inv = if best_scale > 0.0 { 0.5 / best_scale } else { 0.0 };
+            scales.push(best_code);
+            codes.extend(block.iter().map(|&v| e2m1_code(v, inv)));
+        }
+        Self { scales, codes }
+    }
+}
+
+/// `ggml_cuda_float_to_fp4_e2m1` (ggml-cuda/common.cuh): the nearest E2M1
+/// magnitude to `|x| * e`, the first index winning a tie, sign in bit 3 when
+/// `x < 0` (so -0.0 is +0).
+fn e2m1_code(x: f32, e: f32) -> u8 {
+    const POS: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let ax = x.abs() * e;
+    let (mut best_i, mut best_err) = (0usize, (ax - POS[0]).abs());
+    for (i, &p) in POS.iter().enumerate().skip(1) {
+        let err = (ax - p).abs();
+        if err < best_err {
+            best_i = i;
+            best_err = err;
+        }
+    }
+    best_i as u8 | if x < 0.0 { 8 } else { 0 }
+}
+
+/// FP4 x FP4: one NVFP4 weight row against an [`Fp4Row`] — the product the
+/// block-scaled `mma` computes, `D = (A * scale_A) * (B * scale_B) + C` (PTX ISA
+/// 9.7.16.3), which llama.cpp's `vec_dot_fp4_fp4_mma` sums over a row.
+///
+/// Per 16-element sub-block: the integer sum of the doubled E2M1 values, times
+/// the product of the two halved scales. **Every such term is exact in f32** — a
+/// sum of at most 16 x 144 is 12 bits and a product of two UE4M3 mantissas is
+/// 8 — so the only rounding anywhere is the f32 chain across sub-blocks, walked
+/// here serially and ascending. The tensor core adds in its own order, so the
+/// device kernel answers to this within the bound that chain allows rather than
+/// to the bit. The weight's second scale is the model's to apply.
+pub(crate) fn dot_nvfp4_fp4(row: &[u8], x: &Fp4Row) -> f32 {
+    use crate::quant::{KVALUES_MXFP4, ue4m3_to_f32};
+    let mut sumf = 0.0f32;
+    for (ib, block) in row.chunks_exact(36).enumerate() {
+        for s in 0..4 {
+            let sub = 4 * ib + s;
+            let d = ue4m3_to_f32(block[s]) * ue4m3_to_f32(x.scales[sub]);
+            let xc = &x.codes[sub * 16..(sub + 1) * 16];
+            let mut sumi = 0i32;
+            for k in 0..8 {
+                let qv = block[4 + s * 8 + k];
+                sumi += KVALUES_MXFP4[(qv & 0xf) as usize] as i32 * KVALUES_MXFP4[xc[k] as usize] as i32;
+                sumi += KVALUES_MXFP4[(qv >> 4) as usize] as i32 * KVALUES_MXFP4[xc[k + 8] as usize] as i32;
+            }
+            sumf += d * sumi as f32;
+        }
+    }
+    sumf
+}
+
 /// Dot product of one quantized weight row with an f32 activation.
 ///
 /// Used for the unquantized types, where ggml also works directly in f32.
