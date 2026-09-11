@@ -121,6 +121,42 @@ impl Cuda {
     /// reuse variant arrives as a measured change against this baseline —
     /// which is also what keeps decode and prefill unable to disagree while the
     /// exactness claim is being established.
+    /// NVFP4 against a Q8_0 activation: `ops::naive::dot_nvfp4_q8_0` on the
+    /// device, the exact path. The shared expert and the LM head of the NVFP4
+    /// checkpoint; the second scale is the model's to apply, as in llama.cpp.
+    ///
+    /// One thread per output row, serial within it, the batch on `blockIdx.y` —
+    /// correct first, as `matmul_q8_0` began. The FP4 x FP4 tensor-core kernel
+    /// is the fast path measured against this one.
+    fn matmul_nvfp4(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let n_tok = x.len() / w.n_in;
+        let wd = self.expert_or_resident(w)?;
+        let (sd, qd) = self.quantized(x, n_tok * (w.n_in / 32))?;
+        let od = self.mirror_out(out)?;
+        let block = 32u32;
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        self.note_shape("matmul_nvfp4_q8_0", w.n_in, w.n_out);
+        // SAFETY: parameters match `matmul_nvfp4_q8_0`; the grid covers `n_out`
+        // rows by `n_tok` tokens and threads past `n_out` return first.
+        unsafe {
+            self.launch_grid2(
+                "matmul_nvfp4_q8_0",
+                w.n_out.div_ceil(block as usize) as u32,
+                n_tok as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
     fn matmul_kquant(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
         const QK_K: usize = 256;
         let n_tok = x.len() / w.n_in;
@@ -587,12 +623,13 @@ impl Cuda {
                 return self.matmul_kquant(w, x, out);
             }
             GgmlType::F32 => return self.matmul_f32(w, x, out),
+            GgmlType::Nvfp4 => return self.matmul_nvfp4(w, x, out),
             other => {
                 return Err(Error::Cuda {
                     what: "matmul",
                     detail: format!(
-                        "{other:?} has no CUDA kernel; this backend implements Q8_0 and the \
-                         three k-quants the 35B uses (Q5_K, Q6_K, IQ4_XS)"
+                        "{other:?} has no CUDA kernel; this backend implements Q8_0, the \
+                         three k-quants the 35B uses (Q5_K, Q6_K, IQ4_XS) and NVFP4"
                     ),
                 });
             }

@@ -524,6 +524,17 @@ impl QuantizedRow {
 
         Self { scales, quants }
     }
+
+    /// As ggml's `block_q8_0` bytes — the f16 scale, then 32 quants — for
+    /// fixture tests against `quantize_row_q8_0_ref`.
+    pub(crate) fn to_blocks(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.scales.len() * (2 + QK8_0));
+        for (b, &d) in self.scales.iter().enumerate() {
+            out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+            out.extend(self.quants[b * QK8_0..(b + 1) * QK8_0].iter().map(|&q| q as u8));
+        }
+        out
+    }
 }
 
 /// `ggml_vec_dot_q8_0_q8_0`: per block, an integer sum of products scaled by

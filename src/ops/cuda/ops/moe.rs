@@ -134,6 +134,9 @@ impl Cuda {
     ) -> Result<()> {
         const QK_K: usize = 256;
         const MAX: usize = 8;
+        if w.ty == GgmlType::Nvfp4 {
+            return self.matmul_experts_nvfp4(w, route, x, out);
+        }
         if w.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
                 what: "matmul_experts",
@@ -266,6 +269,9 @@ impl Cuda {
     ) -> Result<()> {
         const QK_K: usize = 256;
         const MAX: usize = 8;
+        if gate.ty == GgmlType::Nvfp4 && up.ty == GgmlType::Nvfp4 {
+            return self.moe_glu_nvfp4(gate, up, route, x, out);
+        }
         if gate.ty != GgmlType::Iq4Xs || up.ty != GgmlType::Iq4Xs {
             return Err(Error::Cuda {
                 what: "moe_glu",
@@ -376,6 +382,138 @@ impl Cuda {
                 &args,
             )
         }
+    }
+
+    /// The routed `down` matmul for NVFP4 experts against a Q8_0 activation,
+    /// the exact path (`matmul_nvfp4_q8_0_moe_grouped`).
+    ///
+    /// **Grouped at every batch size, decode included.** `moe_group` runs on the
+    /// device from the device-side ids, so nothing here reads the route on the
+    /// host and the launch can live in a graph; at one token each tile is one
+    /// pair and the arithmetic is the per-pair product. `moe_ungrouped` is the
+    /// IQ4_XS switch and does not apply: there is no per-pair NVFP4 kernel to
+    /// fall back to.
+    fn matmul_experts_nvfp4(
+        &self,
+        w: &Experts<'_>,
+        route: &Route,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let (n_used, n_tok) = (route.n_used(), route.n_tok());
+        let n_pair = n_used * n_tok;
+        let rows = x.len() / w.n_in;
+        if n_used == 0 || n_used > 8 || rows != n_pair {
+            return Err(Error::Cuda {
+                what: "matmul_experts",
+                detail: format!(
+                    "NVFP4 experts read one row per pair: {rows} rows for {n_pair} pairs, \
+                     {n_used} experts per token (at most 8)"
+                ),
+            });
+        }
+        let (sd, qd) = self.quantized(x, rows * (w.n_in / 32))?;
+        let table = self.expert_table(w)?;
+        self.stage_route_ids(route)?;
+        let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, n_tok, slot::PTR_DOWN)?;
+        let od = self.mirror_out(out)?;
+        let (perm, first, count, n_tile, n_tile_max) =
+            self.moe_groups(w.n_expert, n_used, n_tok, MOE_TOK)?;
+        let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
+        // The scale table, uploaded once from the mmap. Absent means 1.0; the
+        // kernel then never reads the pointer, so any valid one stands in.
+        let has_s = !w.scale.is_empty();
+        let sc = if has_s { self.resident(w.scale)? } else { ids };
+        let name = "matmul_nvfp4_q8_0_moe_grouped";
+        self.note_shape(name, w.n_in, w.n_out);
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::I32(has_s as i32),
+            KArg::Ptr(n_tile),
+            KArg::Ptr(perm),
+            KArg::Ptr(first),
+            KArg::Ptr(count),
+            KArg::Ptr(ids),
+            KArg::Ptr(wptrs),
+            KArg::Ptr(sc),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        // SAFETY: parameters match `matmul_nvfp4_q8_0_moe_grouped`; the grid
+        // covers `n_out` rows by the tile bound, blocks past the device-side tile
+        // count return before touching a pointer, and no shared memory is used.
+        unsafe { self.launch_grid2(name, w.n_out.div_ceil(32) as u32, n_tile_max, 32, 0, &args) }
+    }
+
+    /// Gate, up and the SiLU gating for NVFP4 experts, the exact path
+    /// (`matmul_nvfp4_q8_0_moe_glu_grouped`). Grouped at every batch size, for
+    /// the reason `matmul_experts_nvfp4` gives.
+    fn moe_glu_nvfp4(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        route: &Route,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let (n_used, n_tok) = (route.n_used(), route.n_tok());
+        let n_pair = n_used * n_tok;
+        if n_used == 0
+            || n_used > 8
+            || gate.n_in != up.n_in
+            || gate.n_out != up.n_out
+            || x.len() != n_tok * gate.n_in
+        {
+            return Err(Error::Cuda {
+                what: "moe_glu",
+                detail: format!(
+                    "{n_used} experts, gate {:?} vs up {:?}, {} activation floats for {n_tok} tokens",
+                    (gate.n_in, gate.n_out),
+                    (up.n_in, up.n_out),
+                    x.len()
+                ),
+            });
+        }
+        // One activation row per token: every expert of a token reads it.
+        let (sd, qd) = self.quantized(x, n_tok * (gate.n_in / 32))?;
+        let gtab = self.expert_table(gate)?;
+        let utab = self.expert_table(up)?;
+        self.stage_route_ids(route)?;
+        let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, n_tok, slot::PTR_GATE)?;
+        let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, n_tok, slot::PTR_UP)?;
+        let od = self.mirror_out(out)?;
+        let (perm, first, count, n_tile, n_tile_max) =
+            self.moe_groups(gate.n_expert, n_used, n_tok, MOE_TOK)?;
+        let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
+        let (has_gs, has_us) = (!gate.scale.is_empty(), !up.scale.is_empty());
+        let gs = if has_gs { self.resident(gate.scale)? } else { ids };
+        let us = if has_us { self.resident(up.scale)? } else { ids };
+        let name = "matmul_nvfp4_q8_0_moe_glu_grouped";
+        self.note_shape(name, gate.n_in, gate.n_out);
+        let args = [
+            KArg::I32(gate.n_in as i32),
+            KArg::I32(gate.n_out as i32),
+            KArg::I32(n_used as i32),
+            KArg::I32(has_gs as i32),
+            KArg::I32(has_us as i32),
+            KArg::Ptr(n_tile),
+            KArg::Ptr(perm),
+            KArg::Ptr(first),
+            KArg::Ptr(count),
+            KArg::Ptr(ids),
+            KArg::Ptr(gptrs),
+            KArg::Ptr(uptrs),
+            KArg::Ptr(gs),
+            KArg::Ptr(us),
+            KArg::Ptr(sd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        // SAFETY: parameters match `matmul_nvfp4_q8_0_moe_glu_grouped`; as for
+        // `matmul_experts_nvfp4`.
+        unsafe { self.launch_grid2(name, gate.n_out.div_ceil(32) as u32, n_tile_max, 32, 0, &args) }
     }
 
     #[allow(clippy::too_many_arguments)]

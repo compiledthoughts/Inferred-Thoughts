@@ -15,6 +15,7 @@
 #include "kquants.cuh"
 #include "iq4_xs.cuh"
 #include "moe.cuh"
+#include "nvfp4.cuh"
 #include "mma_int8.cuh"
 #include "experiments.cuh"
 #include "attention.cuh"

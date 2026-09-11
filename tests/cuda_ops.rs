@@ -5275,3 +5275,117 @@ fn what_the_fp4_tensor_cores_can_do() {
         );
     }
 }
+
+/// The NVFP4 routed-expert kernels on the GPU, against the oracle, on layer 0's
+/// real weights and per-expert scales from the converted NVFP4 GGUF.
+///
+/// Two claims, each bit-exact:
+///
+/// - `matmul_experts` (gate, up and down, grouped by expert) equals `Naive`'s
+///   default — each pick a `dot_nvfp4_q8_0` row times its expert's scale. The
+///   dot is integer inside a serial f32 chain on both sides, so there is no
+///   rounding to excuse.
+/// - The fused `moe_glu` equals the GPU's own gate and up rows through the GPU's
+///   `silu_mul`. Compared on one device because `expf` is the one op whose bits
+///   differ between CPU and GPU (`only_the_expf_ops_diverge`); everything before
+///   it is covered by the first claim.
+///
+/// The route makes tokens share experts, so a tile holds several pairs and the
+/// grouped loop is exercised rather than degenerate.
+#[test]
+#[ignore = "needs an sm_120 device and the NVFP4 GGUF"]
+fn the_nvfp4_expert_kernels_match_the_oracle() {
+    use inferred_thoughts::gguf::{GgmlType, GgufFile};
+    use inferred_thoughts::ops::{Experts, Ops, Route};
+
+    let Some(path) = common::find_model_named("Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf found; set INFERRED_MODEL_DIR");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open the NVFP4 GGUF");
+    let exps = |name: &str, n_in: usize, n_out: usize| {
+        let info = f.tensor(&format!("blk.0.{name}.weight")).expect("expert tensor");
+        let scale = f
+            .tensor(&format!("blk.0.{name}.scale"))
+            .map(|s| f.tensor_bytes(s))
+            .unwrap_or(&[]);
+        Experts { data: f.tensor_bytes(info), ty: info.ty, n_in, n_out, n_expert: 256, scale }
+    };
+    let gate = exps("ffn_gate_exps", 2048, 512);
+    let up = exps("ffn_up_exps", 2048, 512);
+    let down = exps("ffn_down_exps", 512, 2048);
+    assert_eq!(gate.ty, GgmlType::Nvfp4, "layer 0's experts should be NVFP4");
+    assert!(!gate.scale.is_empty(), "the converted file should carry per-expert scales");
+
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    // Tokens alternate between two overlapping expert sets, so the six tokens'
+    // 48 pairs fall into tiles of up to six.
+    let (n_tok, n_used) = (6usize, 8usize);
+    let pairs = n_tok * n_used;
+    let ids: Vec<usize> = (0..pairs).map(|p| (13 * (p % n_used) + 13 * ((p / n_used) % 2)) % 256).collect();
+    let route = Route::Host { ids, weights: vec![0.125; pairs], n_used };
+
+    // Held for the whole test: the backend keys its mirrors on host addresses.
+    let wave = |n: usize, seed: f32| -> Vec<f32> {
+        (0..n).map(|i| ((i as f32 * 0.7137 + seed).sin() * (1.0 + (i % 7) as f32))).collect()
+    };
+    let x = wave(n_tok * 2048, 0.3);
+    let x_pairs: Vec<f32> = (0..pairs).flat_map(|p| x[(p / n_used) * 2048..(p / n_used + 1) * 2048].to_vec()).collect();
+    let h = wave(pairs * 512, 1.9);
+
+    let mut kept: Vec<Vec<f32>> = Vec::new();
+    let mut against_oracle = |what: &str, w: &Experts<'_>, xin: &[f32]| -> usize {
+        let mut cpu = vec![0.0f32; pairs * w.n_out];
+        inferred_thoughts::Naive.matmul_experts(w, &route, xin, &mut cpu);
+        let mut dev = vec![0.0f32; pairs * w.n_out];
+        gpu.begin_pass(n_tok);
+        gpu.matmul_experts(w, &route, xin, &mut dev);
+        gpu.host_needs(&mut dev);
+        if let Some(e) = gpu.take_error() {
+            panic!("{what}: driver error: {e}");
+        }
+        let differing = cpu.iter().zip(&dev).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        if differing != 0 {
+            let at = cpu.iter().zip(&dev).position(|(a, b)| a.to_bits() != b.to_bits()).unwrap_or(0);
+            panic!(
+                "{what}: {differing} of {} outputs differ from the oracle; first at {at} (pair {}, row {}): \
+                 naive {:e} vs cuda {:e}",
+                cpu.len(), at / w.n_out, at % w.n_out, cpu[at], dev[at]
+            );
+        }
+        println!("  {what:<5} {} outputs bit-identical to naive", dev.len());
+        kept.push(dev);
+        kept.len() - 1
+    };
+    let gi = against_oracle("gate", &gate, &x_pairs);
+    let ui = against_oracle("up", &up, &x_pairs);
+    against_oracle("down", &down, &h);
+
+    let tiles = gpu.last_moe_tiles().expect("a grouped launch ran");
+    assert!((tiles as usize) < pairs, "{tiles} tiles for {pairs} pairs: no tile held more than one pair");
+
+    let mut g = kept[gi].clone();
+    let u = kept[ui].clone();
+    gpu.begin_pass(n_tok);
+    gpu.silu_mul(&mut g, &u);
+    gpu.host_needs(&mut g);
+
+    let mut fused = vec![0.0f32; pairs * 512];
+    let mut scratch = vec![0.0f32; pairs * 512];
+    gpu.begin_pass(n_tok);
+    gpu.moe_glu(&gate, &up, &route, &x, &mut fused, &mut scratch);
+    gpu.host_needs(&mut fused);
+    if let Some(e) = gpu.take_error() {
+        panic!("moe_glu: driver error: {e}");
+    }
+    let differing = g.iter().zip(&fused).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    assert_eq!(
+        differing, 0,
+        "the fused NVFP4 gate+up+SiLU differs from gate, up and silu_mul run separately on the \
+         same device in {differing} of {} outputs",
+        fused.len()
+    );
+    println!("  glu   {} outputs bit-identical to gate, up and silu_mul; {tiles} tiles for {pairs} pairs", fused.len());
+}

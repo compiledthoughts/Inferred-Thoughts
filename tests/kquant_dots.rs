@@ -23,6 +23,10 @@
 //! both of us by about that much. Unlike Q8_0 — where the 32-element block sum
 //! is integer and every implementation must agree — there is no bit-exactness
 //! to be had against llama.cpp's actual arithmetic for the k-quants.
+//!
+//! **NVFP4 rides in the same fixture format with a Q8_0 activation**, its
+//! `vec_dot_type`, in the slot the k-quants use for Q8_K. On x86 ggml has no
+//! SIMD NVFP4 kernel, so its dispatch and generic entries are one function.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,6 +121,16 @@ fn fixtures() -> Vec<Fixture> {
     out
 }
 
+/// The fixtures whose activation is Q8_K: every format but NVFP4.
+fn kquant_fixtures() -> Vec<Fixture> {
+    fixtures().into_iter().filter(|f| f.ty != GgmlType::Nvfp4).collect()
+}
+
+/// The NVFP4 fixtures, whose activation is Q8_0.
+fn nvfp4_fixtures() -> Vec<Fixture> {
+    fixtures().into_iter().filter(|f| f.ty == GgmlType::Nvfp4).collect()
+}
+
 /// ggml's SIMD and portable kernels differ, and only by rounding.
 ///
 /// **Recorded rather than asserted away.** An earlier version of this test
@@ -179,7 +193,7 @@ fn the_simd_and_portable_kernels_differ_only_by_rounding() {
 /// dots fail at once and look like three kernel bugs instead of one.
 #[test]
 fn q8_k_quantization_matches_the_reference_byte_for_byte() {
-    for f in fixtures() {
+    for f in kquant_fixtures() {
         let ours = inferred_thoughts::quant::q8_k_blocks(&f.activation);
         assert_eq!(
             ours.len(),
@@ -228,7 +242,7 @@ fn q8_k_quantization_matches_the_reference_byte_for_byte() {
 /// the fix is never to loosen this.
 #[test]
 fn every_k_quant_dot_reproduces_ggml() {
-    let fx = fixtures();
+    let fx = kquant_fixtures();
     assert!(!fx.is_empty(), "no .itdp fixtures; run scripts/dump_kquant_dots.py");
 
     let mut checked = 0usize;
@@ -252,6 +266,58 @@ fn every_k_quant_dot_reproduces_ggml() {
         }
     }
     println!("  {checked} dot products, bit-exact against ggml");
+}
+
+/// Our Q8_0 activation quantization must reproduce `quantize_row_q8_0_ref`,
+/// byte for byte — checked before the NVFP4 dot for the reason the Q8_K test
+/// is checked before the k-quant dots.
+#[test]
+fn nvfp4_s_q8_0_activation_matches_the_reference_byte_for_byte() {
+    let fx = nvfp4_fixtures();
+    assert!(!fx.is_empty(), "no NVFP4 .itdp fixture; run scripts/dump_kquant_dots.py on the NVFP4 GGUF");
+    for f in fx {
+        let ours = inferred_thoughts::quant::q8_0_blocks(&f.activation);
+        assert_eq!(ours.len(), f.q8k.len(), "{}: Q8_0 byte count", f.name);
+        const Q8_0_BYTES: usize = 34;
+        for b in 0..ours.len() / Q8_0_BYTES {
+            let (a, e) = (
+                &ours[b * Q8_0_BYTES..(b + 1) * Q8_0_BYTES],
+                &f.q8k[b * Q8_0_BYTES..(b + 1) * Q8_0_BYTES],
+            );
+            assert_eq!(
+                a, e,
+                "{}: Q8_0 block {b} differs ({})",
+                f.name,
+                if a[..2] != e[..2] { "the f16 scale" } else { "a quant: check roundf's tie rule" }
+            );
+        }
+    }
+}
+
+/// Every NVFP4 dot product, bit-exact against ggml's
+/// `ggml_vec_dot_nvfp4_q8_0`: integer sums per sub-block inside a serial f32
+/// chain, so any difference is a transcription bug.
+#[test]
+fn every_nvfp4_dot_reproduces_ggml() {
+    let fx = nvfp4_fixtures();
+    assert!(!fx.is_empty(), "no NVFP4 .itdp fixture; run scripts/dump_kquant_dots.py on the NVFP4 GGUF");
+    let mut checked = 0usize;
+    for f in &fx {
+        let row_bytes = f.weights.len() / f.rows;
+        for r in 0..f.rows {
+            let w = &f.weights[r * row_bytes..(r + 1) * row_bytes];
+            let ours = inferred_thoughts::quant::vec_dot_nvfp4_q8_0(w, &f.activation);
+            let want = f.generic[r];
+            assert_eq!(
+                ours.to_bits(),
+                want.to_bits(),
+                "{} row {r}: ours {ours:e} vs ggml {want:e}",
+                f.name
+            );
+            checked += 1;
+        }
+    }
+    println!("  {checked} NVFP4 dot products, bit-exact against ggml");
 }
 
 /// A structural check that cannot be fooled by a regenerated fixture.
@@ -279,7 +345,12 @@ fn the_dots_agree_with_the_proven_dequantizer_to_the_quantization_floor() {
             let deq = inferred_thoughts::quant::dequantize(w, f.ty, f.n)
                 .expect("Stage 6 dequantization");
             let exact: f32 = deq.iter().zip(&f.activation).map(|(a, b)| a * b).sum();
-            let ours = inferred_thoughts::quant::vec_dot_q8_k(f.ty, w, &f.activation);
+            // Each format through its own `vec_dot_type`: Q8_0 for NVFP4.
+            let ours = if f.ty == GgmlType::Nvfp4 {
+                inferred_thoughts::quant::vec_dot_nvfp4_q8_0(w, &f.activation)
+            } else {
+                inferred_thoughts::quant::vec_dot_q8_k(f.ty, w, &f.activation)
+            };
             diffs.push((ours - exact).abs());
             scale = scale.max(exact.abs());
         }
@@ -331,7 +402,7 @@ fn the_device_q8_k_quantizer_matches_the_host_one() {
     let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
 
-    let fx = fixtures();
+    let fx = kquant_fixtures();
     assert!(!fx.is_empty(), "no .itdp fixtures; run scripts/dump_kquant_dots.py");
 
     for f in &fx {

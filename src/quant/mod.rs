@@ -283,6 +283,19 @@ pub(crate) fn ue4m3_to_f32(x: u8) -> f32 {
     raw * 0.5
 }
 
+/// Dot one NVFP4 row against an f32 activation, quantizing the activation to
+/// Q8_0 first as ggml-cpu does. A convenience for fixture tests, as
+/// [`vec_dot_q8_k`] is; the forward path quantizes once per token.
+pub fn vec_dot_nvfp4_q8_0(w: &[u8], x: &[f32]) -> f32 {
+    let qx = crate::ops::naive::QuantizedRow::from_f32(x);
+    crate::ops::naive::dot_nvfp4_q8_0(w, &qx)
+}
+
+/// `x` quantized to Q8_0, as ggml's `block_q8_0` bytes.
+pub fn q8_0_blocks(x: &[f32]) -> Vec<u8> {
+    crate::ops::naive::QuantizedRow::from_f32(x).to_blocks()
+}
+
 /// `dequantize_row_nvfp4`.
 ///
 /// A 36-byte block is four UE4M3 scales `d`, then 32 bytes of nibbles. Byte
