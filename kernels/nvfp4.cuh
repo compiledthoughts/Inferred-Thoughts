@@ -333,6 +333,200 @@ __global__ void matmul_nvfp4_fp4_mma(int n_in, int n_out, int n_tok,
     }
 }
 
+// The routed `down` matmul for one expert tile as FP4 x FP4: the dense kernel's
+// warp over `MOE_MMA_TOK` pairs cut into `MOE_MMA_NTILE` sub-tiles of 8, which
+// share one weight load. `x` is one row per pair.
+//
+// Sub-tile `n`'s B column `g` is the activation of pair `perm[first + 8n + g]`
+// and its D column `2t + (i & 1)` the output of pair `perm[first + 8n + 2t +
+// (i & 1)]`. A slot past the tile loads zeros, which only reach D columns whose
+// own slots are past the tile, and those are dropped.
+__global__ void matmul_nvfp4_fp4_moe_grouped_mma(
+        int n_in, int n_out, int has_s,
+        const int *__restrict__ n_tile,
+        const int *__restrict__ perm,
+        const int *__restrict__ tile_first,
+        const int *__restrict__ tile_n,
+        const int *__restrict__ ids,
+        const unsigned long long *__restrict__ wptrs,
+        const float *__restrict__ scale,
+        const unsigned char *__restrict__ x_d,
+        const unsigned char *__restrict__ x_qs,
+        float *__restrict__ out) {
+    const int tl = blockIdx.y;
+    if (tl >= *n_tile) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    if (j0 >= n_out) return;
+
+    const int nb = n_in / 64;
+    const int first = tile_first[tl];
+    const int nt = tile_n[tl];
+    const int g = lane >> 2, t = lane & 3;
+    const int p0 = perm[first];
+    const int e = ids[p0];
+
+    int pb[MOE_MMA_NTILE];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        const int sb = n * 8 + g;
+        pb[n] = (sb < nt) ? perm[first + sb] : -1;
+    }
+
+    // Every pair in the tile shares an expert, so one pointer serves it.
+    const unsigned char *w = (const unsigned char *)wptrs[p0];
+    const int ra = (j0 + g < n_out) ? j0 + g : n_out - 1;
+    const int rb = (j0 + g + 8 < n_out) ? j0 + g + 8 : n_out - 1;
+    const unsigned char *wa = w + (size_t)ra * nb * 36;
+    const unsigned char *wb = w + (size_t)rb * nb * 36;
+
+    float d[MOE_MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) d[n][k] = 0.0f;
+    }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const unsigned char *ba = wa + (size_t)ib * 36;
+        const unsigned char *bb = wb + (size_t)ib * 36;
+        const unsigned a[4] = {
+            *(const unsigned *)(ba + 4 + 4 * t),  *(const unsigned *)(bb + 4 + 4 * t),
+            *(const unsigned *)(ba + 20 + 4 * t), *(const unsigned *)(bb + 20 + 4 * t),
+        };
+        const unsigned sa = *(const unsigned *)((t == 1) ? bb : ba);
+#pragma unroll
+        for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+            unsigned b[2] = {0u, 0u};
+            unsigned sb = 0u;
+            if (pb[n] >= 0) {
+                const unsigned char *bq = x_qs + (size_t)pb[n] * nb * 32 + (size_t)ib * 32;
+                b[0] = *(const unsigned *)(bq + 4 * t);
+                b[1] = *(const unsigned *)(bq + 16 + 4 * t);
+                sb = *(const unsigned *)(x_d + (size_t)pb[n] * nb * 4 + (size_t)ib * 4);
+            }
+            mma_nvfp4_inplace(d[n], a, b, sa, sb);
+        }
+    }
+
+    const float s = has_s ? scale[e] : 1.0f;
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int slot = n * 8 + 2 * t + (i & 1);
+            const int row = (i < 2) ? j0 + g : j0 + g + 8;
+            if (slot < nt && row < n_out) {
+                float v = d[n][i];
+                if (has_s) v *= s;
+                out[(size_t)perm[first + slot] * n_out + row] = v;
+            }
+        }
+    }
+}
+
+// Gate, up and the SiLU gating for one expert tile as FP4 x FP4. `x` is one
+// row per *token*: sub-tile `n`'s B column `g` reads the token of pair
+// `perm[first + 8n + g]`, and that one load serves both matrices. Each pick's
+// gate and up are scaled by its expert's second scale before the gating reads
+// them, as `Ops::moe_glu`'s default does through `matmul_experts`.
+__global__ void matmul_nvfp4_fp4_moe_glu_grouped_mma(
+        int n_in, int n_ff, int n_used, int has_gs, int has_us,
+        const int *__restrict__ n_tile,
+        const int *__restrict__ perm,
+        const int *__restrict__ tile_first,
+        const int *__restrict__ tile_n,
+        const int *__restrict__ ids,
+        const unsigned long long *__restrict__ gptrs,
+        const unsigned long long *__restrict__ uptrs,
+        const float *__restrict__ gscale,
+        const float *__restrict__ uscale,
+        const unsigned char *__restrict__ x_d,
+        const unsigned char *__restrict__ x_qs,
+        float *__restrict__ out) {
+    const int tl = blockIdx.y;
+    if (tl >= *n_tile) return;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    if (j0 >= n_ff) return;
+
+    const int nb = n_in / 64;
+    const int first = tile_first[tl];
+    const int nt = tile_n[tl];
+    const int g = lane >> 2, t = lane & 3;
+    const int p0 = perm[first];
+    const int e = ids[p0];
+
+    int tb[MOE_MMA_NTILE];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+        const int sb = n * 8 + g;
+        tb[n] = (sb < nt) ? perm[first + sb] / n_used : -1;
+    }
+
+    const unsigned char *gw = (const unsigned char *)gptrs[p0];
+    const unsigned char *uw = (const unsigned char *)uptrs[p0];
+    const int ra = (j0 + g < n_ff) ? j0 + g : n_ff - 1;
+    const int rb = (j0 + g + 8 < n_ff) ? j0 + g + 8 : n_ff - 1;
+    const size_t oa = (size_t)ra * nb * 36, ob = (size_t)rb * nb * 36;
+
+    float dg[MOE_MMA_NTILE][4], du[MOE_MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { dg[n][k] = 0.0f; du[n][k] = 0.0f; }
+    }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const size_t o = (size_t)ib * 36;
+        const unsigned char *gba = gw + oa + o, *gbb = gw + ob + o;
+        const unsigned char *uba = uw + oa + o, *ubb = uw + ob + o;
+        const unsigned ga[4] = {
+            *(const unsigned *)(gba + 4 + 4 * t),  *(const unsigned *)(gbb + 4 + 4 * t),
+            *(const unsigned *)(gba + 20 + 4 * t), *(const unsigned *)(gbb + 20 + 4 * t),
+        };
+        const unsigned ua[4] = {
+            *(const unsigned *)(uba + 4 + 4 * t),  *(const unsigned *)(ubb + 4 + 4 * t),
+            *(const unsigned *)(uba + 20 + 4 * t), *(const unsigned *)(ubb + 20 + 4 * t),
+        };
+        const unsigned sga = *(const unsigned *)((t == 1) ? gbb : gba);
+        const unsigned sua = *(const unsigned *)((t == 1) ? ubb : uba);
+#pragma unroll
+        for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+            unsigned b[2] = {0u, 0u};
+            unsigned sb = 0u;
+            if (tb[n] >= 0) {
+                const unsigned char *bq = x_qs + (size_t)tb[n] * nb * 32 + (size_t)ib * 32;
+                b[0] = *(const unsigned *)(bq + 4 * t);
+                b[1] = *(const unsigned *)(bq + 16 + 4 * t);
+                sb = *(const unsigned *)(x_d + (size_t)tb[n] * nb * 4 + (size_t)ib * 4);
+            }
+            mma_nvfp4_inplace(dg[n], ga, b, sga, sb);
+            mma_nvfp4_inplace(du[n], ua, b, sua, sb);
+        }
+    }
+
+    const float gs = has_gs ? gscale[e] : 1.0f;
+    const float us = has_us ? uscale[e] : 1.0f;
+#pragma unroll
+    for (int n = 0; n < MOE_MMA_NTILE; ++n) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int slot = n * 8 + 2 * t + (i & 1);
+            const int row = (i < 2) ? j0 + g : j0 + g + 8;
+            if (slot < nt && row < n_ff) {
+                float gv = dg[n][i];
+                float uv = du[n][i];
+                if (has_gs) gv *= gs;
+                if (has_us) uv *= us;
+                out[(size_t)perm[first + slot] * n_ff + row] = gv / (1.0f + expf(-gv)) * uv;
+            }
+        }
+    }
+}
+
 #endif  // INFERRED_NVFP4_BLOCK_SCALE
 
 }  // extern "C"

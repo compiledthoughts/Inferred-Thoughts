@@ -412,6 +412,9 @@ impl Cuda {
                 ),
             });
         }
+        if self.nvfp4_fp4.get() && cfg!(nvfp4_block_scale) {
+            return self.matmul_experts_nvfp4_fp4(w, route, x, out);
+        }
         let (sd, qd) = self.quantized(x, rows * (w.n_in / 32))?;
         let table = self.expert_table(w)?;
         self.stage_route_ids(route)?;
@@ -476,6 +479,9 @@ impl Cuda {
                 ),
             });
         }
+        if self.nvfp4_fp4.get() && cfg!(nvfp4_block_scale) {
+            return self.moe_glu_nvfp4_fp4(gate, up, route, x, out);
+        }
         // One activation row per token: every expert of a token reads it.
         let (sd, qd) = self.quantized(x, n_tok * (gate.n_in / 32))?;
         let gtab = self.expert_table(gate)?;
@@ -514,6 +520,107 @@ impl Cuda {
         // SAFETY: parameters match `matmul_nvfp4_q8_0_moe_glu_grouped`; as for
         // `matmul_experts_nvfp4`.
         unsafe { self.launch_grid2(name, gate.n_out.div_ceil(32) as u32, n_tile_max, 32, 0, &args) }
+    }
+
+    /// The routed `down` matmul for NVFP4 experts as FP4 x FP4 on the tensor
+    /// cores (`matmul_nvfp4_fp4_moe_grouped_mma`): the dense kernel's warp over
+    /// an expert tile of `MOE_MMA_TOK` pairs in two 8-pair sub-tiles, sharing
+    /// one weight load. The shape checks are the caller's, done before it
+    /// chose this path.
+    fn matmul_experts_nvfp4_fp4(
+        &self,
+        w: &Experts<'_>,
+        route: &Route,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let (n_used, n_tok) = (route.n_used(), route.n_tok());
+        let n_pair = n_used * n_tok;
+        let rows = x.len() / w.n_in;
+        let (dd, qd) = self.quantized_fp4(x, rows * (w.n_in / 16))?;
+        let table = self.expert_table(w)?;
+        self.stage_route_ids(route)?;
+        let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, n_tok, slot::PTR_DOWN)?;
+        let od = self.mirror_out(out)?;
+        let (perm, first, count, n_tile, n_tile_max) =
+            self.moe_groups(w.n_expert, n_used, n_tok, MOE_MMA_TOK)?;
+        let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
+        let has_s = !w.scale.is_empty();
+        let sc = if has_s { self.resident(w.scale)? } else { ids };
+        let name = "matmul_nvfp4_fp4_moe_grouped_mma";
+        self.note_shape(name, w.n_in, w.n_out);
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::I32(has_s as i32),
+            KArg::Ptr(n_tile),
+            KArg::Ptr(perm),
+            KArg::Ptr(first),
+            KArg::Ptr(count),
+            KArg::Ptr(ids),
+            KArg::Ptr(wptrs),
+            KArg::Ptr(sc),
+            KArg::Ptr(dd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        // SAFETY: parameters match `matmul_nvfp4_fp4_moe_grouped_mma`; the grid
+        // covers `n_out` rows in 64s by the tile bound, blocks past the
+        // device-side tile count or the last row return, and partial row tiles
+        // clamp their loads.
+        unsafe { self.launch_grid2(name, w.n_out.div_ceil(64) as u32, n_tile_max, 128, 0, &args) }
+    }
+
+    /// Gate, up and the SiLU gating for NVFP4 experts as FP4 x FP4 on the
+    /// tensor cores (`matmul_nvfp4_fp4_moe_glu_grouped_mma`): one activation
+    /// load per sub-tile serves both matrices.
+    fn moe_glu_nvfp4_fp4(
+        &self,
+        gate: &Experts<'_>,
+        up: &Experts<'_>,
+        route: &Route,
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<()> {
+        let (n_used, n_tok) = (route.n_used(), route.n_tok());
+        let n_pair = n_used * n_tok;
+        let (dd, qd) = self.quantized_fp4(x, n_tok * (gate.n_in / 16))?;
+        let gtab = self.expert_table(gate)?;
+        let utab = self.expert_table(up)?;
+        self.stage_route_ids(route)?;
+        let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, n_tok, slot::PTR_GATE)?;
+        let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, n_tok, slot::PTR_UP)?;
+        let od = self.mirror_out(out)?;
+        let (perm, first, count, n_tile, n_tile_max) =
+            self.moe_groups(gate.n_expert, n_used, n_tok, MOE_MMA_TOK)?;
+        let ids = self.pooled(slot::ROUTE_IDS, n_pair * 4)?;
+        let (has_gs, has_us) = (!gate.scale.is_empty(), !up.scale.is_empty());
+        let gs = if has_gs { self.resident(gate.scale)? } else { ids };
+        let us = if has_us { self.resident(up.scale)? } else { ids };
+        let name = "matmul_nvfp4_fp4_moe_glu_grouped_mma";
+        self.note_shape(name, gate.n_in, gate.n_out);
+        let args = [
+            KArg::I32(gate.n_in as i32),
+            KArg::I32(gate.n_out as i32),
+            KArg::I32(n_used as i32),
+            KArg::I32(has_gs as i32),
+            KArg::I32(has_us as i32),
+            KArg::Ptr(n_tile),
+            KArg::Ptr(perm),
+            KArg::Ptr(first),
+            KArg::Ptr(count),
+            KArg::Ptr(ids),
+            KArg::Ptr(gptrs),
+            KArg::Ptr(uptrs),
+            KArg::Ptr(gs),
+            KArg::Ptr(us),
+            KArg::Ptr(dd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        // SAFETY: parameters match `matmul_nvfp4_fp4_moe_glu_grouped_mma`; as for
+        // `matmul_experts_nvfp4_fp4`.
+        unsafe { self.launch_grid2(name, gate.n_out.div_ceil(64) as u32, n_tile_max, 128, 0, &args) }
     }
 
     #[allow(clippy::too_many_arguments)]

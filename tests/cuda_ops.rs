@@ -5389,3 +5389,150 @@ fn the_nvfp4_expert_kernels_match_the_oracle() {
     );
     println!("  glu   {} outputs bit-identical to gate, up and silu_mul; {tiles} tiles for {pairs} pairs", fused.len());
 }
+
+/// The NVFP4 routed-expert kernels as **FP4 x FP4 on the tensor cores**,
+/// against the CPU reference on layer 0's real experts and scales.
+///
+/// - `matmul_experts` (gate, up, down): every pick's row within the chain bound
+///   of `quant::vec_dot_nvfp4_fp4` times its expert's scale. The bound is the
+///   one `the_fp4_tensor_core_matmul_is_within_the_chain_bound` derives,
+///   `n_sub * EPSILON * sum|terms|`, times the scale, plus an ulp on each side
+///   for the multiply by it.
+/// - The fused `moe_glu` bit-identical to the device's own gate and up rows
+///   through its `silu_mul`, for the `expf` reason the exact-path test gives.
+///
+/// Twenty tokens over two alternating expert sets put 10 or 20 pairs on an
+/// expert, so a tile's second 8-pair sub-tile runs, and runs partial.
+#[test]
+#[ignore = "needs an sm_120 device and the NVFP4 GGUF"]
+fn the_fp4_expert_kernels_are_within_the_chain_bound() {
+    use inferred_thoughts::gguf::{GgmlType, GgufFile};
+    use inferred_thoughts::ops::{Experts, Ops, Route};
+
+    if !cfg!(nvfp4_block_scale) {
+        println!("SKIPPED: built for sm_120; the FP4 kernels need INFERRED_SM_ARCH=sm_120a");
+        return;
+    }
+    let Some(path) = common::find_model_named("Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf found; set INFERRED_MODEL_DIR");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open the NVFP4 GGUF");
+    let exps = |name: &str, n_in: usize, n_out: usize| {
+        let info = f.tensor(&format!("blk.0.{name}.weight")).expect("expert tensor");
+        let scale = f
+            .tensor(&format!("blk.0.{name}.scale"))
+            .map(|s| f.tensor_bytes(s))
+            .unwrap_or(&[]);
+        Experts { data: f.tensor_bytes(info), ty: info.ty, n_in, n_out, n_expert: 256, scale }
+    };
+    let gate = exps("ffn_gate_exps", 2048, 512);
+    let up = exps("ffn_up_exps", 2048, 512);
+    let down = exps("ffn_down_exps", 512, 2048);
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.nvfp4_fp4(true);
+
+    let (n_tok, n_used) = (20usize, 8usize);
+    let pairs = n_tok * n_used;
+    let ids: Vec<usize> = (0..pairs).map(|p| (13 * (p % n_used) + 13 * ((p / n_used) % 2)) % 256).collect();
+    let route = Route::Host { ids: ids.clone(), weights: vec![0.125; pairs], n_used };
+
+    // Held for the whole test: the backend keys its mirrors on host addresses.
+    let wave = |n: usize, seed: f32| -> Vec<f32> {
+        (0..n).map(|i| ((i as f32 * 0.7137 + seed).sin() * (1.0 + (i % 7) as f32))).collect()
+    };
+    let x = wave(n_tok * 2048, 0.3);
+    let x_pairs: Vec<f32> = (0..pairs).flat_map(|p| x[(p / n_used) * 2048..(p / n_used + 1) * 2048].to_vec()).collect();
+    let h = wave(pairs * 512, 1.9);
+
+    let e2m1 = |c: u8| -> f64 {
+        let m = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(c & 7) as usize];
+        if c & 8 != 0 { -m } else { m }
+    };
+    let ue4m3 = |c: u8| -> f64 {
+        let (e, m) = (((c >> 3) & 0xf) as i32, f64::from(c & 7));
+        if c == 0 || c == 0x7f { 0.0 } else if e == 0 { m * 2f64.powi(-9) } else { (1.0 + m / 8.0) * 2f64.powi(e - 7) }
+    };
+
+    let mut kept: Vec<Vec<f32>> = Vec::new();
+    let mut against_reference = |what: &str, w: &Experts<'_>, xin: &[f32]| -> usize {
+        let mut dev = vec![0.0f32; pairs * w.n_out];
+        gpu.begin_pass(n_tok);
+        gpu.matmul_experts(w, &route, xin, &mut dev);
+        gpu.host_needs(&mut dev);
+        if let Some(e) = gpu.take_error() {
+            panic!("{what}: driver error: {e}");
+        }
+        let row_bytes = GgmlType::Nvfp4.n_bytes(w.n_in as u64) as usize;
+        let (stride, n_sub) = (w.stride(), w.n_in / 16);
+        let (mut worst, mut exact) = (0.0f64, 0usize);
+        for p in 0..pairs {
+            let e = ids[p];
+            let xr = &xin[p * w.n_in..(p + 1) * w.n_in];
+            let (scales, codes) = inferred_thoughts::quant::fp4_activation(xr);
+            let s = w.scale_of(e);
+            for r in 0..w.n_out {
+                let rb = &w.data[e * stride + r * row_bytes..e * stride + (r + 1) * row_bytes];
+                let cpu = (inferred_thoughts::quant::vec_dot_nvfp4_fp4(rb, xr) * s) as f64;
+                let deq = inferred_thoughts::quant::dequantize(rb, GgmlType::Nvfp4, w.n_in).expect("dequantize");
+                let mut sum_abs = 0.0f64;
+                for sb in 0..n_sub {
+                    let xs = ue4m3(scales[sb]);
+                    let term: f64 = (sb * 16..(sb + 1) * 16).map(|k| deq[k] as f64 * e2m1(codes[k]) * xs).sum();
+                    sum_abs += term.abs();
+                }
+                let eps = f32::EPSILON as f64;
+                let bound = (s as f64).abs() * n_sub as f64 * eps * sum_abs + 2.0 * eps * cpu.abs();
+                let got = dev[p * w.n_out + r] as f64;
+                let diff = (got - cpu).abs();
+                assert!(
+                    diff <= bound,
+                    "{what}: pair {p} (expert {e}) row {r}: tensor core {got:e} vs reference {cpu:e}, off by \
+                     {diff:e} against a bound of {bound:e}. Not addition order: suspect a sub-tile's pair, the \
+                     register layout or the scale."
+                );
+                exact += (diff == 0.0) as usize;
+                if bound > 0.0 {
+                    worst = worst.max(diff / bound);
+                }
+            }
+        }
+        println!(
+            "  {what:<5} {} outputs within the chain bound; {exact} bit-identical, worst at {worst:.3} of the bound",
+            dev.len()
+        );
+        kept.push(dev);
+        kept.len() - 1
+    };
+    let gi = against_reference("gate", &gate, &x_pairs);
+    let ui = against_reference("up", &up, &x_pairs);
+    against_reference("down", &down, &h);
+
+    let tiles = gpu.last_moe_tiles().expect("a grouped launch ran");
+    assert!((tiles as usize) * 8 < pairs, "{tiles} tiles for {pairs} pairs: the sub-tiles were never shared");
+
+    let mut g = kept[gi].clone();
+    let u = kept[ui].clone();
+    gpu.begin_pass(n_tok);
+    gpu.silu_mul(&mut g, &u);
+    gpu.host_needs(&mut g);
+
+    let mut fused = vec![0.0f32; pairs * 512];
+    let mut scratch = vec![0.0f32; pairs * 512];
+    gpu.begin_pass(n_tok);
+    gpu.moe_glu(&gate, &up, &route, &x, &mut fused, &mut scratch);
+    gpu.host_needs(&mut fused);
+    if let Some(e) = gpu.take_error() {
+        panic!("moe_glu: driver error: {e}");
+    }
+    let differing = g.iter().zip(&fused).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    assert_eq!(
+        differing, 0,
+        "the fused FP4 gate+up+SiLU differs from gate, up and silu_mul run separately on the same device in \
+         {differing} of {} outputs",
+        fused.len()
+    );
+    println!("  glu   {} outputs bit-identical to its parts; {tiles} tiles for {pairs} pairs", fused.len());
+}
