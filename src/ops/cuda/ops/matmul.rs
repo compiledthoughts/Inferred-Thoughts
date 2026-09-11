@@ -121,6 +121,52 @@ impl Cuda {
     /// reuse variant arrives as a measured change against this baseline —
     /// which is also what keeps decode and prefill unable to disagree while the
     /// exactness claim is being established.
+    /// NVFP4 matmuls as FP4 x FP4 on the tensor cores (`true`) or against a
+    /// Q8_0 activation (`false`, the exact path). Has no effect in an `sm_120`
+    /// build, which carries no FP4 kernels.
+    pub fn nvfp4_fp4(&self, on: bool) {
+        self.nvfp4_fp4.set(on);
+    }
+
+    /// NVFP4 as FP4 x FP4 on the tensor cores: `matmul_nvfp4_fp4_mma` against an
+    /// activation from `quantize_nvfp4_act`.
+    ///
+    /// A precision departure from `matmul_nvfp4`: the activation is FP4, and
+    /// the core adds sub-block terms in its own order. The reference is
+    /// `ops::naive::dot_nvfp4_fp4` on `Fp4Row`, within the f32 chain bound that
+    /// `the_fp4_tensor_core_matmul_is_within_the_chain_bound` checks.
+    fn matmul_nvfp4_fp4(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let n_tok = x.len() / w.n_in;
+        let wd = self.expert_or_resident(w)?;
+        let (dd, qd) = self.quantized_fp4(x, n_tok * (w.n_in / 16))?;
+        let od = self.mirror_out(out)?;
+        // Four warps per block, each 16 weight rows; 8 tokens per block row.
+        let block = 128u32;
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::I32(n_tok as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(dd),
+            KArg::Ptr(qd),
+            KArg::Ptr(od),
+        ];
+        self.note_shape("matmul_nvfp4_fp4_mma", w.n_in, w.n_out);
+        // SAFETY: parameters match `matmul_nvfp4_fp4_mma`; the grid covers
+        // `n_out` rows in 64s by `n_tok` tokens in 8s, warps past either end
+        // return, and partial tiles clamp their loads to valid rows and tokens.
+        unsafe {
+            self.launch_grid2(
+                "matmul_nvfp4_fp4_mma",
+                w.n_out.div_ceil(64) as u32,
+                n_tok.div_ceil(8) as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
     /// NVFP4 against a Q8_0 activation: `ops::naive::dot_nvfp4_q8_0` on the
     /// device, the exact path. The shared expert and the LM head of the NVFP4
     /// checkpoint; the second scale is the model's to apply, as in llama.cpp.
@@ -623,6 +669,9 @@ impl Cuda {
                 return self.matmul_kquant(w, x, out);
             }
             GgmlType::F32 => return self.matmul_f32(w, x, out),
+            GgmlType::Nvfp4 if self.nvfp4_fp4.get() && cfg!(nvfp4_block_scale) => {
+                return self.matmul_nvfp4_fp4(w, x, out);
+            }
             GgmlType::Nvfp4 => return self.matmul_nvfp4(w, x, out),
             other => {
                 return Err(Error::Cuda {
@@ -739,5 +788,27 @@ impl Cuda {
         self.d2h(&mut quants, qd)?;
         self.d2h(&mut bsums, bd)?;
         Ok((scales, quants, bsums))
+    }
+
+    /// Run `quantize_nvfp4_act` on the device and read both outputs back:
+    /// `(scale codes, packed E2M1 codes)`, for comparison with
+    /// `quant::fp4_activation`. For tests, as `quantize_q8_k_readback` is.
+    pub fn quantize_nvfp4_act_readback(&self, x: &[f32]) -> Result<(Vec<u8>, Vec<u8>)> {
+        if x.len() % 64 != 0 {
+            return Err(Error::Cuda {
+                what: "quantize_nvfp4_act_readback",
+                detail: format!("{} values is not a whole number of NVFP4 blocks", x.len()),
+            });
+        }
+        let n_sub = x.len() / 16;
+        self.begin_pass(1);
+        self.host_wrote(x);
+        let (dd, qd) = self.quantized_fp4(x, n_sub)?;
+        self.sync()?;
+        let mut scales = vec![0u8; n_sub];
+        let mut codes = vec![0u8; n_sub * 8];
+        self.d2h(&mut scales, dd)?;
+        self.d2h(&mut codes, qd)?;
+        Ok((scales, codes))
     }
 }

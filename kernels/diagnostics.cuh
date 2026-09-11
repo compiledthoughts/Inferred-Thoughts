@@ -806,17 +806,8 @@ __global__ void bench_mma_ceiling_f16(int iters, float *__restrict__ out) {
 // accepts it, and this card's driver loads the result. `build.rs` defines
 // `INFERRED_NVFP4_BLOCK_SCALE` when built with `INFERRED_SM_ARCH=sm_120a`.
 #ifdef INFERRED_NVFP4_BLOCK_SCALE
-__device__ __forceinline__ void mma_nvfp4_inplace(
-        float (&d)[4], const unsigned (&a)[4], const unsigned (&b)[2],
-        unsigned sa, unsigned sb) {
-    asm volatile(
-        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
-        "%10, {0, 0}, %11, {0, 0};\n"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
-          "r"(sa), "r"(sb));
-}
+// `mma_nvfp4_inplace` lives in nvfp4.cuh, which the NVFP4 kernels share and
+// kernels.cu includes before this file.
 
 __global__ void bench_mma_ceiling_nvfp4(int iters, float *__restrict__ out) {
     // E2M1 0.5 (code 1) in every nibble; every UE4M3 scale 1.0 (0x38).

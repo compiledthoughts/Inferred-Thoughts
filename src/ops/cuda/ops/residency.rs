@@ -50,6 +50,7 @@ impl Cuda {
             // other serving the previous token's values.
             m.quant_valid = false;
             m.quant_k_valid = false;
+            m.quant_f4_valid = false;
         }
         Ok(ptr)
     }
@@ -72,6 +73,8 @@ impl Cuda {
                     quant_valid: false,
                     quant_k: None,
                     quant_k_valid: false,
+                    quant_f4: None,
+                    quant_f4_valid: false,
                 },
             );
         }
@@ -215,6 +218,62 @@ impl Cuda {
             m.quant_valid = true;
         }
         Ok((sd, qd))
+    }
+
+    /// This activation quantized to **FP4** on the device, computed once:
+    /// `quantize_nvfp4_act`, llama.cpp's `quantize_mmq_nvfp4`.
+    ///
+    /// Returns `(scale codes, packed E2M1 codes)`: one byte per 16-element
+    /// sub-block and eight per sub-block, cached on the mirror as the Q8_0 and
+    /// Q8_K forms are and dropped when the buffer is written.
+    pub(super) fn quantized_fp4(
+        &self,
+        x: &[f32],
+        n_sub: usize,
+    ) -> Result<(ffi::CUdeviceptr, ffi::CUdeviceptr)> {
+        let key = x.as_ptr() as usize;
+        let xd = self.mirror_in(x)?;
+
+        let existing = match self.mirrors.borrow().get(&key) {
+            Some(m) => match &m.quant_f4 {
+                Some((d, q)) if d.len_bytes() >= n_sub => {
+                    if m.quant_f4_valid {
+                        return Ok((d.ptr, q.ptr));
+                    }
+                    Some((d.ptr, q.ptr))
+                }
+                _ => None,
+            },
+            None => None,
+        };
+
+        let (dd, qd, fresh_bufs) = match existing {
+            Some((d, q)) => (d, q, None),
+            None => {
+                let scales = DeviceBuffer::new(n_sub)?;
+                let codes = DeviceBuffer::new(n_sub * 8)?;
+                let (d, q) = (scales.ptr, codes.ptr);
+                (d, q, Some((scales, codes)))
+            }
+        };
+        {
+            let args = [KArg::I32(n_sub as i32), KArg::Ptr(xd), KArg::Ptr(dd), KArg::Ptr(qd)];
+            let block = 64u32;
+            self.note_shape("quantize_nvfp4_act", n_sub * 16, 0);
+            // SAFETY: parameters match `quantize_nvfp4_act`; the grid covers
+            // `n_sub` sub-blocks, threads past it return, and both outputs are
+            // sized for `n_sub`.
+            unsafe {
+                self.launch("quantize_nvfp4_act", n_sub.div_ceil(block as usize) as u32, block, &args)?
+            };
+        }
+        if let Some(m) = self.mirrors.borrow_mut().get_mut(&key) {
+            if let Some(bufs) = fresh_bufs {
+                m.quant_f4 = Some(bufs);
+            }
+            m.quant_f4_valid = true;
+        }
+        Ok((dd, qd))
     }
 
     /// Host to device, counted.

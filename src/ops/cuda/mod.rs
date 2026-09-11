@@ -188,6 +188,12 @@ pub struct Cuda {
     /// **On by default**, because it is bit-identical to the oracle and 1.72x
     /// on prefill. `--iq4-scalar` restores the warp dot for the A/B.
     iq4_mma: Cell<bool>,
+    /// NVFP4 matmuls as FP4 x FP4 on the tensor cores, against an activation
+    /// quantized to FP4 as llama.cpp's CUDA backend does, rather than against
+    /// Q8_0 as ggml-cpu does. **A precision departure**: the reference is
+    /// `ops::naive::{Fp4Row, dot_nvfp4_fp4}`, within the f32 chain bound. Only
+    /// in an `sm_120a` build; off until its tests pass.
+    nvfp4_fp4: Cell<bool>,
     /// Route batched IQ4_XS matmuls through the shared-memory staged tile.
     ///
     /// Off by default while it is measured. `INFERRED_IQ4_STAGED=1` selects it
@@ -389,6 +395,12 @@ struct Mirror {
     /// quantizations, and a single slot would thrash between them every layer.
     quant_k: Option<(DeviceBuffer, DeviceBuffer, DeviceBuffer)>,
     quant_k_valid: bool,
+    /// The same buffer quantized to **FP4** for the FP4 x FP4 NVFP4 path: a
+    /// UE4M3 code per 16 elements, and the E2M1 codes packed as NVFP4 weights
+    /// pack theirs. A third slot for the reason the second exists: NVFP4's
+    /// shared expert reads the activation the Q8_0 GatedDeltaNet projections do.
+    quant_f4: Option<(DeviceBuffer, DeviceBuffer)>,
+    quant_f4_valid: bool,
 }
 
 impl Mirror {
@@ -399,6 +411,7 @@ impl Mirror {
         self.device_current = false;
         self.quant_valid = false;
         self.quant_k_valid = false;
+        self.quant_f4_valid = false;
     }
 }
 
@@ -826,6 +839,7 @@ impl Cuda {
                 delta_seq: Cell::new(env_flag("INFERRED_DELTA_SEQ")),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),
+                nvfp4_fp4: Cell::new(false),
                 iq4_staged: Cell::new(env_flag("INFERRED_IQ4_STAGED")),
                 iq4_fold_once: Cell::new(env_flag("INFERRED_IQ4_FOLD_ONCE")),
                 q5k_mma: Cell::new(!env_flag("INFERRED_Q5K_SCALAR")),

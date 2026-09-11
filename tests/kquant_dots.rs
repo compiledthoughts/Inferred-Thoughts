@@ -604,3 +604,170 @@ fn a_batched_k_quant_matmul_agrees_with_its_own_single_token_path() {
         );
     }
 }
+
+// ------------------------------------------------------- FP4 x FP4 on CUDA
+//
+// The tensor-core NVFP4 path against the CPU reference in `ops::naive`, which
+// transcribes llama.cpp's CUDA arithmetic. The quantizer is discrete and must
+// match to the byte; the product may differ only by the order the core adds
+// exact sub-block terms in.
+
+/// E2M1 and UE4M3 as real numbers, unhalved: ISA 5.2.3.
+fn e2m1_value(code: u8) -> f64 {
+    let m = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(code & 7) as usize];
+    if code & 8 != 0 { -m } else { m }
+}
+
+fn ue4m3_value(code: u8) -> f64 {
+    let (e, m) = (((code >> 3) & 0xf) as i32, f64::from(code & 7));
+    if code == 0 || code == 0x7f {
+        0.0
+    } else if e == 0 {
+        m * 2f64.powi(-9)
+    } else {
+        (1.0 + m / 8.0) * 2f64.powi(e - 7)
+    }
+}
+
+/// The device FP4 activation quantizer against `quant::fp4_activation`, byte
+/// for byte, at four scales of the fixture's activation: the seed's CUDA
+/// rounding, the +-2 search's fused error and the E2M1 ties all have to agree,
+/// and 4000x pushes blocks past 448 * 6 into the saturated seed.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_device_fp4_activation_quantizer_matches_the_reference() {
+    if !cfg!(nvfp4_block_scale) {
+        println!("SKIPPED: built for sm_120; the FP4 kernels need INFERRED_SM_ARCH=sm_120a");
+        return;
+    }
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let fx = nvfp4_fixtures();
+    assert!(!fx.is_empty(), "no NVFP4 .itdp fixture; run scripts/dump_kquant_dots.py on the NVFP4 GGUF");
+
+    // Held for the whole test: the backend keys its mirrors on host addresses.
+    let mut held: Vec<Vec<f32>> = Vec::new();
+    for f in &fx {
+        for k in [1.0f32, 0.003, 90.0, 4000.0] {
+            held.push(f.activation.iter().map(|v| v * k).collect());
+            let x = held.last().unwrap();
+            let (want_scales, want_codes) = inferred_thoughts::quant::fp4_activation(x);
+            let n_sub = x.len() / 16;
+            let mut want_packed = vec![0u8; n_sub * 8];
+            for s in 0..n_sub {
+                for j in 0..8 {
+                    want_packed[s * 8 + j] = want_codes[s * 16 + j] | (want_codes[s * 16 + j + 8] << 4);
+                }
+            }
+            let (scales, packed) = gpu.quantize_nvfp4_act_readback(x).expect("quantize_nvfp4_act");
+            if let Some(e) = gpu.take_error() {
+                panic!("{}: driver error: {e}", f.name);
+            }
+            if let Some(s) = scales.iter().zip(&want_scales).position(|(a, b)| a != b) {
+                panic!(
+                    "{} x{k}: sub-block {s} scale code {:#04x} on the device, {:#04x} in the reference \
+                     (amax {:e}). Check the seed's rounding first, then the fused error.",
+                    f.name,
+                    scales[s],
+                    want_scales[s],
+                    x[s * 16..(s + 1) * 16].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+                );
+            }
+            if let Some(b) = packed.iter().zip(&want_packed).position(|(a, w)| a != w) {
+                panic!("{} x{k}: packed code byte {b} (sub-block {}) differs: {:#04x} vs {:#04x}",
+                    f.name, b / 8, packed[b], want_packed[b]);
+            }
+            println!("  {:<52} x{k:<6} {n_sub} sub-blocks identical", f.name);
+        }
+    }
+}
+
+/// FP4 x FP4 on the tensor cores against `quant::vec_dot_nvfp4_fp4`, output by
+/// output.
+///
+/// **The bound is derived, not chosen.** Every sub-block term is exact in f32
+/// (a 12-bit integer times an 8-bit scale mantissa), so the reference and the
+/// core differ only in the order they add `n_sub` exact terms. Each addition
+/// rounds by at most half an ulp of its result, and no partial sum exceeds
+/// `sum|terms|`, so each side is within `n_sub * EPSILON / 2 * sum|terms|` of the
+/// exact sum and the two within `n_sub * EPSILON * sum|terms|` of each other.
+///
+/// 50 of the fixture's 64 rows and 11 tokens, so both the last row tile and the
+/// last token tile are partial.
+#[test]
+#[cfg(feature = "cuda")]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_fp4_tensor_core_matmul_is_within_the_chain_bound() {
+    use inferred_thoughts::ops::{Ops, Weights};
+
+    if !cfg!(nvfp4_block_scale) {
+        println!("SKIPPED: built for sm_120; the FP4 kernels need INFERRED_SM_ARCH=sm_120a");
+        return;
+    }
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.nvfp4_fp4(true);
+    let fx = nvfp4_fixtures();
+    assert!(!fx.is_empty(), "no NVFP4 .itdp fixture; run scripts/dump_kquant_dots.py on the NVFP4 GGUF");
+
+    for f in &fx {
+        let (n_out, n_tok, n_sub) = (50usize, 11usize, f.n / 16);
+        let row_bytes = f.weights.len() / f.rows;
+        let wbytes = &f.weights[..n_out * row_bytes];
+        let w = Weights { data: wbytes, ty: f.ty, n_in: f.n, n_out, pooled: false };
+
+        let mut batch = Vec::with_capacity(n_tok * f.n);
+        for t in 0..n_tok {
+            let k = (1.0 + t as f32 * 0.37) * if t % 3 == 2 { -1.0 } else { 1.0 };
+            batch.extend(f.activation.iter().map(|v| v * k));
+        }
+        let mut dev = vec![0.0f32; n_tok * n_out];
+        gpu.begin_pass(n_tok);
+        gpu.matmul(&w, &batch, &mut dev);
+        gpu.host_needs(&mut dev);
+        if let Some(e) = gpu.take_error() {
+            panic!("{}: driver error: {e}", f.name);
+        }
+
+        let wdeq = inferred_thoughts::quant::dequantize(wbytes, GgmlType::Nvfp4, n_out * f.n)
+            .expect("dequantize the weight rows");
+        let (mut worst, mut exact_hits) = (0.0f64, 0usize);
+        for t in 0..n_tok {
+            let x = &batch[t * f.n..(t + 1) * f.n];
+            let (scales, codes) = inferred_thoughts::quant::fp4_activation(x);
+            for r in 0..n_out {
+                let cpu = inferred_thoughts::quant::vec_dot_nvfp4_fp4(&wbytes[r * row_bytes..(r + 1) * row_bytes], x) as f64;
+                let mut sum_abs = 0.0f64;
+                for s in 0..n_sub {
+                    let xs = ue4m3_value(scales[s]);
+                    let term: f64 = (s * 16..(s + 1) * 16)
+                        .map(|e| wdeq[r * f.n + e] as f64 * e2m1_value(codes[e]) * xs)
+                        .sum();
+                    sum_abs += term.abs();
+                }
+                let bound = n_sub as f64 * f32::EPSILON as f64 * sum_abs;
+                let got = dev[t * n_out + r] as f64;
+                let diff = (got - cpu).abs();
+                assert!(
+                    diff <= bound,
+                    "{} token {t} row {r}: tensor core {got:e} vs reference {cpu:e}, off by {diff:e} \
+                     against a chain bound of {bound:e}. That is not addition order: suspect the \
+                     register layout, a scale selector or the activation packing.",
+                    f.name
+                );
+                if diff == 0.0 {
+                    exact_hits += 1;
+                }
+                if bound > 0.0 {
+                    worst = worst.max(diff / bound);
+                }
+            }
+        }
+        println!(
+            "  {:<52} {n_tok} tokens x {n_out} rows within the chain bound; {exact_hits} bit-identical, \
+             worst at {worst:.3} of the bound",
+            f.name
+        );
+    }
+}

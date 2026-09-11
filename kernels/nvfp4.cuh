@@ -15,6 +15,12 @@
 // output, where `build_moe_ffn` applies it.
 #pragma once
 
+#ifdef INFERRED_NVFP4_BLOCK_SCALE
+// `__nv_fp8_e4m3`, whose float conversion seeds the FP4 activation scale.
+// `cuda_fp8.hpp` refuses to be included directly.
+#include <cuda_fp8.h>
+#endif
+
 extern "C" {
 
 // `kvalues_mxfp4` (ggml-common.h): E2M1 doubled. The magnitude by the low three
@@ -165,5 +171,168 @@ __global__ void matmul_nvfp4_q8_0_moe_grouped(
         out[(size_t)q * n_out + j] = v;
     }
 }
+
+// ------------------------------------------------------------ FP4 x FP4
+//
+// The tensor-core path, and the NVFP4 default once it is proven against
+// `ops::naive::{Fp4Row, dot_nvfp4_fp4}`. Only in an `sm_120a` build: the
+// block-scaled FP4 `mma` is architecture-specific (build.rs).
+#ifdef INFERRED_NVFP4_BLOCK_SCALE
+
+// `D = (A * scale_A) * (B * scale_B) + D` over a 16x8x64 tile, in place.
+//
+// Operand layout, PTX ISA 9.7.16.5.11 with the scale-A pair order from
+// llama.cpp's `vec_dot_fp4_fp4_mma`, verified value by value by
+// `the_nvfp4_block_scaled_mma_follows_the_isa`. With `g = lane >> 2` and
+// `t = lane & 3`:
+//
+//   A   a0: row g,     k = 8t + 0..7        a1: row g + 8, k = 8t + 0..7
+//       a2: row g,     k = 32 + 8t + 0..7   a3: row g + 8, k = 32 + 8t + 0..7
+//   B   b0: col g,     k = 8t + 0..7        b1: col g,     k = 32 + 8t + 0..7
+//   D   d0, d1: row g, cols 2t, 2t + 1      d2, d3: row g + 8, cols 2t, 2t + 1
+//   scale_A for row g from lane 4g, for row g + 8 from lane 4g + 1;
+//   scale_B for col c from lane 4c; byte c of a scale register is chunk c.
+__device__ __forceinline__ void mma_nvfp4_inplace(
+        float (&d)[4], const unsigned (&a)[4], const unsigned (&b)[2],
+        unsigned sa, unsigned sb) {
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+        "%10, {0, 0}, %11, {0, 0};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]),
+          "r"(sa), "r"(sb));
+}
+
+// `ggml_cuda_float_to_fp4_e2m1` (ggml-cuda/common.cuh): nearest E2M1 magnitude
+// to `|x| * e`, the first index winning a tie, sign in bit 3 when `x < 0`.
+__device__ __forceinline__ unsigned nvfp4_e2m1_code(float x, float e) {
+    const float pos[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float ax = fabsf(x) * e;
+    int best_i = 0;
+    float best_err = fabsf(ax - pos[0]);
+    for (int i = 1; i < 8; ++i) {
+        const float err = fabsf(ax - pos[i]);
+        if (err < best_err) {
+            best_err = err;
+            best_i = i;
+        }
+    }
+    return (unsigned)best_i | (x < 0.0f ? 8u : 0u);
+}
+
+// An activation to FP4, one thread per 16-element sub-block over the whole
+// batch: `quantize_mmq_nvfp4` (ggml-cuda/quantize.cu), and `ops::naive::Fp4Row`
+// on the host, bit for bit.
+//
+// Output layout is the NVFP4 weight's, so the tensor-core kernel loads both
+// operands as raw words: `x_d` one UE4M3 code per sub-block, `x_qs` 8 bytes per
+// sub-block whose byte `k` is element `k` in the low nibble and `k + 8` in the
+// high. `n_in` is a multiple of 64, so a token's sub-blocks tile its blocks.
+__global__ void quantize_nvfp4_act(int n_sub,
+                                   const float *__restrict__ x,
+                                   unsigned char *__restrict__ x_d,
+                                   unsigned char *__restrict__ x_qs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_sub) return;
+    const float *v = x + (size_t)i * 16;
+
+    float amax = 0.0f;
+    for (int k = 0; k < 16; ++k) amax = fmaxf(amax, fabsf(v[k]));
+    // `ggml_cuda_fp32_to_ue4m3`: CUDA's FP8 conversion, round to nearest even,
+    // saturating at 448.
+    const float s0 = amax / 6.0f;
+    int seed = 0;
+    if (s0 > 0.0f) {
+        const __nv_fp8_e4m3 f8(s0);
+        seed = (int)f8.__x;
+    }
+
+    const int offs[5] = {0, -1, 1, -2, 2};
+    float best_err = 3.40282347e+38f;
+    float best_scale = 0.0f;
+    unsigned best_code = 0;
+    for (int o = 0; o < 5; ++o) {
+        const int code = seed + offs[o];
+        if (code < 0 || code > 0x7e) continue;
+        const float scale = nvfp4_ue4m3((unsigned)code);
+        const float inv = scale > 0.0f ? 0.5f / scale : 0.0f;
+        float err = 0.0f;
+        for (int k = 0; k < 16; ++k) {
+            const unsigned q = nvfp4_e2m1_code(v[k], inv);
+            const float d = fabsf(v[k]) - fabsf((float)nvfp4_kv(q & 7)) * scale;
+            err = __fmaf_rn(d, d, err);
+        }
+        if (err < best_err) {
+            best_err = err;
+            best_code = (unsigned)code;
+            best_scale = scale;
+        }
+    }
+
+    const float inv = best_scale > 0.0f ? 0.5f / best_scale : 0.0f;
+    x_d[i] = (unsigned char)best_code;
+    for (int k = 0; k < 8; ++k) {
+        x_qs[(size_t)i * 8 + k] = (unsigned char)(nvfp4_e2m1_code(v[k], inv) |
+                                                  (nvfp4_e2m1_code(v[k + 8], inv) << 4));
+    }
+}
+
+// Dense FP4 x FP4 on the tensor cores: one warp per 16 weight rows x 8 tokens,
+// one `mma` per 64-element block. The shared expert and the LM head.
+//
+// **Every operand is a raw 4-byte load.** Word `4t` of a block's nibbles is the
+// A register for `k = 8t..8t+7` and word `16 + 4t` for `k = 32 + 8t..`, and the
+// activation packs its codes the same way, so within every 16-element chunk
+// weight and activation share one permutation of `k` and the dot product is
+// the one `ops::naive::dot_nvfp4_fp4` defines. The f32 accumulation order is the
+// core's, so this answers to the reference within the chain bound, not to the
+// bit. Rows and tokens past the end read the last valid one and are dropped.
+__global__ void matmul_nvfp4_fp4_mma(int n_in, int n_out, int n_tok,
+                                     const unsigned char *__restrict__ w,
+                                     const unsigned char *__restrict__ x_d,
+                                     const unsigned char *__restrict__ x_qs,
+                                     float *__restrict__ out) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;
+    const int t0 = blockIdx.y * 8;
+    if (j0 >= n_out || t0 >= n_tok) return;
+
+    const int nb = n_in / 64;
+    const int g = lane >> 2, t = lane & 3;
+    const int ra = (j0 + g < n_out) ? j0 + g : n_out - 1;
+    const int rb = (j0 + g + 8 < n_out) ? j0 + g + 8 : n_out - 1;
+    const int tk = (t0 + g < n_tok) ? t0 + g : n_tok - 1;
+    const unsigned char *wa = w + (size_t)ra * nb * 36;
+    const unsigned char *wb = w + (size_t)rb * nb * 36;
+    const unsigned char *xq = x_qs + (size_t)tk * nb * 32;
+    const unsigned char *xd = x_d + (size_t)tk * nb * 4;
+
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int ib = 0; ib < nb; ++ib) {
+        const unsigned char *ba = wa + (size_t)ib * 36;
+        const unsigned char *bb = wb + (size_t)ib * 36;
+        const unsigned char *bq = xq + (size_t)ib * 32;
+        const unsigned a[4] = {
+            *(const unsigned *)(ba + 4 + 4 * t),  *(const unsigned *)(bb + 4 + 4 * t),
+            *(const unsigned *)(ba + 20 + 4 * t), *(const unsigned *)(bb + 20 + 4 * t),
+        };
+        const unsigned b[2] = {*(const unsigned *)(bq + 4 * t), *(const unsigned *)(bq + 16 + 4 * t)};
+        // Lane 4g supplies row g's scales and lane 4g + 1 row g + 8's; the
+        // other two lanes' are not read. Lane 4c supplies column c's.
+        const unsigned sa = *(const unsigned *)((t == 1) ? bb : ba);
+        const unsigned sb = *(const unsigned *)(xd + (size_t)ib * 4);
+        mma_nvfp4_inplace(d, a, b, sa, sb);
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        const int row = (i < 2) ? j0 + g : j0 + g + 8;
+        const int tok = t0 + 2 * t + (i & 1);
+        if (row < n_out && tok < n_tok) out[(size_t)tok * n_out + row] = d[i];
+    }
+}
+
+#endif  // INFERRED_NVFP4_BLOCK_SCALE
 
 }  // extern "C"
