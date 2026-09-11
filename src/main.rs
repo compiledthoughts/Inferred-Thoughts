@@ -238,6 +238,15 @@ enum Command {
         /// Pinned pages cannot be swapped, so this is a real claim on host RAM.
         #[arg(long, default_value_t = 0.0)]
         expert_host: f64,
+        /// With --backend cuda: at start-up, prefill a short built-in text once
+        /// and re-place the expert pool by what it read, before the first request.
+        ///
+        /// Expert placement (~25 s on the 35B) happens inside the first forward
+        /// pass, so this moves it from the first request into start-up and adds
+        /// the warm-up prefill and the swaps. Migration still follows the session
+        /// afterwards; this only replaces the layer-order starting point.
+        #[arg(long)]
+        warmup: bool,
         /// Default generation budget when the request does not set one.
         #[arg(short = 'n', long, default_value_t = 512)]
         max_tokens: usize,
@@ -342,6 +351,7 @@ fn main() -> ExitCode {
             null_kernels: _,
             expert_cache,
             expert_host,
+            warmup,
             max_tokens,
             profile_device,
             threads,
@@ -355,6 +365,7 @@ fn main() -> ExitCode {
             max_batch: batch,
             expert_cache,
             expert_host,
+            warmup,
             max_tokens,
             profile_device,
             threads,
@@ -1156,6 +1167,8 @@ struct ServeArgs {
     expert_cache: f64,
     /// Cap the page-locked host tier behind it, in GiB. 0 is automatic.
     expert_host: f64,
+    /// Prefill a built-in text at start-up and re-place experts by it. CUDA only.
+    warmup: bool,
     max_tokens: usize,
     /// Report launch counts and expert residency after each turn.
     profile_device: bool,
@@ -1211,6 +1224,10 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         a.ctx,
     );
 
+    if a.warmup && a.backend != "cuda" {
+        eprintln!("--warmup places experts, which only --backend cuda does; ignored");
+    }
+
     #[cfg(feature = "cuda")]
     if a.backend == "cuda" {
         let cuda = inferred_thoughts::Cuda::new(0)?;
@@ -1232,7 +1249,14 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
             free as f64 / 1073741824.0,
             total as f64 / 1073741824.0,
         );
-        let engine = with_batch(Engine::new(m, &cuda, a.ctx, false), a.max_batch);
+        let mut engine = with_batch(Engine::new(m, &cuda, a.ctx, false), a.max_batch);
+        if a.warmup {
+            let w = inferred_thoughts::serve::warm_up_experts(&mut engine, &tk, &chat)?;
+            eprintln!(
+                "warmup {} tokens in {:.1} s, expert placement included | {} experts re-placed in {:.2} s",
+                w.tokens, w.prefill_s, w.swaps, w.replace_s,
+            );
+        }
         let r = run_server(engine, tk, chat, opts);
         if let Some(e) = cuda.take_error() {
             return Err(e);

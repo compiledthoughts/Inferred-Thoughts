@@ -2467,6 +2467,74 @@ fn the_35b_moe_agrees_with_the_oracle_on_a_batch() {
     );
 }
 
+/// `serve --warmup` must not change a single logit.
+///
+/// Where an expert lives changes which address a kernel reads, never what it
+/// computes, so a warmed-up engine and a cold one must agree to the bit on the
+/// same request, through prefill and through decode. That also proves
+/// `Engine::reset` leaves nothing of the warm-up behind: a KV position or a
+/// recurrent state carried over would move the logits by far more than an ulp.
+///
+/// **And it checks the warm-up actually moved something.** With no swaps the
+/// comparison passes trivially, which is the first thing a test of a placement
+/// change has to rule out.
+#[test]
+#[ignore = "needs an sm_120 device and the real 35B"]
+fn the_serve_warmup_leaves_the_logits_bit_identical() {
+    use inferred_thoughts::Model;
+    use inferred_thoughts::serve::warm_up_experts;
+    use inferred_thoughts::tok::chat::ChatMl;
+
+    const DECODE: usize = 8;
+    let Some(path) = common::find_model_named("Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf") else {
+        println!("SKIPPED: no 35B found");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open model");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let chat = ChatMl::detect(&tk, &f.metadata).expect("chat template");
+    let tokens = tk.encode(
+        &chat.wrap("Explain, in two sentences, why a CPU cache miss is expensive."),
+        true,
+        true,
+    );
+    // Room for the warm-up text as well as the request.
+    let n_ctx = 4096;
+
+    // One device context at a time: two would each size an expert slab from the
+    // same free VRAM. `e` is declared after `gpu`, so it drops first.
+    let run = |warm: bool| -> (Vec<Vec<f32>>, usize) {
+        let gpu = Cuda::new(0).expect("cuda device");
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, &gpu, n_ctx, false);
+        let swaps = if warm {
+            let w = warm_up_experts(&mut e, &tk, &chat).expect("warm-up");
+            println!(
+                "  warm-up {} tokens in {:.1} s (placement included), {} swaps in {:.2} s",
+                w.tokens, w.prefill_s, w.swaps, w.replace_s
+            );
+            w.swaps
+        } else {
+            0
+        };
+        let mut logits = vec![e.prefill(&tokens).expect("prefill")];
+        for _ in 0..DECODE {
+            let next = argmax(logits.last().expect("logits")) as u32;
+            logits.push(e.decode(next).expect("decode"));
+        }
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        (logits, swaps)
+    };
+
+    let (cold, _) = run(false);
+    let (warm, swaps) = run(true);
+    println!("  warm-up re-placed {swaps} experts");
+    assert!(swaps > 0, "the warm-up moved no experts, so this comparison proves nothing");
+    for (i, (a, b)) in cold.iter().zip(&warm).enumerate() {
+        common::assert_bit_identical(a, b, &format!("logits after pass {i}"));
+    }
+}
+
 /// Index of the largest logit; `Qwen3::argmax` is the 0.6B's and takes its own type.
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0;

@@ -597,6 +597,78 @@ pub fn serve<O: Ops>(
     Ok(())
 }
 
+/// The text `serve --warmup` prefills once before the first request.
+#[cfg(feature = "cuda")]
+const WARMUP_TEXT: &str = include_str!("warmup.txt");
+
+/// What the start-up warm-up did.
+#[cfg(feature = "cuda")]
+pub struct Warmup {
+    /// Tokens prefilled, chat markers included.
+    pub tokens: usize,
+    /// Wall time of that prefill, one-time expert placement included.
+    pub prefill_s: f64,
+    /// Experts the re-placement moved between tiers.
+    pub swaps: usize,
+    /// Wall time of the re-placement.
+    pub replace_s: f64,
+}
+
+/// Prefill a short built-in text once, re-place the expert pool by what it
+/// read, and leave the engine empty for the first request.
+///
+/// **Why a warm-up at all.** Every expert must be addressable before the router
+/// can name one, so `ExpertCache::table` places the pool eagerly, in the order
+/// tensors are first seen: VRAM fills with the early layers and the late ones
+/// land in the host tier, busy or not. Migration corrects that during a
+/// session, but at most 200 swaps per 64 tokens, so the first requests run on a
+/// placement that used no information. This spends a few seconds of start-up,
+/// once, to begin from one that did; migration still follows the session.
+///
+/// The text is rendered as a chat turn, so it routes through the same markers a
+/// request does, and it is long enough for tens of reads per expert. A few dozen
+/// tokens would give a handful, which is the noise `ExpertCache::migrate`
+/// records failing to rank.
+///
+/// Nothing of it survives but the placement and its read counts:
+/// `Engine::reset` clears the KV cache and the recurrent state, and the session
+/// is built after this returns, so its prefix matching never sees these tokens.
+/// `the_serve_warmup_leaves_the_logits_bit_identical` holds that to the bit.
+#[cfg(feature = "cuda")]
+pub fn warm_up_experts(
+    engine: &mut Engine<'_, &crate::Cuda>,
+    tk: &Tokenizer,
+    chat: &ChatMl,
+) -> Result<Warmup> {
+    let tokens = tk.encode(&chat.wrap(WARMUP_TEXT), true, true);
+    if tokens.len() >= engine.n_ctx() {
+        return Err(Error::InconsistentArchitecture {
+            what: "warmup",
+            detail: format!(
+                "the warm-up text is {} tokens and the context is {}; raise --ctx",
+                tokens.len(),
+                engine.n_ctx()
+            ),
+        });
+    }
+    let t0 = std::time::Instant::now();
+    engine.prefill(&tokens)?;
+    let prefill_s = t0.elapsed().as_secs_f64();
+    let t1 = std::time::Instant::now();
+    let swaps = engine.ops.replace_experts_by_counts()?;
+    let replace_s = t1.elapsed().as_secs_f64();
+    engine.reset();
+    if let Some(e) = engine.ops.take_error() {
+        return Err(e);
+    }
+    Ok(Warmup {
+        tokens: tokens.len(),
+        prefill_s,
+        swaps,
+        replace_s,
+    })
+}
+
 fn handle<O: Ops>(
     session: &mut Session<'_, O>,
     mut stream: TcpStream,

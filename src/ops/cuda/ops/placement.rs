@@ -69,6 +69,35 @@ impl Cuda {
         }
     }
 
+    /// Re-place the whole expert pool once, by every read counted so far, with
+    /// no swap budget. Returns the experts moved.
+    ///
+    /// **For `serve --warmup`, and only between passes.** Migration is bounded
+    /// per boundary so that no pass stalls, which is right inside a session and
+    /// wrong once at start-up, where nobody is waiting and the pool still sits in
+    /// the layer order `ExpertCache::table` placed it in. Here the exchange runs
+    /// to completion: afterwards every VRAM expert has been read at least as
+    /// often as every host-tier one. Measured on the 35B at the default budget
+    /// after a 733-token warm-up: 5,205 swaps in 1.83 s, ~350 us a swap, which is
+    /// about eight times the ~45 us the migration comments assume.
+    ///
+    /// **The counts are kept.** They are the evidence later migration ranks by,
+    /// and without them the session's first 64 tokens — a handful of reads per
+    /// expert — would swap out experts the warm-up found busy but the session
+    /// has not reached yet.
+    pub fn replace_experts_by_counts(&self) -> Result<usize> {
+        self.absorb_expert_counters();
+        let counts = match self.experts.borrow().as_ref() {
+            Some(c) => c.observed_counts().to_vec(),
+            None => return Ok(0),
+        };
+        let mut cache = self.experts.borrow_mut();
+        let Some(c) = cache.as_mut() else { return Ok(0) };
+        let moved = c.migrate(usize::MAX, &counts)?;
+        c.migration_done();
+        Ok(moved)
+    }
+
     /// Bring the device-side read counters home and fold them into the stats.
     ///
     /// **Without this the cache is unobservable.** Routing on the device means

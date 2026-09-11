@@ -1,0 +1,54 @@
+I'm putting together notes for a small team that builds and runs software on a single workstation, and I'd like your help reviewing a few pieces. Please read everything first, then answer each part in order.
+
+Part 1 - background. The team maintains a service that reads large files from disk, transforms them, and serves the results over HTTP. Most requests are short, but a few clients send long documents, sometimes tens of thousands of words, and expect a summary within a minute. Last quarter the median response time rose from 1.8 seconds to 3.1 seconds after a dependency upgrade, and nobody has explained why. The machine has 32 GB of memory, an eight-core processor, and a fast NVMe drive. Explain, in plain language, how you would find out whether the slowdown comes from the disk, the processor, memory pressure, or the network, and what you would measure first.
+
+Part 2 - code review. This Python function is supposed to return the k most frequent words in a text, ignoring case and punctuation:
+
+```python
+import re
+from collections import Counter
+
+def top_words(text, k=10):
+    words = re.findall(r"[a-z']+", text.lower())
+    counts = Counter(words)
+    return [w for w, _ in counts.most_common(k)]
+```
+
+Point out any bugs or edge cases, suggest tests, and rewrite it if you think it needs it.
+
+Part 3 - a Rust question. Why does the following fail to compile, and what are two ways to fix it?
+
+```rust
+fn longest(a: &str, b: &str) -> &str {
+    if a.len() >= b.len() { a } else { b }
+}
+
+fn main() {
+    let first = String::from("migration");
+    let result;
+    {
+        let second = String::from("placement");
+        result = longest(&first, &second);
+    }
+    println!("{result}");
+}
+```
+
+Part 4 - data. A colleague exported this configuration and says one field is wrong. Which one, and why?
+
+```json
+{
+  "service": "summarizer",
+  "port": 8080,
+  "timeout_seconds": "30",
+  "max_request_bytes": 10485760,
+  "retries": -1,
+  "log_level": "debug"
+}
+```
+
+Part 5 - explanation. Write a short paragraph for a new hire explaining the difference between a process and a thread, when you would choose one over the other, and what can go wrong when two threads update the same counter without a lock. Then give a one-line shell command that shows the ten processes using the most memory on a Linux machine.
+
+Part 6 - arithmetic. A job processes 1,200 files per hour on one core. With eight cores it reaches 7,400 files per hour. What is the speedup, what is the parallel efficiency, and what does Amdahl's law suggest about the fraction of the work that is serial? Show your working.
+
+Part 7 - writing. Finally, draft a brief, friendly message to the team announcing that the service will be restarted on Saturday at 09:00 for about fifteen minutes, that no action is needed, and whom to contact if something looks wrong afterwards.
