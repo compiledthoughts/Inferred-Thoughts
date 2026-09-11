@@ -77,9 +77,22 @@ pub struct Experts<'a> {
     /// Output width of one expert.
     pub n_out: usize,
     pub n_expert: usize,
+    /// Per-expert second scale: `n_expert` little-endian f32, multiplied into
+    /// that expert's matmul output (`ffn_*_exps.scale`, NVFP4 only, applied as
+    /// llama.cpp's `build_moe_ffn` does). **Empty when the file has none**,
+    /// which means 1.0.
+    pub scale: &'a [u8],
 }
 
 impl<'a> Experts<'a> {
+    /// Expert `e`'s second scale, 1.0 when the tensor has none.
+    pub fn scale_of(&self, e: usize) -> f32 {
+        match self.scale.get(e * 4..e * 4 + 4) {
+            Some(b) => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            None => 1.0,
+        }
+    }
+
     /// Bytes one expert occupies: `n_out` rows of `n_in` quantized elements.
     pub fn stride(&self) -> usize {
         self.ty.n_bytes(self.n_in as u64) as usize * self.n_out
@@ -452,6 +465,18 @@ pub trait Ops {
     /// `gate = silu(gate) * up`, in place — the SwiGLU nonlinearity.
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]);
 
+    /// `buf *= s`, in place: a weight's per-tensor second scale, applied after
+    /// its matmul as llama.cpp's `build_lora_mm` does with `ggml_mul`. NVFP4
+    /// tensors carry one; nothing else in the target models does.
+    ///
+    /// **A device backend must override this**: the default writes the host
+    /// copy, which is stale whenever the device holds the current one.
+    fn scale(&self, buf: &mut [f32], s: f32) {
+        for v in buf.iter_mut() {
+            *v *= s;
+        }
+    }
+
     /// L2 normalization per `head_dim`-sized slice, in place. No weight.
     ///
     /// **Not RMSNorm, despite looking like it.** `ggml_compute_forward_l2_norm_f32`
@@ -691,7 +716,13 @@ pub trait Ops {
                 0
             };
             let xi = &x[r * w.n_in..(r + 1) * w.n_in];
-            self.matmul(&w.expert(e), xi, &mut out[i * w.n_out..(i + 1) * w.n_out]);
+            let row = &mut out[i * w.n_out..(i + 1) * w.n_out];
+            self.matmul(&w.expert(e), xi, row);
+            // NVFP4's per-expert second scale, on this pick's output before
+            // anything reads it (`build_moe_ffn`).
+            if !w.scale.is_empty() {
+                self.scale(row, w.scale_of(e));
+            }
         }
     }
 

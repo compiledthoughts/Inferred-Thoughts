@@ -211,6 +211,18 @@ impl Cuda {
         self.mirror_out(gate).map(|_| ())
     }
 
+    pub(super) fn scale_impl(&self, buf: &mut [f32], s: f32) -> Result<()> {
+        let bd = self.mirror_in(buf)?;
+        let args = [KArg::I32(buf.len() as i32), KArg::F32(s), KArg::Ptr(bd)];
+        let block = 256u32;
+        self.note_shape("scale_f32", buf.len(), 0);
+        // SAFETY: parameters match `scale_f32`; `buf` holds `n` floats.
+        unsafe {
+            self.launch("scale_f32", buf.len().div_ceil(block as usize) as u32, block, &args)?
+        };
+        self.mirror_out(buf).map(|_| ())
+    }
+
     pub(super) fn add_assign_impl(&self, a: &mut [f32], b: &[f32]) -> Result<()> {
         let ad = self.mirror_in(a)?;
         let bd = self.mirror_in(b)?;

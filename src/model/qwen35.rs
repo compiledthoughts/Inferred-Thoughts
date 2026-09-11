@@ -561,6 +561,11 @@ enum Ffn<'a> {
         /// matrix so its dot product goes through the seam. It gates the
         /// shared expert's contribution with a sigmoid.
         shared_gate_inp: Weights<'a>,
+        /// The shared expert's per-tensor second scales (`ffn_*_shexp.scale`),
+        /// NVFP4 only, each applied right after its matmul.
+        shared_gate_s: Option<f32>,
+        shared_up_s: Option<f32>,
+        shared_down_s: Option<f32>,
     },
 }
 
@@ -728,6 +733,8 @@ pub struct Qwen35<'a> {
     tok_embd: Weights<'a>,
     output_norm: Vec<f32>,
     output: Weights<'a>,
+    /// `output.scale`, the LM head's second scale: NVFP4 only.
+    output_s: Option<f32>,
     layers: Vec<Layer<'a>>,
     /// Absolute layer index to KV slab. Only attention layers have one.
     ///
@@ -753,9 +760,12 @@ impl<'a> Qwen35<'a> {
         // Same fallback llama.cpp uses (TENSOR_DUPLICATED): tie to the
         // embedding when the file carries no separate head. The 9B has one; the
         // 35B has one too, at Q6_K.
-        let output = match f.tensor("output.weight") {
-            Some(_) => matrix(f, "output.weight", n_embd, cfg.n_vocab)?,
-            None => tok_embd,
+        let (output, output_s) = match f.tensor("output.weight") {
+            Some(_) => (
+                matrix(f, "output.weight", n_embd, cfg.n_vocab)?,
+                super::optional_scalar(f, "output.scale")?,
+            ),
+            None => (tok_embd, None),
         };
 
         // MTP blocks are loaded by llama.cpp but not executed in a normal pass,
@@ -808,6 +818,9 @@ impl<'a> Qwen35<'a> {
                     shared_up: matrix(f, &p("ffn_up_shexp.weight"), n_embd, m.shared_ff)?,
                     shared_down: matrix(f, &p("ffn_down_shexp.weight"), m.shared_ff, n_embd)?,
                     shared_gate_inp: row_matrix(f, &p("ffn_gate_inp_shexp.weight"), n_embd)?,
+                    shared_gate_s: super::optional_scalar(f, &p("ffn_gate_shexp.scale"))?,
+                    shared_up_s: super::optional_scalar(f, &p("ffn_up_shexp.scale"))?,
+                    shared_down_s: super::optional_scalar(f, &p("ffn_down_shexp.scale"))?,
                 },
             };
             layers.push(Layer {
@@ -836,6 +849,7 @@ impl<'a> Qwen35<'a> {
             tok_embd,
             output_norm: vector(f, "output_norm.weight", n_embd)?,
             output,
+            output_s,
             layers,
             kv_slot,
             n_kv_layer: next,
@@ -1005,6 +1019,9 @@ impl<'a> Qwen35<'a> {
                     shared_up,
                     shared_down,
                     shared_gate_inp,
+                    shared_gate_s,
+                    shared_up_s,
+                    shared_down_s,
                 } => {
                     let m = match &c.moe {
                         Some(m) => *m,
@@ -1024,6 +1041,7 @@ impl<'a> Qwen35<'a> {
                         shared_up,
                         shared_down,
                         shared_gate_inp,
+                        shared_s: [*shared_gate_s, *shared_up_s, *shared_down_s],
                     };
                     let mut t = 0;
                     while t < n {
@@ -1062,6 +1080,9 @@ impl<'a> Qwen35<'a> {
         ctx.trace("result_norm", 0, &s.final_norm);
 
         ops.matmul(&self.output, &s.final_norm, &mut s.logits);
+        if let Some(v) = self.output_s {
+            ops.scale(&mut s.logits, v);
+        }
         ops.end_pass();
         ops.host_needs(&mut s.logits);
         ctx.trace("result_output", 0, &s.logits);
@@ -1421,6 +1442,8 @@ struct MoeWeights<'a, 'b> {
     shared_up: &'b Weights<'a>,
     shared_down: &'b Weights<'a>,
     shared_gate_inp: &'b Weights<'a>,
+    /// `[gate, up, down]` second scales of the shared expert, NVFP4 only.
+    shared_s: [Option<f32>; 3],
 }
 
 /// Expert inputs written to a file for the NVFP4 activation study; off unless
@@ -1603,12 +1626,25 @@ fn moe_batch<O: Ops>(
     // The shared expert: always run, gated by a sigmoid of a single logit per
     // token. Batched with no change — these are ordinary matmuls and derive
     // their count from the buffer.
+    //
+    // An NVFP4 file carries a second scale per matmul, applied to its output
+    // before anything reads it — `build_ffn`'s order: up, gate, then down.
     let sff = n * m.shared_ff;
+    let [gate_s, up_s, down_s] = w.shared_s;
     ops.matmul(w.shared_gate, x, &mut s.e_gate[..sff]);
     ops.matmul(w.shared_up, x, &mut s.e_up[..sff]);
+    if let Some(v) = up_s {
+        ops.scale(&mut s.e_up[..sff], v);
+    }
+    if let Some(v) = gate_s {
+        ops.scale(&mut s.e_gate[..sff], v);
+    }
     let (g, u) = (&mut s.e_gate[..sff], &s.e_up[..sff]);
     ops.silu_mul(g, u);
     ops.matmul(w.shared_down, &s.e_gate[..sff], &mut s.e_out[..n * nd]);
+    if let Some(v) = down_s {
+        ops.scale(&mut s.e_out[..n * nd], v);
+    }
 
     // `ffn_gate_inp_shexp` is a vector, not a matrix: one logit per token. It
     // was computed above, paired with the router, because both read `x`.

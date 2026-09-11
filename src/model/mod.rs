@@ -161,6 +161,24 @@ impl<'a> From<Qwen35<'a>> for Model<'a> {
     }
 }
 
+/// Does a tensor's shape equal `want`, ignoring trailing dimensions of 1?
+///
+/// llama.cpp's `check_tensor_dims` (llama-model-loader.cpp) accepts exactly
+/// that: every listed dimension must match and every further one must be 1. A
+/// file is free to store `ffn_gate_inp_shexp` as `{2048}` or `{2048, 1}`, and
+/// `convert_hf_to_gguf.py` has written both.
+pub(crate) fn shape_is(got: &[u64], want: &[u64]) -> bool {
+    let trim = |d: &[u64]| {
+        let mut n = d.len();
+        while n > 0 && d[n - 1] == 1 {
+            n -= 1;
+        }
+        n
+    };
+    let (g, w) = (trim(got), trim(want));
+    g == w && got[..g] == want[..w]
+}
+
 /// Look up a tensor by name, failing with the name rather than an index panic.
 pub(crate) fn tensor<'a>(f: &'a GgufFile, name: &str) -> Result<&'a TensorInfo> {
     f.tensor(name).ok_or_else(|| Error::MissingTensor {
@@ -180,7 +198,7 @@ pub(crate) fn matrix<'a>(
     n_out: usize,
 ) -> Result<Weights<'a>> {
     let info = tensor(f, name)?;
-    if info.dims != vec![n_in as u64, n_out as u64] {
+    if !shape_is(&info.dims, &[n_in as u64, n_out as u64]) {
         return Err(Error::TensorShapeMismatch {
             name: name.to_string(),
             expected: vec![n_in as u64, n_out as u64],
@@ -212,20 +230,43 @@ pub(crate) fn experts<'a>(
 ) -> Result<Experts<'a>> {
     let info = tensor(f, name)?;
     let want = vec![n_in as u64, n_out as u64, n_expert as u64];
-    if info.dims != want {
+    if !shape_is(&info.dims, &want) {
         return Err(Error::TensorShapeMismatch {
             name: name.to_string(),
             expected: want,
             got: info.dims.clone(),
         });
     }
+    // NVFP4's per-expert second scale, written beside the weight by
+    // `convert_hf_to_gguf.py` (`_flush_nvfp4_experts`) and absent otherwise.
+    let scale_name = name.replace(".weight", ".scale");
+    let scale = match f.tensor(&scale_name) {
+        None => &[][..],
+        Some(s) => {
+            vector(f, &scale_name, n_expert)?;
+            if s.ty != crate::gguf::GgmlType::F32 {
+                return Err(Error::UnsupportedQuantType { ty: s.ty.name() });
+            }
+            f.tensor_bytes(s)
+        }
+    };
     Ok(Experts {
         data: f.tensor_bytes(info),
         ty: info.ty,
         n_in,
         n_out,
         n_expert,
+        scale,
     })
+}
+
+/// A weight's optional per-tensor second scale (`<weight>.scale`, one element,
+/// NVFP4 only): `None` when the file carries none.
+pub(crate) fn optional_scalar(f: &GgufFile, name: &str) -> Result<Option<f32>> {
+    if f.tensor(name).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(vector(f, name, 1)?[0]))
 }
 
 /// A 1-D vector (norm weights), dequantized once at load.
@@ -241,7 +282,7 @@ pub(crate) fn experts<'a>(
 /// token and none.
 pub(crate) fn row_matrix<'a>(f: &'a GgufFile, name: &str, n_in: usize) -> Result<Weights<'a>> {
     let info = tensor(f, name)?;
-    if info.dims != vec![n_in as u64] {
+    if !shape_is(&info.dims, &[n_in as u64]) {
         return Err(Error::TensorShapeMismatch {
             name: name.to_string(),
             expected: vec![n_in as u64],
@@ -259,7 +300,7 @@ pub(crate) fn row_matrix<'a>(f: &'a GgufFile, name: &str, n_in: usize) -> Result
 
 pub(crate) fn vector(f: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
     let info = tensor(f, name)?;
-    if info.dims != vec![len as u64] {
+    if !shape_is(&info.dims, &[len as u64]) {
         return Err(Error::TensorShapeMismatch {
             name: name.to_string(),
             expected: vec![len as u64],

@@ -4616,10 +4616,10 @@ fn moe_ffn_cost_table(gpu: &Cuda) {
     let gdata = build(0x9e37);
     let udata = build(0x51c7);
     let gate = Experts {
-        data: &gdata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT,
+        data: &gdata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT, scale: &[],
     };
     let up = Experts {
-        data: &udata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT,
+        data: &udata, ty: GgmlType::Iq4Xs, n_in: N_IN, n_out: N_OUT, n_expert: N_EXPERT, scale: &[],
     };
 
     println!("\nrouted MoE FFN (gate+up+silu), {N_EXPERT} experts, top-{N_USED}, {N_IN}x{N_OUT}");

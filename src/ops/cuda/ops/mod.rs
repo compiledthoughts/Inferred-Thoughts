@@ -178,6 +178,10 @@ impl Ops for Cuda {
         self.note(self.silu_mul_impl(gate, up));
     }
 
+    fn scale(&self, buf: &mut [f32], s: f32) {
+        self.note(self.scale_impl(buf, s));
+    }
+
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
         self.note(self.add_assign_impl(a, b));
     }
@@ -582,6 +586,10 @@ impl Ops for &Cuda {
 
     fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
         (*self).silu_mul(gate, up)
+    }
+
+    fn scale(&self, buf: &mut [f32], s: f32) {
+        (*self).scale(buf, s)
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {

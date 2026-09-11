@@ -533,6 +533,11 @@ impl Cuda {
                 let args = vec![KArg::I32(n_in as i32), KArg::Ptr(a), KArg::Ptr(b)];
                 (args, n_in.div_ceil(256) as u32, 1, 256u32, 0u32)
             }
+            "scale_f32" => {
+                let a = fbuf(n_in)?;
+                let args = vec![KArg::I32(n_in as i32), KArg::F32(0.125), KArg::Ptr(a)];
+                (args, n_in.div_ceil(256) as u32, 1, 256, 0)
+            }
             "add_scaled" => {
                 let (a, b) = (fbuf(n_in)?, fbuf(n_in)?);
                 let args = vec![

@@ -292,6 +292,14 @@ __global__ void silu_mul(int n, float *__restrict__ gate,
     gate[i] = g / (1.0f + expf(-g)) * up[i];
 }
 
+// `x *= s`, in place: a weight's per-tensor second scale (NVFP4), applied after
+// its matmul as llama.cpp's `ggml_mul` with a one-element tensor does.
+__global__ void scale_f32(int n, float s, float *__restrict__ x) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] *= s;
+}
+
 // Residual add, in place.
 __global__ void add_assign(int n, float *__restrict__ a,
                            const float *__restrict__ b) {

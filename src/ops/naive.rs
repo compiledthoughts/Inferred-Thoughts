@@ -65,6 +65,15 @@ impl Naive {
                     out[j] = crate::quant::kquant::dot_row_q8_k(w.ty, w.row(j), &qx);
                 }
             }
+            // NVFP4 pairs with **Q8_0** in ggml-cpu (`vec_dot_type`), not with
+            // FP4: the FP4 x FP4 product is the CUDA backend's departure, and this
+            // is the path it is measured against.
+            GgmlType::Nvfp4 => {
+                let qx = QuantizedRow::from_f32(x);
+                for j in 0..w.n_out {
+                    out[j] = dot_nvfp4_q8_0(w.row(j), &qx);
+                }
+            }
             _ => {
                 for j in 0..w.n_out {
                     out[j] = dot_row(w.ty, w.row(j), x);
@@ -530,6 +539,36 @@ pub(crate) fn dot_q8_0_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
             sumi += (w as i8) as i32 * a as i32;
         }
         sumf += sumi as f32 * (dw * x.scales[i]);
+    }
+    sumf
+}
+
+/// `ggml_vec_dot_nvfp4_q8_0_generic` (ggml-cpu/quants.c).
+///
+/// An NVFP4 block of 64 spans two Q8_0 blocks of 32, so sub-block `s` of 16
+/// reads Q8_0 block `s / 2` at offset `(s % 2) * 16`. Per sub-block, two integer
+/// sums (low and high nibbles) times `dy * d`, accumulated serially in f32 in
+/// sub-block order. The UE4M3 scale is halved and the E2M1 table doubled, as in
+/// [`crate::quant::ue4m3_to_f32`]. The per-tensor second scale is the model's to
+/// apply, as in llama.cpp.
+pub(crate) fn dot_nvfp4_q8_0(row: &[u8], x: &QuantizedRow) -> f32 {
+    use crate::quant::{KVALUES_MXFP4, ue4m3_to_f32};
+    let mut sumf = 0.0f32;
+    for (ib, block) in row.chunks_exact(36).enumerate() {
+        for s in 0..4 {
+            let d = ue4m3_to_f32(block[s]);
+            let q8 = 2 * ib + s / 2;
+            let off = (s % 2) * 16;
+            let dy = x.scales[q8];
+            let qa = &x.quants[q8 * QK8_0..(q8 + 1) * QK8_0];
+            let (mut lo, mut hi) = (0i32, 0i32);
+            for j in 0..8 {
+                let qv = block[4 + s * 8 + j];
+                lo += qa[off + j] as i32 * KVALUES_MXFP4[(qv & 0xf) as usize] as i32;
+                hi += qa[off + j + 8] as i32 * KVALUES_MXFP4[(qv >> 4) as usize] as i32;
+            }
+            sumf += dy * d * (lo + hi) as f32;
+        }
     }
     sumf
 }

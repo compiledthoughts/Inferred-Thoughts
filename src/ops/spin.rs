@@ -89,7 +89,8 @@ enum Act {
 impl Act {
     fn of(ty: GgmlType, x: &[f32]) -> Self {
         match ty {
-            GgmlType::Q8_0 => Act::Q80(naive::QuantizedRow::from_f32(x)),
+            // NVFP4's `vec_dot_type` is Q8_0 in ggml-cpu, like Q8_0's own.
+            GgmlType::Q8_0 | GgmlType::Nvfp4 => Act::Q80(naive::QuantizedRow::from_f32(x)),
             GgmlType::Q5K | GgmlType::Q6K | GgmlType::Iq4Xs => Act::Q8k(Q8KRow::from_f32(x)),
             _ => Act::Raw,
         }
@@ -97,6 +98,7 @@ impl Act {
 
     fn dot(&self, ty: GgmlType, row: &[u8], x: &[f32]) -> f32 {
         match self {
+            Act::Q80(q) if ty == GgmlType::Nvfp4 => naive::dot_nvfp4_q8_0(row, q),
             Act::Q80(q) => naive::dot_q8_0_q8_0(row, q),
             Act::Q8k(q) => kquant::dot_row_q8_k(ty, row, q),
             Act::Raw => naive::dot_row(ty, row, x),

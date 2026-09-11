@@ -1,8 +1,8 @@
 //! Dequantization from GGUF block formats to f32.
 //!
-//! F32, F16, BF16, Q8_0, and the three formats the 35B needs: Q5_K, Q6_K and
-//! IQ4_XS. Nothing is added speculatively — a format arrives when a model we
-//! actually run declares it.
+//! F32, F16, BF16, Q8_0, the three formats the 35B needs: Q5_K, Q6_K and
+//! IQ4_XS, and NVFP4 for the 35B's NVFP4 checkpoint. Nothing is added
+//! speculatively — a format arrives when a model we actually run declares it.
 //!
 //! Layouts are read from the reference, not guessed:
 //!   - `dequantize_row_q8_0` in `ggml/src/ggml-quants.c`
@@ -79,6 +79,7 @@ pub fn dequantize_into(data: &[u8], ty: GgmlType, out: &mut [f32]) -> Result<()>
         GgmlType::Q5K => dequantize_q5_k(data, out),
         GgmlType::Q6K => dequantize_q6_k(data, out),
         GgmlType::Iq4Xs => dequantize_iq4_xs(data, out),
+        GgmlType::Nvfp4 => dequantize_nvfp4(data, out),
         other => {
             return Err(Error::UnsupportedQuantType { ty: other.name() });
         }
@@ -248,6 +249,56 @@ fn dequantize_iq4_xs(data: &[u8], out: &mut [f32]) {
             for j in 0..16 {
                 y[base + j] = dl * KVALUES_IQ4NL[(q[j] & 0xF) as usize] as f32;
                 y[base + j + 16] = dl * KVALUES_IQ4NL[(q[j] >> 4) as usize] as f32;
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------ NVFP4
+//
+// The NVFP4 checkpoint of the 35B, converted by llama.cpp's
+// `convert_hf_to_gguf.py`, which copies ModelOpt's nibbles and E4M3 scale bits
+// unchanged and regroups four 16-element blocks into one 64-element block.
+
+/// `kvalues_mxfp4` from ggml-common.h: the E2M1 values **doubled**, sign in
+/// bit 3. NVFP4 and MXFP4 share it.
+pub(crate) const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// `ggml_ue4m3_to_fp32` from ggml-impl.h: an unsigned E4M3 scale, bias 7,
+/// **halved** to pair with the doubled [`KVALUES_MXFP4`], so a weight is the
+/// ModelOpt value E2M1 x E4M3 exactly. 0 and 0x7F (the NaN code) read as 0.
+/// Bit 7 is not examined, as in the reference.
+pub(crate) fn ue4m3_to_f32(x: u8) -> f32 {
+    if x == 0 || x == 0x7f {
+        return 0.0;
+    }
+    let exp = ((x >> 3) & 0xf) as i32;
+    let man = (x & 7) as f32;
+    // `ldexpf` in the reference; a power of two is exact either way.
+    let raw = if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    };
+    raw * 0.5
+}
+
+/// `dequantize_row_nvfp4`.
+///
+/// A 36-byte block is four UE4M3 scales `d`, then 32 bytes of nibbles. Byte
+/// `j` of sub-block `s` is `qs[8s + j]`: its low nibble is element `j` of the
+/// sub-block and its high nibble element `j + 8`. The per-tensor second scale
+/// is a separate tensor and is **not** applied here, as in the reference.
+fn dequantize_nvfp4(data: &[u8], out: &mut [f32]) {
+    const BYTES: usize = 36;
+    for (block, y) in data.chunks_exact(BYTES).zip(out.chunks_exact_mut(64)) {
+        for s in 0..4 {
+            let d = ue4m3_to_f32(block[s]);
+            let qs = &block[4 + s * 8..4 + s * 8 + 8];
+            let yb = &mut y[s * 16..s * 16 + 16];
+            for j in 0..8 {
+                yb[j] = KVALUES_MXFP4[(qs[j] & 0xf) as usize] as f32 * d;
+                yb[j + 8] = KVALUES_MXFP4[(qs[j] >> 4) as usize] as f32 * d;
             }
         }
     }
@@ -436,6 +487,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// UE4M3 scale 0x38 is 2^0 = 1.0 before the halving, so every weight is
+    /// the E2M1 value itself: this pins the doubled table and the half together.
+    /// Sub-block 1 carries 0x40 (2.0) to catch a scale applied to the wrong
+    /// sixteen, and byte `j`'s two nibbles land on elements `j` and `j + 8`.
+    #[test]
+    fn nvfp4_is_e2m1_times_e4m3_with_split_nibbles() {
+        const E2M1: [f32; 16] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0];
+        let mut blk = vec![0u8; 36];
+        blk[0] = 0x38;
+        blk[1] = 0x40;
+        for j in 0..8 {
+            blk[4 + j] = (j as u8) | ((15 - j as u8) << 4);
+            blk[12 + j] = j as u8;
+        }
+        let got = dequantize(&blk, GgmlType::Nvfp4, 64).unwrap();
+        for j in 0..8 {
+            assert_eq!(got[j], E2M1[j], "low nibble {j}");
+            assert_eq!(got[j + 8], E2M1[15 - j], "high nibble {j}");
+            assert_eq!(got[16 + j], 2.0 * E2M1[j], "sub-block 1, element {j}");
+        }
+        // Sub-blocks 2 and 3 have scale code 0, which reads as zero.
+        assert!(got[32..].iter().all(|&v| v == 0.0));
+    }
+
+    /// The scale decode against the formula, exhaustively: subnormals are
+    /// `m * 2^-9`, the NaN code reads 0, and bit 7 is not examined.
+    #[test]
+    fn ue4m3_decodes_every_code() {
+        for x in 0u8..=255 {
+            // The reference tests `x == 0x7F` on the whole byte, so 0xff is not
+            // the NaN code there: it decodes as 0x7f's bits would, to 240.
+            if x == 0xff {
+                assert_eq!(ue4m3_to_f32(x), 240.0);
+                continue;
+            }
+            let c = x & 0x7f;
+            let (e, m) = ((c >> 3) as i32, (c & 7) as f64);
+            let want = if c == 0 || c == 0x7f {
+                0.0
+            } else if e == 0 {
+                m * 2f64.powi(-9) * 0.5
+            } else {
+                (1.0 + m / 8.0) * 2f64.powi(e - 7) * 0.5
+            };
+            assert_eq!(ue4m3_to_f32(x) as f64, want, "code {x:#04x}");
+        }
+        // The largest finite code, 448, halved.
+        assert_eq!(ue4m3_to_f32(0x7e), 224.0);
     }
 
 }
