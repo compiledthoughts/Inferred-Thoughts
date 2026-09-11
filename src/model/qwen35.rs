@@ -1028,7 +1028,7 @@ impl<'a> Qwen35<'a> {
                     let mut t = 0;
                     while t < n {
                         let take = MOE_CHUNK.min(n - t);
-                        moe_batch(ops, &m, w, t * nd, take, nd, s);
+                        moe_batch(ops, &m, w, il, t * nd, take, nd, s);
                         t += take;
                     }
                     ctx.trace("ffn_moe_out", il, &s.ffn_out);
@@ -1423,6 +1423,65 @@ struct MoeWeights<'a, 'b> {
     shared_gate_inp: &'b Weights<'a>,
 }
 
+/// Expert inputs written to a file for the NVFP4 activation study; off unless
+/// `INFERRED_DUMP_MOE_IN` names one.
+///
+/// `INFERRED_DUMP_MOE_LAYERS` picks the layers, comma-separated, all if unset.
+/// Each record is `[u32 layer][u32 n][u32 n_embd][n * n_embd f32]`, little
+/// endian, read by `scripts/nvfp4_activation_study.py`.
+///
+/// **A diagnostic, never a measurement.** Reading the rows home mid-pass is a
+/// device read the backend latches, which turns CUDA graphs off for the run; run
+/// it with `--no-graphs`.
+struct MoeInputDump {
+    layers: Option<Vec<usize>>,
+    out: std::sync::Mutex<std::io::BufWriter<std::fs::File>>,
+}
+
+impl MoeInputDump {
+    fn get() -> Option<&'static MoeInputDump> {
+        static DUMP: std::sync::OnceLock<Option<MoeInputDump>> = std::sync::OnceLock::new();
+        DUMP.get_or_init(|| {
+            let path = std::env::var("INFERRED_DUMP_MOE_IN").ok()?;
+            let file = match std::fs::File::create(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("INFERRED_DUMP_MOE_IN: cannot create {path}: {e}");
+                    return None;
+                }
+            };
+            let layers = std::env::var("INFERRED_DUMP_MOE_LAYERS")
+                .ok()
+                .map(|v| v.split(',').filter_map(|s| s.trim().parse().ok()).collect());
+            Some(MoeInputDump {
+                layers,
+                out: std::sync::Mutex::new(std::io::BufWriter::new(file)),
+            })
+        })
+        .as_ref()
+    }
+
+    fn wants(&self, il: usize) -> bool {
+        self.layers.as_ref().is_none_or(|l| l.contains(&il))
+    }
+
+    /// Append one record and flush it, since the static holding the writer is
+    /// never dropped.
+    fn write(&self, il: usize, n: usize, nd: usize, rows: &[f32]) {
+        use std::io::Write;
+        let Ok(mut w) = self.out.lock() else { return };
+        let mut ok = w.write_all(&(il as u32).to_le_bytes()).is_ok()
+            && w.write_all(&(n as u32).to_le_bytes()).is_ok()
+            && w.write_all(&(nd as u32).to_le_bytes()).is_ok();
+        for v in rows {
+            ok = ok && w.write_all(&v.to_le_bytes()).is_ok();
+        }
+        if !(ok && w.flush().is_ok()) {
+            eprintln!("INFERRED_DUMP_MOE_IN: a write failed; the dump is incomplete");
+        }
+    }
+}
+
 /// One chunk of tokens through the mixture of experts, writing into
 /// `s.ffn_out` at `at`.
 ///
@@ -1471,12 +1530,12 @@ fn moe_batch<O: Ops>(
     ops: &O,
     m: &Moe,
     w: MoeWeights<'_, '_>,
+    il: usize,
     at: usize,
     n: usize,
     nd: usize,
     s: &mut Scratch,
 ) {
-
     // The chunk's rows, lifted through the seam rather than as `&s.normed[at..]`.
     //
     // **`CLAUDE.md`'s sub-slice rule, and this was the fourth place it applied.**
@@ -1488,6 +1547,10 @@ fn moe_batch<O: Ops>(
     // its place with a batch: `at` is nonzero for every chunk after the first.
     let x = &mut s.e_in[..n * nd];
     ops.gather_chunks(&s.normed, n * nd, n * nd, at, x);
+    if let Some(dump) = MoeInputDump::get().filter(|d| d.wants(il)) {
+        ops.host_needs(&mut s.e_in[..n * nd]);
+        dump.write(il, n, nd, &s.e_in[..n * nd]);
+    }
     let x = &s.e_in[..n * nd];
 
     // The router is F32, so this matmul is exact and the expert choice can be
