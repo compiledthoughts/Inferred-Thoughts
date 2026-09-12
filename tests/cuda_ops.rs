@@ -5222,9 +5222,10 @@ fn what_the_fp4_tensor_cores_can_do() {
     let warps = gpu.sm_count() as u32 * 48;
 
     // (label, kernel, k, float accumulators, recorded ceiling)
-    let arms: [(&str, &'static str, u64, bool, Option<f64>); 3] = [
+    let arms: [(&str, &'static str, u64, bool, Option<f64>); 4] = [
         ("int8  m16n8k32.s8", "bench_mma_ceiling_s8", 32, false, Some(MMA_S8_PEAK_TOPS)),
         ("fp16  m16n8k16", "bench_mma_ceiling_f16", 16, true, Some(MMA_F16_PEAK_TFLOPS)),
+        ("fp8   m16n8k32.e4m3", "bench_mma_ceiling_e4m3", 32, true, None),
         ("nvfp4 m16n8k64 block-scaled", "bench_mma_ceiling_nvfp4", 64, true, None),
     ];
 
@@ -5264,14 +5265,25 @@ fn what_the_fp4_tensor_cores_can_do() {
         let rate = products / (us * 1e-6) / 1e12;
         let vs = reference.map_or("--".to_string(), |r| format!("{:.2}x", rate / r));
         println!("  {label:<30} {iters:>9} {us:>11.1} {rate:>14.1} {vs:>10}");
-        rates.push(rate);
+        rates.push((label, rate, k));
     }
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
-    if rates.len() == 3 {
+
+    // Ratios by label, not by index: the NVFP4 arm is skipped on an `sm_120`
+    // build, so a position in `rates` is not a fixed arm.
+    let rate_of = |name: &str| rates.iter().find(|(l, _, _)| l.starts_with(name));
+    if let (Some((_, s8, k8)), Some((_, other, ko))) = (rate_of("int8"), rate_of("nvfp4")) {
         println!(
             "\n  NVFP4 against int8: {:.2}x products per second, {:.2}x instructions per second",
-            rates[2] / rates[0],
-            rates[2] / rates[0] / 2.0,
+            other / s8,
+            other / s8 * (*k8 as f64) / (*ko as f64),
+        );
+    }
+    if let (Some((_, s8, _)), Some((_, fp8, _))) = (rate_of("int8"), rate_of("fp8")) {
+        println!(
+            "  FP8 e4m3 against int8, the same m16n8k32 shape: {:.2}x. Both are 4,096 products \n  \
+             an instruction, so this is the instruction rate too.",
+            fp8 / s8,
         );
     }
 }

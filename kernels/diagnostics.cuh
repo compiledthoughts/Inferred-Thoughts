@@ -792,6 +792,33 @@ __global__ void bench_mma_ceiling_f16(int iters, float *__restrict__ out) {
     for (int i = 0; i < 4; ++i) out[t * 4 + i] = d[i];
 }
 
+// The FP8 form the NVFP4 checkpoints' attention and GatedDeltaNet projections
+// ship in (E4M3 elements, one f32 scale per tensor). **Plain `mma`, no block
+// scale**: a per-tensor scale factors out of the f32 accumulator, so the
+// checkpoint needs none of the `.kind::mxf8f6f4.block_scale` machinery, whose
+// only scale type is UE8M0 (powers of two) and which `ptxas` accepts for
+// `sm_120a` alone. This form `ptxas` accepts for **both** `sm_120` and
+// `sm_120a`, at k16 and k32 and for e5m2 and the mixed pairs, so it needs no
+// `#ifdef` and costs the forwards-compatible target nothing.
+//
+// Operands 0.5 (0x30) and 0.25 (0x28): one instruction leaves 32 * 0.125 = 4.0
+// in each accumulator, the same per-iteration value the fp16 arm uses, so the
+// exactness check holds at the caller's largest iteration count.
+__global__ void bench_mma_ceiling_e4m3(int iters, float *__restrict__ out) {
+    const unsigned a[4] = {0x30303030u, 0x30303030u, 0x30303030u, 0x30303030u};
+    const unsigned b[2] = {0x28282828u, 0x28282828u};
+    float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int n = 0; n < iters; ++n) {
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+            : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+            : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    for (int i = 0; i < 4; ++i) out[t * 4 + i] = d[i];
+}
+
 // The NVFP4 block-scaled form, as llama.cpp's `mma_block_scaled_fp4` issues it
 // (`ggml-cuda/mma.cuh`), which matches the PTX ISA 9.4 grammar in 9.7.16.3:
 // `d, a, b, c, scale-a-data, {byte-id-a, thread-id-a}, scale-b-data,
