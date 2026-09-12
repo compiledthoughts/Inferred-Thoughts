@@ -39,8 +39,28 @@ DIMS_RE = re.compile(r"=\s*\{([\d,\s]+)\}\s*$")
 ROW_RE = re.compile(r"^\s*\[\s*(-?\d.*?)\s*\],?\s*$")
 NUM_RE = re.compile(r"-?\d+\.\d+(?:[eE][-+]?\d+)?")
 
-# Our trace name -> the reference's name for the same tensor.
-ALIASES = {"inp_embd": "embd"}
+# Our trace name -> the reference's name for the same tensor. A name may carry a
+# `-<layer>` suffix on both sides, which `alias` keeps.
+#
+# The two MoE entries are not cosmetic. llama.cpp's `ffn_moe_out` is the routed
+# experts **alone** -- the shared expert is added afterwards, at `ffn_out` -- and
+# ours is the whole FFN with the shared expert already in it. Comparing the two
+# names that happen to match makes a correct pass look ~40% wrong at every MoE
+# layer, which is exactly what it did on 12-09-2026 before the node graph was
+# read. See HANDOFF-v2 12-09 (llama.cpp reference).
+ALIASES = {
+    "inp_embd": "embd",
+    "ffn_moe_out": "ffn_out",  # ours already includes the shared expert
+    "post_ffn": "l_out",  # ours has the residual added
+}
+
+
+def alias(name: str) -> str:
+    """The reference's name for one of ours, preserving any `-<layer>` suffix."""
+    stem, dash, layer = name.rpartition("-")
+    if dash and layer.isdigit() and stem in ALIASES:
+        return f"{ALIASES[stem]}-{layer}"
+    return ALIASES.get(name, name)
 
 
 class Tensor:
@@ -219,7 +239,7 @@ def main() -> int:
         for name, _, _ in ours:
             tensor_worst = 0.0
             tensor_detail = (0.0, 0.0, 0)
-            key = ALIASES.get(name, name)
+            key = alias(name)
             if key not in ref or name not in dump:
                 continue
             t = ref[key]
@@ -283,7 +303,7 @@ def main() -> int:
     worst_sum = ("", 0.0)
     first_bad = None
     for name, n, got in ours:
-        key = ALIASES.get(name, name)
+        key = alias(name)
         if key not in ref or ref[key].total is None:
             continue
         want = ref[key].total
