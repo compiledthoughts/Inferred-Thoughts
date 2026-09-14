@@ -33,8 +33,8 @@ use crate::quant::dequantize;
 pub enum Model<'a> {
     Qwen3(Qwen3<'a>),
     Qwen35(Qwen35<'a>),
-    /// Qwen3.8-Flash-Next. **Load only** until stage 2 step 3 (SSD-TIER.md,
-    /// "Stage 2 plan"); `forward` refuses it.
+    /// Qwen3.8-Flash-Next. **Load only** until step 3 of its plan
+    /// (`src/model/qwen4exp.md`, "Status"); `forward` refuses it.
     Qwen4Exp(Qwen4Exp<'a>),
 }
 
@@ -169,7 +169,7 @@ impl<'a> Model<'a> {
             Model::Qwen4Exp(_) => Err(Error::NotImplemented {
                 what: "the qwen4exp forward pass",
                 detail: "this build loads and shape-checks the model only; the forward pass is \
-                         stage 2 step 3 (SSD-TIER.md, \"Stage 2 plan\")"
+                         step 3 of src/model/qwen4exp.md, \"Status\""
                     .to_string(),
             }),
         }

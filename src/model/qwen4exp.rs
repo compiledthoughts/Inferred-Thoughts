@@ -1,6 +1,7 @@
 //! Qwen3.8-Flash-Next, architecture `qwen4exp`: settings and weights, **load only**.
 //!
-//! Stage 2 step 1 (SSD-TIER.md, "Stage 2 plan"). Every setting is read from the
+//! Step 1 of `src/model/qwen4exp.md` — the architecture reference, and where the
+//! forward pass below will be specified block by block. Every setting is read from the
 //! file and every tensor is mapped and shape-checked, so a wrong assumption fails
 //! at load with names attached. There is no forward pass yet: `Model::forward`
 //! refuses this architecture with an error rather than computing anything.

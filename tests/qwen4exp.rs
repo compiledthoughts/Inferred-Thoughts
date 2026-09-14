@@ -1,6 +1,6 @@
 //! `qwen4exp` loads from the real files, with every setting the file holds.
 //!
-//! Stage 2 step 1's gate (SSD-TIER.md, "Stage 2 plan"): both GGUFs load, each
+//! Step 1's gate (`src/model/qwen4exp.md`, "Status"): both GGUFs load, each
 //! setting equals what `inferred inspect` and llama.cpp's `gguf_dump.py` print for
 //! the file, and every tensor is either mapped or unread on purpose. The literals
 //! below are copied from those dumps (15-09-2026), not from a model card.

@@ -17,7 +17,7 @@ So every PLE row would be ~5,017x too large, in llama.cpp's reference and in any
 engine tested against it. colibri applies the scale
 (`c/qwen38_core.h:1354`, `e4m3_decode(raw[d]) * m->ple_weight_scale`). Of the
 checkpoint's 73,729 `weight_scale` tensors this is the only one without a matching
-weight (checked 15-09-2026). SSD-TIER.md, "Toward the 125B".
+weight (checked 15-09-2026). `src/model/qwen4exp.md`, "Conversion".
 
 The fix is applied here rather than in the fork, as `convert_nvfp4.sh` fixed the
 35B's NVFP4 detection: the fork and the checkpoint stay untouched. The scale is
