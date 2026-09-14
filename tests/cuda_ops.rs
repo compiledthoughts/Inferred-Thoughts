@@ -5551,3 +5551,198 @@ fn the_fp4_expert_kernels_are_within_the_chain_bound() {
     );
     println!("  glu   {} outputs bit-identical to its parts; {tiles} tiles for {pairs} pairs", fused.len());
 }
+
+/// What resolving one expert miss costs, computed on the CPU against computed on
+/// the GPU from the pinned host tier. SSD-TIER.md fork O2.
+///
+/// **Both options share the SSD read** (stage 0, `TIERS.md`), so this times only
+/// what differs after it: one real expert -- gate, up, SiLU, down -- of layer 0 of
+/// the 35B NVFP4, for 1 token (decode) and 16 (a prefill-shaped batch).
+///
+/// - **CPU option**: `Naive` (the one-thread oracle) and `Spin` (the 8-thread CPU
+///   engine). Their NVFP4 path is NVFP4 x Q8_0.
+/// - **GPU option**: the same expert with its weights in the VRAM slab, then in
+///   the pinned device-mapped host tier, FP4 x FP4 as by default. The difference
+///   is what a host-tier expert adds. Each context is built alone, and both arms
+///   **assert they never reached the eviction fallback**, which computes with the
+///   wrong experts (BENCHMARKS-v2 14-09-2026, stage 1 corrected).
+///
+/// Also asserts the two GPU arms produce **bit-identical** output: the same
+/// kernel over the same bytes must not care which tier holds them, which is the
+/// premise tier 3 rests on.
+///
+/// Not measured here: numerics between the options. The CPU path matches the GPU
+/// only under `INFERRED_NVFP4_Q8=1`, as the NVFP4 kernel tests already show. The
+/// hidden-state transfers the CPU option adds are timed by
+/// `scripts/small_copy_cost.cu`.
+#[test]
+#[ignore = "needs an sm_120 device and the NVFP4 GGUF"]
+fn what_a_miss_costs_on_cpu_and_gpu() {
+    use inferred_thoughts::ops::Route;
+    use inferred_thoughts::Spin;
+
+    let Some(path) = common::find_model_named("Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf found; set INFERRED_MODEL_DIR");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open the NVFP4 GGUF");
+    let exps = |name: &str, n_in: usize, n_out: usize| {
+        let info = f.tensor(&format!("blk.0.{name}.weight")).expect("expert tensor");
+        let scale = f
+            .tensor(&format!("blk.0.{name}.scale"))
+            .map(|s| f.tensor_bytes(s))
+            .unwrap_or(&[]);
+        Experts { data: f.tensor_bytes(info), ty: info.ty, n_in, n_out, n_expert: 256, scale }
+    };
+    let gate = exps("ffn_gate_exps", 2048, 512);
+    let up = exps("ffn_up_exps", 2048, 512);
+    let down = exps("ffn_down_exps", 512, 2048);
+
+    // Expert 200: past the handful of gate experts a tiny slab can hold, so in the
+    // host arm its gate, up and down all land in the pinned tier.
+    const EXPERT: usize = 200;
+    const WARMUP: usize = 5;
+    const SAMPLES: usize = 21;
+    let batches = [1usize, 16];
+
+    // Every buffer held for the whole test: the backend keys mirrors on host
+    // addresses.
+    let wave = |n: usize, seed: f32| -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.7137 + seed).sin() * (1.0 + (i % 7) as f32)).collect()
+    };
+    let max_tok = batches.iter().copied().max().unwrap_or(1);
+    let x_all = wave(max_tok * 2048, 0.3);
+    let routes: Vec<Route> = batches
+        .iter()
+        .map(|&n| Route::Host { ids: vec![EXPERT; n], weights: vec![1.0; n], n_used: 1 })
+        .collect();
+
+    fn median_us(mut run: impl FnMut()) -> f64 {
+        for _ in 0..WARMUP {
+            run();
+        }
+        let mut xs: Vec<f64> = (0..SAMPLES)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                run();
+                t.elapsed().as_secs_f64() * 1e6
+            })
+            .collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        xs[SAMPLES / 2]
+    }
+
+    println!("\nwhat one expert miss costs after the read, 35B layer 0, expert {EXPERT}");
+    println!("  {:<38} {:>12} {:>12}", "", "1 token", "16 tokens");
+
+    // -- CPU option ---------------------------------------------------------
+    let spin = Spin::new(8);
+    let mut cpu_bufs: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+        batches.iter().map(|&n| (vec![0.0; n * 512], vec![0.0; n * 512], vec![0.0; n * 2048])).collect();
+    for label in ["CPU  Naive, 1 thread (oracle)", "CPU  Spin, 8 threads"] {
+        let mut row = Vec::new();
+        for (bi, &n) in batches.iter().enumerate() {
+            let x = &x_all[..n * 2048];
+            let route = &routes[bi];
+            let (g, u, o) = &mut cpu_bufs[bi];
+            let us = if label.contains("Naive") {
+                median_us(|| {
+                    Naive.matmul_experts(&gate, route, x, g);
+                    Naive.matmul_experts(&up, route, x, u);
+                    Naive.silu_mul(g, u);
+                    Naive.matmul_experts(&down, route, g, o);
+                })
+            } else {
+                median_us(|| {
+                    spin.matmul_experts(&gate, route, x, g);
+                    spin.matmul_experts(&up, route, x, u);
+                    spin.silu_mul(g, u);
+                    spin.matmul_experts(&down, route, g, o);
+                })
+            };
+            row.push(us);
+        }
+        println!("  {label:<38} {:>9.1} us {:>9.1} us", row[0], row[1]);
+    }
+
+    // -- GPU option ---------------------------------------------------------
+    // Each arm builds its own context and drops it before the next: concurrent
+    // contexts fault intermittently. Buffers live outside the loop, for the
+    // whole test.
+    let mut gpu_bufs: Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>> = (0..2)
+        .map(|_| {
+            batches.iter().map(|&n| (vec![0.0; n * 512], vec![0.0; n * 512], vec![0.0; n * 2048])).collect()
+        })
+        .collect();
+    let mut gpu_rows: Vec<(String, Vec<f64>)> = Vec::new();
+    for (arm, host_tier) in [false, true].into_iter().enumerate() {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(false);
+        if host_tier {
+            // A slab of a few slots and a pinned tier far larger than layer 0's
+            // 768 slices (452 MiB): every expert placed, none evicted.
+            gpu.set_expert_budget(8 << 20);
+            gpu.set_expert_host_budget(1 << 30);
+        }
+        let mut row = Vec::new();
+        for (bi, &n) in batches.iter().enumerate() {
+            let x = &x_all[..n * 2048];
+            let route = &routes[bi];
+            let (g, scratch, o) = &mut gpu_bufs[arm][bi];
+            let us = median_us(|| {
+                gpu.begin_pass(n);
+                gpu.moe_glu(&gate, &up, route, x, g, scratch);
+                gpu.matmul_experts(&down, route, g, o);
+                gpu.end_pass();
+                gpu.sync().expect("sync");
+            });
+            gpu.begin_pass(n);
+            gpu.moe_glu(&gate, &up, route, x, g, scratch);
+            gpu.matmul_experts(&down, route, g, o);
+            gpu.host_needs(o);
+            if let Some(e) = gpu.take_error() {
+                panic!("driver error: {e}");
+            }
+            row.push(us);
+        }
+        let st = gpu.expert_stats().expect("the expert cache was built");
+        let name = if host_tier { "host-tier" } else { "VRAM" };
+        assert!(
+            !st.degraded && st.evictions == 0,
+            "the {name} arm reached the eviction fallback ({} evictions): its timings would be of \
+             a wrong computation",
+            st.evictions
+        );
+        if host_tier {
+            assert!(st.host_slots > 0, "the host-tier arm placed nothing in the pinned tier");
+        } else {
+            assert_eq!(st.host_slots, 0, "the VRAM arm spilled {} tensors to the host tier", st.host_slots);
+        }
+        gpu_rows.push((format!("GPU  weights in {name} ({} slab slots)", st.slots), row));
+    }
+    for (label, row) in &gpu_rows {
+        println!("  {label:<38} {:>9.1} us {:>9.1} us", row[0], row[1]);
+    }
+    println!(
+        "  {:<38} {:>9.1} us {:>9.1} us",
+        "GPU  the host tier adds",
+        gpu_rows[1].1[0] - gpu_rows[0].1[0],
+        gpu_rows[1].1[1] - gpu_rows[0].1[1]
+    );
+
+    for (bi, &n) in batches.iter().enumerate() {
+        let (vram, host) = (&gpu_bufs[0][bi].2, &gpu_bufs[1][bi].2);
+        let differing = vram.iter().zip(host).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(
+            differing, 0,
+            "{n} tokens: {differing} of {} outputs differ between the VRAM and host-tier arms -- \
+             the tier changed the arithmetic",
+            vram.len()
+        );
+    }
+    println!("  VRAM and host-tier outputs bit-identical at every batch size");
+    println!(
+        "\n  A 125B expert is 2560 x 640, 1.56x the 35B's per matmul, so CPU compute there is\n  \
+         ~1.56x these rows by the arithmetic -- not measured."
+    );
+}
