@@ -110,19 +110,30 @@ fn the_125b_loads_with_every_setting_from_the_file() {
     );
 }
 
+/// **The whole forward pass against llama.cpp, end to end** (`src/model/qwen4exp.md`,
+/// step 3): the 0.2B test model's NVFP4-expert copy, greedy on the `naive` oracle,
+/// reproduces exactly the 40 tokens llama.cpp's CPU build generated from the same
+/// file and prompt — its memorized text. Every block kind runs: GDN, attention,
+/// hyper-connections, MoE with the shared expert, and PLE, whose n-gram window and
+/// conv history carry across the 39 decode passes.
+///
+/// The per-tensor comparison is `scripts/compare_eval_callback.py` against
+/// `llama-eval-callback`; this is the check a regression cannot pass by accident.
 #[test]
 #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF; run with -- --ignored"]
-fn the_qwen4exp_forward_pass_is_refused_until_it_exists() {
+fn the_0_2b_test_model_reproduces_llama_cpps_greedy_text_on_naive() {
     let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
     let m = Model::load(&f).expect("load");
-    let ops = inferred_thoughts::Naive;
-    let mut kv = inferred_thoughts::KvCache::new(m.n_kv_layer(), m.kv_dim(), 8);
-    let mut tracer = |_: &str, _: usize, _: &[f32]| {};
-    let mut prof = inferred_thoughts::Profile::new(false);
-    let mut ctx = inferred_thoughts::Ctx::new(&mut tracer, &mut prof);
-    match m.forward(&ops, &[1], 0, &mut kv, None, &mut ctx) {
-        Err(inferred_thoughts::Error::NotImplemented { .. }) => {}
-        Err(e) => panic!("refused with the wrong error: {e}"),
-        Ok(_) => panic!("a qwen4exp forward pass returned logits before one exists"),
-    }
+    let tokens = tk.encode("According to all known laws", true, true);
+    assert_eq!(tokens, vec![10865, 310, 660, 3750, 6657], "llama.cpp's tokens for the prompt");
+    let mut e = inferred_thoughts::Engine::new(m, inferred_thoughts::Naive, 64, false);
+    let (produced, _) = e.generate(&tokens, 40, None, |_| {}).expect("generate");
+    let text = tk.decode(&produced, false).expect("decode");
+    // `llama-completion -p 'According to all known laws' -n 40 --temp 0 --top-k 1`
+    // on the CPU-only build at 3057bb66c, 15-09-2026.
+    let want = " of aviation, there is no way a bee should be able to fly. Its wings are too \
+                small to get its fat little body off the ground. The bee, of course, flies \
+                anyway because bees";
+    assert_eq!(text, want);
 }

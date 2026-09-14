@@ -23,11 +23,15 @@
 //!
 //! Its own code path, per SSD-TIER.md D17: nothing here is shared with `qwen35`.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 
+use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
 use crate::gguf::{Array, GgufFile, Metadata};
-use crate::ops::{Experts, Weights};
+use crate::ops::{Attn, Delta, Experts, Ops, Weights};
+use crate::profile::Ctx;
+use crate::quant::dequantize_into;
 
 /// llama.cpp `src/llama-hparams.h:13`, `LLAMA_MAX_PLE_NGRAM`.
 pub const MAX_PLE_NGRAM: usize = 8;
@@ -370,6 +374,7 @@ impl Config {
         };
 
         let ple = read_ple(md, n_layer)?;
+        let n_embd = nonzero("embedding_length", u("embedding_length")?)?;
         if let Some(p) = &ple {
             if !recurrent[p.layer] {
                 return Err(Error::InconsistentArchitecture {
@@ -377,11 +382,23 @@ impl Config {
                     detail: format!("PLE layer {} is not a linear attention layer", p.layer),
                 });
             }
+            // `build_inp_ple` reshapes the gathered rows to `[head_dim * n_heads, T]`
+            // and `ple_key` reads that as `n_embd` (`qwen4exp.cpp:1186, 241`).
+            if p.head_dim * p.n_heads() != n_embd {
+                return Err(Error::InconsistentArchitecture {
+                    what: "embedding_length_per_layer_input",
+                    detail: format!(
+                        "{} x {} hash heads != embedding_length {n_embd}",
+                        p.head_dim,
+                        p.n_heads()
+                    ),
+                });
+            }
         }
 
         let cfg = Self {
             n_layer,
-            n_embd: nonzero("embedding_length", u("embedding_length")?)?,
+            n_embd,
             n_head,
             n_head_kv,
             head_dim,
@@ -682,8 +699,30 @@ pub struct Qwen4Exp<'a> {
     /// `per_layer_token_embd`, `{ple.head_dim, rows}`, read by row.
     ple_table: Option<Weights<'a>>,
     layers: Vec<Layer<'a>>,
+    /// Absolute layer -> KV slab; only the QSA layers have one.
+    kv_slot: Vec<usize>,
     /// Every tensor name this loader mapped, for [`Qwen4Exp::unmapped`].
     mapped: HashSet<String>,
+    /// Activation buffers, owned so their addresses never change (CLAUDE.md).
+    scratch: RefCell<Scratch>,
+    /// The PLE layer's per-sequence state: its n-gram window and conv history.
+    ple_state: RefCell<PleState>,
+}
+
+/// What PLE carries between passes of one sequence (`qwen4exp.md`, "PLE").
+///
+/// **Held by the model, not by `RecurrentState`, for now**, and tied to the
+/// position it expects next: a pass at position 0 starts a new sequence, and a
+/// pass anywhere else must continue exactly where the last one ended, or it is
+/// refused. A rewind (`serve`'s prefix reuse) would need the window and the conv
+/// history checkpointed, as pulsar found; that is not built.
+#[derive(Default)]
+struct PleState {
+    next_pos: usize,
+    /// The sequence's last `ngram_size - 1` tokens, oldest first; shorter near its start.
+    prev: Vec<u32>,
+    /// `[hc_dim][(conv_kernel - 1) * ngram_size]`, oldest first; zero at a sequence start.
+    conv: Vec<f32>,
 }
 
 /// Records every tensor it maps, so load can prove nothing in the file went
@@ -840,6 +879,15 @@ impl<'a> Qwen4Exp<'a> {
             layers.push(Layer { hc_attn, hc_ffn, mixer, ple, ffn });
         }
 
+        let mut kv_slot = Vec::with_capacity(cfg.n_layer);
+        let mut next = 0;
+        for il in 0..cfg.n_layer {
+            kv_slot.push(next);
+            if !cfg.is_recurrent(il) {
+                next += 1;
+            }
+        }
+
         Ok(Self {
             cfg,
             tok_embd,
@@ -848,7 +896,10 @@ impl<'a> Qwen4Exp<'a> {
             head_hc,
             ple_table,
             layers,
+            kv_slot,
             mapped: ld.mapped,
+            scratch: RefCell::new(Scratch::default()),
+            ple_state: RefCell::new(PleState::default()),
         })
     }
 
@@ -909,6 +960,570 @@ impl<'a> Qwen4Exp<'a> {
             total += w(&f.shared_gate) + w(&f.shared_up) + w(&f.shared_down) + w(&f.shared_gate_inp);
         }
         total
+    }
+}
+
+// --------------------------------------------------------------- forward pass
+
+/// Every intermediate a pass of `n` tokens needs, token-major, resized in place so
+/// addresses never change (CLAUDE.md; `qwen35::Scratch` records why).
+#[derive(Default)]
+struct Scratch {
+    /// Embeddings, `[n][n_embd]`.
+    x: Vec<f32>,
+    /// The wide residual, `[n][n_stream][n_embd]` — ggml's `[n_embd, hc, T]`.
+    res: Vec<f32>,
+    /// `[n][n_stream]` of 1.0, for `hc_init`'s broadcast.
+    ones_streams: Vec<f32>,
+    /// `[n_embd]` of 1.0: the unit weight a per-stream RMSNorm runs with.
+    ones: Vec<f32>,
+    // hyper-connection read and write
+    xn: Vec<f32>,
+    lo: Vec<f32>,
+    hgate: Vec<f32>,
+    tmp: Vec<f32>,
+    mixed: Vec<f32>,
+    inject: Vec<f32>,
+    wide: Vec<f32>,
+    /// A block's output, `[n][n_embd]`.
+    block: Vec<f32>,
+    // attention
+    qg: Vec<f32>,
+    q: Vec<f32>,
+    g: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    // gated delta
+    qkv: Vec<f32>,
+    z: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    conv: Vec<f32>,
+    q_part: Vec<f32>,
+    k_part: Vec<f32>,
+    v_part: Vec<f32>,
+    core: Vec<f32>,
+    // MoE
+    router: Vec<f32>,
+    logit: Vec<f32>,
+    g_all: Vec<f32>,
+    u_all: Vec<f32>,
+    o_all: Vec<f32>,
+    e_gate: Vec<f32>,
+    e_up: Vec<f32>,
+    e_out: Vec<f32>,
+    // PLE
+    emb: Vec<f32>,
+    pkey: Vec<f32>,
+    pvalue: Vec<f32>,
+    pquery: Vec<f32>,
+    psdot: Vec<f32>,
+    pgated: Vec<f32>,
+    pconv_in: Vec<f32>,
+    pconv_out: Vec<f32>,
+    // the head, one token
+    hres: Vec<f32>,
+    hxn: Vec<f32>,
+    hlo: Vec<f32>,
+    hgate1: Vec<f32>,
+    htmp: Vec<f32>,
+    hmixed: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+impl Scratch {
+    fn fit(&mut self, c: &Config, n: usize) {
+        let (nd, hc, lr, m) = (c.n_embd, c.hc.n_stream, c.hc.low_rank, c.moe);
+        let z = |b: &mut Vec<f32>, k: usize| b.resize(k, 0.0);
+        z(&mut self.x, n * nd);
+        z(&mut self.res, n * hc * nd);
+        self.ones_streams.clear();
+        self.ones_streams.resize(n * hc, 1.0);
+        self.ones.clear();
+        self.ones.resize(nd, 1.0);
+        z(&mut self.xn, n * hc * nd);
+        z(&mut self.lo, n * lr);
+        z(&mut self.hgate, n * hc * nd);
+        z(&mut self.tmp, n * nd);
+        z(&mut self.mixed, n * nd);
+        z(&mut self.inject, n * hc);
+        z(&mut self.wide, n * hc * nd);
+        z(&mut self.block, n * nd);
+        z(&mut self.qg, n * c.q_gate_dim());
+        z(&mut self.q, n * c.head_dim * c.n_head);
+        z(&mut self.g, n * c.head_dim * c.n_head);
+        z(&mut self.k, n * c.kv_dim());
+        z(&mut self.v, n * c.kv_dim());
+        z(&mut self.attn, n * c.head_dim * c.n_head);
+        z(&mut self.qkv, n * c.conv_dim());
+        z(&mut self.z, n * c.value_dim());
+        z(&mut self.alpha, n * c.n_v_heads());
+        z(&mut self.beta, n * c.n_v_heads());
+        z(&mut self.conv, n * c.conv_dim());
+        z(&mut self.q_part, n * c.key_dim());
+        z(&mut self.k_part, n * c.key_dim());
+        z(&mut self.v_part, n * c.value_dim());
+        z(&mut self.core, n * c.value_dim());
+        z(&mut self.router, n * m.n_expert);
+        z(&mut self.logit, n);
+        z(&mut self.g_all, n * m.n_expert_used * m.expert_ff);
+        z(&mut self.u_all, n * m.n_expert_used * m.expert_ff);
+        z(&mut self.o_all, n * m.n_expert_used * nd);
+        z(&mut self.e_gate, n * m.shared_ff);
+        z(&mut self.e_up, n * m.shared_ff);
+        z(&mut self.e_out, n * nd);
+        z(&mut self.emb, n * nd);
+        z(&mut self.pkey, n * hc * nd);
+        z(&mut self.pvalue, n * nd);
+        z(&mut self.pquery, n * hc * nd);
+        z(&mut self.psdot, n * hc);
+        z(&mut self.pgated, n * hc * nd);
+        z(&mut self.pconv_in, n * hc * nd);
+        z(&mut self.pconv_out, n * hc * nd);
+        z(&mut self.hres, hc * nd);
+        z(&mut self.hxn, hc * nd);
+        z(&mut self.hlo, lr);
+        z(&mut self.hgate1, hc * nd);
+        z(&mut self.htmp, nd);
+        z(&mut self.hmixed, nd);
+        z(&mut self.logits, c.n_vocab);
+    }
+}
+
+/// A hyper-connection read (`build_hc_mix`, `qwen4exp.cpp:266-312`): RMSNorm each
+/// stream, times the `hc_dim` weight; a low-rank sigmoid gate; the gated streams'
+/// mean into `mixed`; and, when asked, the inject logits from the normed input.
+///
+/// `res` is `[n][n_stream][n_embd]`; `xn`, `gate` the same size; `lo` `[n][low_rank]`;
+/// `tmp` and `mixed` `[n][n_embd]`; `inject` `[n][n_stream]`.
+#[allow(clippy::too_many_arguments)]
+fn hc_read<O: Ops>(
+    ops: &O,
+    c: &Config,
+    hc: &Hc<'_>,
+    res: &[f32],
+    ones: &[f32],
+    xn: &mut [f32],
+    lo: &mut [f32],
+    gate: &mut [f32],
+    tmp: &mut [f32],
+    mixed: &mut [f32],
+    inject: Option<&mut [f32]>,
+    trace: Option<(&mut Ctx<'_>, usize)>,
+) -> Result<()> {
+    let (nd, n_stream) = (c.n_embd, c.hc.n_stream);
+    let inv = 1.0 / n_stream as f32;
+    ops.gather_chunks(res, res.len(), res.len(), 0, xn);
+    ops.rms_norm_heads(xn, ones, nd, c.rms_eps);
+    ops.mul_rows(xn, &hc.norm);
+    ops.matmul(&hc.down, xn, lo);
+    ops.scale(lo, inv);
+    ops.silu(lo);
+    ops.matmul(&hc.up, lo, gate);
+    // The inject logits read the normed input, before it is gated in place.
+    if let Some(inj) = inject {
+        let w = hc.inject.as_ref().ok_or_else(|| Error::InconsistentArchitecture {
+            what: "hyper-connection",
+            detail: "an inject was asked of a module without inject weights".to_string(),
+        })?;
+        ops.matmul(w, xn, inj);
+    }
+    let mut trace = trace;
+    if let Some((ctx, il)) = trace.as_mut() {
+        ctx.trace("hc_norm", *il, xn);
+    }
+    ops.sigmoid_mul(xn, gate);
+    // The mean in the reference's order: stream 0, + 1, + 2, ..., then x 1/n.
+    ops.gather_chunks(xn, nd, n_stream * nd, 0, mixed);
+    for s in 1..n_stream {
+        ops.gather_chunks(xn, nd, n_stream * nd, s * nd, tmp);
+        ops.add_assign(mixed, tmp);
+    }
+    ops.scale(mixed, inv);
+    Ok(())
+}
+
+impl<'a> Qwen4Exp<'a> {
+    /// Run `tokens` from `start_pos` and return the last one's logits.
+    ///
+    /// The graph of `qwen4exp.cpp:336-441`, written out in `src/model/qwen4exp.md`
+    /// ("The forward pass"). Dense attention only: a pass that would put more than
+    /// `top_k + compress_ratio - 1` cells in a QSA layer's cache is refused, since
+    /// only up to there is dense attention exactly QSA.
+    pub fn forward<O: Ops>(
+        &self,
+        ops: &O,
+        tokens: &[u32],
+        start_pos: usize,
+        kv: &mut KvCache,
+        rs: &mut RecurrentState,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let n = tokens.len();
+        if n == 0 {
+            return Err(Error::InconsistentArchitecture {
+                what: "forward",
+                detail: "no tokens supplied".to_string(),
+            });
+        }
+        rs.check(c.n_layer, c.conv_state_len(), c.ssm_state_len())?;
+        if kv.kv_dim() != c.kv_dim() {
+            return Err(Error::InconsistentArchitecture {
+                what: "kv cache",
+                detail: format!("cache holds {} lanes per position, model needs {}", kv.kv_dim(), c.kv_dim()),
+            });
+        }
+        if start_pos + n > kv.n_ctx() {
+            return Err(Error::ContextOverflow { pos: start_pos + n - 1, n_ctx: kv.n_ctx() });
+        }
+        if let Some(r) = c.compress_ratios.iter().copied().filter(|&r| r > 0).max() {
+            let exact = c.indexer.top_k + r as usize - 1;
+            if start_pos + n > exact {
+                return Err(Error::NotImplemented {
+                    what: "QSA past its budget",
+                    detail: format!(
+                        "position {} needs the sparse indexer; dense attention equals QSA only up to {exact} cached cells",
+                        start_pos + n
+                    ),
+                });
+            }
+        }
+
+        let mut st = self.ple_state.borrow_mut();
+        if let Some(p) = &c.ple {
+            if start_pos == 0 {
+                st.prev.clear();
+                st.conv.clear();
+                st.conv.resize(c.hc_dim() * (p.conv_kernel - 1) * p.ngram_size, 0.0);
+            } else if start_pos != st.next_pos {
+                return Err(Error::NotImplemented {
+                    what: "PLE history across a rewind",
+                    detail: format!(
+                        "pass at position {start_pos}, but the n-gram window and conv history end at {}",
+                        st.next_pos
+                    ),
+                });
+            }
+        }
+
+        ops.begin_pass(n);
+        let (nd, n_stream) = (c.n_embd, c.hc.n_stream);
+        let s = &mut *self.scratch.borrow_mut();
+        s.fit(c, n);
+        for (t, &token) in tokens.iter().enumerate() {
+            if token as usize >= c.n_vocab {
+                return Err(Error::TokenOutOfRange { id: token, vocab_size: c.n_vocab });
+            }
+            dequantize_into(self.tok_embd.row(token as usize), self.tok_embd.ty, &mut s.x[t * nd..(t + 1) * nd])?;
+        }
+        ops.host_wrote(&s.x);
+        ops.host_wrote(&s.ones_streams);
+        ops.host_wrote(&s.ones);
+        ctx.trace("inp_embd", 0, &s.x);
+
+        ops.mul_streams(&mut s.res, &s.x, &s.ones_streams, n_stream);
+        ctx.trace("hc_init", 0, &s.res);
+
+        for il in 0..c.n_layer {
+            let layer = &self.layers[il];
+            if layer.ple.is_some() {
+                self.ple(ops, il, tokens, &mut *st, s, ctx)?;
+            }
+
+            hc_read(
+                ops, c, &layer.hc_attn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
+                &mut s.tmp, &mut s.mixed, Some(&mut s.inject), None,
+            )?;
+            ctx.trace("hc_attn_mixed", il, &s.mixed);
+            match &layer.mixer {
+                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, s, ctx)?,
+                Mixer::Attn { .. } => self.attention(ops, layer, il, start_pos, n, kv, s, ctx)?,
+            }
+            self.hc_write(ops, s);
+            // The reference's second combine is renamed `l_last` (cb overwrites the
+            // name), so its printed `hc_combine` is this one, after the mixer.
+            ctx.trace("hc_combine", il, &s.res);
+
+            hc_read(
+                ops, c, &layer.hc_ffn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
+                &mut s.tmp, &mut s.mixed, Some(&mut s.inject), Some((&mut *ctx, il)),
+            )?;
+            ctx.trace("hc_mixed", il, &s.mixed);
+            ctx.trace("hc_inject", il, &s.inject);
+            self.moe(ops, layer, n, s);
+            ctx.trace("ffn_moe_out", il, &s.block);
+            self.hc_write(ops, s);
+            ctx.trace("l_last", il, &s.res);
+        }
+        kv.commit(start_pos + n);
+
+        if let Some(p) = &c.ple {
+            let keep = p.ngram_size - 1;
+            let mut seq: Vec<u32> = st.prev.iter().copied().chain(tokens.iter().copied()).collect();
+            if seq.len() > keep {
+                seq.drain(..seq.len() - keep);
+            }
+            st.prev = seq;
+        }
+        st.next_pos = start_pos + n;
+
+        // The final mixer carries the output norm; only the last row is needed.
+        let w = n_stream * nd;
+        ops.gather_chunks(&s.res, w, w, (n - 1) * w, &mut s.hres);
+        hc_read(
+            ops, c, &self.head_hc, &s.hres, &s.ones, &mut s.hxn, &mut s.hlo, &mut s.hgate1,
+            &mut s.htmp, &mut s.hmixed, None, None,
+        )?;
+        ctx.trace("result_norm", 0, &s.hmixed);
+        ops.matmul(&self.output, &s.hmixed, &mut s.logits);
+        if let Some(v) = self.output_s {
+            ops.scale(&mut s.logits, v);
+        }
+        ops.end_pass();
+        ops.host_needs(&mut s.logits);
+        ctx.trace("result_output", 0, &s.logits);
+        Ok(s.logits.clone())
+    }
+
+    /// A hyper-connection write (`build_hc_combine`, `qwen4exp.cpp:314-334`):
+    /// `res += block · 2·sigmoid(inject / n_stream)`, per stream.
+    fn hc_write<O: Ops>(&self, ops: &O, s: &mut Scratch) {
+        let n_stream = self.cfg.hc.n_stream;
+        ops.scale(&mut s.inject, 1.0 / n_stream as f32);
+        ops.sigmoid(&mut s.inject);
+        ops.scale(&mut s.inject, 2.0);
+        ops.mul_streams(&mut s.wide, &s.block, &s.inject, n_stream);
+        ops.add_assign(&mut s.res, &s.wide);
+    }
+
+    /// GatedDeltaNet (`build_layer_attn_linear`, `qwen4exp.cpp:847-972`): as
+    /// `qwen35`'s, with the output gate `sigmoid(z)` rather than SiLU.
+    fn gated_delta<O: Ops>(
+        &self,
+        ops: &O,
+        layer: &Layer<'_>,
+        il: usize,
+        rs: &mut RecurrentState,
+        s: &mut Scratch,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Mixer::Delta { wqkv, wgate, conv1d, dt_bias, ssm_a, ssm_beta, ssm_alpha, ssm_norm, ssm_out } =
+            &layer.mixer
+        else {
+            return Err(Error::InconsistentArchitecture {
+                what: "layer kind",
+                detail: format!("layer {il} is attention but was routed to the delta rule"),
+            });
+        };
+        let (kdim, vdim, cdim) = (c.key_dim(), c.value_dim(), c.conv_dim());
+        ops.matmul(wqkv, &s.mixed, &mut s.qkv);
+        ctx.trace("linear_attn_qkv_mixed", il, &s.qkv);
+        ops.matmul(wgate, &s.mixed, &mut s.z);
+        ctx.trace("z", il, &s.z);
+        ops.matmul_pair(ssm_alpha, ssm_beta, &s.mixed, &mut s.alpha, &mut s.beta);
+        ops.ssm_conv(rs.conv_mut(il), &s.qkv, conv1d, c.ssm_d_conv, &mut s.conv);
+        ctx.trace("conv_output_silu", il, &s.conv);
+        ops.gather_chunks(&s.conv, kdim, cdim, 0, &mut s.q_part);
+        ops.gather_chunks(&s.conv, kdim, cdim, kdim, &mut s.k_part);
+        ops.gather_chunks(&s.conv, vdim, cdim, 2 * kdim, &mut s.v_part);
+        ops.l2_norm_heads(&mut s.q_part, c.head_k_dim(), c.rms_eps);
+        ops.l2_norm_heads(&mut s.k_part, c.head_k_dim(), c.rms_eps);
+        ctx.trace("q_conv_predelta", il, &s.q_part);
+        ctx.trace("k_conv_predelta", il, &s.k_part);
+        let d = Delta {
+            q: &s.q_part,
+            k: &s.k_part,
+            v: &s.v_part,
+            alpha: &s.alpha,
+            beta: &s.beta,
+            ssm_a,
+            dt_bias,
+            head_k_dim: c.head_k_dim(),
+            head_v_dim: c.head_v_dim(),
+            n_k_heads: c.n_k_heads(),
+            n_v_heads: c.n_v_heads(),
+        };
+        ops.delta_rule(&d, rs.ssm_mut(il), &mut s.core);
+        // build_norm_gated: rms_norm(core, ssm_norm) · sigmoid(z) (qwen4exp.cpp:459-469).
+        ops.rms_norm_heads(&mut s.core, ssm_norm, c.head_v_dim(), c.rms_eps);
+        ops.sigmoid_mul(&mut s.core, &s.z);
+        ctx.trace("final_output", il, &s.core);
+        ops.matmul(ssm_out, &s.core, &mut s.block);
+        ctx.trace("linear_attn_out", il, &s.block);
+        Ok(())
+    }
+
+    /// Gated attention (`build_layer_attn`, `qwen4exp.cpp:761-845`), dense: as
+    /// `qwen35`'s, which is exactly QSA within the budget `forward` enforces.
+    #[allow(clippy::too_many_arguments)]
+    fn attention<O: Ops>(
+        &self,
+        ops: &O,
+        layer: &Layer<'_>,
+        il: usize,
+        start_pos: usize,
+        n: usize,
+        kv: &mut KvCache,
+        s: &mut Scratch,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let Mixer::Attn { wq, wk, wv, wo, q_norm, k_norm, .. } = &layer.mixer else {
+            return Err(Error::InconsistentArchitecture {
+                what: "layer kind",
+                detail: format!("layer {il} is recurrent but was routed to attention"),
+            });
+        };
+        let (hd, kd) = (c.head_dim, c.kv_dim());
+        ops.matmul(wq, &s.mixed, &mut s.qg);
+        ctx.trace("Qcur_full", il, &s.qg);
+        ops.gather_chunks(&s.qg, hd, 2 * hd, 0, &mut s.q);
+        ops.gather_chunks(&s.qg, hd, 2 * hd, hd, &mut s.g);
+        ops.matmul(wk, &s.mixed, &mut s.k);
+        ops.matmul(wv, &s.mixed, &mut s.v);
+        ops.rms_norm_heads(&mut s.q, q_norm, hd, c.rms_eps);
+        ctx.trace("Qcur_normed", il, &s.q);
+        ops.rms_norm_heads(&mut s.k, k_norm, hd, c.rms_eps);
+        ctx.trace("Kcur_normed", il, &s.k);
+        ops.rope_neox(&mut s.q, start_pos, hd, c.n_rot, c.n_head, c.rope_theta);
+        ctx.trace("Qcur", il, &s.q);
+        ops.rope_neox(&mut s.k, start_pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
+        ctx.trace("Kcur", il, &s.k);
+        let slot = self.kv_slot[il];
+        ops.kv_write(kv.k_layer_mut(slot), start_pos * kd, &s.k);
+        ops.kv_write(kv.v_layer_mut(slot), start_pos * kd, &s.v);
+        let a = Attn {
+            q: &s.q,
+            k: kv.k_layer(slot),
+            v: kv.v_layer(slot),
+            kv_dim: kd,
+            n_pos: start_pos + n,
+            head_dim: hd,
+            n_head: c.n_head,
+            n_head_kv: c.n_head_kv,
+            scale: 1.0 / (hd as f32).sqrt(),
+        };
+        ops.attend(&a, &mut s.attn);
+        ctx.trace("attn_pregate", il, &s.attn);
+        ops.sigmoid_mul(&mut s.attn, &s.g);
+        ctx.trace("attn_gated", il, &s.attn);
+        ops.matmul(wo, &s.attn, &mut s.block);
+        ctx.trace("attn_output", il, &s.block);
+        Ok(())
+    }
+
+    /// The routed experts plus the gated shared expert (`build_layer_ffn`,
+    /// `qwen4exp.cpp:974-1022`) into `s.block`, from `s.mixed`. The same seam calls
+    /// as `qwen35::moe_batch`, for the whole pass at once.
+    fn moe<O: Ops>(&self, ops: &O, layer: &Layer<'_>, n: usize, s: &mut Scratch) {
+        let (m, nd, f) = (self.cfg.moe, self.cfg.n_embd, &layer.ffn);
+        ops.matmul_pair(&f.gate_inp, &f.shared_gate_inp, &s.mixed, &mut s.router, &mut s.logit);
+        ops.softmax(&mut s.router, m.n_expert);
+        let route = ops.route(&mut s.router, m.n_expert, m.n_expert_used);
+        ops.moe_glu(&f.gate, &f.up, &route, &s.mixed, &mut s.g_all, &mut s.u_all);
+        ops.matmul_experts(&f.down, &route, &s.g_all, &mut s.o_all);
+        ops.matmul(&f.shared_gate, &s.mixed, &mut s.e_gate);
+        ops.matmul(&f.shared_up, &s.mixed, &mut s.e_up);
+        if let Some(v) = f.shared_up_s {
+            ops.scale(&mut s.e_up, v);
+        }
+        if let Some(v) = f.shared_gate_s {
+            ops.scale(&mut s.e_gate, v);
+        }
+        ops.silu_mul(&mut s.e_gate, &s.e_up);
+        ops.matmul(&f.shared_down, &s.e_gate, &mut s.e_out);
+        if let Some(v) = f.shared_down_s {
+            ops.scale(&mut s.e_out, v);
+        }
+        ops.moe_finish(&mut s.block, 0, nd, &s.o_all, &route, &s.e_out, &s.logit, 0);
+        let _ = n;
+    }
+
+    /// The PLE block, applied to the wide residual before layer `il`'s HC read
+    /// (`build_inp_ple` and `build_ple`, `qwen4exp.cpp:1024-1283`).
+    #[allow(clippy::too_many_arguments)]
+    fn ple<O: Ops>(
+        &self,
+        ops: &O,
+        il: usize,
+        tokens: &[u32],
+        st: &mut PleState,
+        s: &mut Scratch,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (Some(p), Some(table), Some(pm)) = (&c.ple, &self.ple_table, &self.layers[il].ple) else {
+            return Err(Error::InconsistentArchitecture {
+                what: "PLE",
+                detail: format!("layer {il} has a PLE mixer but the model has no PLE table or settings"),
+            });
+        };
+        let (nd, n_stream, hd, nh) = (c.n_embd, c.hc.n_stream, p.head_dim, p.n_heads());
+        let eos = p.eos_token_id;
+
+        // The row indices, on the host: ggml has no int64 or xor (qwen4exp.cpp:1084-1110).
+        for (t, &token) in tokens.iter().enumerate() {
+            let mut window = vec![0u64; p.ngram_size];
+            window[0] = u64::from(token);
+            let mut cut = false;
+            for back in 1..p.ngram_size {
+                // `back` positions before token `t`: in this pass, else in the window
+                // carried from the last one, else before the sequence start.
+                let pred = if t >= back {
+                    Some(tokens[t - back])
+                } else {
+                    let from_prev = back - t;
+                    st.prev.len().checked_sub(from_prev).map(|i| st.prev[i])
+                };
+                let tok = if cut { None } else { pred };
+                cut = cut || tok.is_none() || tok == Some(eos);
+                window[back] = if cut { u64::from(eos) } else { u64::from(tok.unwrap_or(eos)) };
+            }
+            for ng in 2..=p.ngram_size {
+                let mut mixed = window[0].wrapping_mul(p.layer_multipliers[0]);
+                for j in 1..ng {
+                    mixed ^= window[j].wrapping_mul(p.layer_multipliers[j]);
+                }
+                let base = (ng - 2) * p.heads_per_ngram;
+                for g in 0..p.heads_per_ngram {
+                    let h = base + g;
+                    let row = mixed % u64::from(p.head_vocab_sizes[h]) + u64::from(p.head_offsets[h]);
+                    let at = t * nd + h * hd;
+                    dequantize_into(table.row(row as usize), table.ty, &mut s.emb[at..at + hd])?;
+                }
+            }
+        }
+        let _ = nh;
+        ops.host_wrote(&s.emb);
+        ctx.trace("ple_embd", 0, &s.emb);
+
+        ops.matmul(&pm.key, &s.emb, &mut s.pkey);
+        ops.matmul(&pm.value, &s.emb, &mut s.pvalue);
+        ops.rms_norm_heads(&mut s.pkey, &s.ones, nd, c.rms_eps);
+        ops.mul_rows(&mut s.pkey, &pm.norm_key);
+        ops.gather_chunks(&s.res, s.res.len(), s.res.len(), 0, &mut s.pquery);
+        ops.rms_norm_heads(&mut s.pquery, &s.ones, nd, c.rms_eps);
+        ops.mul_rows(&mut s.pquery, &pm.norm_query);
+        ops.row_dot(&s.pkey, &s.pquery, nd, &mut s.psdot);
+        ops.scale(&mut s.psdot, 1.0 / (nd as f32).sqrt());
+        ops.signed_sqrt_sigmoid(&mut s.psdot);
+        ctx.trace("ple_gate", il, &s.psdot);
+
+        ops.mul_streams(&mut s.pgated, &s.pvalue, &s.psdot, n_stream);
+        ctx.trace("ple_gated_value", il, &s.pgated);
+        ops.gather_chunks(&s.pgated, s.pgated.len(), s.pgated.len(), 0, &mut s.pconv_in);
+        ops.rms_norm_heads(&mut s.pconv_in, &s.ones, nd, c.rms_eps);
+        ops.mul_rows(&mut s.pconv_in, &pm.norm_conv);
+        ops.dilated_conv(&mut st.conv, &s.pconv_in, &pm.conv1d, p.conv_kernel, p.ngram_size, &mut s.pconv_out);
+        ops.silu(&mut s.pconv_out);
+        ctx.trace("ple_conv_out", il, &s.pconv_out);
+
+        ops.add_assign(&mut s.pgated, &s.pconv_out);
+        ops.add_assign(&mut s.res, &s.pgated);
+        Ok(())
     }
 }
 

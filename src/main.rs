@@ -1401,7 +1401,7 @@ fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Re
         // Layer-scoped names carry the index, matching the reference's
         // "attn_norm-0" convention; whole-model ones do not.
         let label = match name {
-            "inp_embd" | "result_norm" | "result_output" => name.to_string(),
+            "inp_embd" | "result_norm" | "result_output" | "hc_init" | "ple_embd" => name.to_string(),
             _ => format!("{name}-{il}"),
         };
         println!("{label}\t{}\t{sum:.6}", data.len());

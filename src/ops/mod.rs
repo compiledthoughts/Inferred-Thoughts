@@ -617,6 +617,131 @@ pub trait Ops {
     /// `a += b`, in place.
     fn add_assign(&self, a: &mut [f32], b: &[f32]);
 
+    // ---- qwen4exp: hyper-connections and PLE (src/model/qwen4exp.md) --------
+    //
+    // Scalar defaults, transcribed from the ggml ops `qwen4exp.cpp` builds, so
+    // every CPU backend inherits the oracle's arithmetic. **A device backend must
+    // override each**: the defaults write host copies. Nothing the 35B runs calls
+    // them.
+
+    /// `x[row][j] *= w[j]`, where a row is `w.len()`: ggml's `ggml_mul` by a
+    /// broadcast weight. A hyper-connection norm's weight spans all `n_stream`
+    /// copies (`hc_dim`), so it is applied here after a per-stream RMSNorm with a
+    /// unit weight — exact, since ggml's RMSNorm is `(x · scale) · w` too.
+    fn mul_rows(&self, x: &mut [f32], w: &[f32]) {
+        debug_assert_eq!(x.len() % w.len(), 0);
+        for row in x.chunks_exact_mut(w.len()) {
+            for (v, &wj) in row.iter_mut().zip(w) {
+                *v *= wj;
+            }
+        }
+    }
+
+    /// `x = silu(x)`, in place: `ggml_silu_f32`, `x / (1 + exp(-x))`.
+    fn silu(&self, x: &mut [f32]) {
+        for v in x.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
+        }
+    }
+
+    /// `x = sigmoid(x)`, in place: `ggml_vec_sigmoid_f32`, `1 / (1 + exp(-x))`.
+    fn sigmoid(&self, x: &mut [f32]) {
+        for v in x.iter_mut() {
+            *v = 1.0 / (1.0 + (-*v).exp());
+        }
+    }
+
+    /// `out[t][s][j] = h[t][j] * w[t][s]`: one row per token broadcast over
+    /// `n_stream` copies and scaled per copy — `ggml_mul(ggml_repeat_4d(h), w)`.
+    /// A hyper-connection write is this then [`Ops::add_assign`]; the PLE gate's
+    /// value is this alone. `n` is `w.len() / n_stream`, a row `h.len() / n`.
+    fn mul_streams(&self, out: &mut [f32], h: &[f32], w: &[f32], n_stream: usize) {
+        let n = w.len() / n_stream;
+        let nd = h.len() / n.max(1);
+        debug_assert_eq!(out.len(), n * n_stream * nd);
+        for t in 0..n {
+            for s in 0..n_stream {
+                let ws = w[t * n_stream + s];
+                let o = &mut out[(t * n_stream + s) * nd..(t * n_stream + s + 1) * nd];
+                for (v, &hj) in o.iter_mut().zip(&h[t * nd..(t + 1) * nd]) {
+                    *v = hj * ws;
+                }
+            }
+        }
+    }
+
+    /// `out[i] = Σ_j a[i][j] · b[i][j]` over rows of `width`: `ggml_mul` then
+    /// `ggml_sum_rows`, whose sum is `ggml_float` — f64, narrowed at the end —
+    /// with the products taken in f32 first.
+    fn row_dot(&self, a: &[f32], b: &[f32], width: usize, out: &mut [f32]) {
+        debug_assert_eq!(a.len(), b.len());
+        debug_assert_eq!(out.len() * width, a.len());
+        for (i, o) in out.iter_mut().enumerate() {
+            let mut sum = 0.0f64;
+            for j in 0..width {
+                sum += f64::from(a[i * width + j] * b[i * width + j]);
+            }
+            *o = sum as f32;
+        }
+    }
+
+    /// PLE's gate, in place: `sigmoid(sgn(s) · sqrt(max(|s|, 1e-6)))`, as the chain
+    /// `ggml_abs`, `ggml_clamp`, `ggml_sqrt`, `ggml_sgn`, `ggml_mul`, `ggml_sigmoid`
+    /// in `build_ple` (`qwen4exp.cpp:1219-1220`). `sgn(0) = 0`.
+    fn signed_sqrt_sigmoid(&self, s: &mut [f32]) {
+        for v in s.iter_mut() {
+            let mag = v.abs().max(1e-6).sqrt();
+            let sgn = if *v > 0.0 {
+                1.0
+            } else if *v < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            let g = sgn * mag;
+            *v = 1.0 / (1.0 + (-g).exp());
+        }
+    }
+
+    /// Depthwise causal conv1d, **dilated**, with no activation, advancing its
+    /// state — PLE's conv (`build_ple`, `qwen4exp.cpp:1235-1276`).
+    ///
+    /// `out[t][c] = Σ_k weight[c][k] · x_pad[c][hist + t − (kernel−1−k)·dilation]`,
+    /// the taps summed in `k` order in f32 (a chain of `ggml_add`), where `x_pad`
+    /// is the state followed by `x`. `hist = (kernel−1)·dilation`; `state` is
+    /// `[channels][hist]`, oldest first, and afterwards holds the last `hist`
+    /// samples of `x_pad`. `weight` is `[channels][kernel]`. `x` is token-major.
+    fn dilated_conv(
+        &self,
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        dilation: usize,
+        out: &mut [f32],
+    ) {
+        let channels = weight.len() / kernel;
+        let hist = (kernel - 1) * dilation;
+        let n = x.len() / channels;
+        debug_assert_eq!(state.len(), channels * hist);
+        debug_assert_eq!(out.len(), x.len());
+        let mut pad = vec![0.0f32; hist + n];
+        for c in 0..channels {
+            pad[..hist].copy_from_slice(&state[c * hist..(c + 1) * hist]);
+            for t in 0..n {
+                pad[hist + t] = x[t * channels + c];
+            }
+            for t in 0..n {
+                let mut acc = pad[hist + t - (kernel - 1) * dilation] * weight[c * kernel];
+                for k in 1..kernel {
+                    acc += pad[hist + t - (kernel - 1 - k) * dilation] * weight[c * kernel + k];
+                }
+                out[t * channels + c] = acc;
+            }
+            state[c * hist..(c + 1) * hist].copy_from_slice(&pad[n..]);
+        }
+    }
+
     /// Two matmuls over the **same** activation, issued together.
     ///
     /// `out_a` and `out_b` are separate buffers, each `n_tok` rows of that

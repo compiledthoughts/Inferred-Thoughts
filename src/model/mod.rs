@@ -33,8 +33,8 @@ use crate::quant::dequantize;
 pub enum Model<'a> {
     Qwen3(Qwen3<'a>),
     Qwen35(Qwen35<'a>),
-    /// Qwen3.8-Flash-Next. **Load only** until step 3 of its plan
-    /// (`src/model/qwen4exp.md`, "Status"); `forward` refuses it.
+    /// Qwen3.8-Flash-Next (`src/model/qwen4exp.md`). The forward pass runs on the
+    /// CPU backends; its new ops have no CUDA kernels until step 4.
     Qwen4Exp(Qwen4Exp<'a>),
 }
 
@@ -166,12 +166,13 @@ impl<'a> Model<'a> {
                 })?;
                 m.forward(ops, tokens, start_pos, kv, rs, ctx)
             }
-            Model::Qwen4Exp(_) => Err(Error::NotImplemented {
-                what: "the qwen4exp forward pass",
-                detail: "this build loads and shape-checks the model only; the forward pass is \
-                         step 3 of src/model/qwen4exp.md, \"Status\""
-                    .to_string(),
-            }),
+            Model::Qwen4Exp(m) => {
+                let rs = rs.ok_or_else(|| Error::InconsistentArchitecture {
+                    what: "recurrent state",
+                    detail: "qwen4exp needs recurrent state and none was supplied".to_string(),
+                })?;
+                m.forward(ops, tokens, start_pos, kv, rs, ctx)
+            }
         }
     }
 }

@@ -1007,6 +1007,67 @@ mod tests {
         }
     }
 
+    /// `dilated_conv` carries its history: a batch equals the same tokens fed one
+    /// at a time, bit for bit, and each output is the reference's sum of taps at
+    /// `(kernel - 1 - k) * dilation` positions back. PLE's conv (qwen4exp.md).
+    #[test]
+    fn dilated_conv_carries_its_history_and_matches_the_definition() {
+        let (kernel, dilation, channels, n) = (4usize, 3usize, 2usize, 11usize);
+        let hist = (kernel - 1) * dilation;
+        let weight: Vec<f32> = (0..channels * kernel).map(|i| 0.25 + 0.5 * i as f32).collect();
+        let x: Vec<f32> = (0..n * channels).map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1).collect();
+        let start: Vec<f32> = (0..channels * hist).map(|i| (i as f32) * 0.01).collect();
+
+        let mut s_batch = start.clone();
+        let mut out_batch = vec![0.0f32; n * channels];
+        Naive.dilated_conv(&mut s_batch, &x, &weight, kernel, dilation, &mut out_batch);
+
+        let mut s_one = start.clone();
+        let mut out_one = vec![0.0f32; n * channels];
+        for t in 0..n {
+            let mut o = [0.0f32; 2];
+            Naive.dilated_conv(&mut s_one, &x[t * channels..(t + 1) * channels], &weight, kernel, dilation, &mut o);
+            out_one[t * channels..(t + 1) * channels].copy_from_slice(&o);
+        }
+        assert_eq!(out_batch, out_one, "a batch must equal token-by-token");
+        assert_eq!(s_batch, s_one, "and leave the same history");
+
+        for c in 0..channels {
+            let mut pad: Vec<f32> = start[c * hist..(c + 1) * hist].to_vec();
+            pad.extend((0..n).map(|t| x[t * channels + c]));
+            for t in 0..n {
+                let mut want = pad[hist + t - (kernel - 1) * dilation] * weight[c * kernel];
+                for k in 1..kernel {
+                    want += pad[hist + t - (kernel - 1 - k) * dilation] * weight[c * kernel + k];
+                }
+                assert_eq!(out_batch[t * channels + c].to_bits(), want.to_bits(), "c {c} t {t}");
+            }
+            assert_eq!(&s_batch[c * hist..(c + 1) * hist], &pad[n..], "history is the last {hist} samples");
+        }
+    }
+
+    /// PLE's gate: `sgn(0) = 0`, so a zero score gates at exactly one half, and the
+    /// magnitude is clamped at 1e-6 before the root.
+    #[test]
+    fn signed_sqrt_sigmoid_follows_the_ggml_chain() {
+        let mut s = [0.0f32, 4.0, -4.0, 1e-9];
+        Naive.signed_sqrt_sigmoid(&mut s);
+        assert_eq!(s[0], 0.5);
+        assert_eq!(s[1], 1.0 / (1.0 + (-2.0f32).exp()));
+        assert_eq!(s[2], 1.0 / (1.0 + (2.0f32).exp()));
+        assert_eq!(s[3], 1.0 / (1.0 + (-(1e-6f32).sqrt()).exp()));
+    }
+
+    /// `mul_streams` lays out `[token][stream][row]`, ggml's `[n_embd, hc, T]`.
+    #[test]
+    fn mul_streams_broadcasts_each_row_over_its_streams() {
+        let h = [1.0f32, 2.0, 10.0, 20.0]; // 2 tokens, rows of 2
+        let w = [1.0f32, -1.0, 0.5, 2.0]; // 2 tokens x 2 streams
+        let mut out = [0.0f32; 8];
+        Naive.mul_streams(&mut out, &h, &w, 2);
+        assert_eq!(out, [1.0, 2.0, -1.0, -2.0, 5.0, 10.0, 20.0, 40.0]);
+    }
+
     #[test]
     fn silu_mul_matches_definition() {
         let mut gate = [1.0f32, -1.0];
