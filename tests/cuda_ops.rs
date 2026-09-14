@@ -5708,10 +5708,11 @@ fn what_a_miss_costs_on_cpu_and_gpu() {
         let st = gpu.expert_stats().expect("the expert cache was built");
         let name = if host_tier { "host-tier" } else { "VRAM" };
         assert!(
-            !st.degraded && st.evictions == 0,
-            "the {name} arm reached the eviction fallback ({} evictions): its timings would be of \
-             a wrong computation",
-            st.evictions
+            !st.oversubscribed && st.evictions == 0,
+            "the {name} arm was oversubscribed ({} evictions, {} fetched): it would time fetches, \
+             not the tier",
+            st.evictions,
+            st.fetched
         );
         if host_tier {
             assert!(st.host_slots > 0, "the host-tier arm placed nothing in the pinned tier");
@@ -5777,7 +5778,17 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
     };
     let f = GgufFile::open(&path).expect("open the NVFP4 GGUF");
     let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
-    let tokens = tk.encode("The capital of France is Paris, and the capital of Japan is", true, true);
+
+    // Real text rather than a repeated sentence: repetitive input routes to a
+    // narrow set of experts and flatters a cache (CLAUDE.md, on `p20k.txt`).
+    // Past 512 tokens so the prompt takes **two** prefill passes and two MoE
+    // chunks (`DEFAULT_MAX_BATCH`, `MOE_CHUNK`): the lease must clear between
+    // them, and one layer resolves a union of up to all its experts at once.
+    const PROMPT_TOKENS: usize = 700;
+    let text = include_str!("../measurements/prompt_6k.txt");
+    let mut tokens = tk.encode(text, true, true);
+    assert!(tokens.len() > PROMPT_TOKENS, "prompt_6k.txt tokenized shorter than {PROMPT_TOKENS}");
+    tokens.truncate(PROMPT_TOKENS);
 
     // The pool, read from the file rather than written down: every routed-expert
     // tensor, times the experts each holds.
@@ -5787,11 +5798,17 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
 
     const MAX_NEW: usize = 32;
     let n_ctx = tokens.len() + MAX_NEW + 8;
-    // 4 + 4 GiB: in the stage 1 sweep a 3.25 GiB slab and a 4 GiB host tier, 13,200
-    // of the 35B's 30,720 slices, 43% addressable -- near the 125B's projected 47%.
-    let arms: [(&str, Option<(f64, f64)>); 2] = [("default budget", None), ("capped 4 + 4 GiB", Some((4.0, 4.0)))];
+    // 4 + 4 GiB: near the 125B's projected ~47% addressable. 2 + 2 GiB: about 19%,
+    // where eviction pressure is far higher and a lease bug has the most chances
+    // to show.
+    let arms: [(&str, Option<(f64, f64)>); 3] = [
+        ("default budget", None),
+        ("capped 4 + 4 GiB", Some((4.0, 4.0))),
+        ("capped 2 + 2 GiB", Some((2.0, 2.0))),
+    ];
 
     println!("\nexpert pool: {expert_tensors} tensors x {n_expert} experts = {pool} slices");
+    println!("prompt: {} tokens of prompt_6k.txt, {MAX_NEW} generated", tokens.len());
     let mut runs: Vec<Vec<u32>> = Vec::new();
     for (label, caps) in arms {
         let gpu = Cuda::new(0).expect("cuda device");
@@ -5833,14 +5850,17 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
         runs.push(produced);
     }
 
-    let (reference, capped) = (&runs[0], &runs[1]);
-    if let Some(at) = reference.iter().zip(capped).position(|(a, b)| a != b) {
-        panic!(
-            "the oversubscribed run diverges from the reference at generated token {at} of {MAX_NEW} \
-             ({} against {}): the expert tier changed the computation",
-            capped[at], reference[at]
-        );
+    let reference = &runs[0];
+    for (i, capped) in runs.iter().enumerate().skip(1) {
+        let label = arms[i].0;
+        if let Some(at) = reference.iter().zip(capped).position(|(a, b)| a != b) {
+            panic!(
+                "{label} diverges from the reference at generated token {at} of {MAX_NEW} \
+                 ({} against {}): the expert tier changed the computation",
+                capped[at], reference[at]
+            );
+        }
+        assert_eq!(reference.len(), capped.len(), "{label} produced a different number of tokens");
+        println!("  {label}: identical, all {} generated tokens match", capped.len());
     }
-    assert_eq!(reference.len(), capped.len(), "the two runs produced different lengths");
-    println!("  identical: all {} generated tokens match", reference.len());
 }

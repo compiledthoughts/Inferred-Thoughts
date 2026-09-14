@@ -64,22 +64,29 @@
 //! fraction of all reads the busiest `slots` tensors account for — i.e. exactly
 //! how much a routing-informed placement could recover over this one.
 //!
-//! **CLOCK survives as the fallback, not as the policy — and the fallback is
-//! wrong.** If the host tier's budget is exhausted before the pool is, there is
-//! nowhere left to place a new tensor and the cache reverts to evicting a VRAM
-//! slot. This comment used to say that path "still works and still thrashes".
-//! It does not work. It was presumably correct while every read resolved its
-//! address through [`ExpertCache::address_of`] on the host; once the pointer
-//! table moved to the device, an eviction inside [`ExpertCache::table`] rewrites
-//! the slot but not the victim's entry in its own, already-built table, whose
-//! mmap pages have also been released. The victim's pointer then leads to the
-//! new occupant's weights, still flagged VRAM. Measured 14-09-2026: every
-//! oversubscribed point of the expert-cap sweep generated garbage text, worse as
-//! evictions rose. [`ExpertStats::degraded`] now says the output is invalid. The
-//! fix is a design decision — fail loudly, or re-read the victim, which is the
-//! SSD tier — and is not made here.
+//! # When both tiers are full: cold experts, fetched on demand (tier 3's MVP)
+//!
+//! If the host tier's budget runs out before the pool does, the rest of the
+//! experts are **cold** (SSD-TIER.md D12). A cold expert has no slot; its table
+//! entry points at a zeroed sentinel, and [`ExpertCache::resolve`] fetches it
+//! from the model file into a VRAM slot when a layer picks it — between the
+//! table lookup and the gather that reads it, so a kernel never sees a cold
+//! entry. Fetching evicts an expert the current layer did not pick (the lease),
+//! and **repoints the evicted expert's own table entry at the sentinel first**.
+//!
+//! That last step is the one this replaced. The old fallback evicted a VRAM slot
+//! and wrote the new expert there but left the victim's entry pointing at the
+//! slot — presumably correct while every read resolved through
+//! [`ExpertCache::address_of`] on the host, and wrong once the pointer table moved
+//! to the device. Measured 14-09-2026: every oversubscribed run of the
+//! expert-cap sweep generated garbage, worse as evictions rose, and a chat prompt
+//! at 4 + 4 GiB emitted EOS as its first token. The acceptance test for the
+//! replacement is `the_35b_generates_identically_with_the_expert_pool_oversubscribed`.
+//!
+//! While oversubscribed the picks are read back mid-pass, so graphs are off
+//! (D13) and migration is paused; both return in later steps.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void};
 
 /// `MADV_DONTNEED`, from `asm-generic/mman-common.h`.
@@ -213,8 +220,8 @@ pub const DEFAULT_RESERVE: usize = 3 << 30;
 /// evictable at all. 6 GiB covers the pool's ~4.3 GiB overflow at the default
 /// cache size with slack, and refuses to grow into swap.
 ///
-/// Overrun is not an error: the cache degrades to CLOCK eviction and says so.
-/// See the module doc.
+/// Overrun is not an error: the rest of the pool goes cold and is fetched from
+/// the model file when a layer picks it. See the module doc.
 pub const DEFAULT_HOST_BUDGET: usize = 6 << 30;
 
 use super::{DeviceBuffer, check, ffi};
@@ -243,11 +250,19 @@ pub struct ExpertStats {
     /// Tensors living in the host tier, and the pinned bytes they occupy.
     pub host_slots: u64,
     pub host_bytes: u64,
-    /// The host tier ran out of budget, so placement fell back to evicting VRAM
-    /// slots. **The run's output is invalid**, not merely ungraphable: each
-    /// eviction leaves one expert's device table entry pointing at a slot that
-    /// now holds another expert's weights. See the module documentation.
-    pub degraded: bool,
+    /// Both tiers filled before the pool did, so some experts are **cold**: not
+    /// resident anywhere a kernel can read. Their table entries point at a
+    /// zeroed sentinel, and [`ExpertCache::resolve`] fetches each from the model
+    /// file into a VRAM slot when a layer picks it. SSD-TIER.md D12.
+    ///
+    /// Replaced `degraded`, which marked the eviction fallback that computed with
+    /// the wrong experts. Being oversubscribed now costs speed, not correctness.
+    pub oversubscribed: bool,
+    /// Cold experts fetched from the model file when a layer picked them, and
+    /// the bytes that took. Every fetch evicts one VRAM slot, so `evictions`
+    /// counts the same events once the slab is full.
+    pub fetched: u64,
+    pub fetch_bytes: u64,
     /// Microseconds spent placing experts, split by where the time went.
     ///
     /// **Because a whole-prefill number cannot say which part is expensive.**
@@ -401,6 +416,23 @@ pub(super) struct ExpertCache {
     /// Reused across tensors so placement does not allocate and zero 142 MiB a
     /// hundred and twenty times. Held rather than local for that reason alone.
     stage: Vec<u8>,
+    /// Experts not resident anywhere a kernel can read. Their table entries
+    /// point at `sentinel`; [`ExpertCache::resolve`] fetches them from the model
+    /// file when a layer picks them. SSD-TIER.md D12.
+    cold: HashSet<usize>,
+    /// Experts picked by the layer being resolved. None may be evicted to make
+    /// room for another, so a layer's gate, up and down all stay put until the
+    /// next routing decision clears it — the lease colibri's expert store names.
+    lease: HashSet<usize>,
+    /// Expert key -> (its tensor's key, its index in that tensor), so an evicted
+    /// expert's *own* table entry can be found and repointed. The eviction this
+    /// replaced never did that, and computed with the wrong experts.
+    home: HashMap<usize, (usize, u32)>,
+    /// One zeroed slot every cold table entry points at. A correct pass never
+    /// reads it; a stray read gets zeros rather than another expert's weights.
+    sentinel: Option<DeviceBuffer>,
+    /// The model file, opened on the first fetch.
+    file: Option<std::fs::File>,
     stats: ExpertStats,
 }
 
@@ -464,6 +496,11 @@ impl ExpertCache {
             since_migration: 0,
             source: None,
             stage: Vec::new(),
+            cold: HashSet::new(),
+            lease: HashSet::new(),
+            home: HashMap::new(),
+            sentinel: None,
+            file: None,
             stats: ExpertStats {
                 slots: slots as u64,
                 slot_bytes: stride as u64,
@@ -514,10 +551,10 @@ impl ExpertCache {
     ///
     /// **Never blocks on a policy decision, and always produces an address a
     /// kernel can dereference.** A tensor that does not fit in VRAM is placed
-    /// in the host tier and read across PCIe by the kernel itself; only
-    /// exhausting *both* tiers falls back to eviction. That is the property a
-    /// CUDA graph needs, and the reason this is not called `get_or_fill` any
-    /// more — nothing is filled on the critical path.
+    /// in the host tier and read across PCIe by the kernel itself. Only once
+    /// *both* tiers are full does a first touch fetch into a VRAM slot, evicting
+    /// an unleased expert — the one case in which something is filled on the
+    /// critical path, and the reason it cannot be graphed.
     ///
     /// `src` is the tensor's bytes in the mmap; `key` is its address, which is
     /// its identity for the life of the run.
@@ -551,6 +588,12 @@ impl ExpertCache {
         // are not reads.
         self.stats.misses += 1;
         let addr = self.place(key, src)?;
+        if self.cold.contains(&key) {
+            // Both tiers were full, so `place` left it cold. This is a read, so
+            // it must come back holding the bytes: fetch it into a VRAM slot now,
+            // from the bytes the caller already holds. SSD-TIER.md D12.
+            return self.make_resident(key, src);
+        }
         match self.map.get(&key).and_then(|e| e.slot) {
             Some(_) => {}
             None => self.stats.host_reads += 1,
@@ -566,6 +609,9 @@ impl ExpertCache {
     fn place(&mut self, key: usize, src: &[u8]) -> Result<ffi::CUdeviceptr> {
         if let Some(e) = self.map.get(&key) {
             return Ok(e.addr);
+        }
+        if self.cold.contains(&key) {
+            return self.sentinel_ptr();
         }
         self.stats.distinct += 1;
 
@@ -591,22 +637,177 @@ impl ExpertCache {
             return Ok(addr);
         }
 
-        // Both tiers full. Back to evicting — which is **not correct** under the
-        // device pointer tables: `old`'s entry in its own table keeps pointing
-        // at this slot after the write below. See the module documentation.
-        self.stats.degraded = true;
-        let slot = self.evict_one();
-        if let Some(old) = self.owner[slot as usize].take() {
-            self.map.remove(&old);
-            self.stats.evictions += 1;
+        // Both tiers full: the expert is **cold**. It gets no slot; its table
+        // entry points at the zeroed sentinel, and `resolve` fetches it from the
+        // model file when a layer picks it (SSD-TIER.md D12).
+        //
+        // This replaced an eviction here that wrote the new expert into a VRAM
+        // slot without repointing the evicted expert's own table entry, so every
+        // oversubscribed run computed with the wrong experts.
+        self.stats.oversubscribed = true;
+        self.cold.insert(key);
+        self.sentinel_ptr()
+    }
+
+    /// Whether any expert is cold. See [`ExpertStats::oversubscribed`].
+    pub fn oversubscribed(&self) -> bool {
+        self.stats.oversubscribed
+    }
+
+    /// End the current lease: a new routing decision means the layer that held it
+    /// is done, so its experts may be evicted again.
+    pub fn clear_lease(&mut self) {
+        self.lease.clear();
+    }
+
+    /// Make every expert `ids` picks from one tensor resident, and lease them.
+    ///
+    /// **Tier 3's MVP** (SSD-TIER.md D12, D13). Called between a tensor's table
+    /// lookup and the gather that reads it, while oversubscribed. Every pick is
+    /// leased *before* any is fetched, so resolving one cannot evict another, and
+    /// the lease persists across this layer's gate, up and down until the next
+    /// routing decision clears it.
+    ///
+    /// A cold pick is fetched into a VRAM slot taken from an expert the layer did
+    /// not pick. The order is what makes it safe: the victim's entry is pointed at
+    /// the sentinel *before* its slot is overwritten, and the fetched expert's
+    /// entry is pointed at the slot only *after* its bytes are in it. The caller
+    /// must have synchronized, so no kernel is still reading the victim's slot.
+    ///
+    /// `tkey` is the tensor's key, its address in the mapping, and `data` the
+    /// tensor's bytes there, read only when no model file is known. Returns the
+    /// bytes fetched.
+    pub fn resolve(&mut self, tkey: usize, data: &[u8], n_expert: usize, ids: &[i32]) -> Result<u64> {
+        let stride = self.stride;
+        let mut picks: Vec<usize> =
+            ids.iter().filter_map(|&e| usize::try_from(e).ok()).filter(|&e| e < n_expert).collect();
+        picks.sort_unstable();
+        picks.dedup();
+
+        for &e in &picks {
+            self.lease.insert(tkey + e * stride);
         }
-        self.slab.write_at(slot as usize * self.stride, src)?;
-        self.stats.filled_bytes += src.len() as u64;
+
+        let mut fetched = 0u64;
+        for &e in &picks {
+            let key = tkey + e * stride;
+            if !self.cold.contains(&key) {
+                if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
+                    self.referenced[slot as usize] = true;
+                }
+                continue;
+            }
+            let mut stage = std::mem::take(&mut self.stage);
+            if stage.len() < stride {
+                stage.resize(stride, 0);
+            }
+            let read = self.read_expert(&mut stage[..stride], data, key, e);
+            let placed = match read {
+                Ok(()) => self.make_resident(key, &stage[..stride]),
+                Err(err) => Err(err),
+            };
+            self.stage = stage;
+            placed?;
+            fetched += stride as u64;
+        }
+        Ok(fetched)
+    }
+
+    /// Put `bytes` — expert `key`'s — into a VRAM slot, evicting an unleased
+    /// expert to make room, and point `key`'s table entry at the slot.
+    fn make_resident(&mut self, key: usize, bytes: &[u8]) -> Result<ffi::CUdeviceptr> {
+        let slot = self.evict_unleased()?;
+        if let Some(victim) = self.owner[slot as usize].take() {
+            self.make_cold(victim)?;
+        }
+        self.slab.write_at(slot as usize * self.stride, bytes)?;
         self.owner[slot as usize] = Some(key);
         self.referenced[slot as usize] = true;
         let addr = self.slot_ptr(slot);
         self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
+        self.cold.remove(&key);
+        if let Some(&(tkey, e)) = self.home.get(&key) {
+            self.write_table_entry(tkey, e, addr)?;
+            if let Some(&base) = self.bases.get(&tkey) {
+                self.set_vram_flag(base + e as usize, 1)?;
+            }
+        }
+        self.stats.fetched += 1;
+        self.stats.fetch_bytes += bytes.len() as u64;
         Ok(addr)
+    }
+
+    /// Give up `victim`'s VRAM residency: point its table entry at the sentinel,
+    /// so nothing can read the slot it is about to lose.
+    ///
+    /// A victim with no table was placed through [`ExpertCache::address_of`] and
+    /// has no entry to repoint; its address was handed to a caller that used it
+    /// at once, with graphs off.
+    fn make_cold(&mut self, victim: usize) -> Result<()> {
+        self.map.remove(&victim);
+        self.cold.insert(victim);
+        self.stats.evictions += 1;
+        if let Some(&(tkey, e)) = self.home.get(&victim) {
+            let sentinel = self.sentinel_ptr()?;
+            self.write_table_entry(tkey, e, sentinel)?;
+            if let Some(&base) = self.bases.get(&tkey) {
+                self.set_vram_flag(base + e as usize, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read expert `e`'s bytes — key `key` — into `dst`: from the model file with
+    /// `pread` when one is known (SSD-TIER.md D10), else from the mapping.
+    fn read_expert(&mut self, dst: &mut [u8], data: &[u8], key: usize, e: usize) -> Result<()> {
+        let stride = self.stride;
+        match self.source.clone() {
+            Some((path, base)) => {
+                use std::os::unix::fs::FileExt;
+                if self.file.is_none() {
+                    let f = std::fs::File::open(&path).map_err(|err| Error::Cuda {
+                        what: "expert fetch",
+                        detail: format!("opening {}: {err}", path.display()),
+                    })?;
+                    self.file = Some(f);
+                }
+                let offset = key.saturating_sub(base) as u64;
+                match self.file.as_ref() {
+                    Some(f) => f.read_exact_at(dst, offset).map_err(|err| Error::Cuda {
+                        what: "expert fetch",
+                        detail: format!("{} bytes at offset {offset} of {}: {err}", dst.len(), path.display()),
+                    }),
+                    None => Err(Error::Cuda {
+                        what: "expert fetch",
+                        detail: "the model file did not stay open".to_string(),
+                    }),
+                }
+            }
+            None => match data.get(e * stride..(e + 1) * stride) {
+                Some(s) => {
+                    dst.copy_from_slice(s);
+                    Ok(())
+                }
+                None => Err(Error::Cuda {
+                    what: "expert fetch",
+                    detail: format!("expert {e} is past the tensor's {} bytes", data.len()),
+                }),
+            },
+        }
+    }
+
+    /// The zeroed slot cold entries point at, allocated on first need.
+    fn sentinel_ptr(&mut self) -> Result<ffi::CUdeviceptr> {
+        if self.sentinel.is_none() {
+            self.sentinel = Some(DeviceBuffer::zeroed(self.stride)?);
+        }
+        match self.sentinel.as_ref() {
+            Some(b) => Ok(b.ptr),
+            None => Err(Error::Cuda {
+                what: "expert cache",
+                detail: "the sentinel slot was not allocated".to_string(),
+            }),
+        }
     }
 
     /// The device pointer table for one `Experts` tensor, built on first sight.
@@ -735,6 +936,7 @@ impl ExpertCache {
                 // time, exactly as before.
                 let src = &src_all[e * stride..(e + 1) * stride];
                 let k = data[e * stride..].as_ptr() as usize;
+                self.home.insert(k, (key, e as u32));
                 addrs.push(self.place(k, src)?);
                 vram.push(i32::from(self.map.get(&k).and_then(|x| x.slot).is_some()));
                 e += 1;
@@ -750,6 +952,7 @@ impl ExpertCache {
             for i in 0..run {
                 let slot = (first + i) as u32;
                 let k = data[(e + i) * stride..].as_ptr() as usize;
+                self.home.insert(k, (key, (e + i) as u32));
                 self.stats.distinct += 1;
                 self.owner[slot as usize] = Some(k);
                 self.referenced[slot as usize] = true;
@@ -874,6 +1077,13 @@ impl ExpertCache {
     pub fn migrate(&mut self, budget: usize, counts: &[u32]) -> Result<usize> {
         let n = self.next_base.min(counts.len()).min(self.counter_owner.len());
         if n == 0 || budget == 0 {
+            return Ok(0);
+        }
+        // **Off while oversubscribed, for the MVP.** A swap here assumes every
+        // expert is resident in one tier or the other; cold experts break that,
+        // and fetches already move experts into VRAM on demand. Migration and
+        // streaming meet in a later step. SSD-TIER.md D12.
+        if self.stats.oversubscribed {
             return Ok(0);
         }
         if self.prev_counts.len() < n {
@@ -1101,41 +1311,67 @@ impl ExpertCache {
         Ok(Some(b.dev + off as ffi::CUdeviceptr))
     }
 
-    /// CLOCK: advance the hand, clearing reference bits, and take the first
-    /// slot whose bit was already clear.
-    ///
-    /// Terminates in at most two laps — a full lap clears every bit, so the
-    /// second cannot find one set. The empty-slot case falls out of the same
-    /// loop because a never-filled slot has its bit clear.
-    ///
-    /// **Only reached once both tiers are full.** Second-chance is a reasonable
-    /// approximation of LRU and was the policy before the host tier existed; it
-    /// is kept because it still works, and because a configuration that cannot
-    /// hold the pool has to do something.
-    fn evict_one(&mut self) -> u32 {
-        let n = self.owner.len();
-        for _ in 0..2 * n {
-            let at = self.hand;
-            self.hand = (self.hand + 1) % n;
-            if self.referenced[at] {
-                self.referenced[at] = false;
-            } else {
-                return at as u32;
-            }
+    /// A VRAM slot to fetch into: CLOCK over the slab, never taking a slot whose
+    /// expert the layer being resolved picked. See [`clock_pick`].
+    fn evict_unleased(&mut self) -> Result<u32> {
+        let (owner, lease) = (&self.owner, &self.lease);
+        match clock_pick(&mut self.referenced, &mut self.hand, |at| {
+            owner[at].is_some_and(|k| lease.contains(&k))
+        }) {
+            Some(at) => Ok(at as u32),
+            None => Err(Error::Cuda {
+                what: "expert cache",
+                detail: format!(
+                    "every one of the {} VRAM slots holds an expert the layer being resolved \
+                     picked; the slab is smaller than one layer's picks",
+                    self.owner.len()
+                ),
+            }),
         }
-        // Unreachable by the argument above; taking the hand is still correct.
-        self.hand as u32
     }
+}
+
+/// CLOCK with leases: advance the hand, clearing reference bits, and take the
+/// first slot that is not leased and whose bit was already clear. Leased slots
+/// are passed over without touching their bit.
+///
+/// Terminates within two laps plus one step whenever any slot is unleased: the
+/// first lap clears every unleased bit, so the second finds one clear. `None`
+/// only when every slot is leased.
+///
+/// A free function rather than a method so the policy is testable without a
+/// device, which is where it can be wrong in a way no output would reveal.
+fn clock_pick(referenced: &mut [bool], hand: &mut usize, leased: impl Fn(usize) -> bool) -> Option<usize> {
+    let n = referenced.len();
+    if n == 0 {
+        return None;
+    }
+    for _ in 0..2 * n + 1 {
+        let at = *hand;
+        *hand = (*hand + 1) % n;
+        if leased(at) {
+            continue;
+        }
+        if referenced[at] {
+            referenced[at] = false;
+        } else {
+            return Some(at);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     //! The policy is testable without a device. Only the fills touch CUDA, so
-    //! the ring is exercised through `evict_one` directly — which is the part
-    //! that can be wrong in a way no output would reveal.
+    //! the ring is exercised through [`super::clock_pick`] directly — which is
+    //! the part that can be wrong in a way no output would reveal.
 
-    /// A standalone CLOCK ring, identical to [`super::ExpertCache`]'s, so the
-    /// policy can be tested where the slab cannot be allocated.
+    use super::clock_pick;
+
+    /// A CLOCK ring over the real [`super::clock_pick`], with nothing leased.
+    /// It used to be a hand-written copy "identical to" the cache's; it now
+    /// calls the function the cache calls, so the two cannot drift.
     struct Clock {
         referenced: Vec<bool>,
         hand: usize,
@@ -1146,18 +1382,50 @@ mod tests {
             Self { referenced: vec![false; n], hand: 0 }
         }
         fn evict(&mut self) -> usize {
-            let n = self.referenced.len();
-            for _ in 0..2 * n {
-                let at = self.hand;
-                self.hand = (self.hand + 1) % n;
-                if self.referenced[at] {
-                    self.referenced[at] = false;
-                } else {
-                    return at;
-                }
-            }
-            self.hand
+            clock_pick(&mut self.referenced, &mut self.hand, |_| false).unwrap_or(usize::MAX)
         }
+    }
+
+    /// **A leased slot is never taken**, even when its reference bit is clear and
+    /// the hand is standing on it. This is the property whose absence made
+    /// resolving a layer's `up` able to evict the `gate` it had just resolved.
+    #[test]
+    fn a_leased_slot_is_never_taken() {
+        let mut referenced = vec![false; 4];
+        let mut hand = 0;
+        let leased = |at: usize| at == 0 || at == 2;
+        let got: Vec<usize> =
+            (0..6).map(|_| clock_pick(&mut referenced, &mut hand, leased).unwrap_or(usize::MAX)).collect();
+        assert!(got.iter().all(|&s| s == 1 || s == 3), "took a leased slot: {got:?}");
+    }
+
+    /// A leased slot's bit is left alone as the hand passes, so the lease does
+    /// not cost it its second chance once the lease ends.
+    #[test]
+    fn passing_a_leased_slot_leaves_its_bit_alone() {
+        let mut referenced = vec![true, false, false];
+        let mut hand = 0;
+        assert_eq!(clock_pick(&mut referenced, &mut hand, |at| at == 0), Some(1));
+        assert!(referenced[0], "the hand cleared a leased slot's reference bit");
+    }
+
+    /// With every slot leased there is nothing to take, and the answer is `None`
+    /// rather than a spin or a leased slot.
+    #[test]
+    fn a_fully_leased_ring_yields_nothing() {
+        let mut referenced = vec![false, true, false];
+        let mut hand = 1;
+        assert_eq!(clock_pick(&mut referenced, &mut hand, |_| true), None);
+    }
+
+    /// One unleased slot among many referenced, leased ones is still found:
+    /// termination must not depend on the leased slots' bits.
+    #[test]
+    fn a_single_unleased_slot_is_found_through_a_full_ring() {
+        let mut referenced = vec![true; 8];
+        let mut hand = 3;
+        let got = clock_pick(&mut referenced, &mut hand, |at| at != 6);
+        assert_eq!(got, Some(6));
     }
 
     /// Every slot is handed out once before any is reused. A ring that returned

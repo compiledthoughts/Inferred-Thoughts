@@ -172,6 +172,7 @@ impl Cuda {
         // launch live in a graph.
         let table = self.expert_table(w)?;
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[w], n_used, route.n_tok())?;
         let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, route.n_tok(), slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
 
@@ -302,6 +303,7 @@ impl Cuda {
         let utab = self.expert_table(up)?;
         // Before either gather, and once for both: they read the same slot.
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[gate, up], n_used, route.n_tok())?;
         let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, route.n_tok(), slot::PTR_GATE)?;
         let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, route.n_tok(), slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
@@ -418,6 +420,7 @@ impl Cuda {
         let (sd, qd) = self.quantized(x, rows * (w.n_in / 32))?;
         let table = self.expert_table(w)?;
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[w], n_used, n_tok)?;
         let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, n_tok, slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
         let (perm, first, count, n_tile, n_tile_max) =
@@ -487,6 +490,7 @@ impl Cuda {
         let gtab = self.expert_table(gate)?;
         let utab = self.expert_table(up)?;
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[gate, up], n_used, n_tok)?;
         let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, n_tok, slot::PTR_GATE)?;
         let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, n_tok, slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
@@ -540,6 +544,7 @@ impl Cuda {
         let (dd, qd) = self.quantized_fp4(x, rows * (w.n_in / 16))?;
         let table = self.expert_table(w)?;
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[w], n_used, n_tok)?;
         let wptrs = self.gather_ptrs(w.data.as_ptr() as usize, table, n_used, n_tok, slot::PTR_DOWN)?;
         let od = self.mirror_out(out)?;
         let (perm, first, count, n_tile, n_tile_max) =
@@ -588,6 +593,7 @@ impl Cuda {
         let gtab = self.expert_table(gate)?;
         let utab = self.expert_table(up)?;
         self.stage_route_ids(route)?;
+        self.resolve_picks(&[gate, up], n_used, n_tok)?;
         let gptrs = self.gather_ptrs(gate.data.as_ptr() as usize, gtab, n_used, n_tok, slot::PTR_GATE)?;
         let uptrs = self.gather_ptrs(up.data.as_ptr() as usize, utab, n_used, n_tok, slot::PTR_UP)?;
         let od = self.mirror_out(out)?;
@@ -776,6 +782,12 @@ impl Cuda {
     /// `moe_topk` reproduces [`Ops::route`]'s default exactly — see
     /// `device_topk_reproduces_the_host_selection`.
     pub(super) fn route_impl(&self, probs: &[f32], n_expert: usize, n_used: usize) -> Result<()> {
+        // A new routing decision means the layer (or prefill chunk) that held the
+        // expert lease is done, so its experts may be evicted again. SSD-TIER.md
+        // D12.
+        if let Some(c) = self.experts.borrow_mut().as_mut() {
+            c.clear_lease();
+        }
         let n_tok = probs.len() / n_expert.max(1);
         let pd = self.mirror_in(probs)?;
         let idd = self.pooled(slot::ROUTE_IDS, n_tok * n_used * 4)?;
@@ -835,6 +847,53 @@ impl Cuda {
         // The kernel takes `int`; `Route` carries `usize`.
         let as_i32: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
         self.h2d(idd, &as_i32)
+    }
+
+    /// **Tier 3's MVP** (SSD-TIER.md D12, D13): before a gather reads these
+    /// tensors' tables, make every expert this layer picked from them resident.
+    ///
+    /// A no-op unless the expert cache is oversubscribed. When it is, this reads
+    /// the picks back from `slot::ROUTE_IDS` — synchronizing first, which also
+    /// guarantees no earlier kernel is still reading a slot about to be
+    /// overwritten — and has the cache fetch every cold pick into a VRAM slot.
+    ///
+    /// Must run after [`Cuda::stage_route_ids`], so the slot holds this route's
+    /// picks for both route kinds, and before the gather. Sized exactly as
+    /// `gather_ptrs` sizes the slot, so its `pooled` call cannot reallocate it.
+    ///
+    /// The readback is a host decision inside the pass, which a graph cannot
+    /// replay, so graphs are turned off for the run here: this runs during the
+    /// first prefill, before any decode graph could be recorded. It does not go
+    /// through `host_needs`, so the mid-pass latch would not do it.
+    fn resolve_picks(&self, tensors: &[&Experts<'_>], n_used: usize, n_tok: usize) -> Result<()> {
+        let oversubscribed = self.experts.borrow().as_ref().is_some_and(|c| c.oversubscribed());
+        if !oversubscribed {
+            return Ok(());
+        }
+        self.graphs_enabled.set(false);
+
+        let n = n_tok * n_used;
+        let idd = self.pooled(slot::ROUTE_IDS, n * 4)?;
+        self.sync()?;
+        let mut ids = vec![0i32; n];
+        self.d2h(&mut ids, idd)?;
+
+        let mut fetched = 0u64;
+        {
+            let mut cache = self.experts.borrow_mut();
+            let Some(c) = cache.as_mut() else { return Ok(()) };
+            for w in tensors {
+                fetched += c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &ids)?;
+            }
+        }
+        if fetched > 0 {
+            // A fetch is a bus crossing and is counted as one, as placement's are.
+            self.bump(|st| {
+                st.h2d_calls += 1;
+                st.h2d_bytes += fetched;
+            });
+        }
+        Ok(())
     }
 
     /// Resolve `n_used` chosen experts to addresses, from `table`.
