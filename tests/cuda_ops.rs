@@ -5746,3 +5746,101 @@ fn what_a_miss_costs_on_cpu_and_gpu() {
          ~1.56x these rows by the arithmetic -- not measured."
     );
 }
+
+/// **The SSD tier's acceptance test** (SSD-TIER.md D14): with the expert caches
+/// capped below the pool, the 35B generates exactly the tokens it generates when
+/// every expert fits.
+///
+/// Placement may change speed, never output. The same kernel over the same bytes
+/// computes the same result wherever the bytes live —
+/// `what_a_miss_costs_on_cpu_and_gpu` shows it for the VRAM and host tiers — and
+/// `Engine::generate` is greedy, so a different token means a different
+/// computation, not drift.
+///
+/// **It fails on the code before tier 3.** Once both tiers fill, that code evicts
+/// VRAM slots without rewriting the evicted experts' table entries, so it computes
+/// with the wrong experts (BENCHMARKS-v2 14-09-2026, stage 1 corrected). The capped
+/// arm asserts it really is oversubscribed, so this cannot pass vacuously, and the
+/// default arm asserts it is not.
+///
+/// **Graphs are off in both arms**, so the tier is the only variable: the MVP runs
+/// ungraphed while oversubscribed (D13). An arm with graphs on joins when graphs
+/// return to the oversubscribed path.
+#[test]
+#[ignore = "needs an sm_120 device and the NVFP4 35B"]
+fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
+    use inferred_thoughts::Model;
+
+    let Some(path) = common::find_model_named("Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf") else {
+        println!("SKIPPED: no Qwen3.6-35B-A3B-NVFP4-Q8_0.gguf found; set INFERRED_MODEL_DIR");
+        return;
+    };
+    let f = GgufFile::open(&path).expect("open the NVFP4 GGUF");
+    let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("The capital of France is Paris, and the capital of Japan is", true, true);
+
+    // The pool, read from the file rather than written down: every routed-expert
+    // tensor, times the experts each holds.
+    let n_expert = u64::from(f.metadata.get_arch_u32("expert_count").expect("expert_count"));
+    let expert_tensors = f.tensors.iter().filter(|t| t.name.ends_with("_exps.weight")).count() as u64;
+    let pool = expert_tensors * n_expert;
+
+    const MAX_NEW: usize = 32;
+    let n_ctx = tokens.len() + MAX_NEW + 8;
+    // 4 + 4 GiB: in the stage 1 sweep a 3.25 GiB slab and a 4 GiB host tier, 13,200
+    // of the 35B's 30,720 slices, 43% addressable -- near the 125B's projected 47%.
+    let arms: [(&str, Option<(f64, f64)>); 2] = [("default budget", None), ("capped 4 + 4 GiB", Some((4.0, 4.0)))];
+
+    println!("\nexpert pool: {expert_tensors} tensors x {n_expert} experts = {pool} slices");
+    let mut runs: Vec<Vec<u32>> = Vec::new();
+    for (label, caps) in arms {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(false);
+        if let Some((vram, host)) = caps {
+            gpu.set_expert_budget((vram * 1073741824.0) as usize);
+            gpu.set_expert_host_budget((host * 1073741824.0) as usize);
+        }
+        gpu.set_model_path(&f.path);
+        let m = Model::load(&f).expect("load the 35B");
+        let mut e = Engine::new(m, &gpu, n_ctx, false);
+        let (produced, _) = e.generate(&tokens, MAX_NEW, None, |_| {}).expect("generate");
+        if let Some(err) = gpu.take_error() {
+            panic!("{label}: driver error: {err}");
+        }
+
+        let st = gpu.expert_stats().expect("the expert cache was built");
+        let addressable = st.slots + st.host_slots;
+        let text = tk.decode(&produced, false).unwrap_or_default();
+        println!(
+            "  {label:<18} slab {} + host {} = {addressable} of {pool} addressable   {} evictions\n  \
+             {:<18} {:?}",
+            st.slots, st.host_slots, st.evictions, "", text
+        );
+        if caps.is_some() {
+            assert!(
+                addressable < pool,
+                "{label}: {addressable} of {pool} slices addressable, so nothing is oversubscribed \
+                 and the comparison would pass vacuously"
+            );
+        } else {
+            assert!(
+                addressable >= pool && st.evictions == 0,
+                "{label}: the reference arm is itself oversubscribed ({addressable} of {pool}, {} \
+                 evictions), so it is not a reference",
+                st.evictions
+            );
+        }
+        runs.push(produced);
+    }
+
+    let (reference, capped) = (&runs[0], &runs[1]);
+    if let Some(at) = reference.iter().zip(capped).position(|(a, b)| a != b) {
+        panic!(
+            "the oversubscribed run diverges from the reference at generated token {at} of {MAX_NEW} \
+             ({} against {}): the expert tier changed the computation",
+            capped[at], reference[at]
+        );
+    }
+    assert_eq!(reference.len(), capped.len(), "the two runs produced different lengths");
+    println!("  identical: all {} generated tokens match", reference.len());
+}
