@@ -64,11 +64,20 @@
 //! fraction of all reads the busiest `slots` tensors account for — i.e. exactly
 //! how much a routing-informed placement could recover over this one.
 //!
-//! **CLOCK survives as the fallback, not as the policy.** If the host tier's
-//! budget is exhausted before the pool is, there is nowhere left to place a new
-//! tensor and the cache reverts to evicting a VRAM slot, as it did before. That
-//! path still works and still thrashes; what it no longer does is pretend to be
-//! graphable, and [`ExpertStats::degraded`] says so out loud.
+//! **CLOCK survives as the fallback, not as the policy — and the fallback is
+//! wrong.** If the host tier's budget is exhausted before the pool is, there is
+//! nowhere left to place a new tensor and the cache reverts to evicting a VRAM
+//! slot. This comment used to say that path "still works and still thrashes".
+//! It does not work. It was presumably correct while every read resolved its
+//! address through [`ExpertCache::address_of`] on the host; once the pointer
+//! table moved to the device, an eviction inside [`ExpertCache::table`] rewrites
+//! the slot but not the victim's entry in its own, already-built table, whose
+//! mmap pages have also been released. The victim's pointer then leads to the
+//! new occupant's weights, still flagged VRAM. Measured 14-09-2026: every
+//! oversubscribed point of the expert-cap sweep generated garbage text, worse as
+//! evictions rose. [`ExpertStats::degraded`] now says the output is invalid. The
+//! fix is a design decision — fail loudly, or re-read the victim, which is the
+//! SSD tier — and is not made here.
 
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
@@ -235,8 +244,9 @@ pub struct ExpertStats {
     pub host_slots: u64,
     pub host_bytes: u64,
     /// The host tier ran out of budget, so placement fell back to evicting VRAM
-    /// slots. The pool is no longer wholly addressable and a graph would be
-    /// unsound.
+    /// slots. **The run's output is invalid**, not merely ungraphable: each
+    /// eviction leaves one expert's device table entry pointing at a slot that
+    /// now holds another expert's weights. See the module documentation.
     pub degraded: bool,
     /// Microseconds spent placing experts, split by where the time went.
     ///
@@ -581,7 +591,9 @@ impl ExpertCache {
             return Ok(addr);
         }
 
-        // Both tiers full. Back to evicting, which works and cannot be graphed.
+        // Both tiers full. Back to evicting — which is **not correct** under the
+        // device pointer tables: `old`'s entry in its own table keeps pointing
+        // at this slot after the write below. See the module documentation.
         self.stats.degraded = true;
         let slot = self.evict_one();
         if let Some(old) = self.owner[slot as usize].take() {

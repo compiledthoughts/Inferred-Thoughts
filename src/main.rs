@@ -901,13 +901,32 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
         // **Not a hit rate.** Every expert is placed before it can be routed
         // to, so nothing misses; what varies is which tier a read resolves to.
         // Printing 100% hit would be true and useless.
-        eprintln!(
-            "         {} reads, {:.1}% from VRAM and {:.1}% across PCIe   {} evictions",
-            e.lookups(),
-            100.0 * (1.0 - e.host_read_rate()),
-            100.0 * e.host_read_rate(),
-            e.evictions,
-        );
+        //
+        // **And meaningless once degraded, so it is not printed then.** When
+        // both tiers fill, placement evicts a VRAM slot but never rewrites the
+        // victim's entry in its tensor's device pointer table, and the
+        // victim's mmap pages are already released. Each eviction leaves one
+        // expert whose pointer leads to another expert's weights and is still
+        // flagged VRAM, so the device tally books reads of the wrong bytes as
+        // VRAM reads. Measured 14-09-2026: the share rose from 93.3% to 96.0%
+        // as the slab shrank to a ninth, while every oversubscribed run
+        // generated garbage. BENCHMARKS-v2 14-09-2026 (stage 1, corrected).
+        if e.degraded {
+            eprintln!(
+                "         {} reads   {} evictions = {} experts whose table entry points at another expert's weights",
+                e.lookups(),
+                e.evictions,
+                e.evictions,
+            );
+        } else {
+            eprintln!(
+                "         {} reads, {:.1}% from VRAM and {:.1}% across PCIe   {} evictions",
+                e.lookups(),
+                100.0 * (1.0 - e.host_read_rate()),
+                100.0 * e.host_read_rate(),
+                e.evictions,
+            );
+        }
         eprintln!(
             "         {:.2} GiB placed at load ({} tensors): {:.1}s h2d + {:.1}s pin + {:.1}s memcpy",
             gib(e.filled_bytes),
@@ -938,14 +957,18 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
         if e.degraded {
             eprintln!(
                 "         DEGRADED: the host tier filled, so placement fell back to
-         eviction. The pool is no longer wholly addressable and a CUDA
-         graph would be unsound. Raise --expert-host or --expert-cache."
+         eviction. **THIS RUN'S OUTPUT IS INVALID**: {} experts' pointers
+         lead to other experts' weights, so the model computed with the wrong
+         experts. Its throughput is the throughput of a wrong computation.
+         Raise --expert-host or --expert-cache until this does not print.",
+                e.evictions,
             );
         }
         // What a placement policy that knew the routing distribution in advance
         // could have served from VRAM, against what first-touch arrival order
-        // actually served. See `ExpertCache::coverage`.
-        if let Some((frac, reads)) = coverage {
+        // actually served. See `ExpertCache::coverage`. Skipped when degraded,
+        // for the same reason as the VRAM share above.
+        if let Some((frac, reads)) = coverage.filter(|_| !e.degraded) {
             eprintln!(
                 "         coverage {:.1}% of {} reads would come from VRAM under an oracle placement,
          against {:.1}% under this one",
