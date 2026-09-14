@@ -86,6 +86,7 @@
 //! While oversubscribed the picks are read back mid-pass, so graphs are off
 //! (D13) and migration is paused; both return in later steps.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void};
 
@@ -263,6 +264,24 @@ pub struct ExpertStats {
     /// counts the same events once the slab is full.
     pub fetched: u64,
     pub fetch_bytes: u64,
+    /// Experts given a cold table entry when their tensor's table was built:
+    /// counted in `distinct`, placed in neither tier. `distinct - host_slots -
+    /// cold_at_load` were placed in VRAM.
+    ///
+    /// **Kept apart because `distinct` alone lied.** The 2 + 2 GiB CLI run
+    /// printed "placed at load (30720 tensors)" with 7,060 placed.
+    pub cold_at_load: u64,
+    /// Host-to-device copies this cache issued, and their bytes: slab fills,
+    /// pointer tables, table entries and residency flags, each counted where it
+    /// is issued. [`ExpertCache::take_uploads`] hands the backend's crossing
+    /// counters what they have not yet seen.
+    ///
+    /// **Counted per copy because the callers could not see them.** Callers
+    /// added one crossing per call that filled anything, so a fetch — the bytes
+    /// plus four eight-byte writes — read as a fifth of itself at best, and the
+    /// 2 + 2 GiB run printed 6,110 up against ~125,000 copies.
+    pub up_calls: u64,
+    pub up_bytes: u64,
     /// Microseconds spent placing experts, split by where the time went.
     ///
     /// **Because a whole-prefill number cannot say which part is expensive.**
@@ -433,6 +452,11 @@ pub(super) struct ExpertCache {
     sentinel: Option<DeviceBuffer>,
     /// The model file, opened on the first fetch.
     file: Option<std::fs::File>,
+    /// Host-to-device copies issued, and bytes: `Cell`s because table-entry and
+    /// flag writes happen from `&self`. See [`ExpertStats::up_calls`].
+    uploads: Cell<(u64, u64)>,
+    /// How much of `uploads` [`ExpertCache::take_uploads`] has handed out.
+    uploads_reported: Cell<(u64, u64)>,
     stats: ExpertStats,
 }
 
@@ -501,6 +525,8 @@ impl ExpertCache {
             home: HashMap::new(),
             sentinel: None,
             file: None,
+            uploads: Cell::new((0, 0)),
+            uploads_reported: Cell::new((0, 0)),
             stats: ExpertStats {
                 slots: slots as u64,
                 slot_bytes: stride as u64,
@@ -512,7 +538,25 @@ impl ExpertCache {
     pub fn stats(&self) -> ExpertStats {
         let mut s = self.stats;
         s.migrated = self.migrated;
+        (s.up_calls, s.up_bytes) = self.uploads.get();
         s
+    }
+
+    /// Host-to-device copies issued since the last call, and their bytes, for
+    /// the backend's crossing counters.
+    pub fn take_uploads(&self) -> (u64, u64) {
+        let (calls, bytes) = self.uploads.get();
+        let (seen_calls, seen_bytes) = self.uploads_reported.replace((calls, bytes));
+        (calls - seen_calls, bytes - seen_bytes)
+    }
+
+    /// Copy `data` into `buf` at `offset_bytes`, counted. Every host-to-device
+    /// copy this cache issues goes through here.
+    fn upload<T: Copy>(&self, buf: &DeviceBuffer, offset_bytes: usize, data: &[T]) -> Result<()> {
+        buf.write_at(offset_bytes, data)?;
+        let (calls, bytes) = self.uploads.get();
+        self.uploads.set((calls + 1, bytes + std::mem::size_of_val(data) as u64));
+        Ok(())
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -620,7 +664,7 @@ impl ExpertCache {
             let slot = self.next_slot as u32;
             self.next_slot += 1;
             let t = std::time::Instant::now();
-            self.slab.write_at(slot as usize * self.stride, src)?;
+            self.upload(&self.slab, slot as usize * self.stride, src)?;
             self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
             self.stats.filled_bytes += src.len() as u64;
             self.owner[slot as usize] = Some(key);
@@ -645,6 +689,7 @@ impl ExpertCache {
         // slot without repointing the evicted expert's own table entry, so every
         // oversubscribed run computed with the wrong experts.
         self.stats.oversubscribed = true;
+        self.stats.cold_at_load += 1;
         self.cold.insert(key);
         self.sentinel_ptr()
     }
@@ -720,7 +765,7 @@ impl ExpertCache {
         if let Some(victim) = self.owner[slot as usize].take() {
             self.make_cold(victim)?;
         }
-        self.slab.write_at(slot as usize * self.stride, bytes)?;
+        self.upload(&self.slab, slot as usize * self.stride, bytes)?;
         self.owner[slot as usize] = Some(key);
         self.referenced[slot as usize] = true;
         let addr = self.slot_ptr(slot);
@@ -946,7 +991,7 @@ impl ExpertCache {
             let first = self.next_slot;
             let src = &src_all[e * stride..(e + run) * stride];
             let t = std::time::Instant::now();
-            self.slab.write_at(first * stride, src)?;
+            self.upload(&self.slab, first * stride, src)?;
             self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
             self.stats.filled_bytes += src.len() as u64;
             for i in 0..run {
@@ -966,7 +1011,8 @@ impl ExpertCache {
         }
         self.stage = stage;
 
-        let buf = DeviceBuffer::from_slice(&addrs)?;
+        let buf = DeviceBuffer::new(std::mem::size_of_val(addrs.as_slice()))?;
+        self.upload(&buf, 0, &addrs)?;
         let ptr = buf.ptr;
         self.tables.insert(key, buf);
 
@@ -999,7 +1045,7 @@ impl ExpertCache {
                 self.counter_owner[base + e] = (key, e as u32);
             }
             if let Some(f) = self.vram_flags.as_ref() {
-                f.write_at(base * 4, &vram)?;
+                self.upload(f, base * 4, &vram)?;
             }
             self.bases.insert(key, base);
             self.next_base = base + n_expert;
@@ -1199,7 +1245,7 @@ impl ExpertCache {
     /// Mark a global expert index as VRAM-resident or not, for the counters.
     fn set_vram_flag(&self, idx: usize, resident: i32) -> Result<()> {
         match self.vram_flags.as_ref() {
-            Some(f) => f.write_at(idx * 4, &[resident]),
+            Some(f) => self.upload(f, idx * 4, &[resident]),
             None => Ok(()),
         }
     }
@@ -1207,7 +1253,7 @@ impl ExpertCache {
     /// Point one table entry at a new address.
     fn write_table_entry(&self, tkey: usize, e: u32, addr: ffi::CUdeviceptr) -> Result<()> {
         match self.tables.get(&tkey) {
-            Some(t) => t.write_at(e as usize * 8, &[addr]),
+            Some(t) => self.upload(t, e as usize * 8, &[addr]),
             None => Err(Error::Cuda {
                 what: "expert table",
                 detail: "migrating an expert whose tensor has no table".to_string(),

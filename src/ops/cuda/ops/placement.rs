@@ -60,12 +60,37 @@ impl Cuda {
             Some(c) => c.observed_counts().to_vec(),
             None => return,
         };
-        if let Some(c) = self.experts.borrow_mut().as_mut() {
-            let r = c.migrate(budget, &counts);
-            c.migration_done();
-            if let Err(e) = r {
-                self.note(Err::<(), _>(e));
+        let r = match self.experts.borrow_mut().as_mut() {
+            Some(c) => {
+                let r = c.migrate(budget, &counts);
+                c.migration_done();
+                r
             }
+            None => return,
+        };
+        self.count_expert_uploads();
+        if let Err(e) = r {
+            self.note(Err::<(), _>(e));
+        }
+    }
+
+    /// Add the expert cache's host-to-device copies since the last call to the
+    /// crossing counters. Called after every cache operation that can copy.
+    ///
+    /// **Per copy, not per call.** The callers used to add one crossing for any
+    /// call that filled bytes, which undercounted a fetch — the bytes and four
+    /// eight-byte writes — and missed migration's table writes entirely.
+    /// SSD-TIER.md, "The first run through the CLI".
+    pub(super) fn count_expert_uploads(&self) {
+        let (calls, bytes) = match self.experts.borrow().as_ref() {
+            Some(c) => c.take_uploads(),
+            None => return,
+        };
+        if calls > 0 {
+            self.bump(|st| {
+                st.h2d_calls += calls;
+                st.h2d_bytes += bytes;
+            });
         }
     }
 
@@ -91,11 +116,15 @@ impl Cuda {
             Some(c) => c.observed_counts().to_vec(),
             None => return Ok(0),
         };
-        let mut cache = self.experts.borrow_mut();
-        let Some(c) = cache.as_mut() else { return Ok(0) };
-        let moved = c.migrate(usize::MAX, &counts)?;
-        c.migration_done();
-        Ok(moved)
+        let moved = {
+            let mut cache = self.experts.borrow_mut();
+            let Some(c) = cache.as_mut() else { return Ok(0) };
+            let moved = c.migrate(usize::MAX, &counts);
+            c.migration_done();
+            moved
+        };
+        self.count_expert_uploads();
+        moved
     }
 
     /// Bring the device-side read counters home and fold them into the stats.
@@ -223,22 +252,15 @@ impl Cuda {
                 });
             }
         };
-        let before = cache.stats().filled_bytes;
-        let ptr = cache.address_of(w.data.as_ptr() as usize, w.data)?;
-        let filled = cache.stats().filled_bytes - before;
+        let ptr = cache.address_of(w.data.as_ptr() as usize, w.data);
         drop(slot);
-        // A miss is a bus crossing and is counted as one; a hit moves nothing.
-        // Counted rather than derived for the reason `DeviceBuffer::from_slice`
-        // taught this session — an upload the counters cannot see reads as
-        // "3.9 MiB up" against an actual 3111, and this is the exact traffic
-        // the whole design is drawn against.
-        if filled > 0 {
-            self.bump(|st| {
-                st.h2d_calls += 1;
-                st.h2d_bytes += filled;
-            });
-        }
-        Ok(ptr)
+        // A miss is a bus crossing and is counted; a hit moves nothing. Counted
+        // rather than derived for the reason `DeviceBuffer::from_slice` taught
+        // this session — an upload the counters cannot see reads as "3.9 MiB
+        // up" against an actual 3111, and this is the exact traffic the whole
+        // design is drawn against.
+        self.count_expert_uploads();
+        ptr
     }
 
     /// The device pointer table for one `Experts` tensor.
@@ -272,16 +294,9 @@ impl Cuda {
                 });
             }
         };
-        let before = cache.stats().filled_bytes;
-        let ptr = cache.table(key, w.data, w.n_expert)?;
-        let filled = cache.stats().filled_bytes - before;
+        let ptr = cache.table(key, w.data, w.n_expert);
         drop(slot);
-        if filled > 0 {
-            self.bump(|st| {
-                st.h2d_calls += 1;
-                st.h2d_bytes += filled;
-            });
-        }
-        Ok(ptr)
+        self.count_expert_uploads();
+        ptr
     }
 }

@@ -5833,13 +5833,48 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
              {:<18} {:?}",
             st.slots, st.host_slots, st.evictions, "", text
         );
+        // The instruments that lied on the first CLI run (SSD-TIER.md, "The first
+        // run through the CLI"), held to what the run did.
+        let dev = gpu.stats();
+        println!(
+            "  {:<18} placed {} VRAM + {} host + {} cold of {}   {} fetched   {} cache uploads, {} up counted",
+            "",
+            st.distinct.saturating_sub(st.host_slots + st.cold_at_load),
+            st.host_slots,
+            st.cold_at_load,
+            st.distinct,
+            st.fetched,
+            st.up_calls,
+            dev.h2d_calls
+        );
+        assert!(
+            dev.h2d_calls >= st.up_calls,
+            "{label}: the crossing counter saw {} uploads but the expert cache issued {}",
+            dev.h2d_calls,
+            st.up_calls
+        );
         if caps.is_some() {
             assert!(
                 addressable < pool,
                 "{label}: {addressable} of {pool} slices addressable, so nothing is oversubscribed \
                  and the comparison would pass vacuously"
             );
+            assert_eq!(st.distinct, pool, "{label}: not every expert was seen when the tables were built");
+            assert_eq!(
+                st.distinct - st.host_slots - st.cold_at_load,
+                st.slots,
+                "{label}: VRAM placements do not match the slab's slots; cold experts miscounted"
+            );
+            // A fetch into a full slab is the bytes, plus a table entry and a
+            // residency flag for both the fetched expert and its victim.
+            assert!(
+                st.up_calls >= 5 * st.fetched,
+                "{label}: {} uploads counted for {} fetches, under five a fetch",
+                st.up_calls,
+                st.fetched
+            );
         } else {
+            assert_eq!(st.cold_at_load, 0, "{label}: the reference arm left experts cold");
             assert!(
                 addressable >= pool && st.evictions == 0,
                 "{label}: the reference arm is itself oversubscribed ({addressable} of {pool}, {} \

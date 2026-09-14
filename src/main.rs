@@ -914,9 +914,16 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             100.0 * e.host_read_rate(),
             e.evictions,
         );
+        // **By tier, and cold apart.** This printed `distinct` as the tensors
+        // placed, which counts cold experts too — "30720 tensors" with 7,060
+        // placed at 2 + 2 GiB — beside `filled_bytes`, which is VRAM only.
         eprintln!(
-            "         {:.2} GiB placed at load ({} tensors): {:.1}s h2d + {:.1}s pin + {:.1}s memcpy",
+            "         placed at load: {} in VRAM ({:.2} GiB), {} in the host tier, {} cold, of {} tensors
+         {:.1}s h2d + {:.1}s pin + {:.1}s memcpy",
+            e.distinct.saturating_sub(e.host_slots + e.cold_at_load),
             gib(e.filled_bytes),
+            e.host_slots,
+            e.cold_at_load,
             e.distinct,
             e.place_h2d_us as f64 / 1e6,
             e.place_pin_us as f64 / 1e6,
@@ -951,17 +958,37 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
                 e.fetch_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
             );
         }
-        // What a placement policy that knew the routing distribution in advance
-        // could have served from VRAM, against what first-touch arrival order
-        // actually served. See `ExpertCache::coverage`.
+        // What a *static* placement that knew the routing distribution in
+        // advance could have served from VRAM — the busiest slab-many experts,
+        // held for the whole run — against what this run served. See
+        // `ExpertCache::coverage`.
+        //
+        // **Only a bound while every expert is addressable.** Placement then
+        // only moves experts between tiers, and the busiest-N set is the best it
+        // can converge to. Oversubscribed, fetching changes what VRAM holds at
+        // every layer, so it beats any fixed placement: the 2 + 2 GiB CLI run
+        // printed an "oracle" 70.1% against 88.1% actual.
         if let Some((frac, reads)) = coverage {
-            eprintln!(
-                "         coverage {:.1}% of {} reads would come from VRAM under an oracle placement,
-         against {:.1}% under this one",
-                100.0 * frac,
-                reads,
-                100.0 * (1.0 - e.host_read_rate()),
-            );
+            if e.oversubscribed {
+                eprintln!(
+                    "         a static placement of the busiest {} experts would serve {:.1}% of {} reads
+         from VRAM, against {:.1}% here. Not a bound while oversubscribed: fetching
+         changes what VRAM holds at every layer, so it can beat any fixed placement.",
+                    e.slots,
+                    100.0 * frac,
+                    reads,
+                    100.0 * (1.0 - e.host_read_rate()),
+                );
+            } else {
+                eprintln!(
+                    "         coverage {:.1}% of {} reads would come from VRAM under an oracle placement
+         (the busiest {} experts, static), against {:.1}% under this one",
+                    100.0 * frac,
+                    reads,
+                    e.slots,
+                    100.0 * (1.0 - e.host_read_rate()),
+                );
+            }
         }
     }
 

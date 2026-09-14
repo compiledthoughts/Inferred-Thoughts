@@ -878,22 +878,17 @@ impl Cuda {
         let mut ids = vec![0i32; n];
         self.d2h(&mut ids, idd)?;
 
-        let mut fetched = 0u64;
-        {
+        let resolved = {
             let mut cache = self.experts.borrow_mut();
             let Some(c) = cache.as_mut() else { return Ok(()) };
-            for w in tensors {
-                fetched += c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &ids)?;
-            }
-        }
-        if fetched > 0 {
-            // A fetch is a bus crossing and is counted as one, as placement's are.
-            self.bump(|st| {
-                st.h2d_calls += 1;
-                st.h2d_bytes += fetched;
-            });
-        }
-        Ok(())
+            tensors
+                .iter()
+                .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &ids).map(|_| ()))
+        };
+        // Every copy a fetch issued — the bytes, and the table entry and flag of
+        // both the fetched expert and its victim — counted as it happened.
+        self.count_expert_uploads();
+        resolved
     }
 
     /// Resolve `n_used` chosen experts to addresses, from `table`.
