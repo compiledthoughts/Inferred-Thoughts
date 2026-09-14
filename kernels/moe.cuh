@@ -440,86 +440,10 @@ extern "C" __global__ void moe_gather_ptrs(int n_used, int base, int n_tok,
 // The sum is *not* order-free, so thread 0 walks the eight picks serially in
 // pick order, exactly as the host does. Eight additions on one thread is not
 // worth splitting.
-extern "C" __global__ void moe_topk(int n_expert, int n_used,
-                                    const float *__restrict__ all_probs,
-                                    int *__restrict__ all_ids,
-                                    float *__restrict__ all_weights) {
-    extern __shared__ unsigned char moe_topk_smem[];
-    float *sv = (float *)moe_topk_smem;
-    int *si = (int *)(sv + blockDim.x);
-
-    // One block per token. Selection is independent per row -- a token's
-    // experts depend only on its own probabilities -- so a prefill batch is
-    // just a wider grid, and decode is `gridDim.x == 1` of the same kernel.
-    const int tok = blockIdx.x;
-    const float *probs = all_probs + (size_t)tok * n_expert;
-    int *ids = all_ids + (size_t)tok * n_used;
-    float *weights = all_weights + (size_t)tok * n_used;
-    // `MAX` in `Cuda::moe_glu` and friends: the routed count this model uses is
-    // 8, and every kernel downstream carries no more.
-    __shared__ int picked[8];
-
-    const int t = threadIdx.x;
-
-    for (int r = 0; r < n_used; ++r) {
-        // This thread's best over the experts it owns, skipping ones already
-        // taken. Strided, so `n_expert` may exceed the block.
-        float bv = 0.0f;
-        int bi = -1;
-        for (int e = t; e < n_expert; e += blockDim.x) {
-            bool taken = false;
-            for (int k = 0; k < r; ++k) {
-                if (picked[k] == e) taken = true;
-            }
-            if (taken) continue;
-            const float v = probs[e];
-            // Strictly greater, so the lowest index survives a tie -- the rule
-            // `moe_token` gets from scanning ascending.
-            if (bi < 0 || v > bv) {
-                bv = v;
-                bi = e;
-            }
-        }
-        sv[t] = bv;
-        si[t] = bi;
-        __syncthreads();
-
-        for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-            if (t < s) {
-                // Take the other half only if it is a real candidate and either
-                // strictly larger, or an equal value at a lower index.
-                const bool other_ok = si[t + s] >= 0;
-                const bool mine_bad = si[t] < 0;
-                const bool better =
-                    other_ok && (mine_bad || sv[t + s] > sv[t] ||
-                                 (sv[t + s] == sv[t] && si[t + s] < si[t]));
-                if (better) {
-                    sv[t] = sv[t + s];
-                    si[t] = si[t + s];
-                }
-            }
-            __syncthreads();
-        }
-        if (t == 0) picked[r] = si[0];
-        __syncthreads();
-    }
-
-    if (t == 0) {
-        // Serial, in pick order, from zero -- `Iterator::sum` on the host folds
-        // left the same way, and this is the one part that would round
-        // differently if it were split.
-        float sum = 0.0f;
-        for (int r = 0; r < n_used; ++r) sum += probs[picked[r]];
-        // f16's smallest normal, guarding the division rather than the weights.
-        // A ternary rather than `fmaxf` so a NaN sum yields the clamp, which is
-        // what Rust's `f32::max` does.
-        const float denom = sum > 6.103515625e-5f ? sum : 6.103515625e-5f;
-        for (int r = 0; r < n_used; ++r) {
-            ids[r] = picked[r];
-            weights[r] = probs[picked[r]] / denom;
-        }
-    }
-}
+//
+// The kernel itself is `moe_topk` / `moe_topk_k10` in `moe_capacity.inc`,
+// included below with `add_scaled_rows`: the pick capacity is its only
+// difference (SSD-TIER.md D18).
 
 // the shared expert's sigmoid gate, and the write back into the layer's output
 // row.
@@ -572,18 +496,29 @@ extern "C" __global__ void moe_finish(int n, int n_used, int at,
 // zero. **Bit-identical to that loop**: the sum is walked serially and
 // ascending exactly as the oracle walks its picks -- parallel over `j`, which
 // the oracle already treats as independent, and serial over `e`, which it does
-// not.
-extern "C" __global__ void add_scaled_rows(int n, int n_rows, float s0, float s1,
-                                           float s2, float s3, float s4, float s5,
-                                           float s6, float s7,
-                                           const float *__restrict__ rows,
-                                           float *__restrict__ acc) {
-    const int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
-    const float sc[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
-    float a = 0.0f;
-    for (int e = 0; e < n_rows; ++e) a += sc[e] * rows[(size_t)e * n + j];
-    acc[j] = a;
-}
+// not. One scalar argument per pick, so its capacity is its signature.
+//
+// `moe_topk` and `add_scaled_rows`, once per pick capacity (SSD-TIER.md D18).
+// The capacity-8 pair keeps the original names, and is what the 35B launches.
+#define MOE_CAP 8
+#define MOE_TOPK_NAME moe_topk
+#define MOE_TOPK_SMEM moe_topk_smem
+#define ADD_SCALED_ROWS_NAME add_scaled_rows
+#include "moe_capacity.inc"
+#undef MOE_CAP
+#undef MOE_TOPK_NAME
+#undef MOE_TOPK_SMEM
+#undef ADD_SCALED_ROWS_NAME
+
+// Top-10: Qwen3.8-Flash-Next routes each token to 10 of 512 experts.
+#define MOE_CAP 10
+#define MOE_TOPK_NAME moe_topk_k10
+#define MOE_TOPK_SMEM moe_topk_k10_smem
+#define ADD_SCALED_ROWS_NAME add_scaled_rows_k10
+#include "moe_capacity.inc"
+#undef MOE_CAP
+#undef MOE_TOPK_NAME
+#undef MOE_TOPK_SMEM
+#undef ADD_SCALED_ROWS_NAME
 
 }  // extern "C"

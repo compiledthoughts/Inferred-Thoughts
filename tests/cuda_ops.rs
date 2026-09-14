@@ -1019,6 +1019,34 @@ fn host_topk(all: &[f32], n_expert: usize, n_used: usize) -> (Vec<i32>, Vec<f32>
     (ids, weights)
 }
 
+/// `add_scaled_rows` on the device equals the oracle's serial ascending sum, to the
+/// bit, at every row count up to both compiled capacities (SSD-TIER.md D18): 8 or
+/// fewer launch `add_scaled_rows`, 9 and 10 launch `add_scaled_rows_k10`, whose
+/// two extra scalar arguments are the only difference.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn add_scaled_rows_matches_the_oracle_at_both_capacities() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    const N: usize = 2048;
+    // Every buffer held for the whole test: the backend keys mirrors on host
+    // addresses.
+    let rows = noise(10 * N, 41);
+    let scales = noise(10, 42);
+    let mut accs: Vec<Vec<f32>> = (0..4).map(|_| vec![0.0f32; N]).collect();
+    let mut wants: Vec<Vec<f32>> = (0..4).map(|_| vec![0.0f32; N]).collect();
+    for (i, n_rows) in [3usize, 8, 9, 10].into_iter().enumerate() {
+        Naive.add_scaled_rows(&mut wants[i], &rows[..n_rows * N], &scales[..n_rows]);
+        gpu.begin_pass(1);
+        gpu.add_scaled_rows(&mut accs[i], &rows[..n_rows * N], &scales[..n_rows]);
+        gpu.host_needs(&mut accs[i]);
+        if let Some(e) = gpu.take_error() {
+            panic!("{n_rows} rows: driver error: {e}");
+        }
+        common::assert_bit_identical(&accs[i], &wants[i], &format!("add_scaled_rows, {n_rows} rows"));
+    }
+}
+
 /// `moe_topk` on the device reproduces the host selection exactly, including
 /// the tie rule and the weight normalization.
 ///
@@ -1112,8 +1140,9 @@ fn device_topk_reproduces_the_host_selection() {
     }
 
     // n_used other than 8, since the kernel loops over it and the shared
-    // `picked` array is sized for the maximum.
-    for n_used in [1usize, 2, 4, 8] {
+    // `picked` array is sized for the maximum. 9 and 10 launch `moe_topk_k10`
+    // (SSD-TIER.md D18), the same source compiled with room for 10.
+    for n_used in [1usize, 2, 4, 8, 9, 10] {
         let probs = {
             let mut p = noise(256, 99);
             for v in p.iter_mut() {
@@ -1128,6 +1157,30 @@ fn device_topk_reproduces_the_host_selection() {
             assert_eq!(g.to_bits(), w.to_bits(), "n_used {n_used}: weights differ");
         }
     }
+
+    // **Qwen3.8-Flash-Next's own shape: top-10 of 512**, batched, with a planted
+    // twelve-way tie for ten places. 512 experts span two 256-thread strides of the
+    // one block, so this is also the first test where the per-thread scan wraps.
+    let mut flash: Vec<f32> = Vec::new();
+    for seed in [7u64, 8, 9] {
+        let mut p = noise(512, seed);
+        for v in p.iter_mut() {
+            *v = v.abs() / 512.0;
+        }
+        flash.extend(p);
+    }
+    let mut tie = vec![0.0005f32; 512];
+    for e in [511usize, 256, 255, 0, 300, 301, 12, 400, 399, 128, 129, 480] {
+        tie[e] = 0.04;
+    }
+    flash.extend(tie);
+    let (want_ids, want_w) = host_topk(&flash, 512, 10);
+    let (got_ids, got_w) = gpu.moe_topk_readback(&flash, 512, 10).expect("moe_topk_k10");
+    assert_eq!(got_ids, want_ids, "top-10 of 512: ids differ");
+    for (i, (g, w)) in got_w.iter().zip(want_w.iter()).enumerate() {
+        assert_eq!(g.to_bits(), w.to_bits(), "top-10 of 512: weight {i}");
+    }
+    assert!(gpu.moe_topk_readback(&flash, 512, 11).is_err(), "11 picks must be refused, not launched");
 }
 
 /// What `attn_flash` costs as decode context grows, at the 35B's attention

@@ -21,6 +21,60 @@ const MOE_TOK: usize = 8;
 /// fill.
 const MOE_MMA_TOK: usize = 16;
 
+/// The pick capacity a routed-FFN kernel is compiled for (SSD-TIER.md D18).
+///
+/// Top-k itself is never a constant here: it arrives as `n_used`, from the file's
+/// `expert_used_count`. What was fixed at 8 is the room two kernels have for it —
+/// `moe_topk`'s shared `picked` array and `add_scaled_rows`'s one scalar argument
+/// per pick — so both are compiled once per capacity from `moe_capacity.inc`, and
+/// this chooses which to launch.
+///
+/// **The capacity-8 kernels keep their original names**, so a model routing to 8
+/// or fewer (the 35B's 8, the 0.2B test model's 4) launches the same source it did
+/// before; 9 or 10 (Qwen3.8-Flash-Next's 10) takes the `_k10` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopK {
+    K8,
+    K10,
+}
+
+impl TopK {
+    /// The smallest compiled capacity that holds `n_used` picks.
+    pub fn for_picks(n_used: usize) -> Result<Self> {
+        match n_used {
+            1..=8 => Ok(TopK::K8),
+            9..=10 => Ok(TopK::K10),
+            _ => Err(Error::Cuda {
+                what: "routed FFN",
+                detail: format!(
+                    "no kernel carries {n_used} picks per token; the compiled capacities are 8 and 10"
+                ),
+            }),
+        }
+    }
+
+    pub const fn capacity(self) -> usize {
+        match self {
+            TopK::K8 => 8,
+            TopK::K10 => 10,
+        }
+    }
+
+    const fn moe_topk(self) -> &'static str {
+        match self {
+            TopK::K8 => "moe_topk",
+            TopK::K10 => "moe_topk_k10",
+        }
+    }
+
+    const fn add_scaled_rows(self) -> &'static str {
+        match self {
+            TopK::K8 => "add_scaled_rows",
+            TopK::K10 => "add_scaled_rows_k10",
+        }
+    }
+}
+
 impl Cuda {
     /// Tiles the last grouped routed FFN cut its chunk into, or `None` if no
     /// grouped launch has happened.
@@ -133,7 +187,6 @@ impl Cuda {
         out: &mut [f32],
     ) -> Result<()> {
         const QK_K: usize = 256;
-        const MAX: usize = 8;
         if w.ty == GgmlType::Nvfp4 {
             return self.matmul_experts_nvfp4(w, route, x, out);
         }
@@ -148,12 +201,9 @@ impl Cuda {
             });
         }
         let n_used = route.n_used();
-        if n_used == 0 || n_used > MAX {
-            return Err(Error::Cuda {
-                what: "matmul_experts",
-                detail: format!("{n_used} experts per token; the kernel carries at most {MAX}"),
-            });
-        }
+        // Guard, not capacity: this kernel only divides by `n_used`. The bound is
+        // the routed FFN's as a whole (`TopK`).
+        TopK::for_picks(n_used)?;
 
         let n_super = w.n_in / QK_K;
         // Every (token, pick) pair gets a block on `y`. Decode is `n_tok == 1`
@@ -269,7 +319,6 @@ impl Cuda {
         out: &mut [f32],
     ) -> Result<()> {
         const QK_K: usize = 256;
-        const MAX: usize = 8;
         if gate.ty == GgmlType::Nvfp4 && up.ty == GgmlType::Nvfp4 {
             return self.moe_glu_nvfp4(gate, up, route, x, out);
         }
@@ -280,7 +329,8 @@ impl Cuda {
             });
         }
         let n_used = route.n_used();
-        if n_used == 0 || n_used > MAX || gate.n_in != up.n_in || gate.n_out != up.n_out {
+        TopK::for_picks(n_used)?;
+        if gate.n_in != up.n_in || gate.n_out != up.n_out {
             return Err(Error::Cuda {
                 what: "moe_glu",
                 detail: format!("{n_used} experts, gate {:?} vs up {:?}",
@@ -405,12 +455,13 @@ impl Cuda {
         let (n_used, n_tok) = (route.n_used(), route.n_tok());
         let n_pair = n_used * n_tok;
         let rows = x.len() / w.n_in;
-        if n_used == 0 || n_used > 8 || rows != n_pair {
+        TopK::for_picks(n_used)?;
+        if rows != n_pair {
             return Err(Error::Cuda {
                 what: "matmul_experts",
                 detail: format!(
                     "NVFP4 experts read one row per pair: {rows} rows for {n_pair} pairs, \
-                     {n_used} experts per token (at most 8)"
+                     {n_used} experts per token"
                 ),
             });
         }
@@ -466,9 +517,8 @@ impl Cuda {
     ) -> Result<()> {
         let (n_used, n_tok) = (route.n_used(), route.n_tok());
         let n_pair = n_used * n_tok;
-        if n_used == 0
-            || n_used > 8
-            || gate.n_in != up.n_in
+        TopK::for_picks(n_used)?;
+        if gate.n_in != up.n_in
             || gate.n_out != up.n_out
             || x.len() != n_tok * gate.n_in
         {
@@ -641,14 +691,10 @@ impl Cuda {
         logit: &[f32],
         logit_at: usize,
     ) -> Result<()> {
-        const MAX: usize = 8;
         let n_used = route.n_used();
-        if n_used == 0 || n_used > MAX {
-            return Err(Error::Cuda {
-                what: "moe_finish",
-                detail: format!("{n_used} rows; the kernel carries at most {MAX}"),
-            });
-        }
+        // Guard, not capacity: `moe_finish` reads the pick weights from device
+        // memory and loops to `n_used`.
+        TopK::for_picks(n_used)?;
         let rd = self.mirror_in(rows)?;
         let shd = self.mirror_in(shared)?;
         let ld = self.mirror_in(logit)?;
@@ -688,38 +734,27 @@ impl Cuda {
         rows: &[f32],
         scales: &[f32],
     ) -> Result<()> {
-        const MAX: usize = 8;
-        if scales.is_empty() || scales.len() > MAX {
-            return Err(Error::Cuda {
-                what: "add_scaled_rows",
-                detail: format!("{} rows; the kernel carries at most {MAX}", scales.len()),
-            });
-        }
+        // One scalar argument per row: the capacity is the kernel's signature.
+        let k = TopK::for_picks(scales.len())?;
         let n = acc.len();
         let rd = self.mirror_in(rows)?;
         // `mirror_out`, not `mirror_in`: every element of `acc` is written, so
         // whatever the host or a previous token left there is irrelevant.
         let ad = self.mirror_out(acc)?;
-        let mut s = [0.0f32; MAX];
+        let mut s = [0.0f32; 10];
         s[..scales.len()].copy_from_slice(scales);
-        let args = [
-            KArg::I32(n as i32),
-            KArg::I32(scales.len() as i32),
-            KArg::F32(s[0]),
-            KArg::F32(s[1]),
-            KArg::F32(s[2]),
-            KArg::F32(s[3]),
-            KArg::F32(s[4]),
-            KArg::F32(s[5]),
-            KArg::F32(s[6]),
-            KArg::F32(s[7]),
-            KArg::Ptr(rd),
-            KArg::Ptr(ad),
-        ];
-        self.note_shape("add_scaled_rows", n, 0);
-        // SAFETY: parameters match `add_scaled_rows`; `rows` holds
+        let mut args = Vec::with_capacity(4 + k.capacity());
+        args.push(KArg::I32(n as i32));
+        args.push(KArg::I32(scales.len() as i32));
+        args.extend(s[..k.capacity()].iter().map(|&v| KArg::F32(v)));
+        args.push(KArg::Ptr(rd));
+        args.push(KArg::Ptr(ad));
+        let name = k.add_scaled_rows();
+        self.note_shape(name, n, 0);
+        // SAFETY: parameters match `add_scaled_rows` / `add_scaled_rows_k10`: two
+        // ints, `k.capacity()` floats, two pointers. `rows` holds
         // `scales.len() * n` floats and one thread covers each output element.
-        unsafe { self.launch("add_scaled_rows", n.div_ceil(256) as u32, 256, &args)? };
+        unsafe { self.launch(name, n.div_ceil(256) as u32, 256, &args)? };
         Ok(())
     }
 
@@ -740,11 +775,11 @@ impl Cuda {
         n_expert: usize,
         n_used: usize,
     ) -> Result<(Vec<i32>, Vec<f32>)> {
-        const MAX: usize = 8;
-        if n_used == 0 || n_used > MAX || n_used > n_expert || n_expert == 0 {
+        let k = TopK::for_picks(n_used)?;
+        if n_used > n_expert || n_expert == 0 {
             return Err(Error::Cuda {
                 what: "moe_topk",
-                detail: format!("{n_used} of {n_expert} experts; the kernel carries at most {MAX}"),
+                detail: format!("{n_used} of {n_expert} experts"),
             });
         }
         let n_tok = probs.len() / n_expert;
@@ -764,9 +799,10 @@ impl Cuda {
             KArg::Ptr(idb.ptr),
             KArg::Ptr(wb.ptr),
         ];
-        // SAFETY: parameters match `moe_topk`; one block per token, each
-        // writing its own `n_used` ids and weights.
-        unsafe { self.launch_shared("moe_topk", n_tok as u32, block, shared, &args)? };
+        // SAFETY: parameters match `moe_topk` / `moe_topk_k10`; one block per
+        // token, each writing its own `n_used` ids and weights, `n_used` within
+        // the kernel's `picked` capacity by `TopK::for_picks`.
+        unsafe { self.launch_shared(k.moe_topk(), n_tok as u32, block, shared, &args)? };
         self.sync()?;
         let mut ids = vec![0i32; n_tok * n_used];
         let mut weights = vec![0.0f32; n_tok * n_used];
@@ -788,6 +824,9 @@ impl Cuda {
         if let Some(c) = self.experts.borrow_mut().as_mut() {
             c.clear_lease();
         }
+        // The file's `expert_used_count` decides the kernel: 8 or fewer picks
+        // launch `moe_topk`, as before; 9–10 launch `moe_topk_k10`.
+        let k = TopK::for_picks(n_used)?;
         let n_tok = probs.len() / n_expert.max(1);
         let pd = self.mirror_in(probs)?;
         let idd = self.pooled(slot::ROUTE_IDS, n_tok * n_used * 4)?;
@@ -800,10 +839,11 @@ impl Cuda {
             KArg::Ptr(idd),
             KArg::Ptr(wd),
         ];
-        // SAFETY: parameters match `moe_topk`; one block per token, each
-        // writing its own `n_used` ids and weights. Shared memory is one float
-        // and one int per thread, which is what the kernel declares.
-        unsafe { self.launch_shared("moe_topk", n_tok as u32, block, block * 8, &args) }
+        // SAFETY: parameters match `moe_topk` / `moe_topk_k10`; one block per
+        // token, each writing its own `n_used` ids and weights, within `picked`'s
+        // capacity. Shared memory is one float and one int per thread, which is
+        // what the kernel declares.
+        unsafe { self.launch_shared(k.moe_topk(), n_tok as u32, block, block * 8, &args) }
     }
 
     /// Put a host-chosen route's picks where the device gather expects them.
@@ -942,5 +982,32 @@ impl Cuda {
             )?
         };
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TopK;
+
+    /// The kernel a routed FFN launches follows the file's pick count: 8 or
+    /// fewer keep the original `moe_topk` and `add_scaled_rows`, which is what
+    /// keeps the 35B on the source it ran before; 9–10 take the `_k10` pair; and
+    /// anything a compiled kernel cannot hold is refused before a launch could
+    /// write past `picked`.
+    #[test]
+    fn the_pick_count_chooses_the_kernel_capacity() {
+        for n in 1..=8 {
+            let k = TopK::for_picks(n).expect("fits K8");
+            assert_eq!((k, k.capacity(), k.moe_topk(), k.add_scaled_rows()), (TopK::K8, 8, "moe_topk", "add_scaled_rows"));
+        }
+        for n in 9..=10 {
+            let k = TopK::for_picks(n).expect("fits K10");
+            assert_eq!(
+                (k, k.capacity(), k.moe_topk(), k.add_scaled_rows()),
+                (TopK::K10, 10, "moe_topk_k10", "add_scaled_rows_k10")
+            );
+        }
+        assert!(TopK::for_picks(0).is_err());
+        assert!(TopK::for_picks(11).is_err());
     }
 }
