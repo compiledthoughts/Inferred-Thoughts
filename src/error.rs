@@ -170,6 +170,12 @@ pub enum Error {
         detail: String,
     },
 
+    #[error("not implemented yet: {what} ({detail})")]
+    NotImplemented {
+        what: &'static str,
+        detail: String,
+    },
+
     #[error(
         "position {pos} exceeds the KV cache context of {n_ctx}; raise --ctx"
     )]

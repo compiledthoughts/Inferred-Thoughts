@@ -25,6 +25,11 @@ enum Command {
         /// Truncate arrays longer than this in human-readable output.
         #[arg(long, default_value_t = 16)]
         max_array: usize,
+
+        /// Also load the model: print the settings the loader read, and account
+        /// for every tensor. Fails loudly on anything the loader rejects.
+        #[arg(long)]
+        model: bool,
     },
 
     /// Generate text greedily, prefilling the prompt and decoding against a
@@ -285,7 +290,8 @@ fn main() -> ExitCode {
             path,
             json,
             max_array,
-        } => inspect(&path, json, max_array),
+            model,
+        } => inspect(&path, json, max_array, model),
         Command::Generate {
             model,
             prompt,
@@ -390,12 +396,36 @@ fn main() -> ExitCode {
     }
 }
 
-fn inspect(path: &str, json: bool, max_array: usize) -> inferred_thoughts::Result<()> {
+fn inspect(path: &str, json: bool, max_array: usize, model: bool) -> inferred_thoughts::Result<()> {
     let f = GgufFile::open(path)?;
     if json {
         print_json(&f);
     } else {
         print_human(&f, max_array);
+    }
+    if model {
+        let m = inferred_thoughts::Model::load(&f)?;
+        println!("\nmodel {} as loaded\n{}", m.arch(), m.describe());
+        println!(
+            "{} layers ({} with kv), {:.2} MiB of weights read per decode token",
+            m.n_layer(),
+            m.n_kv_layer(),
+            m.weight_bytes_per_pass() as f64 / 1048576.0,
+        );
+        if let inferred_thoughts::Model::Qwen4Exp(q) = &m {
+            let (on_purpose, unknown) = q.unmapped(&f);
+            println!(
+                "tensors: {} of {} mapped, {} unread on purpose ({:?}), {} unknown",
+                q.n_mapped(),
+                f.tensors.len(),
+                on_purpose.len(),
+                inferred_thoughts::model::qwen4exp::UNUSED_SUFFIXES,
+                unknown.len(),
+            );
+            for name in unknown.iter().take(20) {
+                println!("  unknown: {name}");
+            }
+        }
     }
     Ok(())
 }

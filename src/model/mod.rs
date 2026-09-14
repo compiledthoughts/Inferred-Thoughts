@@ -2,9 +2,11 @@
 
 pub mod qwen3;
 pub mod qwen35;
+pub mod qwen4exp;
 
 pub use qwen3::Qwen3;
 pub use qwen35::Qwen35;
+pub use qwen4exp::Qwen4Exp;
 
 use crate::cache::{KvCache, RecurrentState};
 use crate::error::{Error, Result};
@@ -31,6 +33,9 @@ use crate::quant::dequantize;
 pub enum Model<'a> {
     Qwen3(Qwen3<'a>),
     Qwen35(Qwen35<'a>),
+    /// Qwen3.8-Flash-Next. **Load only** until stage 2 step 3 (SSD-TIER.md,
+    /// "Stage 2 plan"); `forward` refuses it.
+    Qwen4Exp(Qwen4Exp<'a>),
 }
 
 impl<'a> Model<'a> {
@@ -47,9 +52,12 @@ impl<'a> Model<'a> {
             // identical, which is what `CLAUDE.md` meant by keeping the FFN
             // behind a seam so the MoE variant is a delta rather than a rewrite.
             "qwen35" | "qwen35moe" => Ok(Model::Qwen35(Qwen35::load(f)?)),
+            // Its own stack, not a `qwen35` variant: hyper-connections, PLE and the
+            // QSA indexer change the block itself (SSD-TIER.md D17).
+            "qwen4exp" => Ok(Model::Qwen4Exp(Qwen4Exp::load(f)?)),
             other => Err(Error::UnsupportedArchitecture {
                 arch: other.to_string(),
-                supported: "qwen3, qwen35, qwen35moe",
+                supported: "qwen3, qwen35, qwen35moe, qwen4exp (load only)",
             }),
         }
     }
@@ -59,6 +67,16 @@ impl<'a> Model<'a> {
             Model::Qwen3(_) => "qwen3",
             Model::Qwen35(m) if m.cfg.is_moe() => "qwen35moe",
             Model::Qwen35(_) => "qwen35",
+            Model::Qwen4Exp(_) => "qwen4exp",
+        }
+    }
+
+    /// The settings read from the file, for `inferred inspect --model`.
+    pub fn describe(&self) -> String {
+        match self {
+            Model::Qwen3(m) => format!("{:#?}", m.cfg),
+            Model::Qwen35(m) => format!("{:#?}", m.cfg),
+            Model::Qwen4Exp(m) => format!("{:#?}", m.cfg),
         }
     }
 
@@ -68,6 +86,7 @@ impl<'a> Model<'a> {
         match self {
             Model::Qwen3(m) => m.cfg.n_layer,
             Model::Qwen35(m) => m.cfg.n_main_layer(),
+            Model::Qwen4Exp(m) => m.cfg.n_layer,
         }
     }
 
@@ -75,6 +94,7 @@ impl<'a> Model<'a> {
         match self {
             Model::Qwen3(m) => m.cfg.n_vocab,
             Model::Qwen35(m) => m.cfg.n_vocab,
+            Model::Qwen4Exp(m) => m.cfg.n_vocab,
         }
     }
 
@@ -82,6 +102,7 @@ impl<'a> Model<'a> {
         match self {
             Model::Qwen3(m) => m.cfg.kv_dim(),
             Model::Qwen35(m) => m.cfg.kv_dim(),
+            Model::Qwen4Exp(m) => m.cfg.kv_dim(),
         }
     }
 
@@ -94,6 +115,7 @@ impl<'a> Model<'a> {
         match self {
             Model::Qwen3(m) => m.cfg.n_layer,
             Model::Qwen35(m) => m.n_kv_layer(),
+            Model::Qwen4Exp(m) => m.n_kv_layer(),
         }
     }
 
@@ -106,6 +128,8 @@ impl<'a> Model<'a> {
                 m.cfg.conv_state_len(),
                 m.cfg.ssm_state_len(),
             )),
+            // GDN state only; the PLE conv history joins it with the forward pass.
+            Model::Qwen4Exp(m) => Some((m.cfg.n_layer, m.cfg.conv_state_len(), m.cfg.ssm_state_len())),
         }
     }
 
@@ -113,6 +137,7 @@ impl<'a> Model<'a> {
         match self {
             Model::Qwen3(m) => m.weight_bytes_per_pass(),
             Model::Qwen35(m) => m.weight_bytes_per_pass(),
+            Model::Qwen4Exp(m) => m.weight_bytes_per_pass(),
         }
     }
 
@@ -141,6 +166,12 @@ impl<'a> Model<'a> {
                 })?;
                 m.forward(ops, tokens, start_pos, kv, rs, ctx)
             }
+            Model::Qwen4Exp(_) => Err(Error::NotImplemented {
+                what: "the qwen4exp forward pass",
+                detail: "this build loads and shape-checks the model only; the forward pass is \
+                         stage 2 step 3 (SSD-TIER.md, \"Stage 2 plan\")"
+                    .to_string(),
+            }),
         }
     }
 }
@@ -158,6 +189,12 @@ impl<'a> From<Qwen3<'a>> for Model<'a> {
 impl<'a> From<Qwen35<'a>> for Model<'a> {
     fn from(m: Qwen35<'a>) -> Self {
         Model::Qwen35(m)
+    }
+}
+
+impl<'a> From<Qwen4Exp<'a>> for Model<'a> {
+    fn from(m: Qwen4Exp<'a>) -> Self {
+        Model::Qwen4Exp(m)
     }
 }
 
@@ -296,6 +333,22 @@ pub(crate) fn row_matrix<'a>(f: &'a GgufFile, name: &str, n_in: usize) -> Result
         n_out: 1,
         pooled: false,
     })
+}
+
+/// A small 2-D tensor, `{a, b}` exactly, dequantized: conv kernels, which the
+/// ops index as plain floats. `qwen35.rs` keeps its own `conv_weights`; this is
+/// the same check for `qwen4exp`, added beside it rather than moved, so the
+/// 35B's file is untouched (SSD-TIER.md D17).
+pub(crate) fn dense_2d(f: &GgufFile, name: &str, a: usize, b: usize) -> Result<Vec<f32>> {
+    let info = tensor(f, name)?;
+    if info.dims != vec![a as u64, b as u64] {
+        return Err(Error::TensorShapeMismatch {
+            name: name.to_string(),
+            expected: vec![a as u64, b as u64],
+            got: info.dims.clone(),
+        });
+    }
+    dequantize(f.tensor_bytes(info), info.ty, a * b)
 }
 
 pub(crate) fn vector(f: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
