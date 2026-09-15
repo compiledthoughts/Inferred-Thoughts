@@ -824,6 +824,8 @@ impl Cuda {
         if let Some(c) = self.experts.borrow_mut().as_mut() {
             c.clear_lease();
         }
+        // `moe_topk` below rewrites the picks, so any read back before are stale.
+        self.route_gen.set(self.route_gen.get() + 1);
         // The file's `expert_used_count` decides the kernel: 8 or fewer picks
         // launch `moe_topk`, as before; 9–10 launch `moe_topk_k10`.
         let k = TopK::for_picks(n_used)?;
@@ -886,6 +888,8 @@ impl Cuda {
         let idd = self.pooled(slot::ROUTE_IDS, n * 4)?;
         // The kernel takes `int`; `Route` carries `usize`.
         let as_i32: Vec<i32> = ids.iter().map(|&e| e as i32).collect();
+        // A host route rewrites the picks every call; never trust an earlier readback.
+        self.route_gen.set(self.route_gen.get() + 1);
         self.h2d(idd, &as_i32)
     }
 
@@ -893,9 +897,19 @@ impl Cuda {
     /// tensors' tables, make every expert this layer picked from them resident.
     ///
     /// A no-op unless the expert cache is oversubscribed. When it is, this reads
-    /// the picks back from `slot::ROUTE_IDS` — synchronizing first, which also
-    /// guarantees no earlier kernel is still reading a slot about to be
-    /// overwritten — and has the cache fetch every cold pick into a VRAM slot.
+    /// the picks back from `slot::ROUTE_IDS` — synchronizing first — and has the
+    /// cache fetch every cold pick into a VRAM slot.
+    ///
+    /// **One readback per route, not per call.** A layer resolves twice against
+    /// the same route — gate and up in `moe_glu`, then down — and the second
+    /// reuses the first's picks when `route_gen` has not moved. Skipping its
+    /// synchronize is safe: the kernels still queued read only this layer's
+    /// picked experts, which are leased and so never a victim, and every upload
+    /// into a victim's slot is ordered after the queued work regardless.
+    ///
+    /// **The cache's writes go up together.** Table entries and residency flags
+    /// queue during the resolve and are applied by one copy and one
+    /// `apply_patches` launch after it, before the gather that reads the tables.
     ///
     /// Must run after [`Cuda::stage_route_ids`], so the slot holds this route's
     /// picks for both route kinds, and before the gather. Sized exactly as
@@ -914,24 +928,50 @@ impl Cuda {
 
         let n = n_tok * n_used;
         let idd = self.pooled(slot::ROUTE_IDS, n * 4)?;
-        let t = std::time::Instant::now();
-        self.sync()?;
-        let mut ids = vec![0i32; n];
-        self.d2h(&mut ids, idd)?;
-        let waited = t.elapsed().as_micros() as u64;
+        let route_now = self.route_gen.get();
+        let fresh = {
+            let picks = self.picks.borrow();
+            picks.0 == route_now && picks.1.len() == n
+        };
+        if !fresh {
+            let t = std::time::Instant::now();
+            self.sync()?;
+            let mut ids = vec![0i32; n];
+            self.d2h(&mut ids, idd)?;
+            let waited = t.elapsed().as_micros() as u64;
+            *self.picks.borrow_mut() = (route_now, ids);
+            if let Some(c) = self.experts.borrow_mut().as_mut() {
+                c.note_readback(waited);
+            }
+        }
 
-        let resolved = {
+        let (resolved, flushed) = {
+            let picks = self.picks.borrow();
             let mut cache = self.experts.borrow_mut();
             let Some(c) = cache.as_mut() else { return Ok(()) };
-            c.note_readback(waited);
-            tensors
+            c.defer_writes();
+            let resolved = tensors
                 .iter()
-                .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &ids).map(|_| ()))
+                .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &picks.1).map(|_| ()));
+            // Flushed even after a failed resolve, so the cache never stays deferring.
+            (resolved, c.flush_patches())
         };
-        // Every copy a fetch issued — the bytes, and the table entry and flag of
-        // both the fetched expert and its victim — counted as it happened.
+        let applied = match flushed {
+            Ok(Some((list, n_patch))) => {
+                let args = [KArg::I32(n_patch as i32), KArg::Ptr(list)];
+                // SAFETY: parameters match `apply_patches`; one thread per patch,
+                // guarded against the tail. Each patch names a table entry or
+                // flag inside a live device allocation the cache owns, and the
+                // host dropped duplicate addresses, so no two threads write one.
+                unsafe { self.launch_shared("apply_patches", (n_patch as u32).div_ceil(256), 256, 0, &args) }
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        // Every copy a fetch issued — its bytes, and the one list its table entries
+        // and flags went up in — counted as it happened.
         self.count_expert_uploads();
-        resolved
+        resolved.and(applied)
     }
 
     /// Resolve `n_used` chosen experts to addresses, from `table`.

@@ -86,7 +86,7 @@
 //! While oversubscribed the picks are read back mid-pass, so graphs are off
 //! (D13) and migration is paused; both return in later steps.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void};
 
@@ -331,6 +331,10 @@ pub struct ExpertStats {
     pub fetch_writes_us: u64,
     pub readback_us: u64,
     pub readbacks: u64,
+    /// Table-entry and flag writes queued during resolves, and the flushes that
+    /// sent them: one copy and one `apply_patches` launch each.
+    pub patches: u64,
+    pub patch_flushes: u64,
 }
 
 impl ExpertStats {
@@ -497,6 +501,14 @@ pub(super) struct ExpertCache {
     pinned: Option<super::fetch::Pinned>,
     /// Read threads for a fetch; 1 keeps the serial path. `INFERRED_FETCH_THREADS`.
     fetch_threads: usize,
+    /// While set, table-entry and residency-flag writes queue in `patches`
+    /// instead of each being its own copy; [`ExpertCache::flush_patches`] sends
+    /// them up together. Set only for the length of a resolve.
+    deferring: Cell<bool>,
+    /// Queued writes: `[device address, value, width in bytes]`.
+    patches: RefCell<Vec<[u64; 3]>>,
+    /// Where a flush puts the queued writes for `apply_patches` to read.
+    patch_buf: Option<DeviceBuffer>,
     /// Host-to-device copies issued, and bytes: `Cell`s because table-entry and
     /// flag writes happen from `&self`. See [`ExpertStats::up_calls`].
     uploads: Cell<(u64, u64)>,
@@ -593,6 +605,9 @@ impl ExpertCache {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_FETCH_THREADS)
                 .max(1),
+            deferring: Cell::new(false),
+            patches: RefCell::new(Vec::new()),
+            patch_buf: None,
             uploads: Cell::new((0, 0)),
             uploads_reported: Cell::new((0, 0)),
             stats: ExpertStats {
@@ -760,6 +775,56 @@ impl ExpertCache {
         self.stats.cold_at_load += 1;
         self.cold.insert(key);
         self.sentinel_ptr()
+    }
+
+    /// Queue table-entry and residency-flag writes from here until
+    /// [`ExpertCache::flush_patches`], instead of issuing a copy for each.
+    pub fn defer_writes(&mut self) {
+        self.deferring.set(true);
+    }
+
+    /// Stop queueing, and send the queued writes to the device in one copy.
+    /// Returns where they went and how many there are, for `apply_patches`, or
+    /// `None` when nothing was queued.
+    ///
+    /// **Last write per address wins, as the serial writes did.** A resolve can
+    /// write one entry twice: gate's fetches can evict an `up` expert that `up`'s
+    /// resolve, later in the same call, fetches straight back. The kernel applies
+    /// patches concurrently, so duplicates are dropped here, keeping the last.
+    pub fn flush_patches(&mut self) -> Result<Option<(ffi::CUdeviceptr, usize)>> {
+        self.deferring.set(false);
+        let queued = std::mem::take(&mut *self.patches.borrow_mut());
+        if queued.is_empty() {
+            return Ok(None);
+        }
+        let t = std::time::Instant::now();
+        let mut last: HashMap<u64, usize> = HashMap::with_capacity(queued.len());
+        for (i, p) in queued.iter().enumerate() {
+            last.insert(p[0], i);
+        }
+        let flat: Vec<u64> = queued
+            .iter()
+            .enumerate()
+            .filter(|&(i, p)| last.get(&p[0]) == Some(&i))
+            .flat_map(|(_, p)| p.iter().copied())
+            .collect();
+        let n = flat.len() / 3;
+        if self.patch_buf.as_ref().is_none_or(|b| b.len_bytes() < flat.len() * 8) {
+            self.patch_buf = Some(DeviceBuffer::new((flat.len() * 8).next_power_of_two().max(4096))?);
+        }
+        let ptr = match self.patch_buf.as_ref() {
+            Some(b) => {
+                self.upload(b, 0, &flat)?;
+                b.ptr
+            }
+            None => {
+                return Err(Error::Cuda { what: "expert cache", detail: "the patch buffer vanished".to_string() });
+            }
+        };
+        self.stats.patches += queued.len() as u64;
+        self.stats.patch_flushes += 1;
+        self.stats.fetch_writes_us += t.elapsed().as_micros() as u64;
+        Ok(Some((ptr, n)))
     }
 
     /// Count one picks readback — its synchronize and download — at `us`.
@@ -1397,6 +1462,10 @@ impl ExpertCache {
     /// Mark a global expert index as VRAM-resident or not, for the counters.
     fn set_vram_flag(&self, idx: usize, resident: i32) -> Result<()> {
         match self.vram_flags.as_ref() {
+            Some(f) if self.deferring.get() => {
+                self.patches.borrow_mut().push([f.ptr + (idx * 4) as u64, resident as u32 as u64, 4]);
+                Ok(())
+            }
             Some(f) => self.upload(f, idx * 4, &[resident]),
             None => Ok(()),
         }
@@ -1405,6 +1474,10 @@ impl ExpertCache {
     /// Point one table entry at a new address.
     fn write_table_entry(&self, tkey: usize, e: u32, addr: ffi::CUdeviceptr) -> Result<()> {
         match self.tables.get(&tkey) {
+            Some(t) if self.deferring.get() => {
+                self.patches.borrow_mut().push([t.ptr + (e as usize * 8) as u64, addr, 8]);
+                Ok(())
+            }
             Some(t) => self.upload(t, e as usize * 8, &[addr]),
             None => Err(Error::Cuda {
                 what: "expert table",

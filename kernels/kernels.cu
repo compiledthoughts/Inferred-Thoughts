@@ -23,5 +23,6 @@
 #include "attention_decode.cuh"
 #include "gdn.cuh"
 #include "qwen4exp.cuh"
+#include "tier3.cuh"
 #include "f32.cuh"
 #include "diagnostics.cuh"

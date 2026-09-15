@@ -6077,12 +6077,22 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
                 "{label}: VRAM placements do not match the slab's slots; cold experts miscounted"
             );
             // A fetch into a full slab is the bytes, plus a table entry and a
-            // residency flag for both the fetched expert and its victim.
+            // residency flag for both the fetched expert and its victim. Those
+            // four writes queue during a resolve and go up as one list per flush
+            // (`tier3-speed`), so the copies are one a fetch plus one a flush,
+            // and the queued writes are still four a fetch.
             assert!(
-                st.up_calls >= 5 * st.fetched,
-                "{label}: {} uploads counted for {} fetches, under five a fetch",
-                st.up_calls,
+                st.patches >= 4 * st.fetched,
+                "{label}: {} table and flag writes queued for {} fetches, under four a fetch",
+                st.patches,
                 st.fetched
+            );
+            assert!(
+                st.up_calls >= st.fetched + st.patch_flushes,
+                "{label}: {} uploads counted for {} fetches and {} patch flushes",
+                st.up_calls,
+                st.fetched,
+                st.patch_flushes
             );
         } else {
             assert_eq!(st.cold_at_load, 0, "{label}: the reference arm left experts cold");

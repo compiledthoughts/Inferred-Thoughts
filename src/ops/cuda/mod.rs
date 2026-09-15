@@ -138,6 +138,14 @@ pub struct Cuda {
     /// the cache's default capacity.
     expert_pool: Cell<Option<usize>>,
 
+    /// Bumped whenever `slot::ROUTE_IDS` is written with a new route, so tier 3
+    /// can tell whether the picks it last read back are still the current ones.
+    route_gen: Cell<u64>,
+    /// The picks last read back from `slot::ROUTE_IDS`, and the `route_gen` they
+    /// were read at. A layer's `down` resolves against the same route as its
+    /// gate and up, and reuses these rather than synchronizing and reading again.
+    picks: RefCell<(u64, Vec<i32>)>,
+
     /// Page-locked host memory the expert cache's overflow tier may claim.
     ///
     /// The second tier is what makes every expert addressable without host
@@ -845,6 +853,8 @@ impl Cuda {
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 expert_cap: Cell::new(Some(experts::DEFAULT_SLAB_CAP)),
                 expert_pool: Cell::new(None),
+                route_gen: Cell::new(0),
+                picks: RefCell::new((u64::MAX, Vec::new())),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),
