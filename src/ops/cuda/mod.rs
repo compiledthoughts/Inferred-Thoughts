@@ -20,6 +20,7 @@
 
 pub mod experts;
 pub mod ffi;
+mod fetch;
 mod ops;
 
 use std::cell::{Cell, RefCell};

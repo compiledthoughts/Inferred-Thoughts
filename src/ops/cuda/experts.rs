@@ -490,6 +490,13 @@ pub(super) struct ExpertCache {
     sentinel: Option<DeviceBuffer>,
     /// The model file, opened on the first fetch.
     file: Option<std::fs::File>,
+    /// Threads that read a resolve's cold experts concurrently, started on the
+    /// first fetch. See `fetch`.
+    readers: Option<super::fetch::ReadPool>,
+    /// Page-locked staging for those reads, [`FETCH_CHUNK`] experts at a time.
+    pinned: Option<super::fetch::Pinned>,
+    /// Read threads for a fetch; 1 keeps the serial path. `INFERRED_FETCH_THREADS`.
+    fetch_threads: usize,
     /// Host-to-device copies issued, and bytes: `Cell`s because table-entry and
     /// flag writes happen from `&self`. See [`ExpertStats::up_calls`].
     uploads: Cell<(u64, u64)>,
@@ -511,6 +518,15 @@ pub(super) struct ExpertCache {
 /// `down` and all of layers 43–47 — and still produced llama.cpp's text.
 /// The refusal stays, so an overrun is a reported error rather than a blind layer.
 const DEFAULT_COUNTERS: usize = 65_536;
+
+/// Threads reading cold experts from the model file. `INFERRED_FETCH_THREADS=1`
+/// restores the serial reads timed at `7d7a3a2` (152.8 ms of a 315 ms 125B token).
+const DEFAULT_FETCH_THREADS: usize = 8;
+
+/// Experts read per batch, and so the page-locked staging a fetch holds: 32 x
+/// 0.88 MiB on the 125B. A decode layer boundary fetches a handful; a prefill
+/// resolve that needs more goes in batches.
+const FETCH_CHUNK: usize = 32;
 
 impl ExpertCache {
     /// Allocate a slab of `slots` slots of `stride` bytes, with `host_budget`
@@ -570,6 +586,13 @@ impl ExpertCache {
             home: HashMap::new(),
             sentinel: None,
             file: None,
+            readers: None,
+            pinned: None,
+            fetch_threads: std::env::var("INFERRED_FETCH_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_FETCH_THREADS)
+                .max(1),
             uploads: Cell::new((0, 0)),
             uploads_reported: Cell::new((0, 0)),
             stats: ExpertStats {
@@ -785,6 +808,22 @@ impl ExpertCache {
         }
 
         let mut fetched = 0u64;
+        if self.fetch_threads > 1 && self.source.is_some() {
+            let mut cold = Vec::new();
+            for &e in &picks {
+                let key = tkey + e * stride;
+                if self.cold.contains(&key) {
+                    cold.push(key);
+                } else if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
+                    self.referenced[slot as usize] = true;
+                }
+            }
+            for batch in cold.chunks(FETCH_CHUNK) {
+                self.fetch_batch(batch)?;
+                fetched += (batch.len() * stride) as u64;
+            }
+            return Ok(fetched);
+        }
         for &e in &picks {
             let key = tkey + e * stride;
             if !self.cold.contains(&key) {
@@ -809,6 +848,60 @@ impl ExpertCache {
             fetched += stride as u64;
         }
         Ok(fetched)
+    }
+
+    /// Fetch up to [`FETCH_CHUNK`] cold experts: read them all from the model file
+    /// at once, then publish each through [`ExpertCache::make_resident`] in order.
+    ///
+    /// Reading first changes no device state, so the ordering `resolve` relies on
+    /// is untouched: every pick is leased already, and each expert still evicts,
+    /// repoints its victim, uploads and repoints itself one at a time, in the same
+    /// sequence as the serial path — which is why the two give the same evictions.
+    fn fetch_batch(&mut self, keys: &[usize]) -> Result<()> {
+        let stride = self.stride;
+        let Some((path, base)) = self.source.clone() else {
+            return Err(Error::Cuda {
+                what: "expert fetch",
+                detail: "a parallel fetch needs the model file".to_string(),
+            });
+        };
+        if self.readers.is_none() {
+            let f = std::fs::File::open(&path).map_err(|err| Error::Cuda {
+                what: "expert fetch",
+                detail: format!("opening {}: {err}", path.display()),
+            })?;
+            self.readers = Some(super::fetch::ReadPool::new(f, self.fetch_threads)?);
+        }
+        if self.pinned.as_ref().is_none_or(|p| p.len() < FETCH_CHUNK * stride) {
+            self.pinned = Some(super::fetch::Pinned::new(FETCH_CHUNK * stride)?);
+        }
+        let mut pinned = self.pinned.take().ok_or_else(|| Error::Cuda {
+            what: "expert fetch",
+            detail: "the staging buffer vanished".to_string(),
+        })?;
+
+        let t = std::time::Instant::now();
+        let read = {
+            let mut reads: Vec<(u64, &mut [u8])> = pinned
+                .as_mut_slice()
+                .chunks_exact_mut(stride)
+                .zip(keys)
+                .map(|(dst, &key)| (key.saturating_sub(base) as u64, dst))
+                .collect();
+            match self.readers.as_ref() {
+                Some(pool) => pool.read_all(&mut reads),
+                None => Err(Error::Cuda { what: "expert fetch", detail: "no read pool".to_string() }),
+            }
+        };
+        self.stats.fetch_read_us += t.elapsed().as_micros() as u64;
+
+        let published = read.and_then(|()| {
+            keys.iter().enumerate().try_for_each(|(i, &key)| {
+                self.make_resident(key, &pinned.as_slice()[i * stride..(i + 1) * stride]).map(|_| ())
+            })
+        });
+        self.pinned = Some(pinned);
+        published
     }
 
     /// Put `bytes` — expert `key`'s — into a VRAM slot, evicting an unleased
