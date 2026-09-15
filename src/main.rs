@@ -1004,8 +1004,9 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
             let per = |us: u64| us as f64 / 1000.0 / tokens.max(1) as f64;
             let each = |us: u64, n: u64| if n == 0 { 0.0 } else { us as f64 / n as f64 };
             eprintln!(
-                "         fetch path, ms/token: read {:.1} ({:.0} us each) | upload {:.1} ({:.0} us) | \
+                "         fetch path ({}), ms/token: read {:.1} ({:.0} us each) | upload {:.1} ({:.0} us) | \
 small writes {:.1} | picks readback + sync {:.1} ({:.1} a token)",
+                if e.fetch_direct { "O_DIRECT" } else { "buffered" },
                 per(e.fetch_read_us),
                 each(e.fetch_read_us, e.fetched),
                 per(e.fetch_upload_us),

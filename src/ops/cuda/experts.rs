@@ -335,6 +335,10 @@ pub struct ExpertStats {
     /// sent them: one copy and one `apply_patches` launch each.
     pub patches: u64,
     pub patch_flushes: u64,
+    /// Whether the parallel reads run with `O_DIRECT`: asked for by default, and
+    /// false if refused — `INFERRED_FETCH_DIRECT=0`, a staging buffer that is not
+    /// page-aligned, or a file system that rejects the flag.
+    pub fetch_direct: bool,
 }
 
 impl ExpertStats {
@@ -501,6 +505,9 @@ pub(super) struct ExpertCache {
     pinned: Option<super::fetch::Pinned>,
     /// Read threads for a fetch; 1 keeps the serial path. `INFERRED_FETCH_THREADS`.
     fetch_threads: usize,
+    /// Whether the read pool asks for `O_DIRECT`; `INFERRED_FETCH_DIRECT=0` turns it
+    /// off. What the pool actually got is `ExpertStats::fetch_direct`.
+    fetch_direct: bool,
     /// While set, table-entry and residency-flag writes queue in `patches`
     /// instead of each being its own copy; [`ExpertCache::flush_patches`] sends
     /// them up together. Set only for the length of a resolve.
@@ -605,6 +612,7 @@ impl ExpertCache {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_FETCH_THREADS)
                 .max(1),
+            fetch_direct: std::env::var("INFERRED_FETCH_DIRECT").map_or(true, |v| v != "0"),
             deferring: Cell::new(false),
             patches: RefCell::new(Vec::new()),
             patch_buf: None,
@@ -923,6 +931,7 @@ impl ExpertCache {
     /// repoints its victim, uploads and repoints itself one at a time, in the same
     /// sequence as the serial path — which is why the two give the same evictions.
     fn fetch_batch(&mut self, keys: &[usize]) -> Result<()> {
+        use super::fetch::{DIRECT_ALIGN, Pinned, ReadPool};
         let stride = self.stride;
         let Some((path, base)) = self.source.clone() else {
             return Err(Error::Cuda {
@@ -930,28 +939,56 @@ impl ExpertCache {
                 detail: "a parallel fetch needs the model file".to_string(),
             });
         };
+        // One staging slot per expert. With `O_DIRECT` a read covers the expert's
+        // enclosing page-aligned range — at most `DIRECT_ALIGN - 1` bytes before it
+        // and the rest of its last page after — so a slot is that range's largest
+        // size, and the expert sits `pre` bytes into it (SSD-TIER.md D4).
+        let slot_for = |align: usize| (stride + align - 1).div_ceil(align) * align;
         if self.readers.is_none() {
-            let f = std::fs::File::open(&path).map_err(|err| Error::Cuda {
-                what: "expert fetch",
-                detail: format!("opening {}: {err}", path.display()),
-            })?;
-            self.readers = Some(super::fetch::ReadPool::new(f, self.fetch_threads)?);
+            let mut direct = self.fetch_direct;
+            let pinned = Pinned::new(FETCH_CHUNK * slot_for(DIRECT_ALIGN))?;
+            // Stage 0 found `cuMemHostAlloc` page-aligned; checked, not assumed.
+            if pinned.as_slice().as_ptr() as usize % DIRECT_ALIGN != 0 {
+                direct = false;
+            }
+            let file = match super::fetch::open(&path, direct) {
+                Ok(f) => f,
+                Err(_) if direct => {
+                    direct = false;
+                    super::fetch::open(&path, false).map_err(|err| Error::Cuda {
+                        what: "expert fetch",
+                        detail: format!("opening {}: {err}", path.display()),
+                    })?
+                }
+                Err(err) => {
+                    return Err(Error::Cuda { what: "expert fetch", detail: format!("opening {}: {err}", path.display()) });
+                }
+            };
+            self.fetch_direct = direct;
+            self.stats.fetch_direct = direct;
+            self.pinned = Some(pinned);
+            self.readers = Some(ReadPool::new(file, self.fetch_threads)?);
         }
-        if self.pinned.as_ref().is_none_or(|p| p.len() < FETCH_CHUNK * stride) {
-            self.pinned = Some(super::fetch::Pinned::new(FETCH_CHUNK * stride)?);
-        }
+        let align = if self.fetch_direct { DIRECT_ALIGN } else { 1 };
+        let slot = slot_for(align);
         let mut pinned = self.pinned.take().ok_or_else(|| Error::Cuda {
             what: "expert fetch",
             detail: "the staging buffer vanished".to_string(),
         })?;
 
+        // Where each expert starts in its slot.
+        let pres: Vec<usize> = keys.iter().map(|&key| key.saturating_sub(base) % align).collect();
         let t = std::time::Instant::now();
         let read = {
-            let mut reads: Vec<(u64, &mut [u8])> = pinned
+            let mut reads: Vec<(u64, &mut [u8], usize)> = pinned
                 .as_mut_slice()
-                .chunks_exact_mut(stride)
-                .zip(keys)
-                .map(|(dst, &key)| (key.saturating_sub(base) as u64, dst))
+                .chunks_exact_mut(slot)
+                .zip(keys.iter().zip(&pres))
+                .map(|(dst, (&key, &pre))| {
+                    let start = (key.saturating_sub(base) - pre) as u64;
+                    let len = (pre + stride).div_ceil(align) * align;
+                    (start, &mut dst[..len], pre + stride)
+                })
                 .collect();
             match self.readers.as_ref() {
                 Some(pool) => pool.read_all(&mut reads),
@@ -961,8 +998,9 @@ impl ExpertCache {
         self.stats.fetch_read_us += t.elapsed().as_micros() as u64;
 
         let published = read.and_then(|()| {
-            keys.iter().enumerate().try_for_each(|(i, &key)| {
-                self.make_resident(key, &pinned.as_slice()[i * stride..(i + 1) * stride]).map(|_| ())
+            keys.iter().zip(&pres).enumerate().try_for_each(|(i, (&key, &pre))| {
+                let at = i * slot + pre;
+                self.make_resident(key, &pinned.as_slice()[at..at + stride]).map(|_| ())
             })
         });
         self.pinned = Some(pinned);

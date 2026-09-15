@@ -22,6 +22,33 @@ use std::thread::JoinHandle;
 use super::{check, ffi};
 use crate::error::{Error, Result};
 
+/// `O_DIRECT` on Linux x86_64: `#define __O_DIRECT 040000` in glibc's
+/// `bits/fcntl-linux.h:88`, and `00040000` in the kernel's `asm-generic/fcntl.h:48`.
+/// The crate has no `libc` dependency for one flag.
+const O_DIRECT: i32 = 0o40000;
+
+/// What an `O_DIRECT` read must be aligned to: its buffer, its offset and its
+/// length, in whole 4 KiB pages. The disk under the WSL VHDX reports 512-byte
+/// logical and 4,096-byte physical blocks, so 4 KiB satisfies both — and is what
+/// stage 0 measured with (`scripts/ssd_fetch_rate.cu`, TIERS.md).
+pub(crate) const DIRECT_ALIGN: usize = 4096;
+
+/// Open the model file for tier-3 reads, with `O_DIRECT` when `direct`.
+///
+/// **Why `O_DIRECT`** (SSD-TIER.md D3): stage 0 on this drive read 4.7–4.9 GB/s
+/// with it at one thread against 1.18 GB/s buffered and cold, and 10.1 against 6.5
+/// at eight. It also keeps the fetches out of WSL's page cache, which filling
+/// with model pages is what hung the machine on 16-09.
+pub(crate) fn open(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if direct {
+        o.custom_flags(O_DIRECT);
+    }
+    o.open(path)
+}
+
 /// Page-locked host memory owned for its lifetime. Not device-mapped: nothing
 /// but a host-to-device copy ever reads it.
 pub(crate) struct Pinned {
@@ -36,10 +63,6 @@ impl Pinned {
         // `Drop` returns the allocation.
         unsafe { check(ffi::cuMemHostAlloc(&mut host, len, 0), "cuMemHostAlloc")? };
         Ok(Self { ptr: host as *mut u8, len })
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
@@ -64,12 +87,34 @@ impl Drop for Pinned {
     }
 }
 
-/// One read: `len` bytes of the file at `offset` into the memory at `dst`.
+/// One read: up to `len` bytes of the file at `offset` into the memory at `dst`,
+/// of which the first `need` must arrive. An aligned `O_DIRECT` read of the file's
+/// last expert can run past the end of the file, and gets a short read there.
 struct Job {
     offset: u64,
     dst: usize,
     len: usize,
+    need: usize,
     done: mpsc::Sender<std::io::Result<()>>,
+}
+
+/// Read from `offset` into `dst` until at least `need` bytes have arrived.
+fn read_at_least(file: &File, dst: &mut [u8], offset: u64, need: usize) -> std::io::Result<()> {
+    let mut got = 0usize;
+    while got < need {
+        match file.read_at(&mut dst[got..], offset + got as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("{got} of {need} bytes at offset {offset}"),
+                ));
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Threads that `pread` the model file on request.
@@ -102,7 +147,7 @@ impl ReadPool {
                         // it sent has reported, so the memory outlives this use and
                         // no other thread touches it meanwhile.
                         let dst = unsafe { std::slice::from_raw_parts_mut(job.dst as *mut u8, job.len) };
-                        let _ = job.done.send(file.read_exact_at(dst, job.offset));
+                        let _ = job.done.send(read_at_least(&file, dst, job.offset, job.need));
                     }
                 })
                 .map_err(|e| Error::Cuda { what: "expert fetch", detail: format!("starting a read thread: {e}") })?;
@@ -111,9 +156,10 @@ impl ReadPool {
         Ok(Self { jobs: Some(tx), workers })
     }
 
-    /// Fill every `(offset, dst)` from the file, concurrently. Returns once all
-    /// have finished, with the first error if any failed.
-    pub(crate) fn read_all(&self, reads: &mut [(u64, &mut [u8])]) -> Result<()> {
+    /// Fill every `(offset, dst, need)` from the file, concurrently: at least `need`
+    /// bytes into each `dst`. Returns once all have finished, with the first error
+    /// if any failed.
+    pub(crate) fn read_all(&self, reads: &mut [(u64, &mut [u8], usize)]) -> Result<()> {
         let jobs = self.jobs.as_ref().ok_or_else(|| Error::Cuda {
             what: "expert fetch",
             detail: "the read pool is shut down".to_string(),
@@ -121,8 +167,14 @@ impl ReadPool {
         let (done_tx, done_rx) = mpsc::channel();
         let mut sent = 0usize;
         let mut first: Option<String> = None;
-        for (offset, dst) in reads.iter_mut() {
-            let job = Job { offset: *offset, dst: dst.as_mut_ptr() as usize, len: dst.len(), done: done_tx.clone() };
+        for (offset, dst, need) in reads.iter_mut() {
+            let job = Job {
+                offset: *offset,
+                dst: dst.as_mut_ptr() as usize,
+                len: dst.len(),
+                need: *need,
+                done: done_tx.clone(),
+            };
             match jobs.send(job) {
                 Ok(()) => sent += 1,
                 Err(_) => {
