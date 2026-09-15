@@ -132,8 +132,297 @@ fn the_0_2b_test_model_reproduces_llama_cpps_greedy_text_on_naive() {
     let text = tk.decode(&produced, false).expect("decode");
     // `llama-completion -p 'According to all known laws' -n 40 --temp 0 --top-k 1`
     // on the CPU-only build at 3057bb66c, 15-09-2026.
-    let want = " of aviation, there is no way a bee should be able to fly. Its wings are too \
-                small to get its fat little body off the ground. The bee, of course, flies \
-                anyway because bees";
-    assert_eq!(text, want);
+    assert_eq!(text, LLAMA_CPP_40);
+}
+
+/// `llama-completion -p 'According to all known laws' -n 40 --temp 0 --top-k 1` on
+/// the CPU-only build at 3057bb66c, 15-09-2026, from the 0.2B NVFP4-expert copy.
+const LLAMA_CPP_40: &str = " of aviation, there is no way a bee should be able to fly. Its wings are \
+                            too small to get its fat little body off the ground. The bee, of course, \
+                            flies anyway because bees";
+
+/// Greedy, ties to the lower id.
+#[cfg(feature = "cuda")]
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > logits[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// **Step 4, part 2: with the `expf` ops on the CPU, the GPU reproduces the oracle
+/// bit for bit through the whole 0.2B** (`src/model/qwen4exp.md`, step 4).
+///
+/// Everything that is exact on the device runs there — every matmul (Q8_0, the F32
+/// router, the NVFP4 experts against a Q8_0 activation), the serial RMSNorm, RoPE,
+/// the gathers and adds, and qwen4exp's `mul_rows`, `mul_streams`, `row_dot` and
+/// `dilated_conv` with its history held on the device. Everything that calls
+/// `expf`, or is otherwise outside the exact set, runs on `Naive`: softmax and
+/// routing, every SiLU and sigmoid (fused or not), PLE's gate, the GDN conv and
+/// delta rule, attention and its KV writes.
+///
+/// Prefill and 16 decode passes, each pass's logits compared to the bit. A failure
+/// here is a kernel or residency defect, not rounding; if this passes and the
+/// full-GPU test fails, the cause is `expf` and FP4 activations.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
+    use inferred_thoughts::ops::{Attn, Delta, Experts, Ops, Route, Weights};
+    use inferred_thoughts::{Cuda, Engine, Naive};
+
+    /// The exact kernels on the GPU, the rest on the CPU. A bisection instrument,
+    /// not a backend: every GPU result is pulled home for the next CPU op, and
+    /// every CPU write is announced so a later GPU op re-uploads it.
+    ///
+    /// The second field is a host staging buffer for `moe_glu`, reserved once so its
+    /// address — which the device keys its mirror on — never changes.
+    struct ExactOnly<'a>(&'a Cuda, std::cell::RefCell<Vec<f32>>);
+    impl Ops for ExactOnly<'_> {
+        // ---- on the GPU, exact
+        fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
+            self.0.rms_norm(x, w, eps, out);
+            self.0.host_needs(out);
+        }
+        fn matmul(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) {
+            self.0.matmul(w, x, out);
+            self.0.host_needs(out);
+        }
+        fn matmul_pair(&self, a: &Weights<'_>, b: &Weights<'_>, x: &[f32], oa: &mut [f32], ob: &mut [f32]) {
+            self.0.matmul_pair(a, b, x, oa, ob);
+            self.0.host_needs(oa);
+            self.0.host_needs(ob);
+        }
+        fn matmul_experts(&self, w: &Experts<'_>, route: &Route, x: &[f32], out: &mut [f32]) {
+            self.0.matmul_experts(w, route, x, out);
+            self.0.host_needs(out);
+        }
+        fn rms_norm_heads(&self, x: &mut [f32], w: &[f32], head_dim: usize, eps: f32) {
+            self.0.rms_norm_heads(x, w, head_dim, eps);
+            self.0.host_needs(x);
+        }
+        fn l2_norm_heads(&self, x: &mut [f32], head_dim: usize, eps: f32) {
+            self.0.l2_norm_heads(x, head_dim, eps);
+            self.0.host_needs(x);
+        }
+        fn rope_neox(&self, x: &mut [f32], pos: usize, hd: usize, n_rot: usize, nh: usize, theta: f32) {
+            self.0.rope_neox(x, pos, hd, n_rot, nh, theta);
+            self.0.host_needs(x);
+        }
+        fn add_assign(&self, a: &mut [f32], b: &[f32]) {
+            self.0.add_assign(a, b);
+            self.0.host_needs(a);
+        }
+        fn scale(&self, buf: &mut [f32], s: f32) {
+            self.0.scale(buf, s);
+            self.0.host_needs(buf);
+        }
+        fn gather_chunks(&self, src: &[f32], chunk: usize, stride: usize, offset: usize, out: &mut [f32]) {
+            self.0.gather_chunks(src, chunk, stride, offset, out);
+            self.0.host_needs(out);
+        }
+        fn scatter_chunks(&self, src: &[f32], chunk: usize, stride: usize, offset: usize, dst: &mut [f32]) {
+            self.0.scatter_chunks(src, chunk, stride, offset, dst);
+            self.0.host_needs(dst);
+        }
+        fn mul_rows(&self, x: &mut [f32], w: &[f32]) {
+            self.0.mul_rows(x, w);
+            self.0.host_needs(x);
+        }
+        fn mul_streams(&self, out: &mut [f32], h: &[f32], w: &[f32], n_stream: usize) {
+            self.0.mul_streams(out, h, w, n_stream);
+            self.0.host_needs(out);
+        }
+        fn row_dot(&self, a: &[f32], b: &[f32], width: usize, out: &mut [f32]) {
+            self.0.row_dot(a, b, width, out);
+            self.0.host_needs(out);
+        }
+        fn dilated_conv(
+            &self,
+            state: &mut [f32],
+            x: &[f32],
+            weight: &[f32],
+            kernel: usize,
+            dilation: usize,
+            out: &mut [f32],
+        ) {
+            self.0.dilated_conv(state, x, weight, kernel, dilation, out);
+            self.0.host_needs(out);
+        }
+
+        // ---- on the CPU: expf, or outside the exact set
+        fn softmax(&self, x: &mut [f32], row: usize) {
+            Naive.softmax(x, row);
+            self.0.host_wrote(x);
+        }
+        fn silu_mul(&self, gate: &mut [f32], up: &[f32]) {
+            Naive.silu_mul(gate, up);
+            self.0.host_wrote(gate);
+        }
+        fn sigmoid_mul(&self, x: &mut [f32], g: &[f32]) {
+            Naive.sigmoid_mul(x, g);
+            self.0.host_wrote(x);
+        }
+        fn silu(&self, x: &mut [f32]) {
+            Naive.silu(x);
+            self.0.host_wrote(x);
+        }
+        fn sigmoid(&self, x: &mut [f32]) {
+            Naive.sigmoid(x);
+            self.0.host_wrote(x);
+        }
+        fn signed_sqrt_sigmoid(&self, s: &mut [f32]) {
+            Naive.signed_sqrt_sigmoid(s);
+            self.0.host_wrote(s);
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn moe_finish(
+            &self,
+            out: &mut [f32],
+            at: usize,
+            n: usize,
+            rows: &[f32],
+            route: &Route,
+            shared: &[f32],
+            logit: &[f32],
+            logit_at: usize,
+        ) {
+            Naive.moe_finish(out, at, n, rows, route, shared, logit, logit_at);
+            self.0.host_wrote(out);
+        }
+        fn ssm_conv(&self, state: &mut [f32], x: &[f32], weight: &[f32], kernel: usize, out: &mut [f32]) {
+            Naive.ssm_conv(state, x, weight, kernel, out);
+            self.0.host_wrote(out);
+        }
+        fn delta_rule(&self, d: &Delta<'_>, state: &mut [f32], out: &mut [f32]) {
+            Naive.delta_rule(d, state, out);
+            self.0.host_wrote(out);
+        }
+        fn kv_write(&self, slab: &mut [u16], offset: usize, src: &[f32]) {
+            Naive.kv_write(slab, offset, src);
+        }
+        fn attend(&self, a: &Attn<'_>, out: &mut [f32]) {
+            Naive.attend(a, out);
+            self.0.host_wrote(out);
+        }
+        /// The gated half split at its SiLU: gate and up as GPU matmuls, the SiLU on
+        /// the CPU. CUDA's NVFP4 `matmul_experts` takes only one row per (token,
+        /// pick) — gate and up normally go through its fused `moe_glu` — so each
+        /// token's row is repeated per pick here. Every output is still the same
+        /// weight row against the same activation values.
+        fn moe_glu(
+            &self,
+            gate: &Experts<'_>,
+            up: &Experts<'_>,
+            route: &Route,
+            x: &[f32],
+            out: &mut [f32],
+            scratch: &mut [f32],
+        ) {
+            let (n_used, n_in) = (route.n_used(), gate.n_in);
+            let mut rep = self.1.borrow_mut();
+            rep.clear();
+            for p in 0..(x.len() / n_in) * n_used {
+                let r = p / n_used;
+                rep.extend_from_slice(&x[r * n_in..(r + 1) * n_in]);
+            }
+            assert!(rep.capacity() == 1 << 20, "the staging buffer moved");
+            self.0.host_wrote(&rep);
+            self.matmul_experts(gate, route, &rep, out);
+            self.matmul_experts(up, route, &rep, scratch);
+            self.silu_mul(out, scratch);
+        }
+        // `route` keeps its trait default: chosen on the host from the CPU softmax.
+
+        // ---- residency, forwarded
+        fn host_wrote(&self, buf: &[f32]) {
+            self.0.host_wrote(buf)
+        }
+        fn host_needs(&self, buf: &mut [f32]) {
+            self.0.host_needs(buf)
+        }
+        fn begin_pass(&self, n_tokens: usize) {
+            self.0.begin_pass(n_tokens)
+        }
+        fn end_pass(&self) {
+            self.0.end_pass()
+        }
+        fn forget_state(&self) {
+            self.0.forget_state()
+        }
+    }
+
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("According to all known laws", true, true);
+    let steps = 16;
+    let n_ctx = tokens.len() + steps + 4;
+
+    // The oracle, and the tokens both runs are fed.
+    let (fed, cpu) = {
+        let mut e = Engine::new(Model::load(&f).expect("load"), Naive, n_ctx, false);
+        let mut all = vec![e.prefill(&tokens).expect("cpu prefill")];
+        let mut fed = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(all.last().expect("logits"));
+            fed.push(t);
+            all.push(e.decode(t).expect("cpu decode"));
+        }
+        (fed, all)
+    };
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.rms_serial(true);
+    gpu.nvfp4_fp4(false);
+    let mixed = {
+        let mut e = Engine::new(
+            Model::load(&f).expect("load"),
+            ExactOnly(&gpu, std::cell::RefCell::new(Vec::with_capacity(1 << 20))),
+            n_ctx,
+            false,
+        );
+        let mut all = vec![e.prefill(&tokens).expect("mixed prefill")];
+        for &t in &fed {
+            all.push(e.decode(t).expect("mixed decode"));
+        }
+        all
+    };
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+
+    for (pass, (a, b)) in cpu.iter().zip(&mixed).enumerate() {
+        let differing = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        let worst = a.iter().zip(b).fold(0.0f32, |m, (x, y)| m.max((x - y).abs()));
+        println!("  pass {pass:>2}: {differing} of {} logits differ, worst {worst:e}", a.len());
+        assert_eq!(
+            differing, 0,
+            "pass {pass}: the exact kernels are not exact through the whole model; worst {worst:e}"
+        );
+    }
+}
+
+/// **Step 4, part 3: the 0.2B on the GPU at its defaults reproduces llama.cpp's 40
+/// greedy tokens word for word** — FP4 x FP4 NVFP4 experts, tensor-core attention,
+/// tree RMSNorm, device routing and CUDA graphs on decode. The departures from the
+/// oracle are real (`expf`, FP4 activations); the text agreeing across 40 tokens is
+/// the evidence they stay below what changes a greedy choice here.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_test_model_reproduces_llama_cpps_greedy_text_on_the_gpu() {
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("According to all known laws", true, true);
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    let mut e = inferred_thoughts::Engine::new(Model::load(&f).expect("load"), &gpu, 64, false);
+    let (produced, _) = e.generate(&tokens, 40, None, |_| {}).expect("generate");
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+    println!("  graphs off for a mid-pass read: {}", gpu.graphs_off_for_mid_pass_read());
+    let text = tk.decode(&produced, false).expect("decode");
+    assert_eq!(text, LLAMA_CPP_40);
 }

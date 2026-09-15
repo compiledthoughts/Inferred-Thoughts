@@ -321,6 +321,164 @@ fn every_op_agrees_with_the_oracle() {
     assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
 }
 
+/// The error an elementwise op that calls `expf` is allowed, derived.
+///
+/// Everything but `expf` is the oracle's arithmetic in the oracle's order, so the
+/// only freedom is exp's own rounding: one f32 ulp, relative. A sigmoid `s` moves
+/// by `s(1-s)` per unit of relative change in `exp(-x)`, at most a quarter, so one
+/// ulp there is at most `EPSILON/4` of output; SiLU multiplies that by `|x|`. The
+/// final division rounds once more, one ulp of the output. So the gap is under
+/// `(|x|/4 + 1) * EPSILON` — under `2 * EPSILON * max(1, |x|)` — and this allows
+/// twice that. An indexing or ordering slip is orders of magnitude larger.
+fn expf_tolerance(input: &[f32]) -> f32 {
+    let magnitude = input.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    4.0 * f32::EPSILON * magnitude.max(1.0)
+}
+
+/// **qwen4exp's hyper-connection and PLE ops on the GPU, against their scalar
+/// trait defaults** (`src/model/qwen4exp.md`, step 4).
+///
+/// Four are exact and must be bit-identical: `mul_rows`, `mul_streams`, `row_dot`
+/// (an f64 serial sum, as `ggml_sum_rows`) and `dilated_conv`, output **and** the
+/// history it leaves behind. Three call `expf` and get [`expf_tolerance`]:
+/// `silu`, `sigmoid`, `signed_sqrt_sigmoid`.
+///
+/// Shapes are the 0.2B's (`n_embd` 256, four streams, `hc_dim` 1024) and the
+/// 125B's widths where a kernel loops over one (`row_dot` at 2560). The conv runs
+/// at PLE's kernel 4 and dilation 3 — a 9-sample history — at batch sizes on both
+/// sides of it, then carries its state across a second pass, which is what decode
+/// does. A second geometry (kernel 3, dilation 2) keeps the indexing honest.
+///
+/// Every weight is built once and held for the whole test: `resident` and
+/// `state_resident` key on host addresses, and a recycled address would hand a
+/// case the previous one's device copy.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_qwen4exp_ops_agree_with_the_oracle() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    let (nd, n_stream, n_tok) = (256usize, 4usize, 3usize);
+    let hc_dim = nd * n_stream;
+
+    // --- mul_rows ------------------------------------------------------
+    let w_rows = noise(hc_dim, 0x401);
+    {
+        let mut a = noise(n_tok * hc_dim, 0x402);
+        let mut b = a.clone();
+        Naive.mul_rows(&mut a, &w_rows);
+        gpu.begin_pass(n_tok);
+        gpu.mul_rows(&mut b, &w_rows);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        exact("mul_rows", &a, &b);
+    }
+
+    // --- silu, sigmoid -------------------------------------------------
+    // Wide inputs, so both tails and the middle of the curve are exercised.
+    {
+        let x: Vec<f32> = noise(4096, 0x403).iter().map(|v| v * 12.0).collect();
+        let (mut a, mut b) = (x.clone(), x.clone());
+        Naive.silu(&mut a);
+        gpu.begin_pass(1);
+        gpu.silu(&mut b);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        close("silu", &a, &b, expf_tolerance(&x));
+
+        let (mut a, mut b) = (x.clone(), x.clone());
+        Naive.sigmoid(&mut a);
+        gpu.begin_pass(1);
+        gpu.sigmoid(&mut b);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        close("sigmoid", &a, &b, expf_tolerance(&[1.0]));
+    }
+
+    // --- mul_streams ---------------------------------------------------
+    {
+        let h = noise(n_tok * nd, 0x404);
+        let w = noise(n_tok * n_stream, 0x405);
+        let (mut a, mut b) = (vec![0.0f32; n_tok * hc_dim], vec![0.0f32; n_tok * hc_dim]);
+        Naive.mul_streams(&mut a, &h, &w, n_stream);
+        gpu.begin_pass(n_tok);
+        gpu.mul_streams(&mut b, &h, &w, n_stream);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        exact("mul_streams", &a, &b);
+    }
+
+    // --- row_dot -------------------------------------------------------
+    for width in [nd, 2560] {
+        let rows = n_tok * n_stream;
+        let x = noise(rows * width, 0x406 + width as u64);
+        let y = noise(rows * width, 0x407 + width as u64);
+        let (mut a, mut b) = (vec![0.0f32; rows], vec![0.0f32; rows]);
+        Naive.row_dot(&x, &y, width, &mut a);
+        gpu.begin_pass(n_tok);
+        gpu.row_dot(&x, &y, width, &mut b);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        exact(&format!("row_dot {width}"), &a, &b);
+    }
+
+    // --- signed_sqrt_sigmoid -------------------------------------------
+    // Zeros of both signs, values under the 1e-6 clamp, and the range PLE's
+    // scaled dot products reach.
+    {
+        let mut s: Vec<f32> = noise(4096, 0x408).iter().map(|v| v * 40.0).collect();
+        s[..6].copy_from_slice(&[0.0, -0.0, 1e-9, -1e-9, 1e-6, -1e-6]);
+        let (mut a, mut b) = (s.clone(), s.clone());
+        Naive.signed_sqrt_sigmoid(&mut a);
+        gpu.begin_pass(1);
+        gpu.signed_sqrt_sigmoid(&mut b);
+        gpu.host_needs(&mut b);
+        gpu.end_pass();
+        close("signed_sqrt_sig", &a, &b, expf_tolerance(&[1.0]));
+    }
+
+    // --- dilated_conv --------------------------------------------------
+    let geometries = [(4usize, 3usize), (3, 2)];
+    let weights: Vec<Vec<f32>> =
+        geometries.iter().map(|&(k, d)| noise(hc_dim * k, 0x409 + (k * 10 + d) as u64)).collect();
+    for (g, &(kernel, dilation)) in geometries.iter().enumerate() {
+        let w = &weights[g];
+        let hist = (kernel - 1) * dilation;
+        for n in [1usize, 2, 5, hist, hist + 1, 17] {
+            let seed = noise(hc_dim * hist, 0x40a + n as u64);
+            let x1 = noise(n * hc_dim, 0x40b + n as u64);
+            let x2 = noise(hc_dim, 0x40c + n as u64);
+
+            // The oracle: this pass, then one decode step carrying the history.
+            let mut s_cpu = seed.clone();
+            let (mut o1_cpu, mut o2_cpu) = (vec![0.0f32; n * hc_dim], vec![0.0f32; hc_dim]);
+            Naive.dilated_conv(&mut s_cpu, &x1, w, kernel, dilation, &mut o1_cpu);
+            Naive.dilated_conv(&mut s_cpu, &x2, w, kernel, dilation, &mut o2_cpu);
+
+            let mut s_gpu = seed.clone();
+            let (mut o1_gpu, mut o2_gpu) = (vec![0.0f32; n * hc_dim], vec![0.0f32; hc_dim]);
+            gpu.forget_state();
+            gpu.begin_pass(n);
+            gpu.dilated_conv(&mut s_gpu, &x1, w, kernel, dilation, &mut o1_gpu);
+            gpu.host_needs(&mut o1_gpu);
+            gpu.end_pass();
+            gpu.begin_pass(1);
+            gpu.dilated_conv(&mut s_gpu, &x2, w, kernel, dilation, &mut o2_gpu);
+            gpu.host_needs(&mut o2_gpu);
+            gpu.end_pass();
+            gpu.read_state_into(&mut s_gpu).expect("read conv history");
+            assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+
+            let tag = format!("conv k{kernel} d{dilation} n{n}");
+            exact(&format!("{tag} out"), &o1_cpu, &o1_gpu);
+            exact(&format!("{tag} next"), &o2_cpu, &o2_gpu);
+            exact(&format!("{tag} state"), &s_cpu, &s_gpu);
+        }
+    }
+
+    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+}
+
 /// The whole model, GPU against CPU.
 ///
 /// Deliberately **not** a bit-equality test, and deliberately not a loose one

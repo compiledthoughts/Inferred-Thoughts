@@ -22,5 +22,6 @@
 #include "attention_mma.cuh"
 #include "attention_decode.cuh"
 #include "gdn.cuh"
+#include "qwen4exp.cuh"
 #include "f32.cuh"
 #include "diagnostics.cuh"

@@ -44,6 +44,7 @@ mod matmul;
 mod moe;
 mod norm;
 mod placement;
+mod qwen4exp;
 mod residency;
 
 use super::{Cuda, experts};
@@ -141,13 +142,6 @@ impl Cuda {
     }
 }
 
-/// The error a qwen4exp-only op reports on this backend until it has a kernel.
-fn qwen4exp_op(op: &'static str) -> crate::error::Error {
-    crate::error::Error::NotImplemented {
-        what: "a qwen4exp op on CUDA",
-        detail: format!("`{op}` has no kernel yet; qwen4exp runs on the CPU backends until step 4 of src/model/qwen4exp.md"),
-    }
-}
 
 impl Ops for Cuda {
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
@@ -190,37 +184,37 @@ impl Ops for Cuda {
         self.note(self.scale_impl(buf, s));
     }
 
-    // qwen4exp's hyper-connection and PLE ops have no kernels yet (step 4 of
-    // src/model/qwen4exp.md). Refused rather than inherited: the trait defaults
-    // would compute on host copies the device may not hold.
-    fn mul_rows(&self, _x: &mut [f32], _w: &[f32]) {
-        self.note(Err(qwen4exp_op("mul_rows")));
+    // qwen4exp's hyper-connection and PLE ops (src/model/qwen4exp.md). Every one
+    // must be overridden here: the trait defaults would compute on host copies
+    // the device may not hold.
+    fn mul_rows(&self, x: &mut [f32], w: &[f32]) {
+        self.note(self.mul_rows_impl(x, w));
     }
-    fn silu(&self, _x: &mut [f32]) {
-        self.note(Err(qwen4exp_op("silu")));
+    fn silu(&self, x: &mut [f32]) {
+        self.note(self.activation_impl("silu_f32", x));
     }
-    fn sigmoid(&self, _x: &mut [f32]) {
-        self.note(Err(qwen4exp_op("sigmoid")));
+    fn sigmoid(&self, x: &mut [f32]) {
+        self.note(self.activation_impl("sigmoid_f32", x));
     }
-    fn mul_streams(&self, _out: &mut [f32], _h: &[f32], _w: &[f32], _n_stream: usize) {
-        self.note(Err(qwen4exp_op("mul_streams")));
+    fn mul_streams(&self, out: &mut [f32], h: &[f32], w: &[f32], n_stream: usize) {
+        self.note(self.mul_streams_impl(out, h, w, n_stream));
     }
-    fn row_dot(&self, _a: &[f32], _b: &[f32], _width: usize, _out: &mut [f32]) {
-        self.note(Err(qwen4exp_op("row_dot")));
+    fn row_dot(&self, a: &[f32], b: &[f32], width: usize, out: &mut [f32]) {
+        self.note(self.row_dot_impl(a, b, width, out));
     }
-    fn signed_sqrt_sigmoid(&self, _s: &mut [f32]) {
-        self.note(Err(qwen4exp_op("signed_sqrt_sigmoid")));
+    fn signed_sqrt_sigmoid(&self, s: &mut [f32]) {
+        self.note(self.signed_sqrt_sigmoid_impl(s));
     }
     fn dilated_conv(
         &self,
-        _state: &mut [f32],
-        _x: &[f32],
-        _weight: &[f32],
-        _kernel: usize,
-        _dilation: usize,
-        _out: &mut [f32],
+        state: &mut [f32],
+        x: &[f32],
+        weight: &[f32],
+        kernel: usize,
+        dilation: usize,
+        out: &mut [f32],
     ) {
-        self.note(Err(qwen4exp_op("dilated_conv")));
+        self.note(self.dilated_conv_impl(state, x, weight, kernel, dilation, out));
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {

@@ -1197,6 +1197,10 @@ impl<'a> Qwen4Exp<'a> {
                 st.prev.clear();
                 st.conv.clear();
                 st.conv.resize(c.hc_dim() * (p.conv_kernel - 1) * p.ngram_size, 0.0);
+                // A device backend owns the conv history once a kernel has written
+                // it, so zeroing the host copy is invisible to it without this —
+                // the same reason `Engine::reset` calls it for the GDN state.
+                ops.forget_state();
             } else if start_pos != st.next_pos {
                 return Err(Error::NotImplemented {
                     what: "PLE history across a rewind",
