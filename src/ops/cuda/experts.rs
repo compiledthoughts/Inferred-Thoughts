@@ -205,6 +205,25 @@ fn release_pages(data: &[u8]) {
 /// overrides it when the budget is actually known.
 pub const DEFAULT_RESERVE: usize = 3 << 30;
 
+/// What a reserve holds beyond the model's permanent weights: activation mirrors,
+/// recurrent state and the driver's working set. Used by `Cuda::reserve_for_weights`,
+/// which raises the reserve to `dense weights + this` when that exceeds
+/// [`DEFAULT_RESERVE`].
+///
+/// **Derived so the 35B is untouched.** `DEFAULT_RESERVE` was set on the 35B, whose
+/// dense weights are 1.31 GiB (IQ4_XS) and 1.68 GiB (NVFP4) by
+/// `Model::dense_weight_bytes`; 3 − 1.68 = 1.32 GiB, rounded down, so both files
+/// still get exactly `DEFAULT_RESERVE`. The 125B's 4.44 GiB of dense weights take
+/// its reserve to 5.69 GiB — the case `DEFAULT_RESERVE` never covered, since the
+/// slab is sized inside block 0, before the later blocks upload theirs.
+pub const NON_WEIGHT_RESERVE: usize = 5 << 28;
+
+/// The automatic expert slab's ceiling, in bytes: 12 GiB (15-09-2026, the user's
+/// call). An explicit `--expert-cache` is not capped by it. On this card the 35B's
+/// automatic slab is ~11.7 GiB, under the cap; the 125B's is bounded by its
+/// reserve well before it.
+pub const DEFAULT_SLAB_CAP: usize = 12 << 30;
+
 /// Page-locked host memory the overflow tier may claim, in bytes.
 ///
 /// **The premise below is false and this constant has not been re-derived.**

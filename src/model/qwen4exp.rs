@@ -935,11 +935,25 @@ impl<'a> Qwen4Exp<'a> {
     /// dense weights, `n_expert_used / n_expert` of each expert tensor, and one
     /// PLE row per hash head.
     pub fn weight_bytes_per_pass(&self) -> u64 {
+        self.weight_bytes(true)
+    }
+
+    /// Bytes of the weights a device holds whole: everything a pass reads except
+    /// the routed experts (the expert cache's tiers) and the PLE rows (read from
+    /// the file on the host). What the expert slab has to leave room for.
+    pub fn dense_weight_bytes(&self) -> u64 {
+        self.weight_bytes(false)
+    }
+
+    /// The matmul weights; with `routed`, also the used share of each expert
+    /// tensor and one PLE row per hash head.
+    fn weight_bytes(&self, routed: bool) -> u64 {
         let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
-        let e = |x: &Experts<'_>| x.data.len() as u64 * self.cfg.moe.n_expert_used as u64 / self.cfg.moe.n_expert as u64;
+        let n_used = if routed { self.cfg.moe.n_expert_used as u64 } else { 0 };
+        let e = |x: &Experts<'_>| x.data.len() as u64 * n_used / self.cfg.moe.n_expert as u64;
         let hc = |h: &Hc<'_>| w(&h.down) + w(&h.up) + h.inject.as_ref().map_or(0, w);
         let mut total = w(&self.output) + hc(&self.head_hc);
-        if let (Some(t), Some(p)) = (&self.ple_table, &self.cfg.ple) {
+        if let (true, Some(t), Some(p)) = (routed, &self.ple_table, &self.cfg.ple) {
             total += t.ty.n_bytes(t.n_in as u64) * p.n_heads() as u64;
         }
         for l in &self.layers {

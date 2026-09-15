@@ -878,9 +878,20 @@ impl<'a> Qwen35<'a> {
     /// [`crate::profile`]. Recurrent state is excluded because it is not a
     /// weight; the KV cache is accounted separately.
     pub fn weight_bytes_per_pass(&self) -> u64 {
-        let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
         // 8 of 256 on the routed variant; irrelevant on the dense one.
-        let n_used = self.cfg.moe.map_or(0, |m| m.n_expert_used);
+        self.weight_bytes(self.cfg.moe.map_or(0, |m| m.n_expert_used))
+    }
+
+    /// Bytes of the weights a device holds whole: everything a pass reads except
+    /// the routed experts, which live in the expert cache's tiers. What the expert
+    /// slab has to leave room for.
+    pub fn dense_weight_bytes(&self) -> u64 {
+        self.weight_bytes(0)
+    }
+
+    /// The matmul weights, with `n_used` experts' worth of each routed tensor.
+    fn weight_bytes(&self, n_used: usize) -> u64 {
+        let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
         let per_layer: u64 = self
             .layers
             .iter()

@@ -128,6 +128,10 @@ pub struct Cuda {
     /// caller knows the context length.
     expert_reserve: Cell<usize>,
 
+    /// The automatic slab's ceiling, [`experts::DEFAULT_SLAB_CAP`]; `None` once an
+    /// explicit budget is set, which is then the reserve's job alone.
+    expert_cap: Cell<Option<usize>>,
+
     /// Page-locked host memory the expert cache's overflow tier may claim.
     ///
     /// The second tier is what makes every expert addressable without host
@@ -833,6 +837,7 @@ impl Cuda {
                 launches: RefCell::new(HashMap::new()),
                 record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
+                expert_cap: Cell::new(Some(experts::DEFAULT_SLAB_CAP)),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),

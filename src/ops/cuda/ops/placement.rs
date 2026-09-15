@@ -163,8 +163,40 @@ impl Cuda {
         // Expressed as a reserve because that is what the sizing code has to
         // work with: total free VRAM minus what everything else will need.
         let (free, _) = self.mem_info().unwrap_or((0, 0));
-        self.expert_reserve
-            .set(if bytes == 0 { experts::DEFAULT_RESERVE } else { free.saturating_sub(bytes) });
+        if bytes == 0 {
+            self.expert_reserve.set(experts::DEFAULT_RESERVE);
+            self.expert_cap.set(Some(experts::DEFAULT_SLAB_CAP));
+        } else {
+            self.expert_reserve.set(free.saturating_sub(bytes));
+            self.expert_cap.set(None);
+        }
+    }
+
+    /// Leave room for the model's permanent weights when sizing the automatic slab.
+    ///
+    /// **The hole this closes is the one `reserve_for_kv` closed for the cache.**
+    /// The slab is sized at the first pooled tensor, inside block 0, when almost
+    /// none of the permanent weights are up yet. `DEFAULT_RESERVE` covered the
+    /// 35B's 1.68 GiB of them; the 125B has 4.44 GiB, so a default slab took VRAM
+    /// its later blocks then failed to get. The reserve becomes the larger of
+    /// what it is and `dense + NON_WEIGHT_RESERVE`, which leaves both 35B files at
+    /// `DEFAULT_RESERVE` exactly.
+    ///
+    /// No effect after an explicit `set_expert_budget`, whose number is the
+    /// caller's. Call before `reserve_for_kv`, which adds to the result.
+    pub fn reserve_for_weights(&self, dense_bytes: usize) {
+        if self.expert_cap.get().is_none() {
+            return;
+        }
+        let want = dense_bytes.saturating_add(experts::NON_WEIGHT_RESERVE);
+        self.expert_reserve.set(self.expert_reserve.get().max(want));
+    }
+
+    /// Slab bytes from free VRAM at sizing time: free minus the reserve, under
+    /// the automatic cap when there is one.
+    fn slab_budget(&self, free: usize) -> usize {
+        let budget = free.saturating_sub(self.expert_reserve.get());
+        self.expert_cap.get().map_or(budget, |cap| budget.min(cap))
     }
 
     /// Cap the page-locked host tier behind the expert slab, in bytes.
@@ -237,8 +269,7 @@ impl Cuda {
             // means something once the permanent weights are on their way up.
             // Nothing before the first expert of layer 0 is large.
             let (free, _) = self.mem_info()?;
-            let reserve = self.expert_reserve.get();
-            let budget = free.saturating_sub(reserve);
+            let budget = self.slab_budget(free);
             let slots = budget / w.data.len().max(1);
             *slot =
                 Some(experts::ExpertCache::new(w.data.len(), slots, self.expert_host_budget.get())?);
@@ -273,7 +304,7 @@ impl Cuda {
         let mut slot = self.experts.borrow_mut();
         if slot.is_none() {
             let (free, _) = self.mem_info()?;
-            let budget = free.saturating_sub(self.expert_reserve.get());
+            let budget = self.slab_budget(free);
             let stride = w.stride();
             let mut c = experts::ExpertCache::new(
                 stride,

@@ -499,11 +499,12 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         format!("{} ({n_threads} threads)", o.backend)
     };
     eprintln!(
-        "model {} | {} | {} layers ({} with kv) | {} prompt tokens{} | ctx {} | {label}",
+        "model {} | {} | {} layers ({} with kv) | dense {:.2} GiB | {} prompt tokens{} | ctx {} | {label}",
         f.path.file_name().unwrap_or_default().to_string_lossy(),
         m.arch(),
         m.n_layer(),
         m.n_kv_layer(),
+        m.dense_weight_bytes() as f64 / 1073741824.0,
         tokens.len(),
         if o.chat { " (chat)" } else { "" },
         o.n_ctx,
@@ -524,6 +525,9 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         cuda.iq4_mma(!o.iq4_scalar);
         cuda.set_expert_budget((o.expert_cache * 1073741824.0) as usize);
         cuda.set_expert_host_budget((o.expert_host * 1073741824.0) as usize);
+        // The slab also sizes itself before most permanent weights are up; a model
+        // whose dense weights outgrow the default reserve says so here.
+        cuda.reserve_for_weights(m.dense_weight_bytes() as usize);
         // The KV cache is allocated lazily, at the first attention layer, which
         // is *after* the expert slab has sized itself from free VRAM. Told here
         // because this is the only place that knows the context length.
@@ -542,6 +546,12 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
             free as f64 / 1073741824.0,
             total as f64 / 1073741824.0,
         );
+        // The slab's sizing inputs, before it sizes itself: `serve` prints the same.
+        for (label, value) in inferred_thoughts::ops::Ops::config_report(&cuda) {
+            if label == "budgets" {
+                eprintln!("budgets {value}");
+            }
+        }
         // Borrowed, not moved, so the sticky error survives the engine. An op
         // that failed has produced meaningless output, so this is fatal.
         let cpu0 = inferred_thoughts::profile::cpu_time_ns();
@@ -1304,6 +1314,8 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         cuda.set_model_path(&f.path);
         cuda.set_map_base(f.map_base());
         cuda.report_per_turn(a.profile_device);
+        // As in `generate`: room for the permanent weights, then for the cache.
+        cuda.reserve_for_weights(m.dense_weight_bytes() as usize);
         // See the same call in `generate`: the KV slabs are allocated after the
         // expert slab has already sized itself from free VRAM, so the context
         // length has to be declared here or the slab takes VRAM the cache needs.

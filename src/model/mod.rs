@@ -141,6 +141,17 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Bytes of weight a device backend holds whole — every matmul weight except
+    /// the routed experts, which the expert cache tiers. qwen3 has no experts, so
+    /// that is all of a pass.
+    pub fn dense_weight_bytes(&self) -> u64 {
+        match self {
+            Model::Qwen3(m) => m.weight_bytes_per_pass(),
+            Model::Qwen35(m) => m.dense_weight_bytes(),
+            Model::Qwen4Exp(m) => m.dense_weight_bytes(),
+        }
+    }
+
     /// Run `tokens` from absolute position `start_pos` and return logits for
     /// the last one.
     ///

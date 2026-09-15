@@ -405,8 +405,11 @@ impl Ops for Cuda {
         out.push((
             "budgets",
             format!(
-                "expert reserve {:.1} GiB | host tier {:.1} GiB | qgroup {}",
+                "expert reserve {:.2} GiB | slab cap {} | host tier {:.1} GiB | qgroup {}",
                 self.expert_reserve.get() as f64 / 1073741824.0,
+                self.expert_cap
+                    .get()
+                    .map_or("explicit".to_string(), |c| format!("{:.1} GiB", c as f64 / 1073741824.0)),
                 self.expert_host_budget.get() as f64 / 1073741824.0,
                 self.qgroup.get(),
             ),
