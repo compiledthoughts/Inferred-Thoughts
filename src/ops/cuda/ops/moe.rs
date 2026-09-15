@@ -914,13 +914,16 @@ impl Cuda {
 
         let n = n_tok * n_used;
         let idd = self.pooled(slot::ROUTE_IDS, n * 4)?;
+        let t = std::time::Instant::now();
         self.sync()?;
         let mut ids = vec![0i32; n];
         self.d2h(&mut ids, idd)?;
+        let waited = t.elapsed().as_micros() as u64;
 
         let resolved = {
             let mut cache = self.experts.borrow_mut();
             let Some(c) = cache.as_mut() else { return Ok(()) };
+            c.note_readback(waited);
             tensors
                 .iter()
                 .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &ids).map(|_| ()))

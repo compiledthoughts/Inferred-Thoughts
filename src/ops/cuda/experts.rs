@@ -315,6 +315,22 @@ pub struct ExpertStats {
     pub released_bytes: u64,
     /// Experts exchanged between the tiers since load.
     pub migrated: u64,
+    /// Microseconds of the tier-3 fetch path, split where the time goes: reading
+    /// cold experts from the file, uploading them into their slots, the small
+    /// table-entry and flag writes around each (the victim's two, the fetched
+    /// expert's two), and the picks readback that starts each resolve — its
+    /// synchronize and download. `readbacks` counts those. The synchronize also
+    /// waits out the kernels already queued ahead of it, so `readback_us` holds
+    /// GPU time too, not only the cost of the readback.
+    ///
+    /// **Measured before parallelizing the reads**, because the 125B's decode rate
+    /// tracked serial disk throughput and nothing said how much of a 300 ms token
+    /// the disk actually was.
+    pub fetch_read_us: u64,
+    pub fetch_upload_us: u64,
+    pub fetch_writes_us: u64,
+    pub readback_us: u64,
+    pub readbacks: u64,
 }
 
 impl ExpertStats {
@@ -723,6 +739,12 @@ impl ExpertCache {
         self.sentinel_ptr()
     }
 
+    /// Count one picks readback — its synchronize and download — at `us`.
+    pub fn note_readback(&mut self, us: u64) {
+        self.stats.readback_us += us;
+        self.stats.readbacks += 1;
+    }
+
     /// Whether any expert is cold. See [`ExpertStats::oversubscribed`].
     pub fn oversubscribed(&self) -> bool {
         self.stats.oversubscribed
@@ -775,7 +797,9 @@ impl ExpertCache {
             if stage.len() < stride {
                 stage.resize(stride, 0);
             }
+            let t = std::time::Instant::now();
             let read = self.read_expert(&mut stage[..stride], data, key, e);
+            self.stats.fetch_read_us += t.elapsed().as_micros() as u64;
             let placed = match read {
                 Ok(()) => self.make_resident(key, &stage[..stride]),
                 Err(err) => Err(err),
@@ -792,19 +816,25 @@ impl ExpertCache {
     fn make_resident(&mut self, key: usize, bytes: &[u8]) -> Result<ffi::CUdeviceptr> {
         let slot = self.evict_unleased()?;
         if let Some(victim) = self.owner[slot as usize].take() {
+            let t = std::time::Instant::now();
             self.make_cold(victim)?;
+            self.stats.fetch_writes_us += t.elapsed().as_micros() as u64;
         }
+        let t = std::time::Instant::now();
         self.upload(&self.slab, slot as usize * self.stride, bytes)?;
+        self.stats.fetch_upload_us += t.elapsed().as_micros() as u64;
         self.owner[slot as usize] = Some(key);
         self.referenced[slot as usize] = true;
         let addr = self.slot_ptr(slot);
         self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
         self.cold.remove(&key);
         if let Some(&(tkey, e)) = self.home.get(&key) {
+            let t = std::time::Instant::now();
             self.write_table_entry(tkey, e, addr)?;
             if let Some(&base) = self.bases.get(&tkey) {
                 self.set_vram_flag(base + e as usize, 1)?;
             }
+            self.stats.fetch_writes_us += t.elapsed().as_micros() as u64;
         }
         self.stats.fetched += 1;
         self.stats.fetch_bytes += bytes.len() as u64;
