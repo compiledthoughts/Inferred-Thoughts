@@ -141,6 +141,89 @@ const LLAMA_CPP_40: &str = " of aviation, there is no way a bee should be able t
                             too small to get its fat little body off the ground. The bee, of course, \
                             flies anyway because bees";
 
+/// Prefill `prompt[..split]`, checkpoint, continue with the rest; then return to
+/// the checkpoint, wander off down `detour`, return again, and replay the rest.
+/// Returns the logits of the first continuation and of the replay.
+///
+/// The detour is the point: without it a restore that forgot PLE's state would
+/// still find the window and conv history where the first continuation left
+/// them — wrong, but by coincidence only as wrong as a refusal. After a detour
+/// they hold another history entirely.
+fn replay_through_a_checkpoint<O: inferred_thoughts::ops::Ops>(
+    e: &mut inferred_thoughts::Engine<'_, O>,
+    prompt: &[u32],
+    split: usize,
+    detour: &[u32],
+) -> (Vec<f32>, Vec<f32>) {
+    e.prefill(&prompt[..split]).expect("prefill the prefix");
+    let cp = e.checkpoint().expect("qwen4exp has recurrent state, so a checkpoint must exist");
+    assert_eq!(cp.pos(), split, "a checkpoint stands at the position it was taken");
+    let first = e.prefill(&prompt[split..]).expect("continue");
+    e.restore(&cp).expect("restore for the detour");
+    e.prefill(detour).expect("the detour");
+    e.restore(&cp).expect("restore for the replay");
+    assert_eq!(e.pos(), split, "restoring returns the engine to the checkpoint's position");
+    let second = e.prefill(&prompt[split..]).expect("replay");
+    (first, second)
+}
+
+fn assert_same_bits(a: &[f32], b: &[f32], what: &str) {
+    let differing = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+    assert_eq!(differing, 0, "{what}: {differing} of {} logits differ", a.len());
+}
+
+/// **A checkpoint carries PLE's state: `serve` can return to one mid-conversation**
+/// (`src/model/qwen4exp.md`, PLE). On the `naive` oracle: the continuation replayed
+/// after a restore — past a detour — is bit-identical to the first, and a prefill
+/// split around the checkpoint equals one shot, since chunking is exact.
+///
+/// Before `PleSnapshot`, every restore here was refused ("PLE history across a
+/// rewind"), which is what limited `serve` to a single turn.
+#[test]
+#[ignore = "needs the 0.2B test model's NVFP4-expert GGUF; run with -- --ignored"]
+fn the_0_2b_restores_a_checkpoint_with_its_ple_state_on_naive() {
+    use inferred_thoughts::{Engine, Naive};
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let prompt = tk.encode("According to all known laws of aviation, there is no way a bee should be able", true, true);
+    let detour = tk.encode(" The quick brown fox jumps over", false, false);
+    let split = prompt.len() / 2;
+    assert!(split >= 4 && !detour.is_empty(), "prompt and detour too short to test anything");
+
+    let one_shot = {
+        let mut e = Engine::new(Model::load(&f).expect("load"), Naive, 64, false);
+        e.prefill(&prompt).expect("one-shot prefill")
+    };
+    let mut e = Engine::new(Model::load(&f).expect("load"), Naive, 64, false);
+    let (first, second) = replay_through_a_checkpoint(&mut e, &prompt, split, &detour);
+    assert_same_bits(&first, &one_shot, "a prefill split at the checkpoint against one shot");
+    assert_same_bits(&second, &first, "the continuation replayed after a restore");
+}
+
+/// **The same on CUDA**, where PLE's conv history lives on the device: the replay
+/// equals the first continuation only if the checkpoint read that history back
+/// (`Ops::read_state`) and the restore made the device reload it (`forget_state`).
+/// Either one missing restores into the detour's history, or a stale one.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_restores_a_checkpoint_with_its_ple_state_on_the_gpu() {
+    use inferred_thoughts::{Cuda, Engine};
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let prompt = tk.encode("According to all known laws of aviation, there is no way a bee should be able", true, true);
+    let detour = tk.encode(" The quick brown fox jumps over", false, false);
+    let split = prompt.len() / 2;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    let mut e = Engine::new(Model::load(&f).expect("load"), &gpu, 64, false);
+    let (first, second) = replay_through_a_checkpoint(&mut e, &prompt, split, &detour);
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+    assert_same_bits(&second, &first, "the continuation replayed after a restore, on the GPU");
+}
+
 /// Greedy, ties to the lower id.
 #[cfg(feature = "cuda")]
 fn argmax(logits: &[f32]) -> u32 {

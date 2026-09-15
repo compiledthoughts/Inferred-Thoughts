@@ -100,11 +100,15 @@ pub const DEFAULT_MAX_BATCH: usize = 512;
 /// llama.cpp's context checkpoints are the same mechanism for the same reason —
 /// they exist for recurrent and hybrid models, because a pure-attention model
 /// needs only a truncation.
+///
+/// **`qwen4exp` carries one more piece of state**, held by the model rather than
+/// in the recurrent slabs: PLE's n-gram window and conv history, in `ple`.
 #[derive(Clone)]
 pub struct Checkpoint {
     pos: usize,
     conv: Vec<f32>,
     ssm: Vec<f32>,
+    ple: Option<crate::model::qwen4exp::PleSnapshot>,
 }
 
 impl Checkpoint {
@@ -117,6 +121,7 @@ impl Checkpoint {
     /// Bytes held, so a caller can bound how many it keeps.
     pub fn bytes(&self) -> usize {
         (self.conv.len() + self.ssm.len()) * std::mem::size_of::<f32>()
+            + self.ple.as_ref().map_or(0, |p| p.bytes())
     }
 }
 
@@ -217,11 +222,12 @@ impl<'a, O: Ops> Engine<'a, O> {
             self.ops.read_state(r.ssm_mut(il));
         }
         let (conv, ssm) = r.slabs();
-        Some(Checkpoint {
-            pos: self.cache.len(),
-            conv: conv.to_vec(),
-            ssm: ssm.to_vec(),
-        })
+        let (conv, ssm) = (conv.to_vec(), ssm.to_vec());
+        let ple = match &self.model {
+            Model::Qwen4Exp(m) => m.ple_snapshot(&self.ops),
+            _ => None,
+        };
+        Some(Checkpoint { pos: self.cache.len(), conv, ssm, ple })
     }
 
     /// Return to a checkpoint: truncate the KV log and reload the state.
@@ -238,8 +244,11 @@ impl<'a, O: Ops> Engine<'a, O> {
         self.cache.commit(c.pos);
         if let Some(r) = self.recurrent.as_mut() {
             r.load(&c.conv, &c.ssm)?;
+            if let (Model::Qwen4Exp(m), Some(p)) = (&self.model, &c.ple) {
+                m.ple_restore(p)?;
+            }
             // The device owns the authoritative copy once it has touched it, so
-            // writing the host slab is invisible without this.
+            // writing the host slabs is invisible without this. After both halves.
             self.ops.forget_state();
         }
         Ok(())

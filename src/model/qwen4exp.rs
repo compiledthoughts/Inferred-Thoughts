@@ -711,11 +711,11 @@ pub struct Qwen4Exp<'a> {
 
 /// What PLE carries between passes of one sequence (`qwen4exp.md`, "PLE").
 ///
-/// **Held by the model, not by `RecurrentState`, for now**, and tied to the
-/// position it expects next: a pass at position 0 starts a new sequence, and a
-/// pass anywhere else must continue exactly where the last one ended, or it is
-/// refused. A rewind (`serve`'s prefix reuse) would need the window and the conv
-/// history checkpointed, as pulsar found; that is not built.
+/// **Held by the model, not by `RecurrentState`**, and tied to the position it
+/// expects next: a pass at position 0 starts a new sequence, and a pass anywhere
+/// else must continue exactly where the last one ended, or it is refused. A rewind
+/// — `serve` returning to a checkpoint — goes through [`PleSnapshot`], which the
+/// engine's checkpoints carry beside the GatedDeltaNet state.
 #[derive(Default)]
 struct PleState {
     next_pos: usize,
@@ -723,6 +723,26 @@ struct PleState {
     prev: Vec<u32>,
     /// `[hc_dim][(conv_kernel - 1) * ngram_size]`, oldest first; zero at a sequence start.
     conv: Vec<f32>,
+}
+
+/// A copy of PLE's per-sequence state at one position, for a checkpoint.
+///
+/// **Without it `serve` could answer one turn and no more**: a new request whose
+/// history differs from what was cached returns to a checkpoint, and PLE refused
+/// every pass that did not continue exactly where the last ended. pulsar reports
+/// the same gap (`qwen4exp.md`, "Other implementations").
+#[derive(Clone, Debug)]
+pub struct PleSnapshot {
+    next_pos: usize,
+    prev: Vec<u32>,
+    conv: Vec<f32>,
+}
+
+impl PleSnapshot {
+    /// Bytes held, for a caller bounding how many checkpoints it keeps.
+    pub fn bytes(&self) -> usize {
+        self.prev.len() * std::mem::size_of::<u32>() + self.conv.len() * std::mem::size_of::<f32>()
+    }
 }
 
 /// Records every tensor it maps, so load can prove nothing in the file went
@@ -905,6 +925,41 @@ impl<'a> Qwen4Exp<'a> {
 
     pub fn n_kv_layer(&self) -> usize {
         self.cfg.n_kv_layer()
+    }
+
+    /// PLE's state as it stands, for a checkpoint; `None` for a model without PLE.
+    ///
+    /// **The conv history is read back from the device first.** A device backend
+    /// owns it once `dilated_conv` has written it and never sends it home on the
+    /// forward path, so without the read a checkpoint would save a stale host copy
+    /// and restore "successfully" into a history the sequence never had.
+    pub fn ple_snapshot<O: Ops>(&self, ops: &O) -> Option<PleSnapshot> {
+        self.cfg.ple.as_ref()?;
+        let mut st = self.ple_state.borrow_mut();
+        if !st.conv.is_empty() {
+            ops.read_state(&mut st.conv);
+        }
+        Some(PleSnapshot { next_pos: st.next_pos, prev: st.prev.clone(), conv: st.conv.clone() })
+    }
+
+    /// Put PLE's state back as a checkpoint held it. The caller must tell the
+    /// backend the host copy is authoritative again (`Ops::forget_state`).
+    pub fn ple_restore(&self, s: &PleSnapshot) -> Result<()> {
+        let mut st = self.ple_state.borrow_mut();
+        if st.conv.len() == s.conv.len() {
+            // In place, so the conv history keeps the address its device copy is keyed on.
+            st.conv.copy_from_slice(&s.conv);
+        } else if st.conv.is_empty() {
+            st.conv = s.conv.clone();
+        } else {
+            return Err(Error::InconsistentArchitecture {
+                what: "PLE checkpoint",
+                detail: format!("holds {} conv floats, this model's history is {}", s.conv.len(), st.conv.len()),
+            });
+        }
+        st.prev = s.prev.clone();
+        st.next_pos = s.next_pos;
+        Ok(())
     }
 
     /// Tensors this loader mapped.
