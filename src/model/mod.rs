@@ -152,6 +152,15 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Width of the indexer keys each attention layer caches per position for
+    /// sparse attention; 0 for a model that has none.
+    pub fn index_dim(&self) -> usize {
+        match self {
+            Model::Qwen4Exp(m) if m.cfg.compress_ratios.iter().any(|&r| r > 0) => m.cfg.indexer.head_dim,
+            _ => 0,
+        }
+    }
+
     /// Experts across every routed expert tensor, which a device backend's expert
     /// cache has to be able to count.
     pub fn expert_pool(&self) -> usize {

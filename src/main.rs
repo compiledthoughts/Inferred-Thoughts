@@ -1457,6 +1457,14 @@ fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Re
     // prints the whole batch. That difference matters when reading the dump and
     // is why the comparison script slices by the reference's own ne0.
     let mut cache = inferred_thoughts::KvCache::new(m.n_kv_layer(), m.kv_dim(), tokens.len());
+    // As `Engine::new`: a sparse-attention model caches indexer keys beside K and V.
+    if m.index_dim() > 0 {
+        cache = cache.with_index(m.index_dim());
+    }
+    // As `Engine::new`: a sparse-attention model caches indexer keys beside K and V.
+    if m.index_dim() > 0 {
+        cache = cache.with_index(m.index_dim());
+    }
     let mut recurrent = m
         .recurrent_dims()
         .map(|(n, conv, ssm)| inferred_thoughts::RecurrentState::new(n, conv, ssm));
@@ -1753,5 +1761,7 @@ fn json_string(s: &str) -> String {
 /// need.
 #[cfg(feature = "cuda")]
 fn kv_reserve_bytes(m: &inferred_thoughts::Model, n_ctx: usize) -> usize {
-    m.n_kv_layer().saturating_mul(n_ctx).saturating_mul(m.kv_dim()).saturating_mul(2 * 2)
+    // K and V, plus the indexer keys a sparse-attention model caches beside them.
+    let per_position = m.kv_dim().saturating_mul(2).saturating_add(m.index_dim());
+    m.n_kv_layer().saturating_mul(n_ctx).saturating_mul(per_position).saturating_mul(2)
 }

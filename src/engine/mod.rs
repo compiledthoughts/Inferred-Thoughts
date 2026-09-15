@@ -130,7 +130,10 @@ impl<'a, O: Ops> Engine<'a, O> {
         let model = model.into();
         // Slabs for the layers that actually attend, which on a hybrid
         // architecture is a fraction of them.
-        let cache = KvCache::new(model.n_kv_layer(), model.kv_dim(), n_ctx);
+        let mut cache = KvCache::new(model.n_kv_layer(), model.kv_dim(), n_ctx);
+        if model.index_dim() > 0 {
+            cache = cache.with_index(model.index_dim());
+        }
         let recurrent = model
             .recurrent_dims()
             .map(|(n, conv, ssm)| RecurrentState::new(n, conv, ssm));

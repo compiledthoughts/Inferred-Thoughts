@@ -38,6 +38,13 @@ pub struct KvCache {
     len: usize,
     k: Vec<u16>,
     v: Vec<u16>,
+    /// QSA's indexer keys, `[layer][position][idx_dim]` f16, for the layers that
+    /// attend; empty for a model without an indexer. Stored raw — before norm and
+    /// rope, since pooling precedes both — and at the cache's f16, as llama.cpp's
+    /// indexer cache takes the KV cache's `type_k` (`llama-memory-hybrid-idx.cpp:64`).
+    /// A log like K and V, so a rewind is a truncation here too.
+    idx_dim: usize,
+    idx: Vec<u16>,
 }
 
 impl KvCache {
@@ -50,7 +57,31 @@ impl KvCache {
             len: 0,
             k: vec![0; cells],
             v: vec![0; cells],
+            idx_dim: 0,
+            idx: Vec::new(),
         }
+    }
+
+    /// Add an indexer-key lane of `idx_dim` per position to every layer.
+    pub fn with_index(mut self, idx_dim: usize) -> Self {
+        self.idx_dim = idx_dim;
+        self.idx = vec![0; self.n_layer * self.n_ctx * idx_dim];
+        self
+    }
+
+    pub fn idx_dim(&self) -> usize {
+        self.idx_dim
+    }
+
+    /// One layer's indexer-key slab, `n_ctx * idx_dim` f16 bits, position-major.
+    pub fn idx_layer(&self, il: usize) -> &[u16] {
+        &self.idx[il * self.n_ctx * self.idx_dim..(il + 1) * self.n_ctx * self.idx_dim]
+    }
+
+    /// One layer's indexer-key slab, mutably. See [`KvCache::k_layer_mut`].
+    pub fn idx_layer_mut(&mut self, il: usize) -> &mut [u16] {
+        let (lo, hi) = (il * self.n_ctx * self.idx_dim, (il + 1) * self.n_ctx * self.idx_dim);
+        &mut self.idx[lo..hi]
     }
 
     pub fn n_ctx(&self) -> usize {
@@ -72,13 +103,13 @@ impl KvCache {
 
     /// Total resident bytes, both tensors, whether or not they are filled.
     pub fn capacity_bytes(&self) -> u64 {
-        (self.k.len() + self.v.len()) as u64 * 2
+        (self.k.len() + self.v.len() + self.idx.len()) as u64 * 2
     }
 
     /// Bytes one position occupies across all layers — what a decode step
     /// writes, and what each additional position adds to every later read.
     pub fn bytes_per_position(&self) -> u64 {
-        (self.n_layer * self.kv_dim * 2 * 2) as u64
+        (self.n_layer * (self.kv_dim * 2 + self.idx_dim) * 2) as u64
     }
 
     /// Forget everything. Buffers are kept so a second run does not reallocate.

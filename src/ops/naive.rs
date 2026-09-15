@@ -465,6 +465,59 @@ pub(crate) fn attend_kv_head(
     }
 }
 
+/// [`attend_kv_head`] over the listed `cells` only: QSA's sparse attention.
+///
+/// `cells` are the positions query row `t` attends to, ascending, every one below
+/// `a.n_pos_of(t)`. The arithmetic is [`attend_kv_head`]'s line for line with the
+/// position loop walking `cells` instead of `0..n_pos` — so **given every cell it
+/// performs the same operations in the same order and returns the same bits**,
+/// and a cell left out contributes exactly what `-inf` in the dense mask would:
+/// nothing. `tests::sparse_attention_over_every_cell_is_dense_attention`.
+pub(crate) fn attend_kv_head_cells(
+    a: &Attn<'_>,
+    t: usize,
+    h_kv: usize,
+    cells: &[u32],
+    out: &mut [f32],
+    sc: &mut Scratch,
+) {
+    sc.fit(a);
+    let (hd, group, n) = (a.head_dim, a.group(), cells.len());
+    let off = h_kv * hd;
+    let q_row = t * a.n_head * hd;
+    debug_assert_eq!(out.len(), group * hd);
+    debug_assert!(n <= a.n_pos_of(t));
+
+    for (j, &s) in cells.iter().enumerate() {
+        let key = &a.k[s as usize * a.kv_dim + off..][..hd];
+        for (dst, &bits) in sc.conv.iter_mut().zip(key) {
+            *dst = f16_to_f32(bits);
+        }
+        for g in 0..group {
+            let q = &a.q[q_row + (h_kv * group + g) * hd..][..hd];
+            let dot: f32 = q.iter().zip(&sc.conv).map(|(x, y)| x * y).sum();
+            sc.scores[g * n + j] = dot * a.scale;
+        }
+    }
+    for g in 0..group {
+        softmax_in_place(&mut sc.scores[g * n..(g + 1) * n]);
+    }
+
+    out.fill(0.0);
+    for (j, &s) in cells.iter().enumerate() {
+        let val = &a.v[s as usize * a.kv_dim + off..][..hd];
+        for (dst, &bits) in sc.conv.iter_mut().zip(val) {
+            *dst = f16_to_f32(bits);
+        }
+        for g in 0..group {
+            let w = sc.scores[g * n + j];
+            for (o, &vi) in out[g * hd..(g + 1) * hd].iter_mut().zip(&sc.conv) {
+                *o += w * vi;
+            }
+        }
+    }
+}
+
 /// The `1/sqrt(mean(x^2) + eps)` factor of RMSNorm.
 ///
 /// Transcribed from `ggml_compute_forward_rms_norm_f32` in
@@ -809,6 +862,57 @@ mod tests {
         let mut two = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
         Naive.rope_neox(&mut two, 5, 4, 4, 2, 10000.0);
         assert_eq!(two[0..4], two[4..8]);
+    }
+
+    /// `rope_rows` at consecutive positions is `rope_neox`, to the bit — so the only
+    /// thing it adds is the freedom to name each row's position.
+    #[test]
+    fn rope_rows_at_consecutive_positions_is_rope_neox() {
+        let (hd, n_rot, nh, rows) = (128usize, 64usize, 2usize, 5usize);
+        let x: Vec<f32> = (0..rows * nh * hd).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
+        let (mut a, mut b) = (x.clone(), x);
+        Naive.rope_neox(&mut a, 2049, hd, n_rot, nh, 1.0e7);
+        let positions: Vec<u32> = (2049..2049 + rows as u32).collect();
+        Naive.rope_rows(&mut b, &positions, hd, n_rot, nh, 1.0e7);
+        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+    }
+
+    /// **Sparse attention over every cell is dense attention, to the bit** — the
+    /// claim that makes QSA's only behavioral change the cells it leaves out.
+    /// Grouped-query heads, and a batch, so the causal mask varies by row.
+    #[test]
+    fn sparse_attention_over_every_cell_is_dense_attention() {
+        let (hd, n_head, n_head_kv, n_q, n_pos) = (16usize, 8usize, 2usize, 3usize, 21usize);
+        let kv_dim = n_head_kv * hd;
+        let noise = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n).map(|i| (((i + seed) * 2654435761) % 10007) as f32 / 5003.5 - 1.0).collect()
+        };
+        let q = noise(n_q * n_head * hd, 1);
+        let k: Vec<u16> = noise(n_pos * kv_dim, 2).iter().map(|&v| f32_to_f16(v)).collect();
+        let v: Vec<u16> = noise(n_pos * kv_dim, 3).iter().map(|&v| f32_to_f16(v)).collect();
+        let a = Attn { q: &q, k: &k, v: &v, kv_dim, n_pos, head_dim: hd, n_head, n_head_kv, scale: 1.0 / (hd as f32).sqrt() };
+
+        let mut dense = vec![0.0f32; n_q * n_head * hd];
+        Naive.attend(&a, &mut dense);
+
+        let (mut cells, mut starts) = (Vec::new(), vec![0u32]);
+        for t in 0..n_q {
+            cells.extend(0..a.n_pos_of(t) as u32);
+            starts.push(cells.len() as u32);
+        }
+        let mut sparse = vec![0.0f32; n_q * n_head * hd];
+        Naive.attend_sparse(&a, &cells, &starts, &mut sparse);
+        assert!(dense.iter().zip(&sparse).all(|(p, q)| p.to_bits() == q.to_bits()));
+
+        // And leaving a cell out does change the answer.
+        let (mut fewer, mut fstarts) = (Vec::new(), vec![0u32]);
+        for t in 0..n_q {
+            fewer.extend((0..a.n_pos_of(t) as u32).filter(|&c| c != 3));
+            fstarts.push(fewer.len() as u32);
+        }
+        let mut dropped = vec![0.0f32; n_q * n_head * hd];
+        Naive.attend_sparse(&a, &fewer, &fstarts, &mut dropped);
+        assert!(dense.iter().zip(&dropped).any(|(p, q)| p.to_bits() != q.to_bits()));
     }
 
     #[test]

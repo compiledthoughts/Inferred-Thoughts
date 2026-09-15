@@ -32,6 +32,7 @@ use crate::gguf::{Array, GgufFile, Metadata};
 use crate::ops::{Attn, Delta, Experts, Ops, Weights};
 use crate::profile::Ctx;
 use crate::quant::dequantize_into;
+use crate::quant::half::f16_to_f32;
 
 /// llama.cpp `src/llama-hparams.h:13`, `LLAMA_MAX_PLE_NGRAM`.
 pub const MAX_PLE_NGRAM: usize = 8;
@@ -1103,6 +1104,16 @@ struct Scratch {
     hlo: Vec<f32>,
     hgate1: Vec<f32>,
     htmp: Vec<f32>,
+    // QSA: indexer keys and queries for this pass, pooled block keys and their
+    // positions, block scores, and the cells each query attends to past the budget.
+    ik: Vec<f32>,
+    iq: Vec<f32>,
+    pooled: Vec<f32>,
+    block_pos: Vec<u32>,
+    bscores: Vec<f32>,
+    order: Vec<u32>,
+    cells: Vec<u32>,
+    starts: Vec<u32>,
     hmixed: Vec<f32>,
     logits: Vec<f32>,
 }
@@ -1161,9 +1172,41 @@ impl Scratch {
         z(&mut self.hlo, lr);
         z(&mut self.hgate1, hc * nd);
         z(&mut self.htmp, nd);
+        z(&mut self.ik, n * c.indexer.head_dim);
+        z(&mut self.iq, n * c.indexer.n_head * c.indexer.head_dim);
         z(&mut self.hmixed, nd);
         z(&mut self.logits, c.n_vocab);
     }
+}
+
+/// QSA's reference selection for the query at `pos` (`qwen4exp.md`, QSA; decided
+/// 16-09): the best `budget` whole blocks of `ratio` cells that are fully visible
+/// to it, ties to the lower block index, then its tail — the cells after the last
+/// full block, up to and including itself. Appends them to `cells`, ascending.
+///
+/// `scores` holds one score per block, at least `(pos + 1) / ratio` of them.
+/// Transcribed from colibri's `q38_attention` (`c/qwen38_core.h:1593-1627`), written
+/// from the Hugging Face reference. With `budget` or fewer full blocks every visible
+/// cell is chosen, which is dense attention.
+fn select_cells(scores: &[f32], ratio: usize, budget: usize, pos: usize, order: &mut Vec<u32>, cells: &mut Vec<u32>) {
+    let visible = pos + 1;
+    let full = visible / ratio;
+    debug_assert!(scores.len() >= full);
+    order.clear();
+    order.extend(0..full as u32);
+    if full > budget {
+        // A total order: score descending, then block ascending, so ties are decided.
+        order.select_nth_unstable_by(budget, |&a, &b| {
+            scores[b as usize].total_cmp(&scores[a as usize]).then(a.cmp(&b))
+        });
+        order.truncate(budget);
+        order.sort_unstable();
+    }
+    for &b in order.iter() {
+        let first = b as usize * ratio;
+        cells.extend((first..first + ratio).map(|c| c as u32));
+    }
+    cells.extend((full * ratio..visible).map(|c| c as u32));
 }
 
 /// A hyper-connection read (`build_hc_mix`, `qwen4exp.cpp:266-312`): RMSNorm each
@@ -1253,17 +1296,17 @@ impl<'a> Qwen4Exp<'a> {
         if start_pos + n > kv.n_ctx() {
             return Err(Error::ContextOverflow { pos: start_pos + n - 1, n_ctx: kv.n_ctx() });
         }
-        if let Some(r) = c.compress_ratios.iter().copied().filter(|&r| r > 0).max() {
-            let exact = c.indexer.top_k + r as usize - 1;
-            if start_pos + n > exact {
-                return Err(Error::NotImplemented {
-                    what: "QSA past its budget",
-                    detail: format!(
-                        "position {} needs the sparse indexer; dense attention equals QSA only up to {exact} cached cells",
-                        start_pos + n
-                    ),
-                });
-            }
+        // Past QSA's budget the indexer reads keys cached at every earlier position,
+        // so the cache must have been built with the lane (`Engine::new` does).
+        if c.compress_ratios.iter().any(|&r| r > 0) && kv.idx_dim() != c.indexer.head_dim {
+            return Err(Error::InconsistentArchitecture {
+                what: "kv cache",
+                detail: format!(
+                    "the cache holds {} indexer values per position, QSA needs {}",
+                    kv.idx_dim(),
+                    c.indexer.head_dim
+                ),
+            });
         }
 
         let mut st = self.ple_state.borrow_mut();
@@ -1450,13 +1493,38 @@ impl<'a> Qwen4Exp<'a> {
         ctx: &mut Ctx<'_>,
     ) -> Result<()> {
         let c = &self.cfg;
-        let Mixer::Attn { wq, wk, wv, wo, q_norm, k_norm, .. } = &layer.mixer else {
+        let Mixer::Attn { wq, wk, wv, wo, q_norm, k_norm, indexer } = &layer.mixer else {
             return Err(Error::InconsistentArchitecture {
                 what: "layer kind",
                 detail: format!("layer {il} is recurrent but was routed to attention"),
             });
         };
         let (hd, kd) = (c.head_dim, c.kv_dim());
+        let slot = self.kv_slot[il];
+        let ratio = c.compress_ratios[il] as usize;
+        // QSA: every pass caches this layer's raw indexer keys, below the budget too,
+        // because a later query pools them (`qwen4exp.cpp:599-603`) — but only when
+        // this cache is long enough for a pass ever to pass the budget. A context of
+        // 2,051 or fewer is dense attention throughout and never reads them, so it
+        // runs no indexer at all (and the 0.2B's F16 indexer, which CUDA has no
+        // matmul for yet, stays out of GPU runs that cannot use it).
+        let qsa_reachable = ratio > 0 && kv.n_ctx() > c.indexer.top_k + ratio - 1;
+        if qsa_reachable {
+            ops.matmul(&indexer.k_proj, &s.mixed, &mut s.ik);
+            ctx.trace("indexer_k_raw", il, &s.ik);
+            ops.kv_write(kv.idx_layer_mut(slot), start_pos * c.indexer.head_dim, &s.ik);
+        }
+        // Past the budget, choose each query's cells before K and V are published:
+        // the selection reads only indexer keys, so the order does not matter to it.
+        // `INFERRED_QSA_DENSE=1` keeps every cell past the budget: the control arm,
+        // and what the model did before the indexer existed. Slower, not exact — the
+        // model was trained to see the selection.
+        let sparse = qsa_reachable
+            && start_pos + n > c.indexer.top_k + ratio - 1
+            && std::env::var("INFERRED_QSA_DENSE").is_err();
+        if sparse {
+            self.qsa_select(ops, indexer, il, slot, start_pos, n, kv, s, ctx)?;
+        }
         ops.matmul(wq, &s.mixed, &mut s.qg);
         ctx.trace("Qcur_full", il, &s.qg);
         ops.gather_chunks(&s.qg, hd, 2 * hd, 0, &mut s.q);
@@ -1471,7 +1539,6 @@ impl<'a> Qwen4Exp<'a> {
         ctx.trace("Qcur", il, &s.q);
         ops.rope_neox(&mut s.k, start_pos, hd, c.n_rot, c.n_head_kv, c.rope_theta);
         ctx.trace("Kcur", il, &s.k);
-        let slot = self.kv_slot[il];
         ops.kv_write(kv.k_layer_mut(slot), start_pos * kd, &s.k);
         ops.kv_write(kv.v_layer_mut(slot), start_pos * kd, &s.v);
         let a = Attn {
@@ -1485,12 +1552,88 @@ impl<'a> Qwen4Exp<'a> {
             n_head_kv: c.n_head_kv,
             scale: 1.0 / (hd as f32).sqrt(),
         };
-        ops.attend(&a, &mut s.attn);
+        if sparse {
+            ops.attend_sparse(&a, &s.cells, &s.starts, &mut s.attn);
+        } else {
+            ops.attend(&a, &mut s.attn);
+        }
         ctx.trace("attn_pregate", il, &s.attn);
         ops.sigmoid_mul(&mut s.attn, &s.g);
         ctx.trace("attn_gated", il, &s.attn);
         ops.matmul(wo, &s.attn, &mut s.block);
         ctx.trace("attn_output", il, &s.block);
+        Ok(())
+    }
+
+    /// QSA's indexer, past the budget: which cells each query of this pass attends
+    /// to, into `s.cells` and `s.starts` (`build_qsa_top_k`, `qwen4exp.cpp:525-674`,
+    /// with the model's reference selection — `select_cells`).
+    ///
+    /// - queries: `index_q_proj`, RMSNorm per head, RoPE at their positions;
+    /// - keys: every block full at the pass's last position, pooled from the cache's
+    ///   raw f16 keys as `((k0 + k1) + k2) + k3` scaled by `1/ratio` — `ggml_add`'s
+    ///   chain then `ggml_scale` (`qwen4exp.cpp:609-617`) — then RMSNorm, then RoPE
+    ///   at the block's first position;
+    /// - scores: [`Ops::qsa_scores`], one per (query, block).
+    ///
+    /// **Reads the cache's host copy of the indexer keys**, which a device backend
+    /// does not keep current; CUDA refuses the ops below until it has kernels (Q2).
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_select<O: Ops>(
+        &self,
+        ops: &O,
+        ix: &Indexer<'_>,
+        il: usize,
+        slot: usize,
+        start_pos: usize,
+        n: usize,
+        kv: &KvCache,
+        s: &mut Scratch,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let (idim, ih) = (c.indexer.head_dim, c.indexer.n_head);
+        let ratio = c.compress_ratios[il] as usize;
+        let budget = c.indexer.top_k / ratio;
+
+        ops.matmul(&ix.q_proj, &s.mixed, &mut s.iq);
+        ops.rms_norm_heads(&mut s.iq, &ix.q_norm, idim, c.rms_eps);
+        ops.rope_neox(&mut s.iq, start_pos, idim, c.n_rot, ih, c.rope_theta);
+        ctx.trace("indexer_q", il, &s.iq);
+
+        let n_blocks = (start_pos + n) / ratio;
+        let raw = kv.idx_layer(slot);
+        s.pooled.resize(n_blocks * idim, 0.0);
+        s.block_pos.clear();
+        let inv = 1.0 / ratio as f32;
+        for b in 0..n_blocks {
+            let first = b * ratio;
+            for d in 0..idim {
+                let mut acc = f16_to_f32(raw[first * idim + d]);
+                for m in 1..ratio {
+                    acc += f16_to_f32(raw[(first + m) * idim + d]);
+                }
+                s.pooled[b * idim + d] = acc * inv;
+            }
+            s.block_pos.push(first as u32);
+        }
+        ops.host_wrote(&s.pooled);
+        ops.rms_norm_heads(&mut s.pooled, &ix.k_norm, idim, c.rms_eps);
+        ops.rope_rows(&mut s.pooled, &s.block_pos, idim, c.n_rot, 1, c.rope_theta);
+
+        s.bscores.resize(n * n_blocks, 0.0);
+        ops.qsa_scores(&s.iq, &s.pooled, ih, idim, &mut s.bscores);
+        ops.host_needs(&mut s.bscores);
+
+        s.cells.clear();
+        s.starts.clear();
+        s.starts.push(0);
+        for t in 0..n {
+            let pos = start_pos + t;
+            let row = &s.bscores[t * n_blocks..(t + 1) * n_blocks];
+            select_cells(row, ratio, budget, pos, &mut s.order, &mut s.cells);
+            s.starts.push(s.cells.len() as u32);
+        }
         Ok(())
     }
 
@@ -1672,5 +1815,47 @@ mod tests {
         };
         assert_eq!(p.n_heads(), 2);
         assert_eq!(p.min_rows(), 4116);
+    }
+
+    fn select(scores: &[f32], ratio: usize, budget: usize, pos: usize) -> Vec<u32> {
+        let (mut order, mut cells) = (Vec::new(), Vec::new());
+        select_cells(scores, ratio, budget, pos, &mut order, &mut cells);
+        cells
+    }
+
+    /// Within the budget every visible cell is chosen: dense attention.
+    #[test]
+    fn qsa_selects_everything_within_the_budget() {
+        // 3 full blocks plus a tail of 2, budget 3.
+        let cells = select(&[0.1, 0.9, 0.5], 4, 3, 13);
+        assert_eq!(cells, (0..=13).collect::<Vec<u32>>());
+    }
+
+    /// The worked example put to the user on 16-09: budget 3 blocks, query at 25.
+    #[test]
+    fn qsa_keeps_the_best_whole_blocks_and_the_tail() {
+        let scores = [0.9, 0.1, 0.7, 0.3, 0.8, 0.2];
+        let cells = select(&scores, 4, 3, 25);
+        let want: Vec<u32> = [0..4, 8..12, 16..20, 24..26].into_iter().flatten().collect();
+        assert_eq!(cells, want, "blocks 0, 2 and 4, then the tail 24-25, ascending");
+    }
+
+    /// Equal scores go to the lower block, and a query ending a block has no tail.
+    #[test]
+    fn qsa_ties_go_to_the_lower_block() {
+        let cells = select(&[0.5; 6], 4, 2, 23);
+        assert_eq!(cells, (0..8).collect::<Vec<u32>>());
+    }
+
+    /// Only blocks fully visible to the query are scored: at 21 the block 20-23 is
+    /// not yet whole, so its cells are tail and its (high) score is never a
+    /// candidate. The five full blocks tie at 0, so budget 1 takes block 0.
+    #[test]
+    fn qsa_never_scores_a_block_the_query_cannot_fully_see() {
+        let mut scores = vec![0.0f32; 6];
+        scores[5] = 100.0;
+        let cells = select(&scores, 4, 1, 21);
+        let want: Vec<u32> = [0..4, 20..22].into_iter().flatten().collect();
+        assert_eq!(cells, want);
     }
 }

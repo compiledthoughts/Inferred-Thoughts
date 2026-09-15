@@ -96,6 +96,28 @@ def parse_ref(path: str) -> dict[str, Tensor]:
     before: list[list[float]] = []
     after: list[list[float]] = []
     truncated = False
+    # **Groups are truncated too, not only rows.** Past six blocks along ne2 the
+    # dump prints the first three, `...`, then the last three. Counting printed
+    # groups therefore labels the tail 3, 4, 5 instead of ne2-3, ne2-2, ne2-1, and
+    # every tail comparison then reads the wrong tokens — which at 3,527 tokens
+    # made even `hc_init`, a copy of the embeddings, look 1.3 of scale wrong.
+    # `group_cut` is the first provisional group after the ellipsis; `close_tensor`
+    # renumbers those to the end.
+    group_cut: int | None = None
+
+    def close_tensor():
+        nonlocal group_cut
+        if cur is not None and group_cut is not None:
+            ne2 = cur.dims[2] if len(cur.dims) > 2 else 1
+            total = group + 1
+            tail = total - group_cut
+            cur.rows = [
+                ((ne2 - (total - g), i1, vals) if g >= group_cut else (g, i1, vals))
+                for g, i1, vals in cur.rows
+            ]
+            if tail > ne2:
+                cur.rows = []
+        group_cut = None
 
     def close_group():
         nonlocal before, after, truncated
@@ -117,6 +139,7 @@ def parse_ref(path: str) -> dict[str, Tensor]:
             m = NAME_RE.match(line)
             if m:
                 close_group()
+                close_tensor()
                 if name is not None and cur is not None:
                     out[name] = cur
                 name = m.group(1).strip()
@@ -143,11 +166,14 @@ def parse_ref(path: str) -> dict[str, Tensor]:
                     close_group()
                 depth -= 1
                 continue
-            if stripped.startswith("...."):
-                truncated = True
-                continue
-            if stripped == "...," or stripped == "...":
-                truncated = True
+            if stripped.startswith("....") or stripped in ("...,", "..."):
+                # Depth 2 is inside a group: rows were cut, and what follows are the
+                # last rows. Depth 1 is between groups: the groups themselves were
+                # cut, and what follows are the last groups along ne2.
+                if depth >= 2:
+                    truncated = True
+                elif group_cut is None:
+                    group_cut = group + 1
                 continue
 
             m = ROW_RE.match(line)
@@ -164,6 +190,7 @@ def parse_ref(path: str) -> dict[str, Tensor]:
                 continue
 
     close_group()
+    close_tensor()
     if name is not None and cur is not None:
         out[name] = cur
     return out

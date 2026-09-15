@@ -224,6 +224,40 @@ fn the_0_2b_restores_a_checkpoint_with_its_ple_state_on_the_gpu() {
     assert_same_bits(&second, &first, "the continuation replayed after a restore, on the GPU");
 }
 
+/// **Past the budget the indexer really does cut cells** — and below it, nothing
+/// changes. Prefills the 0.2B just past 2,051 cells and compares the logits with
+/// the same run forced dense (`INFERRED_QSA_DENSE=1`): they must differ, or the
+/// sparse path is not engaging and every other QSA check would pass vacuously.
+///
+/// Run on its own process because the switch is read from the environment.
+#[test]
+#[ignore = "needs the 0.2B test model's NVFP4-expert GGUF; run with -- --ignored"]
+fn qsa_selection_changes_the_answer_past_the_budget() {
+    use inferred_thoughts::{Engine, Naive};
+    let Some(f) = open(TINY) else { return };
+    // 2,060 tokens: past 2,051, so the last few queries select; short enough to
+    // prefill on the oracle in a few seconds.
+    let tokens: Vec<u32> = (0..2060u32).map(|i| 1000 + (i * 7919) % 50_000).collect();
+    let run = || {
+        let mut e = Engine::new(Model::load(&f).expect("load"), Naive, tokens.len() + 4, false);
+        e.prefill(&tokens).expect("prefill")
+    };
+
+    let sparse = run();
+    // SAFETY: single-threaded test, and the variable is read inside `run` below.
+    unsafe { std::env::set_var("INFERRED_QSA_DENSE", "1") };
+    let dense = run();
+    unsafe { std::env::remove_var("INFERRED_QSA_DENSE") };
+
+    let differing = sparse.iter().zip(&dense).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    assert!(
+        differing > 0,
+        "sparse and dense gave identical logits at {} cells, so the selection never engaged",
+        tokens.len()
+    );
+    println!("  {differing} of {} logits differ between the selection and dense", sparse.len());
+}
+
 /// Greedy, ties to the lower id.
 #[cfg(feature = "cuda")]
 fn argmax(logits: &[f32]) -> u32 {
@@ -504,7 +538,9 @@ fn the_0_2b_test_model_reproduces_llama_cpps_greedy_text_on_the_gpu() {
     let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
     let mut e = inferred_thoughts::Engine::new(Model::load(&f).expect("load"), &gpu, 64, false);
     let (produced, _) = e.generate(&tokens, 40, None, |_| {}).expect("generate");
-    assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
     println!("  graphs off for a mid-pass read: {}", gpu.graphs_off_for_mid_pass_read());
     let text = tk.decode(&produced, false).expect("decode");
     assert_eq!(text, LLAMA_CPP_40);

@@ -143,6 +143,16 @@ impl Cuda {
 }
 
 
+/// The error a QSA-past-budget op reports on this backend until it has a kernel.
+fn qsa_op(op: &'static str) -> Error {
+    Error::NotImplemented {
+        what: "sparse attention on CUDA",
+        detail: format!(
+            "`{op}` has no kernel yet; a qwen4exp context past its QSA budget (2,051 cells) runs on the CPU backends until step Q2"
+        ),
+    }
+}
+
 impl Ops for Cuda {
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
         self.note(self.rms_norm_impl(x, weight, eps, out));
@@ -215,6 +225,19 @@ impl Ops for Cuda {
         out: &mut [f32],
     ) {
         self.note(self.dilated_conv_impl(state, x, weight, kernel, dilation, out));
+    }
+
+    // QSA past its budget: no kernels yet (Q1 is the CPU oracle). Refused rather
+    // than inherited, since the defaults would compute on host copies of device
+    // data — the indexer keys and K and V live on the device here.
+    fn rope_rows(&self, _x: &mut [f32], _positions: &[u32], _hd: usize, _n_rot: usize, _nh: usize, _theta: f32) {
+        self.note(Err(qsa_op("rope_rows")));
+    }
+    fn qsa_scores(&self, _q: &[f32], _keys: &[f32], _n_head: usize, _dim: usize, _out: &mut [f32]) {
+        self.note(Err(qsa_op("qsa_scores")));
+    }
+    fn attend_sparse(&self, _a: &Attn<'_>, _cells: &[u32], _starts: &[u32], _out: &mut [f32]) {
+        self.note(Err(qsa_op("attend_sparse")));
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
@@ -659,6 +682,16 @@ impl Ops for &Cuda {
         out: &mut [f32],
     ) {
         (*self).dilated_conv(state, x, weight, kernel, dilation, out)
+    }
+
+    fn rope_rows(&self, x: &mut [f32], positions: &[u32], hd: usize, n_rot: usize, nh: usize, theta: f32) {
+        (*self).rope_rows(x, positions, hd, n_rot, nh, theta)
+    }
+    fn qsa_scores(&self, q: &[f32], keys: &[f32], n_head: usize, dim: usize, out: &mut [f32]) {
+        (*self).qsa_scores(q, keys, n_head, dim, out)
+    }
+    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], starts: &[u32], out: &mut [f32]) {
+        (*self).attend_sparse(a, cells, starts, out)
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
