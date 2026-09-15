@@ -59,6 +59,21 @@ use crate::tok::chat::ChatMl;
 /// minutes a full restart costs there.
 const CHECKPOINT_EVERY: usize = 2048;
 
+/// The closest checkpoints are ever spaced, however small the context: each one
+/// copies the whole recurrent state (~150 MiB on Qwen3.8-Flash-Next) to the host.
+const CHECKPOINT_MIN_SPACING: usize = 256;
+
+/// Tokens between checkpoints for a context of `n_ctx`: the eight return points
+/// spread across it, between [`CHECKPOINT_MIN_SPACING`] and [`CHECKPOINT_EVERY`].
+///
+/// **A fixed 2,048 never checkpointed Qwen3.8-Flash-Next at all**: it refuses
+/// contexts past 2,051 cells, so every diverging turn re-prefilled the whole
+/// conversation from token zero. At `--ctx 2048` this is 256, so a divergence
+/// re-runs at most 256 tokens. The 35B at `--ctx 32768` still gets 2,048.
+fn checkpoint_spacing(n_ctx: usize) -> usize {
+    (n_ctx / MAX_CHECKPOINTS).clamp(CHECKPOINT_MIN_SPACING, CHECKPOINT_EVERY)
+}
+
 /// Return points kept at once.
 ///
 /// One is the whole model's recurrent state — 84 MiB on the 35B, and **fixed
@@ -439,8 +454,9 @@ impl<O: Ops> Session<'_, O> {
         // which `split_prefill_equals_single_prefill` pins down.
         let mut logits = Vec::new();
         let mut done = 0usize;
+        let spacing = checkpoint_spacing(self.engine.n_ctx());
         while done < tokens.len() {
-            let take = CHECKPOINT_EVERY.min(tokens.len() - done);
+            let take = spacing.min(tokens.len() - done);
             logits = self.engine.prefill(&tokens[done..done + take])?;
             self.tokens.extend_from_slice(&tokens[done..done + take]);
             done += take;
@@ -453,7 +469,7 @@ impl<O: Ops> Session<'_, O> {
             // is not "a copy of where we already are": the next turn continues
             // past it, which is precisely what makes it a return point for the
             // divergence after that.
-            if self.consumed - self.last_ckpt >= CHECKPOINT_EVERY {
+            if self.consumed - self.last_ckpt >= spacing {
                 self.take_checkpoint();
             }
         }
@@ -1167,4 +1183,20 @@ fn send_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
     let body = value.to_string();
     send_head(stream, status, "application/json", body.len())?;
     write_all(stream, body.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 35B's long contexts keep the spacing they had; Qwen3.8-Flash-Next's
+    /// 2,048-token context gets checkpoints at all; nothing goes below the floor.
+    #[test]
+    fn checkpoint_spacing_follows_the_context() {
+        assert_eq!(checkpoint_spacing(32_768), 2_048);
+        assert_eq!(checkpoint_spacing(128_000), 2_048);
+        assert_eq!(checkpoint_spacing(4_096), 512);
+        assert_eq!(checkpoint_spacing(2_048), 256);
+        assert_eq!(checkpoint_spacing(512), 256);
+    }
 }
