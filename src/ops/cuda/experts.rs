@@ -418,9 +418,12 @@ pub(super) struct ExpertCache {
     ///
     /// **The cache's only remaining eyes.** With selection on the device the
     /// host never sees a read, so these are written by `moe_gather_ptrs` and
-    /// read back at report time. Sized once, generously, because growing them
-    /// would invalidate the bases already handed out.
+    /// read back at report time. Sized once, to `counter_capacity`, because
+    /// growing them would invalidate the bases already handed out.
     counts: Option<DeviceBuffer>,
+    /// Experts the counter arrays hold: the model's whole pool when setup
+    /// declared it, else [`DEFAULT_COUNTERS`].
+    counter_capacity: usize,
     vram_flags: Option<DeviceBuffer>,
     /// Two counters: reads that resolved to VRAM, and reads that resolved to
     /// the host tier.
@@ -479,13 +482,19 @@ pub(super) struct ExpertCache {
     stats: ExpertStats,
 }
 
-/// Experts the global counter arrays have room for.
+/// Experts the global counter arrays hold when no pool size was declared.
 ///
-/// The 35B needs 30,720. Overrunning it does not corrupt anything — a tensor
-/// past the cap simply gets no counters and [`ExpertCache::counters`] reports
-/// that it is incomplete, which is the behaviour an instrument should have when
-/// it cannot see everything.
-const COUNTER_CAP: usize = 65_536;
+/// **Setup declares the real one** (`Cuda::set_expert_pool`, from
+/// `Model::expert_pool`): 30,720 on the 35B, 73,728 on the 125B. This fallback is
+/// for callers that drive expert ops without an engine — the per-op tests.
+///
+/// **Overrunning it is not harmless**, whatever this comment used to say. A tensor
+/// past the capacity has no counter slice, `moe_gather_ptrs` refuses to launch,
+/// and the expert op returns before its matmul: the layer's routed output is
+/// never computed. The 125B's first run hit it at the 129th tensor — layer 42's
+/// `down` and all of layers 43–47 — and still produced llama.cpp's text.
+/// The refusal stays, so an overrun is a reported error rather than a blind layer.
+const DEFAULT_COUNTERS: usize = 65_536;
 
 impl ExpertCache {
     /// Allocate a slab of `slots` slots of `stride` bytes, with `host_budget`
@@ -528,6 +537,7 @@ impl ExpertCache {
             tables: HashMap::new(),
             bases: HashMap::new(),
             counts: None,
+            counter_capacity: DEFAULT_COUNTERS,
             vram_flags: None,
             tally: None,
             next_base: 0,
@@ -1053,12 +1063,12 @@ impl ExpertCache {
 
         // Counters for this tensor's slice of the global arrays.
         if self.counts.is_none() {
-            self.counts = Some(DeviceBuffer::zeroed(COUNTER_CAP * 4)?);
-            self.vram_flags = Some(DeviceBuffer::zeroed(COUNTER_CAP * 4)?);
+            self.counts = Some(DeviceBuffer::zeroed(self.counter_capacity * 4)?);
+            self.vram_flags = Some(DeviceBuffer::zeroed(self.counter_capacity * 4)?);
             self.tally = Some(DeviceBuffer::zeroed(2 * 8)?);
         }
         let base = self.next_base;
-        if base + n_expert <= COUNTER_CAP {
+        if base + n_expert <= self.counter_capacity {
             self.counter_owner.resize(base + n_expert, (0, 0));
             for e in 0..n_expert {
                 self.counter_owner[base + e] = (key, e as u32);
@@ -1073,7 +1083,7 @@ impl ExpertCache {
     }
 
     /// The device counter arrays a gather launch writes: `(vram_flags, counts,
-    /// tally, base)`. `None` if this tensor is past [`COUNTER_CAP`].
+    /// tally, base)`. `None` if this tensor is past the counter capacity.
     pub fn counters(
         &self,
         key: usize,
@@ -1277,6 +1287,14 @@ impl ExpertCache {
                 what: "expert table",
                 detail: "migrating an expert whose tensor has no table".to_string(),
             }),
+        }
+    }
+
+    /// Size the counter arrays for `n_experts`, the model's whole pool. Only
+    /// before the first table: the arrays are allocated there, once.
+    pub fn set_counter_capacity(&mut self, n_experts: usize) {
+        if self.counts.is_none() && n_experts > 0 {
+            self.counter_capacity = n_experts;
         }
     }
 

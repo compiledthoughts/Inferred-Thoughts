@@ -945,6 +945,12 @@ impl<'a> Qwen4Exp<'a> {
         self.weight_bytes(false)
     }
 
+    /// Experts across every routed tensor: `n_expert` for each layer's gate, up
+    /// and down.
+    pub fn expert_pool(&self) -> usize {
+        self.layers.iter().map(|l| l.ffn.gate.n_expert + l.ffn.up.n_expert + l.ffn.down.n_expert).sum()
+    }
+
     /// The matmul weights; with `routed`, also the used share of each expert
     /// tensor and one PLE row per hash head.
     fn weight_bytes(&self, routed: bool) -> u64 {

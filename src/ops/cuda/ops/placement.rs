@@ -192,6 +192,18 @@ impl Cuda {
         self.expert_reserve.set(self.expert_reserve.get().max(want));
     }
 
+    /// Declare the model's whole expert pool — the sum of `n_expert` over every
+    /// expert tensor — so the read counters are sized for all of it.
+    ///
+    /// **Setup's job, before the first pass.** The counters are one flat device
+    /// array handed out a slice per tensor in first-seen order, allocated once
+    /// because growing it would move the slices already given out. A fixed size
+    /// was right for the 35B's 30,720 and wrong for the 125B's 73,728, where the
+    /// last 16 tensors got no slice and their layers' experts never ran.
+    pub fn set_expert_pool(&self, n_experts: usize) {
+        self.expert_pool.set((n_experts > 0).then_some(n_experts));
+    }
+
     /// Slab bytes from free VRAM at sizing time: free minus the reserve, under
     /// the automatic cap when there is one.
     fn slab_budget(&self, free: usize) -> usize {
@@ -271,8 +283,11 @@ impl Cuda {
             let (free, _) = self.mem_info()?;
             let budget = self.slab_budget(free);
             let slots = budget / w.data.len().max(1);
-            *slot =
-                Some(experts::ExpertCache::new(w.data.len(), slots, self.expert_host_budget.get())?);
+            let mut c = experts::ExpertCache::new(w.data.len(), slots, self.expert_host_budget.get())?;
+            if let Some(n) = self.expert_pool.get() {
+                c.set_counter_capacity(n);
+            }
+            *slot = Some(c);
         }
         let cache = match slot.as_mut() {
             Some(c) => c,
@@ -313,6 +328,9 @@ impl Cuda {
             )?;
             if let (Some(p), Some(b)) = (self.model_path.borrow().as_ref(), self.map_base.get()) {
                 c.set_source(p.clone(), b);
+            }
+            if let Some(n) = self.expert_pool.get() {
+                c.set_counter_capacity(n);
             }
             *slot = Some(c);
         }

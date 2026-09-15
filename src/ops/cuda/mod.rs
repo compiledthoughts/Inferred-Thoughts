@@ -132,6 +132,11 @@ pub struct Cuda {
     /// explicit budget is set, which is then the reserve's job alone.
     expert_cap: Cell<Option<usize>>,
 
+    /// The model's whole expert pool, in experts, declared at setup so the
+    /// expert cache's read counters cover every tensor. `None` falls back to
+    /// the cache's default capacity.
+    expert_pool: Cell<Option<usize>>,
+
     /// Page-locked host memory the expert cache's overflow tier may claim.
     ///
     /// The second tier is what makes every expert addressable without host
@@ -838,6 +843,7 @@ impl Cuda {
                 record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
                 expert_cap: Cell::new(Some(experts::DEFAULT_SLAB_CAP)),
+                expert_pool: Cell::new(None),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),

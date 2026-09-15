@@ -152,6 +152,16 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Experts across every routed expert tensor, which a device backend's expert
+    /// cache has to be able to count.
+    pub fn expert_pool(&self) -> usize {
+        match self {
+            Model::Qwen3(_) => 0,
+            Model::Qwen35(m) => m.expert_pool(),
+            Model::Qwen4Exp(m) => m.expert_pool(),
+        }
+    }
+
     /// Run `tokens` from absolute position `start_pos` and return logits for
     /// the last one.
     ///

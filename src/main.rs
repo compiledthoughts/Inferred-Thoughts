@@ -528,6 +528,8 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
         // The slab also sizes itself before most permanent weights are up; a model
         // whose dense weights outgrow the default reserve says so here.
         cuda.reserve_for_weights(m.dense_weight_bytes() as usize);
+        // And its expert pool, so the read counters cover every expert tensor.
+        cuda.set_expert_pool(m.expert_pool());
         // The KV cache is allocated lazily, at the first attention layer, which
         // is *after* the expert slab has sized itself from free VRAM. Told here
         // because this is the only place that knows the context length.
@@ -1316,6 +1318,7 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         cuda.report_per_turn(a.profile_device);
         // As in `generate`: room for the permanent weights, then for the cache.
         cuda.reserve_for_weights(m.dense_weight_bytes() as usize);
+        cuda.set_expert_pool(m.expert_pool());
         // See the same call in `generate`: the KV slabs are allocated after the
         // expert slab has already sized itself from free VRAM, so the context
         // length has to be declared here or the slab takes VRAM the cache needs.

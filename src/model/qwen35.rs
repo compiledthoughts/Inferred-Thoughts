@@ -889,6 +889,18 @@ impl<'a> Qwen35<'a> {
         self.weight_bytes(0)
     }
 
+    /// Experts across every routed tensor: `n_expert` for each layer's gate, up
+    /// and down. Zero on the dense variant.
+    pub fn expert_pool(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| match &l.ffn {
+                Ffn::Moe { gate, up, down, .. } => gate.n_expert + up.n_expert + down.n_expert,
+                Ffn::Dense { .. } => 0,
+            })
+            .sum()
+    }
+
     /// The matmul weights, with `n_used` experts' worth of each routed tensor.
     fn weight_bytes(&self, n_used: usize) -> u64 {
         let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;
