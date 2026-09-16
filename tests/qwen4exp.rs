@@ -270,26 +270,12 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-/// **Step 4, part 2: with the `expf` ops on the CPU, the GPU reproduces the oracle
-/// bit for bit through the whole 0.2B** (`src/model/qwen4exp.md`, step 4).
-///
-/// Everything that is exact on the device runs there — every matmul (Q8_0, the F32
-/// router, the NVFP4 experts against a Q8_0 activation), the serial RMSNorm, RoPE,
-/// the gathers and adds, and qwen4exp's `mul_rows`, `mul_streams`, `row_dot` and
-/// `dilated_conv` with its history held on the device. Everything that calls
-/// `expf`, or is otherwise outside the exact set, runs on `Naive`: softmax and
-/// routing, every SiLU and sigmoid (fused or not), PLE's gate, the GDN conv and
-/// delta rule, attention and its KV writes.
-///
-/// Prefill and 16 decode passes, each pass's logits compared to the bit. A failure
-/// here is a kernel or residency defect, not rounding; if this passes and the
-/// full-GPU test fails, the cause is `expf` and FP4 activations.
+/// The exact kernels on the GPU, the rest on the CPU: the bisection instrument of
+/// step 4's part 2, and of QSA Q2's.
 #[cfg(feature = "cuda")]
-#[test]
-#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
-fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
-    use inferred_thoughts::ops::{Attn, Delta, Experts, Ops, Route, Weights};
-    use inferred_thoughts::{Cuda, Engine, Naive};
+mod exact_only {
+    use inferred_thoughts::ops::{Attn, Delta, Experts, Ops, QsaPool, QsaSelect, Route, Weights};
+    use inferred_thoughts::{Cuda, Naive};
 
     /// The exact kernels on the GPU, the rest on the CPU. A bisection instrument,
     /// not a backend: every GPU result is pulled home for the next CPU op, and
@@ -297,7 +283,7 @@ fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
     ///
     /// The second field is a host staging buffer for `moe_glu`, reserved once so its
     /// address — which the device keys its mirror on — never changes.
-    struct ExactOnly<'a>(&'a Cuda, std::cell::RefCell<Vec<f32>>);
+    pub struct ExactOnly<'a>(pub &'a Cuda, pub std::cell::RefCell<Vec<f32>>);
     impl Ops for ExactOnly<'_> {
         // ---- on the GPU, exact
         fn rms_norm(&self, x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
@@ -454,6 +440,22 @@ fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
         }
         // `route` keeps its trait default: chosen on the host from the CPU softmax.
 
+
+        // ---- QSA: pooling and selection on the GPU, where they are exact; the
+        // lanes and the cells stay there. Attention on the CPU, over the device's
+        // cells read back (`Cuda::read_cells`, the debug readback).
+        fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
+            self.0.qsa_pool(raw, pooled, p);
+        }
+        fn qsa_select(&self, q: &[f32], pooled: &[f32], sel: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
+            self.0.qsa_select(q, pooled, sel, scores, cells);
+        }
+        fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], sel: &QsaSelect, out: &mut [f32]) {
+            let device = self.0.read_cells(cells).expect("the device's selection");
+            Naive.attend_sparse(a, &device, sel, out);
+            self.0.host_wrote(out);
+        }
+
         // ---- residency, forwarded
         fn host_wrote(&self, buf: &[f32]) {
             self.0.host_wrote(buf)
@@ -471,6 +473,28 @@ fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
             self.0.forget_state()
         }
     }
+}
+
+/// **Step 4, part 2: with the `expf` ops on the CPU, the GPU reproduces the oracle
+/// bit for bit through the whole 0.2B** (`src/model/qwen4exp.md`, step 4).
+///
+/// Everything that is exact on the device runs there — every matmul (Q8_0, the F32
+/// router, the NVFP4 experts against a Q8_0 activation), the serial RMSNorm, RoPE,
+/// the gathers and adds, and qwen4exp's `mul_rows`, `mul_streams`, `row_dot` and
+/// `dilated_conv` with its history held on the device. Everything that calls
+/// `expf`, or is otherwise outside the exact set, runs on `Naive`: softmax and
+/// routing, every SiLU and sigmoid (fused or not), PLE's gate, the GDN conv and
+/// delta rule, attention and its KV writes.
+///
+/// Prefill and 16 decode passes, each pass's logits compared to the bit. A failure
+/// here is a kernel or residency defect, not rounding; if this passes and the
+/// full-GPU test fails, the cause is `expf` and FP4 activations.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_on_the_gpu_is_bit_identical_with_the_expf_ops_on_the_cpu() {
+    use exact_only::ExactOnly;
+    use inferred_thoughts::{Cuda, Engine, Naive};
 
     let Some(f) = open(TINY) else { return };
     let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
@@ -542,6 +566,133 @@ fn the_0_2b_test_model_reproduces_llama_cpps_greedy_text_on_the_gpu() {
         panic!("a CUDA op reported an error: {err}");
     }
     println!("  graphs off for a mid-pass read: {}", gpu.graphs_off_for_mid_pass_read());
+    let text = tk.decode(&produced, false).expect("decode");
+    assert_eq!(text, LLAMA_CPP_40);
+}
+
+/// Token ids for a synthetic prompt: deterministic, spread over the vocabulary.
+fn synthetic(n: usize, seed: u32) -> Vec<u32> {
+    (0..n as u32).map(|i| 1000 + (i * 7919 + seed * 104_729) % 50_000).collect()
+}
+
+/// **QSA Q2, part 2: past the budget, with the `expf` ops and attention on the
+/// CPU, the GPU reproduces the oracle bit for bit** (`src/model/qwen4exp.md`,
+/// "QSA on CUDA").
+///
+/// Step 4's instrument, with QSA's pooling and selection on the device and the
+/// attention on `Naive` over the cells the device chose (read back). 2,060 prompt
+/// tokens — the last prefill chunk selects — then 16 decode passes, each of which
+/// selects, every logit compared to the bit. Since pooling, scores and selection
+/// are exact, this holds only if the device keeps the oracle's cells in every
+/// query of every pass, through the pooled lanes and their watermark.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_past_the_budget_is_bit_identical_with_the_expf_ops_on_the_cpu() {
+    use exact_only::ExactOnly;
+    use inferred_thoughts::{Cuda, Engine, Naive};
+
+    let Some(f) = open(TINY) else { return };
+    let tokens = synthetic(2060, 0);
+    let steps = 16;
+    let n_ctx = tokens.len() + steps + 4;
+
+    let (fed, cpu) = {
+        let mut e = Engine::new(Model::load(&f).expect("load"), Naive, n_ctx, false);
+        let mut all = vec![e.prefill(&tokens).expect("cpu prefill")];
+        let mut fed = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(all.last().expect("logits"));
+            fed.push(t);
+            all.push(e.decode(t).expect("cpu decode"));
+        }
+        (fed, all)
+    };
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    gpu.rms_serial(true);
+    gpu.nvfp4_fp4(false);
+    let mixed = {
+        let mut e = Engine::new(
+            Model::load(&f).expect("load"),
+            ExactOnly(&gpu, std::cell::RefCell::new(Vec::with_capacity(1 << 20))),
+            n_ctx,
+            false,
+        );
+        let mut all = vec![e.prefill(&tokens).expect("mixed prefill")];
+        for &t in &fed {
+            all.push(e.decode(t).expect("mixed decode"));
+        }
+        all
+    };
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+    for (pass, (a, b)) in cpu.iter().zip(&mixed).enumerate() {
+        let differing = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        println!("  pass {pass:>2}: {differing} of {} logits differ", a.len());
+        assert_eq!(differing, 0, "pass {pass}: past the budget the device's selection is not the oracle's");
+    }
+}
+
+/// **The pooled-key watermark survives a checkpoint round trip on the GPU**, past
+/// the budget: prefill to 2,100, checkpoint, continue to 2,400 (pooling blocks up
+/// to 600), return and take a 300-token detour, return again and replay.
+///
+/// **The detour is the pass that can go wrong.** It rewrites cells 2,100 on, so
+/// blocks 525 on must be pooled again from its keys; a watermark left at 600
+/// would select against the first continuation's pooled keys. So the detour is
+/// compared with the same detour taken by a fresh engine that never saw the
+/// continuation. The replay alone cannot tell: stale keys from the first
+/// continuation are the right ones for its replay (checked: with the watermark
+/// never lowered, the replay still matched and the detour did not).
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_restores_a_checkpoint_past_the_budget_on_the_gpu() {
+    use inferred_thoughts::{Cuda, Engine};
+    let Some(f) = open(TINY) else { return };
+    let (prompt, detour, split) = (synthetic(2400, 0), synthetic(300, 7), 2100);
+    let gpu = Cuda::new(0).expect("cuda device");
+    let mut e = Engine::new(Model::load(&f).expect("load"), &gpu, 2464, false);
+    e.prefill(&prompt[..split]).expect("prefix");
+    let cp = e.checkpoint().expect("a checkpoint");
+    let first = e.prefill(&prompt[split..]).expect("continue");
+    e.restore(&cp).expect("restore for the detour");
+    let detour_after = e.prefill(&detour).expect("the detour");
+    e.restore(&cp).expect("restore for the replay");
+    let second = e.prefill(&prompt[split..]).expect("replay");
+
+    // Held alongside `e`, so no buffer the device keys on is recycled.
+    let mut fresh = Engine::new(Model::load(&f).expect("load"), &gpu, 2464, false);
+    fresh.prefill(&prompt[..split]).expect("fresh prefix");
+    let detour_fresh = fresh.prefill(&detour).expect("fresh detour");
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+    assert_same_bits(&detour_after, &detour_fresh, "a detour after a restore against a fresh one, past the budget");
+    assert_same_bits(&second, &first, "the continuation replayed after a restore, past the budget");
+}
+
+/// **Decode selects at every depth once QSA is reachable**, and below the budget
+/// the selection keeps every cell: with a 4,096-cell context, the 0.2B's decode
+/// runs the sparse path — gather, then attention over the window — from its first
+/// token, under CUDA graphs, and must still print llama.cpp's 40 tokens.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_reproduces_llama_cpps_greedy_text_through_the_sparse_path_on_the_gpu() {
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("According to all known laws", true, true);
+    let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
+    let mut e = inferred_thoughts::Engine::new(Model::load(&f).expect("load"), &gpu, 4096, false);
+    let (produced, _) = e.generate(&tokens, 40, None, |_| {}).expect("generate");
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+    assert!(!gpu.graphs_off_for_mid_pass_read(), "the sparse path must not read the device mid-pass");
     let text = tk.decode(&produced, false).expect("decode");
     assert_eq!(text, LLAMA_CPP_40);
 }

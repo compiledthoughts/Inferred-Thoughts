@@ -50,7 +50,7 @@ mod residency;
 
 use super::{Cuda, experts};
 use crate::error::{Error, Result};
-use crate::ops::{Attn, Delta, Experts, Ops, Route, Weights};
+use crate::ops::{Attn, Delta, Experts, Ops, QsaPool, QsaSelect, Route, Weights};
 
 /// Scratch slots. Distinct within any one method, reused across methods.
 mod slot {
@@ -81,6 +81,9 @@ mod slot {
     pub const TILE_FIRST: usize = 17;
     pub const TILE_N: usize = 18;
     pub const N_TILE: usize = 19;
+    /// QSA's gathered K and V windows (`attend_sparse_impl`).
+    pub const QSA_KW: usize = 20;
+    pub const QSA_VW: usize = 21;
 }
 
 impl Cuda {
@@ -143,16 +146,6 @@ impl Cuda {
     }
 }
 
-
-/// The error a QSA-past-budget op reports on this backend until it has a kernel.
-fn qsa_op(op: &'static str) -> Error {
-    Error::NotImplemented {
-        what: "sparse attention on CUDA",
-        detail: format!(
-            "`{op}` has no kernel yet; a qwen4exp context past its QSA budget (2,051 cells) runs on the CPU backends until step Q2"
-        ),
-    }
-}
 
 impl Ops for Cuda {
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
@@ -228,17 +221,17 @@ impl Ops for Cuda {
         self.note(self.dilated_conv_impl(state, x, weight, kernel, dilation, out));
     }
 
-    // QSA past its budget: no kernels yet (Q1 is the CPU oracle). Refused rather
-    // than inherited, since the defaults would compute on host copies of device
-    // data — the indexer keys and K and V live on the device here.
-    fn rope_rows(&self, _x: &mut [f32], _positions: &[u32], _hd: usize, _n_rot: usize, _nh: usize, _theta: f32) {
-        self.note(Err(qsa_op("rope_rows")));
+    // QSA past its budget (kernels/qsa.cuh). Overridden, never inherited: the
+    // defaults would compute on host copies of device data — the indexer keys,
+    // the pooled lanes and K and V live on the device here.
+    fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
+        self.note(self.qsa_pool_impl(raw, pooled, p));
     }
-    fn qsa_scores(&self, _q: &[f32], _keys: &[f32], _n_head: usize, _dim: usize, _out: &mut [f32]) {
-        self.note(Err(qsa_op("qsa_scores")));
+    fn qsa_select(&self, q: &[f32], pooled: &[f32], sel: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
+        self.note(self.qsa_select_impl(q, pooled, sel, scores, cells));
     }
-    fn attend_sparse(&self, _a: &Attn<'_>, _cells: &[u32], _starts: &[u32], _out: &mut [f32]) {
-        self.note(Err(qsa_op("attend_sparse")));
+    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], sel: &QsaSelect, out: &mut [f32]) {
+        self.note(self.attend_sparse_impl(a, cells, sel, out));
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {
@@ -685,14 +678,14 @@ impl Ops for &Cuda {
         (*self).dilated_conv(state, x, weight, kernel, dilation, out)
     }
 
-    fn rope_rows(&self, x: &mut [f32], positions: &[u32], hd: usize, n_rot: usize, nh: usize, theta: f32) {
-        (*self).rope_rows(x, positions, hd, n_rot, nh, theta)
+    fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
+        (*self).qsa_pool(raw, pooled, p)
     }
-    fn qsa_scores(&self, q: &[f32], keys: &[f32], n_head: usize, dim: usize, out: &mut [f32]) {
-        (*self).qsa_scores(q, keys, n_head, dim, out)
+    fn qsa_select(&self, q: &[f32], pooled: &[f32], sel: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
+        (*self).qsa_select(q, pooled, sel, scores, cells)
     }
-    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], starts: &[u32], out: &mut [f32]) {
-        (*self).attend_sparse(a, cells, starts, out)
+    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], sel: &QsaSelect, out: &mut [f32]) {
+        (*self).attend_sparse(a, cells, sel, out)
     }
 
     fn add_assign(&self, a: &mut [f32], b: &[f32]) {

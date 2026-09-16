@@ -45,6 +45,18 @@ pub struct KvCache {
     /// A log like K and V, so a rewind is a truncation here too.
     idx_dim: usize,
     idx: Vec<u16>,
+    /// QSA's pooled block keys, `[layer][n_ctx / idx_ratio][idx_dim]` f32: each
+    /// block's mean raw key, RMSNormed and roped at its first position. A pure
+    /// function of the block's raw keys, so each is computed once and kept.
+    idx_ratio: usize,
+    pooled: Vec<f32>,
+    /// Per layer, how many leading blocks of `pooled` are current: **the
+    /// watermark**. A pass at `start_pos` rewrites every cell from there on, so it
+    /// first lowers this to `start_pos / idx_ratio` — which covers a rewind, a
+    /// checkpoint restore and a reset alike, since every overwrite of a cell
+    /// happens in a pass that starts at or before it. See
+    /// [`KvCache::pooled_mut`].
+    pooled_through: Vec<usize>,
 }
 
 impl KvCache {
@@ -59,14 +71,55 @@ impl KvCache {
             v: vec![0; cells],
             idx_dim: 0,
             idx: Vec::new(),
+            idx_ratio: 0,
+            pooled: Vec::new(),
+            pooled_through: Vec::new(),
         }
     }
 
-    /// Add an indexer-key lane of `idx_dim` per position to every layer.
-    pub fn with_index(mut self, idx_dim: usize) -> Self {
+    /// Add an indexer-key lane of `idx_dim` per position to every layer, and a
+    /// pooled-key lane of `idx_dim` per block of `ratio` positions.
+    ///
+    /// Both are zeroed allocations, so a backend that keeps them on a device
+    /// never makes the host pages resident.
+    pub fn with_index(mut self, idx_dim: usize, ratio: usize) -> Self {
+        let ratio = ratio.max(1);
         self.idx_dim = idx_dim;
         self.idx = vec![0; self.n_layer * self.n_ctx * idx_dim];
+        self.idx_ratio = ratio;
+        self.pooled = vec![0.0; self.n_layer * self.n_blocks() * idx_dim];
+        self.pooled_through = vec![0; self.n_layer];
         self
+    }
+
+    /// Whole blocks the pooled lane holds per layer.
+    pub fn n_blocks(&self) -> usize {
+        self.n_ctx / self.idx_ratio.max(1)
+    }
+
+    /// One layer's raw indexer keys and its pooled-key lane, for a pass starting
+    /// at `start_pos`, **with the watermark already lowered for it**: returns the
+    /// first block that is not current. The caller pools from there and then
+    /// calls [`KvCache::set_pooled_through`].
+    pub fn pooled_mut(&mut self, il: usize, start_pos: usize) -> (&[u16], &mut [f32], usize) {
+        let through = &mut self.pooled_through[il];
+        *through = (*through).min(start_pos / self.idx_ratio.max(1));
+        let from = *through;
+        let (lo, hi) = (il * self.n_ctx * self.idx_dim, (il + 1) * self.n_ctx * self.idx_dim);
+        let nb = self.n_ctx / self.idx_ratio.max(1);
+        let (plo, phi) = (il * nb * self.idx_dim, (il + 1) * nb * self.idx_dim);
+        (&self.idx[lo..hi], &mut self.pooled[plo..phi], from)
+    }
+
+    /// Record that the first `blocks` blocks of layer `il` are current.
+    pub fn set_pooled_through(&mut self, il: usize, blocks: usize) {
+        self.pooled_through[il] = blocks;
+    }
+
+    /// One layer's pooled-key lane, `n_blocks * idx_dim` f32, block-major.
+    pub fn pooled_layer(&self, il: usize) -> &[f32] {
+        let nb = self.n_blocks();
+        &self.pooled[il * nb * self.idx_dim..(il + 1) * nb * self.idx_dim]
     }
 
     pub fn idx_dim(&self) -> usize {
@@ -103,7 +156,7 @@ impl KvCache {
 
     /// Total resident bytes, both tensors, whether or not they are filled.
     pub fn capacity_bytes(&self) -> u64 {
-        (self.k.len() + self.v.len() + self.idx.len()) as u64 * 2
+        (self.k.len() + self.v.len() + self.idx.len()) as u64 * 2 + self.pooled.len() as u64 * 4
     }
 
     /// Bytes one position occupies across all layers — what a decode step
@@ -228,6 +281,24 @@ mod tests {
         }
         c.commit(3);
         c
+    }
+
+    /// The watermark only ever falls to the pass's start: a pass continuing past
+    /// the pooled blocks keeps them, a rewind below them drops exactly the blocks
+    /// that reach its start, and a reset (a pass at 0) drops them all.
+    #[test]
+    fn a_pass_lowers_the_pooled_watermark_to_its_start() {
+        let mut c = KvCache::new(2, 4, 40).with_index(8, 4);
+        assert_eq!(c.n_blocks(), 10);
+        assert_eq!(c.pooled_mut(1, 0).2, 0);
+        c.set_pooled_through(1, 9);
+        assert_eq!(c.pooled_mut(1, 37).2, 9, "a continuation keeps every block");
+        assert_eq!(c.pooled_mut(1, 23).2, 5, "a rewind to 23 keeps blocks 0-4 (cells 0-19)");
+        assert_eq!(c.pooled_mut(1, 30).2, 5, "a later start does not raise it again");
+        assert_eq!(c.pooled_mut(0, 30).2, 0, "layers are independent");
+        assert_eq!(c.pooled_mut(1, 0).2, 0, "a reset drops them all");
+        let (raw, pooled, _) = c.pooled_mut(1, 0);
+        assert_eq!((raw.len(), pooled.len()), (40 * 8, 10 * 8));
     }
 
     #[test]

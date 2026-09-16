@@ -1476,6 +1476,247 @@ fn what_attention_costs_as_context_grows() {
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
 }
 
+/// **QSA Q2, per op: pooling, scores and the selection are bit-identical to the
+/// oracle, so the device keeps exactly the oracle's cells** (`src/model/qwen4exp.md`,
+/// "QSA on CUDA").
+///
+/// - `qsa_pool`: two lanes of 1,024 blocks, pooled on the device in two steps and
+///   an empty third (as decode issues it), against one oracle call.
+/// - `qsa_select`: prefill rows and decode rows past the budget, rows below it
+///   (every cell kept), and a decode row with no whole block yet. **The second
+///   lane starts with 2,400 zero cells**, whose 600 blocks pool to exactly zero
+///   and score exactly 0, so the 512-block boundary falls inside a 600-way tie
+///   and the tie rule decides which zero blocks are kept.
+/// - `attend_sparse`, at the 125B's and the 0.2B's attention shapes: **equal to
+///   the bit to the device's own dense attention over the same cells gathered on
+///   the host**, in the default decode mode (the kept window is past 2,048, so
+///   the tensor cores), which is what proves the gather and the per-row wiring;
+///   and in the scalar mode, within `attend_tolerance` of the oracle.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_qsa_ops_agree_with_the_oracle() {
+    use inferred_thoughts::ops::{QsaPool, QsaSelect};
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let (dim, ih, ratio, budget, n_ctx) = (128usize, 4usize, 4usize, 512usize, 4096usize);
+    let n_blocks = n_ctx / ratio;
+    let norm: Vec<f32> = noise(dim, 0x9a01).iter().map(|v| 1.0 + 0.25 * v).collect();
+    let (eps, n_rot, theta) = (1e-6f32, 64usize, 1.0e7f32);
+    let pool = |from: usize, to: usize| QsaPool { from, to, ratio, dim, norm: &norm, eps, n_rot, theta };
+
+    // Every buffer the device keys by address is held to the end of the test.
+    let raw_noise: Vec<u16> = noise(n_ctx * dim, 0x9a02).iter().map(|&v| f32_to_f16(v)).collect();
+    let mut raw_ties = raw_noise.clone();
+    raw_ties[..2400 * dim].fill(0);
+    let raws = [raw_noise, raw_ties];
+    let mut cpu_lanes = vec![vec![0.0f32; n_blocks * dim]; 2];
+    let mut gpu_lanes = vec![vec![0.0f32; n_blocks * dim]; 2];
+
+    // --- qsa_pool ------------------------------------------------------
+    for (li, raw) in raws.iter().enumerate() {
+        Naive.qsa_pool(raw, &mut cpu_lanes[li], &pool(0, n_blocks));
+        gpu.begin_pass(1);
+        gpu.qsa_pool(raw, &mut gpu_lanes[li], &pool(0, 300));
+        gpu.qsa_pool(raw, &mut gpu_lanes[li], &pool(300, n_blocks));
+        gpu.qsa_pool(raw, &mut gpu_lanes[li], &pool(n_blocks, n_blocks));
+        gpu.end_pass();
+        if let Some(e) = gpu.take_error() {
+            panic!("cuda error pooling lane {li}: {e}");
+        }
+        let got = gpu.read_pooled(&gpu_lanes[li]).expect("pooled readback");
+        exact(&format!("qsa_pool {li}"), &cpu_lanes[li], &got);
+    }
+    let zero_block = cpu_lanes[1][..dim].to_vec();
+    assert!(zero_block.iter().all(|&v| v.to_bits() == 0), "a zero block must pool to +0.0");
+
+    // --- qsa_select ----------------------------------------------------
+    // (lane, start_pos, rows, blocks pooled)
+    let cases = [
+        (0usize, 4093usize, 3usize, 1024usize),
+        (1, 4093, 3, 1024),
+        (0, 4095, 1, 1024),
+        (1, 4095, 1, 1024),
+        (0, 100, 2, 25),
+        (0, 1, 1, 0),
+    ];
+    let sel_of = |start_pos: usize, nb: usize| QsaSelect { n_head: ih, dim, n_blocks: nb, start_pos, ratio, budget };
+    struct Sel {
+        q: Vec<f32>,
+        cpu_scores: Vec<f32>,
+        gpu_scores: Vec<f32>,
+        cpu_cells: Vec<u32>,
+        gpu_cells: Vec<u32>,
+    }
+    let stride = sel_of(0, 0).stride();
+    let mut sels: Vec<Sel> = cases
+        .iter()
+        .enumerate()
+        .map(|(ci, &(_, _, n_q, nb))| Sel {
+            q: noise(n_q * ih * dim, 0x9b00 + ci as u64),
+            cpu_scores: vec![0.0; n_q * nb.max(1)],
+            gpu_scores: vec![0.0; n_q * nb.max(1)],
+            cpu_cells: vec![0; n_q * stride],
+            gpu_cells: vec![0; n_q * stride],
+        })
+        .collect();
+    for (ci, &(lane, start_pos, n_q, nb)) in cases.iter().enumerate() {
+        let sel = sel_of(start_pos, nb);
+        let Sel { q, cpu_scores, gpu_scores, cpu_cells, gpu_cells } = &mut sels[ci];
+        Naive.qsa_select(q, &cpu_lanes[lane], &sel, cpu_scores, cpu_cells);
+        gpu.begin_pass(n_q);
+        gpu.host_wrote(q);
+        gpu.qsa_select(q, &gpu_lanes[lane], &sel, gpu_scores, gpu_cells);
+        gpu.host_needs(gpu_scores);
+        gpu.end_pass();
+        if let Some(e) = gpu.take_error() {
+            panic!("cuda error selecting case {ci}: {e}");
+        }
+        // With no whole block there are no scores, only a placeholder slot.
+        if nb > 0 {
+            exact(&format!("scores {ci}"), cpu_scores, gpu_scores);
+        }
+        let got = gpu.read_cells(gpu_cells).expect("cells readback");
+        let mut kept_zero = (0usize, 0usize);
+        for t in 0..n_q {
+            let pos = start_pos + t;
+            let count = sel.count(pos);
+            let (want, have) = (&cpu_cells[t * stride..][..count], &got[t * stride..][..count]);
+            assert_eq!(want, have, "case {ci} row {t}: the device kept different cells than the oracle");
+            let full = (pos + 1) / ratio;
+            if full > budget {
+                assert!(count < pos + 1, "case {ci} row {t}: past the budget, cells must be dropped");
+            } else {
+                assert_eq!(count, pos + 1, "case {ci} row {t}: within the budget, every cell is kept");
+            }
+            if lane == 1 && full > budget {
+                let row = &cpu_scores[t * nb..(t + 1) * nb];
+                let kept: std::collections::HashSet<u32> = want.iter().map(|&c| c / ratio as u32).collect();
+                for b in 0..full {
+                    if row[b] == 0.0 {
+                        if kept.contains(&(b as u32)) {
+                            kept_zero.0 += 1;
+                        } else {
+                            kept_zero.1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // The copies made above are the device's cells; hold them for attention.
+        gpu_cells.copy_from_slice(&got);
+        if lane == 1 && start_pos > 1000 {
+            println!("  case {ci}: zero-score blocks kept {} / dropped {}", kept_zero.0, kept_zero.1);
+            assert!(
+                kept_zero.0 > 0 && kept_zero.1 > 0,
+                "the tie lane must put the budget's boundary inside the zero-score tie"
+            );
+        }
+    }
+
+    // --- attend_sparse -------------------------------------------------
+    // (head_dim, n_head, n_head_kv): the 125B, the 0.2B.
+    let shapes = [(256usize, 24usize, 2usize), (256, 8, 2)];
+    let attn_cases = [1usize, 2];
+    struct Att {
+        k: Vec<u16>,
+        v: Vec<u16>,
+        q: Vec<f32>,
+        sparse: Vec<f32>,
+        scalar: Vec<f32>,
+        want: Vec<f32>,
+        rows_q: Vec<Vec<f32>>,
+        rows_k: Vec<Vec<u16>>,
+        rows_v: Vec<Vec<u16>>,
+        rows_out: Vec<Vec<f32>>,
+    }
+    let mut atts: Vec<Att> = Vec::new();
+    for (si, &(hd, nh, nkv)) in shapes.iter().enumerate() {
+        for &ci in &attn_cases {
+            let n_q = cases[ci].2;
+            let kv_dim = nkv * hd;
+            atts.push(Att {
+                k: noise(n_ctx * kv_dim, 0x9c00 + si as u64).iter().map(|&x| f32_to_f16(x)).collect(),
+                v: noise(n_ctx * kv_dim, 0x9d00 + si as u64).iter().map(|&x| f32_to_f16(x)).collect(),
+                q: noise(n_q * nh * hd, 0x9e00 + (si * 10 + ci) as u64),
+                sparse: vec![0.0; n_q * nh * hd],
+                scalar: vec![0.0; n_q * nh * hd],
+                want: vec![0.0; n_q * nh * hd],
+                rows_q: (0..n_q).map(|_| vec![0.0; nh * hd]).collect(),
+                rows_k: (0..n_q).map(|_| vec![0; stride * kv_dim]).collect(),
+                rows_v: (0..n_q).map(|_| vec![0; stride * kv_dim]).collect(),
+                rows_out: (0..n_q).map(|_| vec![0.0; nh * hd]).collect(),
+            });
+        }
+    }
+    let mut ai = 0;
+    for &(hd, nh, nkv) in &shapes {
+        for &ci in &attn_cases {
+            let (_, start_pos, n_q, nb) = cases[ci];
+            let sel = sel_of(start_pos, nb);
+            let cells = &sels[ci].gpu_cells;
+            let kv_dim = nkv * hd;
+            let scale = 1.0 / (hd as f32).sqrt();
+            let Att { k, v, q, sparse, scalar, want, rows_q, rows_k, rows_v, rows_out } = &mut atts[ai];
+            ai += 1;
+            let a = Attn { q: &q[..], k: &k[..], v: &v[..], kv_dim, n_pos: start_pos + n_q, head_dim: hd, n_head: nh, n_head_kv: nkv, scale };
+
+            gpu.begin_pass(n_q);
+            gpu.host_wrote(&q[..]);
+            gpu.attend_sparse(&a, cells, &sel, sparse);
+            gpu.host_needs(sparse);
+            gpu.end_pass();
+
+            gpu.attn_decode_mma(Some(false));
+            gpu.begin_pass(n_q);
+            gpu.host_wrote(&q[..]);
+            gpu.attend_sparse(&a, cells, &sel, scalar);
+            gpu.host_needs(scalar);
+            gpu.end_pass();
+            gpu.attn_decode_mma(None);
+            if let Some(e) = gpu.take_error() {
+                panic!("cuda error in attend_sparse {nh}q case {ci}: {e}");
+            }
+
+            Naive.attend_sparse(&a, cells, &sel, want);
+            let name = format!("sparse {nh}q c{ci}");
+            close(&name, want, scalar, attend_tolerance(stride, want));
+
+            // The same cells gathered on the host, attended densely by the device
+            // one row at a time: the same kernels on the same data.
+            let per_row = nh * hd;
+            for t in 0..n_q {
+                let count = sel.count(start_pos + t);
+                for (j, &c) in cells[t * stride..][..count].iter().enumerate() {
+                    let (src, dst) = (c as usize * kv_dim, j * kv_dim);
+                    rows_k[t][dst..dst + kv_dim].copy_from_slice(&k[src..src + kv_dim]);
+                    rows_v[t][dst..dst + kv_dim].copy_from_slice(&v[src..src + kv_dim]);
+                }
+                rows_q[t].copy_from_slice(&q[t * per_row..(t + 1) * per_row]);
+                let ar = Attn {
+                    q: &rows_q[t],
+                    k: &rows_k[t],
+                    v: &rows_v[t],
+                    kv_dim,
+                    n_pos: count,
+                    head_dim: hd,
+                    n_head: nh,
+                    n_head_kv: nkv,
+                    scale,
+                };
+                gpu.begin_pass(1);
+                gpu.host_wrote(&rows_q[t]);
+                gpu.attend(&ar, &mut rows_out[t]);
+                gpu.host_needs(&mut rows_out[t]);
+                gpu.end_pass();
+                exact(&format!("{name} row {t}"), &rows_out[t], &sparse[t * per_row..(t + 1) * per_row]);
+            }
+        }
+    }
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error: {e}");
+    }
+}
+
 /// What gathering QSA's kept cells into a dense window costs: the gather arm of
 /// the Q2 decode fork (`src/model/qwen4exp.md`). The mask arm is priced by
 /// `what_attention_costs_as_context_grows` at full depth; the gather arm is

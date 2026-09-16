@@ -19,7 +19,7 @@
 // module, never inside it.
 #![forbid(unsafe_code)]
 
-use super::{Attn, Delta, Ops, Weights};
+use super::{Attn, Delta, Ops, QsaPool, QsaSelect, Weights};
 use crate::gguf::GgmlType;
 use crate::quant::half::{f16_to_f32, f32_to_f16};
 
@@ -518,6 +518,102 @@ pub(crate) fn attend_kv_head_cells(
     }
 }
 
+/// [`Ops::qsa_pool`]'s oracle: pool, RMSNorm and rope blocks `p.from..p.to`.
+pub(crate) fn qsa_pool(raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
+    let (dim, ratio) = (p.dim, p.ratio);
+    let inv = 1.0 / ratio as f32;
+    let half = p.n_rot / 2;
+    for b in p.from..p.to {
+        let first = b * ratio;
+        let key = &mut pooled[b * dim..(b + 1) * dim];
+        for (d, k) in key.iter_mut().enumerate() {
+            let mut acc = f16_to_f32(raw[first * dim + d]);
+            for m in 1..ratio {
+                acc += f16_to_f32(raw[(first + m) * dim + d]);
+            }
+            *k = acc * inv;
+        }
+        let scale = rms_scale(key, p.eps);
+        for (k, &w) in key.iter_mut().zip(p.norm) {
+            *k = *k * scale * w;
+        }
+        // `rope_neox`'s table and rotation, at the block's first position.
+        for i in 0..half {
+            let freq = (p.theta as f64).powf(-2.0 * i as f64 / p.n_rot as f64);
+            let (sin, cos) = (first as f64 * freq).sin_cos();
+            let (sin, cos) = (sin as f32, cos as f32);
+            let (x0, x1) = (key[i], key[i + half]);
+            key[i] = x0 * cos - x1 * sin;
+            key[i + half] = x0 * sin + x1 * cos;
+        }
+    }
+}
+
+/// [`Ops::qsa_select`]'s scores: `out[t][b] = Σ_h relu(q[t][h] · pooled[b])`.
+pub(crate) fn qsa_scores(q: &[f32], pooled: &[f32], s: &QsaSelect, out: &mut [f32]) {
+    let (dim, nh, nb) = (s.dim, s.n_head, s.n_blocks);
+    let n_q = q.len() / (nh * dim).max(1);
+    debug_assert!(out.len() >= n_q * nb);
+    for t in 0..n_q {
+        for b in 0..nb {
+            let k = &pooled[b * dim..(b + 1) * dim];
+            let mut sum = 0.0f32;
+            for h in 0..nh {
+                let qh = &q[(t * nh + h) * dim..(t * nh + h + 1) * dim];
+                let mut dot = 0.0f64;
+                for (x, y) in qh.iter().zip(k) {
+                    dot += f64::from(x * y);
+                }
+                sum += (dot as f32).max(0.0);
+            }
+            out[t * nb + b] = sum;
+        }
+    }
+}
+
+/// [`Ops::qsa_select`]'s selection: each row's cells at its stride.
+pub(crate) fn qsa_select_cells(scores: &[f32], s: &QsaSelect, cells: &mut [u32]) {
+    let (nb, stride) = (s.n_blocks, s.stride());
+    let n_q = cells.len() / stride.max(1);
+    let mut row = Vec::with_capacity(stride);
+    for t in 0..n_q {
+        let pos = s.start_pos + t;
+        row.clear();
+        select_cells(&scores[t * nb..(t + 1) * nb], s.ratio, s.budget, pos, &mut row);
+        debug_assert_eq!(row.len(), s.count(pos));
+        cells[t * stride..t * stride + row.len()].copy_from_slice(&row);
+    }
+}
+
+/// QSA's reference selection for the query at `pos` (`qwen4exp.md`, QSA; decided
+/// 16-09): the best `budget` whole blocks of `ratio` cells that are fully visible
+/// to it, ties to the lower block index, then its tail — the cells after the last
+/// full block, up to and including itself. Appends them to `cells`, ascending.
+///
+/// `scores` holds one score per block, at least `(pos + 1) / ratio` of them.
+/// Transcribed from colibri's `q38_attention` (`c/qwen38_core.h:1593-1627`), written
+/// from the Hugging Face reference. With `budget` or fewer full blocks every visible
+/// cell is chosen, which is dense attention.
+pub(crate) fn select_cells(scores: &[f32], ratio: usize, budget: usize, pos: usize, cells: &mut Vec<u32>) {
+    let visible = pos + 1;
+    let full = visible / ratio;
+    debug_assert!(scores.len() >= full);
+    let mut order: Vec<u32> = (0..full as u32).collect();
+    if full > budget {
+        // A total order: score descending, then block ascending, so ties are decided.
+        order.select_nth_unstable_by(budget, |&a, &b| {
+            scores[b as usize].total_cmp(&scores[a as usize]).then(a.cmp(&b))
+        });
+        order.truncate(budget);
+        order.sort_unstable();
+    }
+    for &b in order.iter() {
+        let first = b as usize * ratio;
+        cells.extend((first..first + ratio).map(|c| c as u32));
+    }
+    cells.extend((full * ratio..visible).map(|c| c as u32));
+}
+
 /// The `1/sqrt(mean(x^2) + eps)` factor of RMSNorm.
 ///
 /// Transcribed from `ggml_compute_forward_rms_norm_f32` in
@@ -864,22 +960,42 @@ mod tests {
         assert_eq!(two[0..4], two[4..8]);
     }
 
-    /// `rope_rows` at consecutive positions is `rope_neox`, to the bit — so the only
-    /// thing it adds is the freedom to name each row's position.
+    /// A pooled key is the block's mean, then `rms_norm_heads`, then `rope_neox`
+    /// at the block's first position — to the bit — and blocks outside
+    /// `from..to` are left alone.
     #[test]
-    fn rope_rows_at_consecutive_positions_is_rope_neox() {
-        let (hd, n_rot, nh, rows) = (128usize, 64usize, 2usize, 5usize);
-        let x: Vec<f32> = (0..rows * nh * hd).map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0).collect();
-        let (mut a, mut b) = (x.clone(), x);
-        Naive.rope_neox(&mut a, 2049, hd, n_rot, nh, 1.0e7);
-        let positions: Vec<u32> = (2049..2049 + rows as u32).collect();
-        Naive.rope_rows(&mut b, &positions, hd, n_rot, nh, 1.0e7);
-        assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+    fn qsa_pool_is_mean_then_norm_then_rope_at_the_blocks_first_cell() {
+        let (dim, ratio, n_rot) = (128usize, 4usize, 64usize);
+        let raw: Vec<u16> = (0..40 * dim).map(|i| f32_to_f16(((i * 7919) % 1000) as f32 / 500.0 - 1.0)).collect();
+        let norm: Vec<f32> = (0..dim).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let p = QsaPool { from: 2, to: 4, ratio, dim, norm: &norm, eps: 1e-6, n_rot, theta: 1.0e7 };
+        let mut pooled = vec![-9.0f32; 10 * dim];
+        qsa_pool(&raw, &mut pooled, &p);
+        for b in 0..10 {
+            let key = &pooled[b * dim..(b + 1) * dim];
+            if !(2..4).contains(&b) {
+                assert!(key.iter().all(|&v| v == -9.0), "block {b} was written");
+                continue;
+            }
+            let mut want: Vec<f32> = (0..dim)
+                .map(|d| {
+                    let mut acc = f16_to_f32(raw[b * ratio * dim + d]);
+                    for m in 1..ratio {
+                        acc += f16_to_f32(raw[(b * ratio + m) * dim + d]);
+                    }
+                    acc * (1.0 / ratio as f32)
+                })
+                .collect();
+            Naive.rms_norm_heads(&mut want, &norm, dim, 1e-6);
+            Naive.rope_neox(&mut want, b * ratio, dim, n_rot, 1, 1.0e7);
+            assert!(want.iter().zip(key).all(|(x, y)| x.to_bits() == y.to_bits()), "block {b}");
+        }
     }
 
     /// **Sparse attention over every cell is dense attention, to the bit** — the
     /// claim that makes QSA's only behavioral change the cells it leaves out.
-    /// Grouped-query heads, and a batch, so the causal mask varies by row.
+    /// Grouped-query heads, and a batch, so the causal mask varies by row. A
+    /// budget of 5 blocks of 4 keeps everything up to position 23.
     #[test]
     fn sparse_attention_over_every_cell_is_dense_attention() {
         let (hd, n_head, n_head_kv, n_q, n_pos) = (16usize, 8usize, 2usize, 3usize, 21usize);
@@ -891,28 +1007,84 @@ mod tests {
         let k: Vec<u16> = noise(n_pos * kv_dim, 2).iter().map(|&v| f32_to_f16(v)).collect();
         let v: Vec<u16> = noise(n_pos * kv_dim, 3).iter().map(|&v| f32_to_f16(v)).collect();
         let a = Attn { q: &q, k: &k, v: &v, kv_dim, n_pos, head_dim: hd, n_head, n_head_kv, scale: 1.0 / (hd as f32).sqrt() };
+        let sel = QsaSelect { n_head: 1, dim: 1, n_blocks: 5, start_pos: n_pos - n_q, ratio: 4, budget: 5 };
+        let stride = sel.stride();
 
         let mut dense = vec![0.0f32; n_q * n_head * hd];
         Naive.attend(&a, &mut dense);
 
-        let (mut cells, mut starts) = (Vec::new(), vec![0u32]);
+        let mut cells = vec![0u32; n_q * stride];
         for t in 0..n_q {
-            cells.extend(0..a.n_pos_of(t) as u32);
-            starts.push(cells.len() as u32);
+            assert_eq!(sel.count(a.n_pos_of(t) - 1), a.n_pos_of(t));
+            for c in 0..a.n_pos_of(t) {
+                cells[t * stride + c] = c as u32;
+            }
         }
         let mut sparse = vec![0.0f32; n_q * n_head * hd];
-        Naive.attend_sparse(&a, &cells, &starts, &mut sparse);
+        Naive.attend_sparse(&a, &cells, &sel, &mut sparse);
         assert!(dense.iter().zip(&sparse).all(|(p, q)| p.to_bits() == q.to_bits()));
 
-        // And leaving a cell out does change the answer.
-        let (mut fewer, mut fstarts) = (Vec::new(), vec![0u32]);
-        for t in 0..n_q {
-            fewer.extend((0..a.n_pos_of(t) as u32).filter(|&c| c != 3));
-            fstarts.push(fewer.len() as u32);
-        }
-        let mut dropped = vec![0.0f32; n_q * n_head * hd];
-        Naive.attend_sparse(&a, &fewer, &fstarts, &mut dropped);
-        assert!(dense.iter().zip(&dropped).any(|(p, q)| p.to_bits() != q.to_bits()));
+        // And pointing a row at a different cell does change the answer.
+        cells[stride + 3] = 4;
+        let mut moved = vec![0.0f32; n_q * n_head * hd];
+        Naive.attend_sparse(&a, &cells, &sel, &mut moved);
+        assert!(dense.iter().zip(&moved).any(|(p, q)| p.to_bits() != q.to_bits()));
+    }
+
+    /// Scores are the per-head ReLU'd dot products, summed: a head that points
+    /// away from a block contributes nothing rather than subtracting.
+    #[test]
+    fn qsa_scores_sum_relu_over_heads() {
+        let sel = QsaSelect { n_head: 2, dim: 2, n_blocks: 2, start_pos: 0, ratio: 4, budget: 1 };
+        let q = [1.0f32, 0.0, -1.0, 0.0];
+        let pooled = [2.0f32, 0.0, 0.0, 3.0];
+        let mut out = [9.0f32; 2];
+        qsa_scores(&q, &pooled, &sel, &mut out);
+        assert_eq!(out, [2.0, 0.0]);
+    }
+
+    fn select(scores: &[f32], ratio: usize, budget: usize, pos: usize) -> Vec<u32> {
+        let mut cells = Vec::new();
+        select_cells(scores, ratio, budget, pos, &mut cells);
+        let sel = QsaSelect { n_head: 1, dim: 1, n_blocks: scores.len(), start_pos: pos, ratio, budget };
+        assert_eq!(cells.len(), sel.count(pos), "the count the host derives agrees");
+        cells
+    }
+
+    /// Within the budget every visible cell is chosen: dense attention.
+    #[test]
+    fn qsa_selects_everything_within_the_budget() {
+        // 3 full blocks plus a tail of 2, budget 3.
+        let cells = select(&[0.1, 0.9, 0.5], 4, 3, 13);
+        assert_eq!(cells, (0..=13).collect::<Vec<u32>>());
+    }
+
+    /// The worked example put to the user on 16-09: budget 3 blocks, query at 25.
+    #[test]
+    fn qsa_keeps_the_best_whole_blocks_and_the_tail() {
+        let scores = [0.9, 0.1, 0.7, 0.3, 0.8, 0.2];
+        let cells = select(&scores, 4, 3, 25);
+        let want: Vec<u32> = [0..4, 8..12, 16..20, 24..26].into_iter().flatten().collect();
+        assert_eq!(cells, want, "blocks 0, 2 and 4, then the tail 24-25, ascending");
+    }
+
+    /// Equal scores go to the lower block, and a query ending a block has no tail.
+    #[test]
+    fn qsa_ties_go_to_the_lower_block() {
+        let cells = select(&[0.5; 6], 4, 2, 23);
+        assert_eq!(cells, (0..8).collect::<Vec<u32>>());
+    }
+
+    /// Only blocks fully visible to the query are scored: at 21 the block 20-23 is
+    /// not yet whole, so its cells are tail and its (high) score is never a
+    /// candidate. The five full blocks tie at 0, so budget 1 takes block 0.
+    #[test]
+    fn qsa_never_scores_a_block_the_query_cannot_fully_see() {
+        let mut scores = vec![0.0f32; 6];
+        scores[5] = 100.0;
+        let cells = select(&scores, 4, 1, 21);
+        let want: Vec<u32> = [0..4, 20..22].into_iter().flatten().collect();
+        assert_eq!(cells, want);
     }
 
     #[test]

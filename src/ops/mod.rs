@@ -240,6 +240,54 @@ impl Attn<'_> {
     }
 }
 
+/// What [`Ops::qsa_pool`] pools: blocks `from..to` of `ratio` cells of `dim`.
+pub struct QsaPool<'a> {
+    pub from: usize,
+    pub to: usize,
+    pub ratio: usize,
+    pub dim: usize,
+    /// `indexer.k_norm`, `dim` wide.
+    pub norm: &'a [f32],
+    pub eps: f32,
+    pub n_rot: usize,
+    pub theta: f32,
+}
+
+/// The shape of one QSA selection: this pass's query rows against its pooled
+/// blocks, and the budget they are chosen under.
+#[derive(Clone, Copy, Debug)]
+pub struct QsaSelect {
+    /// Indexer heads per query row, each `dim` wide.
+    pub n_head: usize,
+    pub dim: usize,
+    /// Blocks pooled: every block whole at the pass's last position.
+    pub n_blocks: usize,
+    /// Row 0's position; rows are consecutive.
+    pub start_pos: usize,
+    pub ratio: usize,
+    /// Whole blocks kept, `top_k / ratio`.
+    pub budget: usize,
+}
+
+impl QsaSelect {
+    /// Cells per row in the selection buffer: the most any query keeps,
+    /// `budget * ratio` plus a tail of up to `ratio - 1`.
+    pub fn stride(&self) -> usize {
+        self.budget * self.ratio + self.ratio - 1
+    }
+
+    /// Cells the query at `pos` keeps: every visible cell while it can see
+    /// `budget` or fewer whole blocks, otherwise `budget` blocks and its tail.
+    pub fn count(&self, pos: usize) -> usize {
+        let visible = pos + 1;
+        if visible / self.ratio <= self.budget {
+            visible
+        } else {
+            self.budget * self.ratio + visible % self.ratio
+        }
+    }
+}
+
 /// One token's inputs to the gated delta rule — GatedDeltaNet's recurrent core.
 ///
 /// A struct for the same reason [`Attn`] is one: this has four dimensions and
@@ -747,69 +795,49 @@ pub trait Ops {
     // Scalar defaults, the oracle for the model's reference selection (decided
     // 16-09). A device backend must override each or refuse it.
 
-    /// RoPE with an explicit position per row: [`Ops::rope_neox`]'s arithmetic, but
-    /// row `t` rotates at `positions[t]` rather than at `pos + t`. QSA ropes each
-    /// pooled indexer key at its block's first position — 0, 4, 8, … — which are
-    /// not consecutive. `x` is `positions.len()` rows of `n_heads * head_dim`.
-    #[allow(clippy::too_many_arguments)]
-    fn rope_rows(&self, x: &mut [f32], positions: &[u32], head_dim: usize, n_rot: usize, n_heads: usize, theta_base: f32) {
-        let per_row = head_dim * n_heads;
-        debug_assert_eq!(x.len(), positions.len() * per_row);
-        let half = n_rot / 2;
-        for (row, &pos) in x.chunks_exact_mut(per_row).zip(positions) {
-            for head in row.chunks_exact_mut(head_dim) {
-                for i in 0..half {
-                    let freq = (theta_base as f64).powf(-2.0 * i as f64 / n_rot as f64);
-                    let (sin, cos) = (pos as f64 * freq).sin_cos();
-                    let (sin, cos) = (sin as f32, cos as f32);
-                    let x0 = head[i];
-                    let x1 = head[i + half];
-                    head[i] = x0 * cos - x1 * sin;
-                    head[i + half] = x0 * sin + x1 * cos;
-                }
-            }
-        }
+    /// Pool blocks `p.from..p.to` of one layer's raw indexer keys into its
+    /// pooled-key lane: for block `b`, the mean of cells `b*ratio ..
+    /// (b+1)*ratio` as `((k0 + k1) + k2) + k3` times `1/ratio` — `ggml_add`'s
+    /// chain then `ggml_scale` (`qwen4exp.cpp:609-617`) — then RMSNorm with
+    /// `p.norm`, then RoPE at position `b*ratio`.
+    ///
+    /// `raw` is the layer's whole f16 lane, `pooled` its whole pooled lane,
+    /// block-major; only blocks `from..to` are written. The arithmetic is the
+    /// oracle's serial RMSNorm and `rope_neox`'s f64 table, on every backend,
+    /// because the scores only rank blocks and an ulp can reorder a near-tie.
+    fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
+        naive::qsa_pool(raw, pooled, p);
     }
 
-    /// QSA's block scores: `out[t][b] = Σ_h relu(q[t][h] · keys[b])` for `n_head`
-    /// indexer heads of `dim`, over `keys.len() / dim` pooled block keys.
+    /// Score and select, per query row of this pass: `scores[t][b] = Σ_h
+    /// relu(q[t][h] · pooled[b])` over `s.n_blocks` blocks (`build_qsa_top_k`'s
+    /// `mul_mat`, `relu` and per-head sum, `qwen4exp.cpp:627-643`), then row `t`'s
+    /// cells into `cells[t * s.stride()..]`, ascending — [`naive::select_cells`],
+    /// the model's reference rule. Row `t` gets [`QsaSelect::count`] cells; the
+    /// rest of its stride is left as it was.
     ///
-    /// `build_qsa_top_k`'s `mul_mat`, `relu` and per-head sum (`qwen4exp.cpp:627-643`).
     /// The dot accumulates in f64, as ggml's scalar `vec_dot_f32` does; the heads
-    /// are summed in f32 in order, as its chain of `ggml_add` does. The scores only
-    /// rank blocks, so their arithmetic matters only between near-ties.
-    fn qsa_scores(&self, q: &[f32], keys: &[f32], n_head: usize, dim: usize, out: &mut [f32]) {
-        let (n_blocks, n_q) = (keys.len() / dim.max(1), q.len() / (n_head * dim).max(1));
-        debug_assert_eq!(out.len(), n_q * n_blocks);
-        for t in 0..n_q {
-            for b in 0..n_blocks {
-                let k = &keys[b * dim..(b + 1) * dim];
-                let mut sum = 0.0f32;
-                for h in 0..n_head {
-                    let qh = &q[(t * n_head + h) * dim..(t * n_head + h + 1) * dim];
-                    let mut dot = 0.0f64;
-                    for (x, y) in qh.iter().zip(k) {
-                        dot += f64::from(x * y);
-                    }
-                    sum += (dot as f32).max(0.0);
-                }
-                out[t * n_blocks + b] = sum;
-            }
-        }
+    /// are summed in f32 in order, as its chain of `ggml_add` does.
+    fn qsa_select(&self, q: &[f32], pooled: &[f32], s: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
+        naive::qsa_scores(q, pooled, s, scores);
+        naive::qsa_select_cells(scores, s, cells);
     }
 
     /// Attention restricted, per query row, to chosen cells: QSA past its budget.
     ///
-    /// Row `t` attends to `cells[starts[t]..starts[t + 1]]`, ascending positions,
-    /// all below `a.n_pos_of(t)`. Everything else about `a` is [`Ops::attend`]'s.
-    /// **Given every cell for every row it is `attend`, to the bit**, on the oracle.
-    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], starts: &[u32], out: &mut [f32]) {
+    /// Row `t` attends to `cells[t * stride ..][.. count]`, ascending positions,
+    /// where `count` is [`qsa_cell_count`] at the row's position — known on the
+    /// host, so nothing is read back. Everything else about `a` is
+    /// [`Ops::attend`]'s. **Given every cell for every row it is `attend`, to the
+    /// bit**, on the oracle.
+    fn attend_sparse(&self, a: &Attn<'_>, cells: &[u32], sel: &QsaSelect, out: &mut [f32]) {
         debug_assert_eq!(out.len(), a.n_q() * a.n_head * a.head_dim);
-        debug_assert_eq!(starts.len(), a.n_q() + 1);
         let per_kv = a.group() * a.head_dim;
+        let stride = sel.stride();
         let mut sc = naive::Scratch::for_attn(a);
         for t in 0..a.n_q() {
-            let row_cells = &cells[starts[t] as usize..starts[t + 1] as usize];
+            let count = sel.count(a.n_pos_of(t) - 1);
+            let row_cells = &cells[t * stride..t * stride + count];
             let row = &mut out[t * a.n_head * a.head_dim..][..a.n_head * a.head_dim];
             for (h_kv, chunk) in row.chunks_mut(per_kv).enumerate() {
                 naive::attend_kv_head_cells(a, t, h_kv, row_cells, chunk, &mut sc);

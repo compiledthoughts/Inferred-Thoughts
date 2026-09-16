@@ -159,6 +159,12 @@ pub struct Cuda {
     /// Two F32 weights interleaved into one column-major stack, keyed on both
     /// source pointers. See `Cuda::resident_f32_t_pair`.
     f32t_pair: RefCell<HashMap<(usize, usize), DeviceBuffer>>,
+    /// QSA's device-owned buffers — pooled-key lanes and selected cells — keyed
+    /// on the host buffer's address (`ops::qsa`).
+    qsa_bufs: RefCell<HashMap<usize, DeviceBuffer>>,
+    /// QSA's RoPE table for pooled keys: (ratio, n_rot, theta bits), blocks, cos, sin.
+    #[allow(clippy::type_complexity)]
+    qsa_rope: RefCell<Option<((usize, usize, u32), usize, DeviceBuffer, DeviceBuffer)>>,
 
     /// Force the warp-per-position score phase on or off. `None` picks by
     /// context depth; see `Cuda::attend_impl`.
@@ -858,6 +864,8 @@ impl Cuda {
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),
+                qsa_bufs: RefCell::new(HashMap::new()),
+                qsa_rope: RefCell::new(None),
                 attn_warp: Cell::new(None),
                 iq4_untiled: Cell::new(false),
                 q6k_scalar: Cell::new(env_flag("INFERRED_Q6K_SCALAR")),
@@ -1180,6 +1188,9 @@ impl Cuda {
         }
         if let Some(c) = self.experts.borrow().as_ref() {
             r.expert_slab_bytes = c.resident_bytes();
+        }
+        for b in self.qsa_bufs.borrow().values() {
+            r.kv_bytes += b.len_bytes() as u64;
         }
         for m in self.kv.borrow().values() {
             r.kv_bytes += m.buf.len_bytes() as u64;

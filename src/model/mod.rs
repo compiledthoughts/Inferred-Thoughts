@@ -161,6 +161,15 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Positions per pooled indexer block, the smallest nonzero compress ratio;
+    /// 0 for a model with no indexer.
+    pub fn index_ratio(&self) -> usize {
+        match self {
+            Model::Qwen4Exp(m) => m.cfg.compress_ratios.iter().copied().filter(|&r| r > 0).min().unwrap_or(0) as usize,
+            _ => 0,
+        }
+    }
+
     /// Experts across every routed expert tensor, which a device backend's expert
     /// cache has to be able to count.
     pub fn expert_pool(&self) -> usize {

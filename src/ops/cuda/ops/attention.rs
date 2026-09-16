@@ -408,7 +408,7 @@ impl Cuda {
 
     /// A group of query rows against the cache — the flash-decoding pair.
     #[allow(clippy::too_many_arguments)]
-    fn attend_rows(
+    pub(super) fn attend_rows(
         &self,
         a: &Attn<'_>,
         t0: usize,

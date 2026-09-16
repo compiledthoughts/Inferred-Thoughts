@@ -1459,11 +1459,7 @@ fn trace(model: &str, prompt: &str, dump: Option<&str>) -> inferred_thoughts::Re
     let mut cache = inferred_thoughts::KvCache::new(m.n_kv_layer(), m.kv_dim(), tokens.len());
     // As `Engine::new`: a sparse-attention model caches indexer keys beside K and V.
     if m.index_dim() > 0 {
-        cache = cache.with_index(m.index_dim());
-    }
-    // As `Engine::new`: a sparse-attention model caches indexer keys beside K and V.
-    if m.index_dim() > 0 {
-        cache = cache.with_index(m.index_dim());
+        cache = cache.with_index(m.index_dim(), m.index_ratio());
     }
     let mut recurrent = m
         .recurrent_dims()
@@ -1763,5 +1759,11 @@ fn json_string(s: &str) -> String {
 fn kv_reserve_bytes(m: &inferred_thoughts::Model, n_ctx: usize) -> usize {
     // K and V, plus the indexer keys a sparse-attention model caches beside them.
     let per_position = m.kv_dim().saturating_mul(2).saturating_add(m.index_dim());
-    m.n_kv_layer().saturating_mul(n_ctx).saturating_mul(per_position).saturating_mul(2)
+    let kv = m.n_kv_layer().saturating_mul(n_ctx).saturating_mul(per_position).saturating_mul(2);
+    // And QSA's pooled keys, f32, one per block of `index_ratio` positions.
+    let pooled = match m.index_ratio() {
+        0 => 0,
+        r => m.n_kv_layer().saturating_mul(n_ctx / r).saturating_mul(m.index_dim()).saturating_mul(4),
+    };
+    kv.saturating_add(pooled)
 }
