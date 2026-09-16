@@ -463,6 +463,34 @@ impl Cuda {
         Ok(ptr)
     }
 
+    /// An F16 weight, transposed at upload into column-major and **kept f16**:
+    /// `resident_f32_t`'s layout for `matmul_f16_t`, at half the bytes. Shares
+    /// its map, so residency counts it; the size check tells the two apart.
+    pub(super) fn resident_f16_t(&self, w: &Weights<'_>) -> Result<ffi::CUdeviceptr> {
+        let key = w.data.as_ptr() as usize;
+        if let Some(b) = self.f32t.borrow().get(&key) {
+            // Sized, not trusted by address alone: see `resident_f32_t`.
+            if b.len_bytes() == w.n_in * w.n_out * std::mem::size_of::<u16>() {
+                return Ok(b.ptr);
+            }
+        }
+        let mut t = vec![0u16; w.n_in * w.n_out];
+        for j in 0..w.n_out {
+            let row = &w.data[j * w.n_in * 2..(j + 1) * w.n_in * 2];
+            for (k, c) in row.chunks_exact(2).enumerate() {
+                t[k * w.n_out + j] = u16::from_le_bytes([c[0], c[1]]);
+            }
+        }
+        let buf = DeviceBuffer::from_slice(&t)?;
+        self.bump(|s| {
+            s.h2d_calls += 1;
+            s.h2d_bytes += std::mem::size_of_val(&t[..]) as u64;
+        });
+        let ptr = buf.ptr;
+        self.f32t.borrow_mut().insert(key, buf);
+        Ok(ptr)
+    }
+
     /// Two F32 weights interleaved into one column-major stack, uploaded once.
     ///
     /// **Interleaved, not appended.** `matmul_f32_t` indexes

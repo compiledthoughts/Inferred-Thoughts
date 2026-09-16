@@ -2475,6 +2475,98 @@ fn the_staged_f32_matmul_is_bit_identical() {
     }
 }
 
+/// The F16 matmul is bit-identical to the oracle.
+///
+/// Qwen3.8-Flash-Next's 0.2B test model stores its QSA indexer projections as
+/// F16 (`{256, 512}` and `{256, 128}`), and QSA's selection ranks blocks by
+/// scores computed from them, so an ulp here can change which cells a query
+/// sees. The weights are arbitrary f16 bit patterns rather than rounded noise,
+/// so subnormals and both zeros are exercised; only the exponent-31 patterns
+/// (inf and NaN), which no weight holds, are left out.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_f16_matmul_is_bit_identical() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // Held for the whole test: the backend caches the transposed weight by host
+    // address (see `the_staged_f32_matmul_is_bit_identical`).
+    let shapes = [(256usize, 512usize), (256, 128), (2560, 512), (2560, 129), (7, 1)];
+    let held: Vec<Vec<u8>> = shapes
+        .iter()
+        .map(|&(n_in, n_out)| {
+            let mut state = 0x16f0_0000u64 + n_out as u64;
+            (0..n_in * n_out)
+                .flat_map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let mut h = (state >> 33) as u16;
+                    if h & 0x7c00 == 0x7c00 {
+                        h &= !0x4000;
+                    }
+                    h.to_le_bytes()
+                })
+                .collect()
+        })
+        .collect();
+    let mut outputs = Vec::new();
+    for (&(n_in, n_out), bytes) in shapes.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: inferred_thoughts::gguf::GgmlType::F16, n_in, n_out, pooled: false };
+        for n_tok in [1usize, 3] {
+            let x = noise(n_in * n_tok, 0xf16 + n_tok as u64);
+            let mut want = vec![0.0f32; n_out * n_tok];
+            cpu.matmul(&w, &x, &mut want);
+
+            let mut got = vec![0.0f32; n_out * n_tok];
+            gpu.begin_pass(n_tok);
+            gpu.host_wrote(&x);
+            gpu.matmul(&w, &x, &mut got);
+            gpu.host_needs(&mut got);
+            gpu.end_pass();
+            if let Some(e) = gpu.take_error() {
+                panic!("cuda error at {{{n_in},{n_out}}} n_tok {n_tok}: {e}");
+            }
+            exact(&format!("matmul F16 {{{n_in},{n_out}}} n_tok {n_tok}"), &want, &got);
+            outputs.push((x, got));
+        }
+    }
+
+    // The negative case: the comparison above catches a weight read off by one
+    // f16 code. The GPU gets a copy (its own address, so its own upload) in
+    // which one weight is 8200 where the oracle's is 8192; that row, and only
+    // that row, must differ in every token.
+    let (n_in, n_out, n_tok, row) = (256usize, 512usize, 3usize, 5usize);
+    let x = noise(n_in * n_tok, 0xf16f);
+    let col = (0..n_in)
+        .find(|&k| (0..n_tok).all(|t| x[t * n_in + k].abs() > 0.5))
+        .expect("a column where every token's input is large");
+    let mut good = held[0].clone();
+    let at = (row * n_in + col) * 2;
+    good[at..at + 2].copy_from_slice(&0x7000u16.to_le_bytes());
+    let mut bad = good.clone();
+    bad[at..at + 2].copy_from_slice(&0x7001u16.to_le_bytes());
+    let wg = Weights { data: &good, ty: inferred_thoughts::gguf::GgmlType::F16, n_in, n_out, pooled: false };
+    let wb = Weights { data: &bad, ty: inferred_thoughts::gguf::GgmlType::F16, n_in, n_out, pooled: false };
+    let mut want = vec![0.0f32; n_out * n_tok];
+    cpu.matmul(&wg, &x, &mut want);
+    let mut got = vec![0.0f32; n_out * n_tok];
+    gpu.begin_pass(n_tok);
+    gpu.host_wrote(&x);
+    gpu.matmul(&wb, &x, &mut got);
+    gpu.host_needs(&mut got);
+    gpu.end_pass();
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error in the negative case: {e}");
+    }
+    let differing: Vec<usize> = (0..n_out * n_tok).filter(|&i| want[i].to_bits() != got[i].to_bits()).collect();
+    let expected: Vec<usize> = (0..n_tok).map(|t| t * n_out + row).collect();
+    println!("  negative case: outputs {differing:?} differ, expected {expected:?}");
+    assert_eq!(
+        differing, expected,
+        "one weight moved by one f16 code must change exactly its own output row in every          token; if nothing differs, the comparison cannot see a misread weight"
+    );
+}
+
 /// The warp-per-position score phase agrees with the oracle at the depths it
 /// actually runs at.
 ///

@@ -81,6 +81,26 @@ extern "C" __global__ void matmul_f32_t(int n_in, int n_out,
     out[(size_t)tok * n_out + j] = sum;
 }
 
+// F16 matrix-vector: `matmul_f32_t` over a column-major **f16** weight, each
+// weight widened as it is read -- `ops::naive::dot_row`'s F16 arm, which
+// multiplies `f16_to_f32(w) * x` and sums serially in ascending k. Widening is
+// exact and the chain is the same, so this is bit-identical to the oracle.
+// Qwen3.8-Flash-Next's 0.2B test model stores its QSA indexer projections as
+// F16 (src/model/qwen4exp.md); the weight stays f16 on the device, as CLAUDE.md
+// requires.
+extern "C" __global__ void matmul_f16_t(int n_in, int n_out,
+                                        const unsigned short *__restrict__ wt,
+                                        const float *__restrict__ x,
+                                        float *__restrict__ out) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n_out) return;
+    const int tok = blockIdx.y;
+    const float *xt = x + (size_t)tok * n_in;
+    float sum = 0.0f;
+    for (int k = 0; k < n_in; ++k) sum += h2f(wt[(size_t)k * n_out + j]) * xt[k];
+    out[(size_t)tok * n_out + j] = sum;
+}
+
 // Two F32 matmuls over the **same** activation, in one launch.
 //
 // **The cost of this kernel is reading `x`, not producing outputs.** Its own

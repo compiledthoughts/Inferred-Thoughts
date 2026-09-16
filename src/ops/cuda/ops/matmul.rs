@@ -663,6 +663,37 @@ impl Cuda {
         }
     }
 
+    /// F16 weights: `matmul_f32`'s row-per-thread shape over an f16 weight,
+    /// bit-identical to the oracle. Only Qwen3.8-Flash-Next's 0.2B test model
+    /// reaches it (its QSA indexer), so it has no staged form.
+    fn matmul_f16(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
+        let n_tok = x.len() / w.n_in;
+        self.note_shape("matmul_f16_t", w.n_in, w.n_out);
+        let wd = self.resident_f16_t(w)?;
+        let xd = self.mirror_in(x)?;
+        let od = self.mirror_out(out)?;
+        let args = [
+            KArg::I32(w.n_in as i32),
+            KArg::I32(w.n_out as i32),
+            KArg::Ptr(wd),
+            KArg::Ptr(xd),
+            KArg::Ptr(od),
+        ];
+        let block = 128u32;
+        // SAFETY: parameters match `matmul_f16_t`; the grid covers exactly
+        // `n_out` rows by `n_tok` tokens, and the f16 weight is column-major.
+        unsafe {
+            self.launch_grid2(
+                "matmul_f16_t",
+                w.n_out.div_ceil(block as usize) as u32,
+                n_tok as u32,
+                block,
+                0,
+                &args,
+            )
+        }
+    }
+
     pub(super) fn matmul_impl(&self, w: &Weights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
         match w.ty {
             GgmlType::Q8_0 => {}
@@ -670,6 +701,7 @@ impl Cuda {
                 return self.matmul_kquant(w, x, out);
             }
             GgmlType::F32 => return self.matmul_f32(w, x, out),
+            GgmlType::F16 => return self.matmul_f16(w, x, out),
             GgmlType::Nvfp4 if self.nvfp4_fp4.get() && cfg!(nvfp4_block_scale) => {
                 return self.matmul_nvfp4_fp4(w, x, out);
             }
