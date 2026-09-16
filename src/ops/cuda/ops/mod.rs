@@ -44,6 +44,7 @@ mod matmul;
 mod moe;
 mod norm;
 mod placement;
+mod qsa;
 mod qwen4exp;
 mod residency;
 

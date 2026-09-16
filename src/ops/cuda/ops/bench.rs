@@ -866,7 +866,7 @@ impl Cuda {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn time_launches_2d(
+    pub(super) fn time_launches_2d(
         &self,
         kernel: &'static str,
         grid_x: u32,

@@ -1476,6 +1476,46 @@ fn what_attention_costs_as_context_grows() {
     println!("  ms/token is one call x {LAYERS} attending layers.\n");
 }
 
+/// What gathering QSA's kept cells into a dense window costs: the gather arm of
+/// the Q2 decode fork (`src/model/qwen4exp.md`). The mask arm is priced by
+/// `what_attention_costs_as_context_grows` at full depth; the gather arm is
+/// that bench's d2048 row plus this.
+///
+/// 2,051 cells, the most a query keeps: 512 whole blocks of 4 spread evenly
+/// over the cache (the least local choice), plus a 3-cell tail. Qwen3.8's
+/// attention shape, `kv_dim` 512. A few seconds; prints, does not assert
+/// beyond the gather's own check that it copied the right rows.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn what_the_qsa_gather_costs() {
+    const KV_DIM: usize = 512;
+    const RATIO: usize = 4;
+    const BLOCKS: usize = 512;
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    println!("
+qsa_gather_kv, {} cells x kv_dim {KV_DIM}, K and V", BLOCKS * RATIO + 3);
+    println!("  {:>7}  {:>9}  {:>9}  {:>8}", "n_pos", "device us", "issue us", "GB/s");
+    for n_pos in [4096usize, 16384, 65536] {
+        let k: Vec<u16> = (0..n_pos * KV_DIM).map(|i| ((i * 2654435761) >> 13) as u16 & 0x3bff).collect();
+        let v: Vec<u16> = (0..n_pos * KV_DIM).map(|i| ((i * 40503) >> 11) as u16 & 0x3bff).collect();
+        let full = (n_pos - 3) / RATIO;
+        let mut cells: Vec<u32> = (0..BLOCKS)
+            .flat_map(|b| {
+                let first = b * full / BLOCKS * RATIO;
+                (first..first + RATIO).map(|c| c as u32)
+            })
+            .collect();
+        cells.extend((full * RATIO..full * RATIO + 3).map(|c| c as u32));
+        let (dev, issue) = gpu.bench_qsa_gather(&k, &v, KV_DIM, &cells, 50).expect("gather bench");
+        let bytes = (cells.len() * KV_DIM * 2 * 2) as f64;
+        println!("  {n_pos:>7}  {dev:>9.1}  {issue:>9.1}  {:>8.1}", bytes / (dev * 1e3));
+    }
+    if let Some(e) = gpu.take_error() {
+        panic!("cuda error: {e}");
+    }
+}
+
 /// **Where attention changes regime with depth, and which buffer does it.**
 ///
 /// Prefill at depth fits two lines rather than one (`BENCHMARKS.md`, 10-09
