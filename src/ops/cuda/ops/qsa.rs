@@ -8,17 +8,23 @@ use crate::ops::cuda::{Cuda, DeviceBuffer, KArg, ffi};
 use crate::ops::{Attn, QsaPool, QsaSelect};
 
 impl Cuda {
-    /// A device buffer the device owns, keyed on the host buffer's address and
-    /// sized to it: a layer's pooled-key lane, or a pass's selected cells. Never
-    /// uploaded and never brought home but by [`Cuda::read_cells`]; a size change
-    /// replaces it, zeroed, which is safe because every reader is preceded by a
+    /// A device buffer the device owns, keyed on the host buffer's address: a
+    /// layer's pooled-key lane, or a pass's selected cells. Never uploaded and
+    /// never brought home but by [`Cuda::read_cells`]. Replaced, zeroed, only
+    /// when it must grow — which is safe because every reader is preceded by a
     /// writer covering what it reads (the watermark for a lane, `qsa_select` for
     /// cells).
+    ///
+    /// **Never shrunk**, as activation mirrors are not: a smaller pass reuses the
+    /// larger buffer. Replacing it freed memory that recorded launches still
+    /// pointed at, and `--profile-device`'s launch replay, re-issuing a prefill's
+    /// gathers after decode had shrunk the cells, faulted with an illegal address
+    /// on the 125B (16-09).
     fn qsa_buf<T: Copy>(&self, host: &[T]) -> Result<ffi::CUdeviceptr> {
         let (key, bytes) = (host.as_ptr() as usize, std::mem::size_of_val(host));
         let mut map = self.qsa_bufs.borrow_mut();
         if let Some(b) = map.get(&key)
-            && b.len_bytes() == bytes
+            && b.len_bytes() >= bytes
         {
             return Ok(b.ptr);
         }
@@ -255,7 +261,7 @@ impl Cuda {
         let map = self.qsa_bufs.borrow();
         let b = map
             .get(&(host.as_ptr() as usize))
-            .filter(|b| b.len_bytes() == std::mem::size_of_val(host))
+            .filter(|b| b.len_bytes() >= std::mem::size_of_val(host))
             .ok_or_else(|| Error::Cuda {
                 what: "qsa readback",
                 detail: "the device holds no QSA buffer for this host buffer".to_string(),
