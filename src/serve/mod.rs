@@ -428,6 +428,14 @@ impl<O: Ops> Session<'_, O> {
                 common
             };
             let how = self.return_to(target)?;
+            if !self.rendered.is_empty() {
+                eprintln!(
+                    "chat: the request left the held text at {}; tokens agree for {common} of {}, {}",
+                    divergence(&self.rendered, want),
+                    want_tokens.len(),
+                    how.label(),
+                );
+            }
             let base = Base::Ids(want_tokens[..how.at()].to_vec());
             (how, want_tokens[how.at()..].to_vec(), base)
         };
@@ -489,6 +497,15 @@ impl<O: Ops> Session<'_, O> {
             if self.consumed - self.last_ckpt >= spacing {
                 self.take_checkpoint();
             }
+        }
+        // **And one at the end of every prompt**, however short the turn. A
+        // client that sends the model's last reply back changed diverges inside
+        // that reply, just past this point; with checkpoints only every spacing,
+        // a conversation shorter than one spacing had nowhere to return to but
+        // zero, and Cline restarted every turn of a ~1,100-token session (17-09).
+        // The ladder is still capped at `MAX_CHECKPOINTS`.
+        if self.consumed > self.last_ckpt {
+            self.take_checkpoint();
         }
         self.rendered = want.to_string();
         Ok(Advanced::Ready(logits, at_how, tokens.len()))
@@ -608,6 +625,26 @@ impl<O: Ops> Session<'_, O> {
         // the model's own previous answer.
         self.tokens.extend_from_slice(ids);
     }
+}
+
+/// Where `sent` stops agreeing with `held`: the character offset and a few
+/// characters of each side from there, escaped, for the log.
+fn divergence(held: &str, sent: &str) -> String {
+    let at = held
+        .char_indices()
+        .zip(sent.chars())
+        .find(|((_, a), b)| a != b)
+        .map(|((i, _), _)| i)
+        .unwrap_or_else(|| held.len().min(sent.len()));
+    let window = |t: &str| -> String { escape(&t[at.min(t.len())..].chars().take(48).collect::<String>()) };
+    format!(
+        "char {} of {} held / {} sent — held \"{}\", sent \"{}\"",
+        held[..at].chars().count(),
+        held.chars().count(),
+        sent.chars().count(),
+        window(held),
+        window(sent),
+    )
 }
 
 /// What [`Session::advance`] did.
@@ -1269,12 +1306,11 @@ mod tests {
     /// matching prefix of its text; the same request again continues at 1,024
     /// and finishes where an uncancelled session does. Where the rest tokenizes
     /// as it did in one piece, the logits are the uncancelled ones to the bit.
-    #[test]
-    #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
-    fn a_cancel_during_prefill_stops_between_slices_and_resumes() {
-        use crate::gguf::GgufFile;
-        use crate::model::Model;
-        use crate::ops::naive::Naive;
+    use crate::gguf::GgufFile;
+    use crate::ops::naive::Naive;
+
+    /// The 0.2B test model, from `INFERRED_MODEL_DIR` or `~/models`.
+    fn tiny_model() -> Option<GgufFile> {
         let name = "Qwen3.8-Flash-Next-0.2B-A0.2B-NVFP4exp.gguf";
         let path = std::env::var("INFERRED_MODEL_DIR")
             .ok()
@@ -1283,27 +1319,38 @@ mod tests {
             .chain(std::env::var("HOME").ok().map(|h| std::path::Path::new(&h).join("models")))
             .map(|d| d.join(name))
             .find(|p| p.exists());
-        let Some(path) = path else {
-            println!("SKIPPED: no {name}");
-            return;
-        };
-        let f = GgufFile::open(&path).expect("open");
+        match path {
+            Some(p) => Some(GgufFile::open(&p).expect("open")),
+            None => {
+                println!("SKIPPED: no {name}");
+                None
+            }
+        }
+    }
+
+    /// A fresh `serve` session on `Naive`, as `serve` builds one.
+    fn tiny_session(f: &GgufFile, n_ctx: usize) -> Session<'_, Naive> {
+        let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+        let chat = ChatMl::detect(&tk, &f.metadata).expect("chatml");
+        Session {
+            engine: Engine::new(crate::model::Model::load(f).expect("load"), Naive, n_ctx, false),
+            tk,
+            chat,
+            rendered: String::new(),
+            tokens: Vec::new(),
+            checkpoints: Vec::new(),
+            last_ckpt: 0,
+            consumed: 0,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
+    fn a_cancel_during_prefill_stops_between_slices_and_resumes() {
+        let Some(f) = tiny_model() else { return };
         let readme = include_str!("../../README.md");
         let cut = readme.char_indices().map(|(i, _)| i).take_while(|&i| i <= 5000).last().unwrap_or(0);
-        let session = || {
-            let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
-            let chat = ChatMl::detect(&tk, &f.metadata).expect("chatml");
-            Session {
-                engine: Engine::new(Model::load(&f).expect("load"), Naive, 4096, false),
-                tk,
-                chat,
-                rendered: String::new(),
-                tokens: Vec::new(),
-                checkpoints: Vec::new(),
-                last_ckpt: 0,
-                consumed: 0,
-            }
-        };
+        let session = || tiny_session(&f, 4096);
         let mut plain = session();
         let want = plain.chat.wrap(&readme[..cut]);
 
@@ -1339,6 +1386,49 @@ mod tests {
                 "same tokens, same slices, different logits"
             );
         }
+    }
+
+    /// **A client that sends the last reply back changed resumes at the end of the
+    /// prompt, not from zero** (17-09). A turn far shorter than one checkpoint
+    /// spacing (`--ctx 8192`, 1,024), eight generated tokens, then the same
+    /// conversation with a different assistant message and a new question: the
+    /// only return point is the checkpoint every prompt now ends with. Before it,
+    /// Cline restarted every turn of a ~1,100-token session.
+    #[test]
+    #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
+    fn a_changed_reply_returns_to_the_end_of_the_prompt() {
+        let Some(f) = tiny_model() else { return };
+        let mut s = tiny_session(&f, 8192);
+        let user = "According to all known laws of aviation, there is no way a bee should be able to fly.";
+        let first = s.chat.wrap_turns(&[("user", user)]);
+        let Advanced::Ready(logits, _, n) = s.advance(&first, || false).expect("first turn") else {
+            panic!("the first turn reported a cancel");
+        };
+        assert!(n < checkpoint_spacing(8192), "the turn must be shorter than a spacing: {n}");
+        let (text, _, ids) = generate(&mut s, logits, 8, |_| Ok(()), || false).expect("generate");
+        s.absorb(&text, &ids);
+
+        let second = s.chat.wrap_turns(&[
+            ("user", user),
+            ("assistant", "Something else entirely."),
+            ("user", "And then?"),
+        ]);
+        let Advanced::Ready(_, how, fresh) = s.advance(&second, || false).expect("second turn") else {
+            panic!("the second turn reported a cancel");
+        };
+        println!("  first turn {n} tokens, generated {:?}; second turn {}, {fresh} new", text, how.label());
+        assert!(matches!(how, Resume::Restored(p) if p == n), "resumed as {}, not at {n}", how.label());
+    }
+
+    #[test]
+    fn divergence_names_the_first_differing_character() {
+        let d = divergence("hello world", "hello there");
+        assert!(d.starts_with("char 6 of 11 held / 11 sent"), "{d}");
+        assert!(d.contains("\"world\"") && d.contains("\"there\""), "{d}");
+        let d = divergence("abc", "abcdef");
+        assert!(d.starts_with("char 3 of 3 held / 6 sent"), "{d}");
+        let d = divergence("héllo", "hélp");
+        assert!(d.starts_with("char 3 of 5 held / 4 sent"), "{d}");
     }
 
     /// The 35B's long contexts keep the spacing they had; Qwen3.8-Flash-Next's
