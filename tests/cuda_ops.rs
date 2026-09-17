@@ -6401,7 +6401,11 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
             gpu.set_expert_budget((vram * 1073741824.0) as usize);
             gpu.set_expert_host_budget((host * 1073741824.0) as usize);
         }
+        // Both, or the cache has no file to read from and takes the serial
+        // mapped-memory path: until 17-09 this test set only the path, so the
+        // parallel `O_DIRECT` reads and grouped fetches never ran in it.
         gpu.set_model_path(&f.path);
+        gpu.set_map_base(f.map_base());
         let m = Model::load(&f).expect("load the 35B");
         let mut e = Engine::new(m, &gpu, n_ctx, false);
         let (produced, _) = e.generate(&tokens, MAX_NEW, None, |_| {}).expect("generate");
@@ -6437,6 +6441,17 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
             dev.h2d_calls,
             st.up_calls
         );
+        // The parallel read path is the one that ran: it alone records whether
+        // its reads are `O_DIRECT`, so an unset flag means the serial fallback.
+        if caps.is_some()
+            && std::env::var("INFERRED_FETCH_THREADS").map_or(true, |v| v != "1")
+            && std::env::var("INFERRED_FETCH_DIRECT").map_or(true, |v| v != "0")
+        {
+            assert!(
+                st.fetch_direct,
+                "{label}: the fetches did not take the parallel O_DIRECT path, so this run tested the serial fallback"
+            );
+        }
         if caps.is_some() {
             assert!(
                 addressable < pool,
