@@ -508,6 +508,18 @@ pub(super) struct ExpertCache {
     /// Whether the read pool asks for `O_DIRECT`; `INFERRED_FETCH_DIRECT=0` turns it
     /// off. What the pool actually got is `ExpertStats::fetch_direct`.
     fetch_direct: bool,
+    /// Whether a layer's tensors are fetched as one batch (SSD-TIER.md D20):
+    /// `INFERRED_FETCH_GROUP=0` goes back to one batch per tensor.
+    group_fetch: bool,
+    /// Tensors resolved under one routing decision, keyed by the first: a layer's
+    /// gate with its up and down. Learned from the resolves themselves, since the
+    /// pool is declared only as a count. See [`ExpertCache::group_for`].
+    groups: HashMap<usize, Vec<usize>>,
+    /// The routing decision being learned, and the tensor that opened it.
+    learning: Option<(u64, usize)>,
+    /// `INFERRED_EXPERT_LOG`: the routing decision whose tensors were already
+    /// logged, and which, so a tensor fetched early is logged once.
+    logged: (u64, Vec<usize>),
     /// While set, table-entry and residency-flag writes queue in `patches`
     /// instead of each being its own copy; [`ExpertCache::flush_patches`] sends
     /// them up together. Set only for the length of a resolve.
@@ -613,6 +625,10 @@ impl ExpertCache {
                 .unwrap_or(DEFAULT_FETCH_THREADS)
                 .max(1),
             fetch_direct: std::env::var("INFERRED_FETCH_DIRECT").map_or(true, |v| v != "0"),
+            group_fetch: std::env::var("INFERRED_FETCH_GROUP").map_or(true, |v| v != "0"),
+            groups: HashMap::new(),
+            learning: None,
+            logged: (u64::MAX, Vec::new()),
             deferring: Cell::new(false),
             patches: RefCell::new(Vec::new()),
             patch_buf: None,
@@ -893,21 +909,8 @@ impl ExpertCache {
         }
 
         let mut fetched = 0u64;
-        if self.fetch_threads > 1 && self.source.is_some() {
-            let mut cold = Vec::new();
-            for &e in &picks {
-                let key = tkey + e * stride;
-                if self.cold.contains(&key) {
-                    cold.push(key);
-                } else if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
-                    self.referenced[slot as usize] = true;
-                }
-            }
-            for batch in cold.chunks(FETCH_CHUNK) {
-                self.fetch_batch(batch)?;
-                fetched += (batch.len() * stride) as u64;
-            }
-            return Ok(fetched);
+        if self.parallel_fetch() {
+            return self.resolve_many(&[tkey], n_expert, ids);
         }
         for &e in &picks {
             let key = tkey + e * stride;
@@ -933,6 +936,98 @@ impl ExpertCache {
             fetched += stride as u64;
         }
         Ok(fetched)
+    }
+
+    /// Whether cold experts are read by the parallel pool — the path
+    /// [`ExpertCache::resolve_many`] batches.
+    pub fn parallel_fetch(&self) -> bool {
+        self.fetch_threads > 1 && self.source.is_some()
+    }
+
+    /// Whether a layer's tensors are fetched as one batch; `INFERRED_FETCH_GROUP=0`
+    /// turns it off.
+    pub fn group_fetch(&self) -> bool {
+        self.group_fetch
+    }
+
+    /// [`ExpertCache::resolve`] for several tensors picked by the same routing
+    /// decision, **their cold experts read as one batch** (SSD-TIER.md D20). Each
+    /// tensor used to be its own batch — gate, then up, then down at its own
+    /// matmul — so a 125B layer issued three sequential batches of ~2 reads while
+    /// most of the eight threads idled: 75 ms of a 181 ms token. Every pick of
+    /// every tensor is leased first, so fetching down's experts with gate's
+    /// cannot evict anything this layer uses. Parallel path only.
+    pub fn resolve_many(&mut self, tkeys: &[usize], n_expert: usize, ids: &[i32]) -> Result<u64> {
+        let stride = self.stride;
+        let mut picks: Vec<usize> =
+            ids.iter().filter_map(|&e| usize::try_from(e).ok()).filter(|&e| e < n_expert).collect();
+        picks.sort_unstable();
+        picks.dedup();
+        let mut cold = Vec::new();
+        for &tkey in tkeys {
+            for &e in &picks {
+                let key = tkey + e * stride;
+                self.lease.insert(key);
+                if self.cold.contains(&key) {
+                    cold.push(key);
+                } else if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
+                    self.referenced[slot as usize] = true;
+                }
+            }
+        }
+        let mut fetched = 0u64;
+        for batch in cold.chunks(FETCH_CHUNK) {
+            self.fetch_batch(batch)?;
+            fetched += (batch.len() * stride) as u64;
+        }
+        Ok(fetched)
+    }
+
+    /// The tensors to resolve now for a call on `tkeys` under routing decision
+    /// `route`: `tkeys` themselves, then — when grouping is on and this call opens
+    /// the decision — the tensors learned to follow it (a layer's down, after its
+    /// gate and up). Learning: every tensor resolved under the decision a call
+    /// opened joins that call's group, so the first pass teaches the second.
+    pub fn group_for(&mut self, route: u64, tkeys: &[usize]) -> Vec<usize> {
+        let mut all = tkeys.to_vec();
+        let Some(&first) = tkeys.first() else { return all };
+        match self.learning {
+            Some((g, opener)) if g == route => {
+                let group = self.groups.entry(opener).or_default();
+                for &k in tkeys {
+                    if k != opener && !group.contains(&k) {
+                        group.push(k);
+                    }
+                }
+            }
+            _ => {
+                self.learning = Some((route, first));
+                let group = self.groups.entry(first).or_default();
+                for &k in &tkeys[1..] {
+                    if !group.contains(&k) {
+                        group.push(k);
+                    }
+                }
+                if self.group_fetch {
+                    all.extend(group.iter().copied().filter(|k| !tkeys.contains(k)));
+                }
+            }
+        }
+        all
+    }
+
+    /// `INFERRED_EXPERT_LOG`: whether `tkey` is still to be logged under routing
+    /// decision `route`, marking it logged. A tensor fetched early with its group is
+    /// logged there, with its cold flags as they were, and not again.
+    pub fn log_once(&mut self, route: u64, tkey: usize) -> bool {
+        if self.logged.0 != route {
+            self.logged = (route, Vec::new());
+        }
+        if self.logged.1.contains(&tkey) {
+            return false;
+        }
+        self.logged.1.push(tkey);
+        true
     }
 
     /// Fetch up to [`FETCH_CHUNK`] cold experts: read them all from the model file

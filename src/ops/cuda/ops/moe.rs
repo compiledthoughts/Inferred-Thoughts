@@ -950,13 +950,22 @@ impl Cuda {
             let mut cache = self.experts.borrow_mut();
             let Some(c) = cache.as_mut() else { return Ok(()) };
             c.defer_writes();
+            // A layer's tensors under one routing decision, read as one batch:
+            // the call's own, plus any learned to follow it (SSD-TIER.md D20).
+            let n_expert = tensors.first().map_or(0, |w| w.n_expert);
+            let own: Vec<usize> = tensors.iter().map(|w| w.data.as_ptr() as usize).collect();
+            let same_width = tensors.iter().all(|w| w.n_expert == n_expert);
+            let keys = c.group_for(route_now, &own);
             // `INFERRED_EXPERT_LOG`: what each resolve picked and which picks
-            // were cold, before resolving makes them resident.
+            // were cold, before resolving makes them resident — once per tensor
+            // per decision, so a tensor fetched early is logged where it was.
             if let Some(d) = crate::dump::experts() {
-                for w in tensors {
-                    let tkey = w.data.as_ptr() as usize;
-                    let cold = c.cold_flags(tkey, w.n_expert, &picks.1);
-                    let head = [n_tok as u32, n_used as u32, w.n_expert as u32];
+                for &tkey in &keys {
+                    if !c.log_once(route_now, tkey) {
+                        continue;
+                    }
+                    let cold = c.cold_flags(tkey, n_expert, &picks.1);
+                    let head = [n_tok as u32, n_used as u32, n_expert as u32];
                     d.record(&[
                         b"ELOG",
                         &self.passes_seen.get().to_le_bytes(),
@@ -967,9 +976,15 @@ impl Cuda {
                     ]);
                 }
             }
-            let resolved = tensors
-                .iter()
-                .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &picks.1).map(|_| ()));
+            // `INFERRED_FETCH_GROUP=0` resolves tensor by tensor, as before
+            // grouping: the control arm, exactly the old batches.
+            let resolved = if c.parallel_fetch() && c.group_fetch() && same_width {
+                c.resolve_many(&keys, n_expert, &picks.1).map(|_| ())
+            } else {
+                tensors
+                    .iter()
+                    .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &picks.1).map(|_| ()))
+            };
             // Flushed even after a failed resolve, so the cache never stays deferring.
             (resolved, c.flush_patches())
         };
