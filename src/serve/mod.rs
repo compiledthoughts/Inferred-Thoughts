@@ -378,7 +378,7 @@ impl<O: Ops> Session<'_, O> {
     /// both resume at a nonzero position and both then run the remainder. It
     /// printed `continued at 4096` for a restore, hiding the mechanism this
     /// exists for on the very run that first exercised it.
-    fn advance(&mut self, want: &str) -> Result<(Vec<f32>, Resume, usize)> {
+    fn advance(&mut self, want: &str, mut cancelled: impl FnMut() -> bool) -> Result<Advanced> {
         // **The text prefix stays the fast path, and that is deliberate.**
         // Comparing tokens instead was tried and rejected for a measured
         // reason, recorded on `Session`: the model emits a newline, the client
@@ -393,10 +393,14 @@ impl<O: Ops> Session<'_, O> {
         // common-prefix scan against what was actually consumed.
         debug_assert_eq!(self.tokens.len(), self.consumed, "token log and position disagree");
 
-        let (at_how, tokens) = if !self.rendered.is_empty() && want.starts_with(self.rendered.as_str())
+        // `base` is what the engine holds before this turn's new tokens, as text
+        // (a continuation) or as ids (after a return), so a prefill cut short by a
+        // cancel can still say which prefix of `want` it has consumed.
+        let (at_how, tokens, base) = if !self.rendered.is_empty() && want.starts_with(self.rendered.as_str())
         {
             let text = &want[self.rendered.len()..];
-            (Resume::Continued(self.consumed), self.tk.encode(text, false, true))
+            let tokens = self.tk.encode(text, false, true);
+            (Resume::Continued(self.consumed), tokens, Base::Text(self.rendered.clone()))
         } else {
             // An edit, a branch, a condensed history, or a client that rewrote
             // its system prompt. Before checkpoints this restarted from token
@@ -424,7 +428,8 @@ impl<O: Ops> Session<'_, O> {
                 common
             };
             let how = self.return_to(target)?;
-            (how, want_tokens[how.at()..].to_vec())
+            let base = Base::Ids(want_tokens[..how.at()].to_vec());
+            (how, want_tokens[how.at()..].to_vec(), base)
         };
 
         if tokens.is_empty() {
@@ -448,15 +453,27 @@ impl<O: Ops> Session<'_, O> {
             });
         }
 
-        // Prefilled in slices so a checkpoint can be taken between them. Each
-        // slice is an ordinary prefill at a later `start_pos` — the engine
-        // already chunks internally for memory — so this cannot change a bit,
-        // which `split_prefill_equals_single_prefill` pins down.
+        // Prefilled in slices so a checkpoint can be taken between them, and so
+        // a cancel is heard between them. Each slice is an ordinary prefill at a
+        // later `start_pos` — the engine already chunks at `max_batch` — so this
+        // cannot change a bit, which `split_prefill_equals_single_prefill` pins
+        // down.
+        //
+        // **No wider than a batch, and the client checked before each.** A
+        // prefill used to be one uninterruptible call per checkpoint spacing,
+        // and on Qwen3.8-Flash-Next a 3,879-token Cline turn is 100 s of it: a
+        // cancel there was heard only when decode began (17-09). A batch is
+        // ~15 s on that model and a fraction of a second on the 35B.
         let mut logits = Vec::new();
         let mut done = 0usize;
         let spacing = checkpoint_spacing(self.engine.n_ctx());
+        let slice = spacing.min(self.engine.max_batch());
         while done < tokens.len() {
-            let take = spacing.min(tokens.len() - done);
+            if cancelled() {
+                self.rendered = self.consumed_text(want, &base, &tokens[..done]);
+                return Ok(Advanced::Cancelled { done, of: tokens.len() });
+            }
+            let take = slice.min(tokens.len() - done);
             logits = self.engine.prefill(&tokens[done..done + take])?;
             self.tokens.extend_from_slice(&tokens[done..done + take]);
             done += take;
@@ -474,7 +491,31 @@ impl<O: Ops> Session<'_, O> {
             }
         }
         self.rendered = want.to_string();
-        Ok((logits, at_how, tokens.len()))
+        Ok(Advanced::Ready(logits, at_how, tokens.len()))
+    }
+
+    /// The prefix of `want` the engine holds after a prefill stopped `done`
+    /// tokens in, for `rendered`, or empty when it cannot be said exactly.
+    ///
+    /// Decoding a prefix of an encoding gives back a prefix of the text on this
+    /// byte-level tokenizer, specials rendered — but it is checked, not assumed:
+    /// a cut inside a multi-byte character, or a BOS the text does not carry,
+    /// fails the check. An empty `rendered` sends the next request down the
+    /// token path, which finds the same position more slowly; a wrong one would
+    /// skip text the engine never saw.
+    fn consumed_text(&self, want: &str, base: &Base, done: &[u32]) -> String {
+        let text = match base {
+            Base::Text(t) => self.tk.decode(done, true).ok().map(|d| format!("{t}{d}")),
+            Base::Ids(ids) => {
+                let mut all = ids.clone();
+                all.extend_from_slice(done);
+                self.tk.decode(&all, true).ok()
+            }
+        };
+        match text {
+            Some(t) if want.starts_with(t.as_str()) => t,
+            _ => String::new(),
+        }
     }
 
     /// Put the engine back at or before `common`, and say where it landed.
@@ -490,6 +531,12 @@ impl<O: Ops> Session<'_, O> {
     /// Falls back to a full reset when no checkpoint is early enough, which is
     /// the old behaviour and is still correct.
     fn return_to(&mut self, common: usize) -> Result<Resume> {
+        // **Already there**: a prefill cancelled part-way, then resent, has
+        // exactly this as its common prefix. Restoring a checkpoint instead would
+        // re-run up to a spacing of tokens for nothing.
+        if common == self.consumed && common == self.engine.pos() {
+            return Ok(Resume::Continued(common));
+        }
         if self.engine.rewind(common) {
             self.tokens.truncate(common);
             self.consumed = common;
@@ -561,6 +608,24 @@ impl<O: Ops> Session<'_, O> {
         // the model's own previous answer.
         self.tokens.extend_from_slice(ids);
     }
+}
+
+/// What [`Session::advance`] did.
+enum Advanced {
+    /// Prefilled: the last position's logits, where it resumed from, and how
+    /// many new tokens it ran.
+    Ready(Vec<f32>, Resume, usize),
+    /// The client went away after `done` of `of` new tokens. The engine and the
+    /// session agree on what was consumed; nothing is owed to the client.
+    Cancelled { done: usize, of: usize },
+}
+
+/// What the engine held before a turn's new tokens.
+enum Base {
+    /// A continuation: the session's text.
+    Text(String),
+    /// After a return: the ids of the new request's own encoding, up to there.
+    Ids(Vec<u32>),
 }
 
 /// Serve until the process is stopped.
@@ -792,8 +857,16 @@ fn chat_completions<O: Ops>(
     if approx > 2048 {
         eprintln!("chat: ~{approx} new tokens to prefill; this will take a while");
     }
-    let (logits, how, fresh) = match session.advance(&want) {
-        Ok(v) => v,
+    // Probed between prefill slices, as `generate` probes between tokens.
+    let probe = stream.try_clone().ok();
+    let advanced = session.advance(&want, || probe.as_ref().is_some_and(client_gone));
+    let (logits, how, fresh) = match advanced {
+        Ok(Advanced::Ready(logits, how, fresh)) => (logits, how, fresh),
+        Ok(Advanced::Cancelled { done, of }) => {
+            eprintln!("chat: client went away during prefill after {done} of {of} tokens; stopped");
+            report(&session.engine, mark);
+            return Ok(());
+        }
         Err(e) => {
             return send_json(stream, 400, &json!({"error": {"message": e.to_string()}}));
         }
@@ -1188,6 +1261,85 @@ fn send_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A cancel during prefill is heard between slices, and the resent request
+    /// continues where it stopped** (17-09). The 0.2B test model on `Naive`, a
+    /// ~1,400-token turn at `--ctx 4096` (spacing 512, batch 512): cancelled
+    /// after two slices, the session holds exactly 1,024 of its tokens and the
+    /// matching prefix of its text; the same request again continues at 1,024
+    /// and finishes where an uncancelled session does. Where the rest tokenizes
+    /// as it did in one piece, the logits are the uncancelled ones to the bit.
+    #[test]
+    #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
+    fn a_cancel_during_prefill_stops_between_slices_and_resumes() {
+        use crate::gguf::GgufFile;
+        use crate::model::Model;
+        use crate::ops::naive::Naive;
+        let name = "Qwen3.8-Flash-Next-0.2B-A0.2B-NVFP4exp.gguf";
+        let path = std::env::var("INFERRED_MODEL_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .chain(std::env::var("HOME").ok().map(|h| std::path::Path::new(&h).join("models")))
+            .map(|d| d.join(name))
+            .find(|p| p.exists());
+        let Some(path) = path else {
+            println!("SKIPPED: no {name}");
+            return;
+        };
+        let f = GgufFile::open(&path).expect("open");
+        let readme = include_str!("../../README.md");
+        let cut = readme.char_indices().map(|(i, _)| i).take_while(|&i| i <= 5000).last().unwrap_or(0);
+        let session = || {
+            let tk = Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+            let chat = ChatMl::detect(&tk, &f.metadata).expect("chatml");
+            Session {
+                engine: Engine::new(Model::load(&f).expect("load"), Naive, 4096, false),
+                tk,
+                chat,
+                rendered: String::new(),
+                tokens: Vec::new(),
+                checkpoints: Vec::new(),
+                last_ckpt: 0,
+                consumed: 0,
+            }
+        };
+        let mut plain = session();
+        let want = plain.chat.wrap(&readme[..cut]);
+
+        let Advanced::Ready(whole, _, n) = plain.advance(&want, || false).expect("uncancelled") else {
+            panic!("an uncancelled prefill reported a cancel");
+        };
+        assert!(n > 1024 + 256, "the turn is too short to cut after two slices: {n} tokens");
+
+        let mut s = session();
+        let mut checks = 0;
+        let r = s.advance(&want, || {
+            checks += 1;
+            checks == 3
+        });
+        let Ok(Advanced::Cancelled { done, of }) = r else {
+            panic!("the third check should have cancelled");
+        };
+        assert_eq!((done, of), (1024, n));
+        assert_eq!((s.consumed, s.engine.pos(), s.tokens.len()), (1024, 1024, 1024));
+        assert!(!s.rendered.is_empty() && want.starts_with(s.rendered.as_str()), "the text prefix was lost");
+
+        let Advanced::Ready(resumed, how, fresh) = s.advance(&want, || false).expect("resent") else {
+            panic!("the resent request reported a cancel");
+        };
+        println!("  resumed: {} , {fresh} new tokens, ends at {}", how.label(), s.engine.pos());
+        assert!(matches!(how, Resume::Continued(1024)), "resumed as {}", how.label());
+        assert_eq!(s.consumed, s.engine.pos());
+        let same_split = s.tokens == plain.tokens;
+        println!("  the rest tokenized as in one piece: {same_split}");
+        if same_split {
+            assert!(
+                whole.iter().zip(&resumed).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "same tokens, same slices, different logits"
+            );
+        }
+    }
 
     /// The 35B's long contexts keep the spacing they had; Qwen3.8-Flash-Next's
     /// 2,048-token context gets checkpoints at all; nothing goes below the floor.
