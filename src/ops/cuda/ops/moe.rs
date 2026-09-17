@@ -4,7 +4,7 @@
 use super::slot;
 use crate::error::{Error, Result};
 use crate::gguf::GgmlType;
-use crate::ops::{Experts, Route};
+use crate::ops::{Experts, Route, Weights};
 use crate::ops::cuda::{Cuda, DeviceBuffer, KArg, ffi};
 
 /// Pairs per grouped-expert tile. **Must equal `MOE_TOK` in
@@ -817,6 +817,33 @@ impl Cuda {
     /// the host read they replace would turn CUDA graphs off for this model.
     /// `moe_topk` reproduces [`Ops::route`]'s default exactly — see
     /// `device_topk_reproduces_the_host_selection`.
+    /// [`Ops::prefetch_hint`] on the device: the next router on this layer's input,
+    /// queued before this layer's resolve so its one synchronize and readback
+    /// bring the logits home too; the top-k is taken on the host. Only while
+    /// oversubscribed and prefetching, and only for one token: decode.
+    ///
+    /// **The top-k is not a kernel** (17-09): a one-thread `topk_ids` launch — k
+    /// passes of a max over 512 — cost each layer's synchronize ~2.5 ms, and
+    /// prefetch on read 3.90 tok/s against 6.13–6.47 off. 512 logits are 2 KB.
+    pub(super) fn prefetch_hint_impl(&self, w: &Weights<'_>, x: &[f32], k: usize) -> Result<()> {
+        let wanted = self
+            .experts
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.oversubscribed() && c.prefetch_on() && c.parallel_fetch());
+        if !wanted || x.len() != w.n_in || w.ty != GgmlType::F32 || w.n_out == 0 {
+            return Ok(());
+        }
+        let k = k.min(w.n_out);
+        let mut logits = self.hint_logits.borrow_mut();
+        if logits.len() != w.n_out {
+            *logits = vec![0.0; w.n_out];
+        }
+        self.matmul_impl(w, x, &mut logits[..])?;
+        self.hint.set(Some((self.route_gen.get(), k)));
+        Ok(())
+    }
+
     pub(super) fn route_impl(&self, probs: &[f32], n_expert: usize, n_used: usize) -> Result<()> {
         // A new routing decision means the layer (or prefill chunk) that held the
         // expert lease is done, so its experts may be evicted again. SSD-TIER.md
@@ -938,6 +965,17 @@ impl Cuda {
             self.sync()?;
             let mut ids = vec![0i32; n];
             self.d2h(&mut ids, idd)?;
+            // The lookahead hint for this decision, in the same readback.
+            if let Some((route, k)) = self.hint.get()
+                && route == route_now
+            {
+                let logits = self.hint_logits.borrow();
+                let mut host = vec![0f32; logits.len()];
+                self.d2h(&mut host, self.mirror_in(&logits[..])?)?;
+                *self.hint_ids.borrow_mut() = top_k(&host, k);
+            } else {
+                self.hint_ids.borrow_mut().clear();
+            }
             let waited = t.elapsed().as_micros() as u64;
             *self.picks.borrow_mut() = (route_now, ids);
             if let Some(c) = self.experts.borrow_mut().as_mut() {
@@ -984,6 +1022,13 @@ impl Cuda {
                 tensors
                     .iter()
                     .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &picks.1).map(|_| ()))
+            };
+            // This layer's picks are resident; start reading the next layer's
+            // likely ones while the GPU computes this one. Once per decision.
+            let hint = std::mem::take(&mut *self.hint_ids.borrow_mut());
+            let resolved = match resolved {
+                Ok(()) if !hint.is_empty() => c.start_prefetch(&hint),
+                other => other,
             };
             // Flushed even after a failed resolve, so the cache never stays deferring.
             (resolved, c.flush_patches())
@@ -1085,4 +1130,18 @@ mod tests {
         assert!(TopK::for_picks(0).is_err());
         assert!(TopK::for_picks(11).is_err());
     }
+}
+
+/// The indices of the `k` largest of `logits`, largest first, ties to the lower
+/// index: the lookahead hint's guesses (SSD-TIER.md D20).
+fn top_k(logits: &[f32], k: usize) -> Vec<i32> {
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    let by = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
+    let k = k.min(idx.len());
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k, by);
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(by);
+    idx.into_iter().map(|i| i as i32).collect()
 }

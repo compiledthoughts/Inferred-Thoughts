@@ -33,6 +33,25 @@ use crate::ops::{Attn, Delta, Experts, Ops, QsaPool, QsaSelect, Weights};
 use crate::profile::Ctx;
 use crate::quant::dequantize_into;
 
+/// Experts guessed per layer for lookahead prefetch.
+///
+/// **Ten, measured, not the recall study's 16.** The offline study ranked
+/// predictors by recall, where more guesses are always better: top-16 recalled
+/// 81.4% of the 125B's picks against top-10's 67.7%. On the machine the opposite
+/// end binds — a wrong guess is a read the host pays for — and the 125B's decode
+/// peaked at 10: medians 7.00 tok/s at k=10, 6.76 at 8, 6.73 at 12, 6.48 at 16,
+/// against 6.74 with prefetch off (SSD-TIER.md D20). `INFERRED_PREFETCH_K`
+/// overrides it.
+const PREFETCH_K: usize = 10;
+
+/// [`PREFETCH_K`], or `INFERRED_PREFETCH_K` when set; read once.
+fn prefetch_k() -> usize {
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("INFERRED_PREFETCH_K").ok().and_then(|v| v.parse().ok()).unwrap_or(PREFETCH_K)
+    })
+}
+
 /// llama.cpp `src/llama-hparams.h:13`, `LLAMA_MAX_PLE_NGRAM`.
 pub const MAX_PLE_NGRAM: usize = 8;
 /// llama.cpp `src/llama-hparams.h:14`, `LLAMA_MAX_PLE_HEADS`.
@@ -1353,7 +1372,8 @@ impl<'a> Qwen4Exp<'a> {
                     crate::dump::bytes_of(&s.mixed),
                 ]);
             }
-            self.moe(ops, layer, n, s);
+            let next_router = self.layers.get(il + 1).map(|l| &l.ffn.gate_inp);
+            self.moe(ops, layer, next_router, n, s);
             ctx.trace("ffn_moe_out", il, &s.block);
             self.hc_write(ops, s);
             ctx.trace("l_last", il, &s.res);
@@ -1614,11 +1634,18 @@ impl<'a> Qwen4Exp<'a> {
     /// The routed experts plus the gated shared expert (`build_layer_ffn`,
     /// `qwen4exp.cpp:974-1022`) into `s.block`, from `s.mixed`. The same seam calls
     /// as `qwen35::moe_batch`, for the whole pass at once.
-    fn moe<O: Ops>(&self, ops: &O, layer: &Layer<'_>, n: usize, s: &mut Scratch) {
+    fn moe<O: Ops>(&self, ops: &O, layer: &Layer<'_>, next_router: Option<&Weights<'_>>, n: usize, s: &mut Scratch) {
         let (m, nd, f) = (self.cfg.moe, self.cfg.n_embd, &layer.ffn);
         ops.matmul_pair(&f.gate_inp, &f.shared_gate_inp, &s.mixed, &mut s.router, &mut s.logit);
         ops.softmax(&mut s.router, m.n_expert);
         let route = ops.route(&mut s.router, m.n_expert, m.n_expert_used);
+        // Decode: the next layer's likely experts, from this layer's input, so
+        // their reads can start while this layer computes (SSD-TIER.md D20).
+        if n == 1
+            && let Some(w) = next_router
+        {
+            ops.prefetch_hint(w, &s.mixed, prefetch_k());
+        }
         ops.moe_glu(&f.gate, &f.up, &route, &s.mixed, &mut s.g_all, &mut s.u_all);
         ops.matmul_experts(&f.down, &route, &s.g_all, &mut s.o_all);
         ops.matmul(&f.shared_gate, &s.mixed, &mut s.e_gate);

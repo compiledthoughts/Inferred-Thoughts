@@ -95,8 +95,13 @@ struct Job {
     dst: usize,
     len: usize,
     need: usize,
-    done: mpsc::Sender<std::io::Result<()>>,
+    /// Handed back with the result, so one channel can collect many jobs.
+    tag: usize,
+    done: mpsc::Sender<(usize, std::io::Result<()>)>,
 }
+
+/// Where a submitted read reports: its tag and its result.
+pub(crate) type Done = mpsc::Sender<(usize, std::io::Result<()>)>;
 
 /// Read from `offset` into `dst` until at least `need` bytes have arrived.
 fn read_at_least(file: &File, dst: &mut [u8], offset: u64, need: usize) -> std::io::Result<()> {
@@ -142,12 +147,11 @@ impl ReadPool {
                             Err(_) => break,
                         };
                         let Ok(job) = job else { break };
-                        // SAFETY: `read_all` hands out `dst` from disjoint
-                        // `&mut [u8]` slices and does not return until every job
-                        // it sent has reported, so the memory outlives this use and
-                        // no other thread touches it meanwhile.
+                        // SAFETY: `read_all` and `submit`'s callers hand out `dst`
+                        // from disjoint memory that stays alive and untouched until
+                        // this job has reported, which is their contract.
                         let dst = unsafe { std::slice::from_raw_parts_mut(job.dst as *mut u8, job.len) };
-                        let _ = job.done.send(read_at_least(&file, dst, job.offset, job.need));
+                        let _ = job.done.send((job.tag, read_at_least(&file, dst, job.offset, job.need)));
                     }
                 })
                 .map_err(|e| Error::Cuda { what: "expert fetch", detail: format!("starting a read thread: {e}") })?;
@@ -167,12 +171,13 @@ impl ReadPool {
         let (done_tx, done_rx) = mpsc::channel();
         let mut sent = 0usize;
         let mut first: Option<String> = None;
-        for (offset, dst, need) in reads.iter_mut() {
+        for (i, (offset, dst, need)) in reads.iter_mut().enumerate() {
             let job = Job {
                 offset: *offset,
                 dst: dst.as_mut_ptr() as usize,
                 len: dst.len(),
                 need: *need,
+                tag: i,
                 done: done_tx.clone(),
             };
             match jobs.send(job) {
@@ -188,8 +193,8 @@ impl ReadPool {
         // raw pointers in `Job` sound.
         for _ in 0..sent {
             match done_rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok((_, Ok(()))) => {}
+                Ok((_, Err(e))) => {
                     first.get_or_insert_with(|| e.to_string());
                 }
                 // Every sender is gone, so every job sent has been dropped or done.
@@ -203,6 +208,37 @@ impl ReadPool {
             None => Ok(()),
             Some(detail) => Err(Error::Cuda { what: "expert fetch", detail }),
         }
+    }
+}
+
+impl ReadPool {
+    /// Queue one read and return at once: at least `need` of `len` bytes of the
+    /// file at `offset` into the memory at `dst`, reported on `done` with `tag`.
+    /// For prefetch, whose reads run while the GPU computes (SSD-TIER.md D20).
+    ///
+    /// # Safety
+    ///
+    /// `dst` must be valid for writes of `len` bytes, and no one else may read or
+    /// write it or free it, until `(tag, _)` has been received from `done` — or
+    /// until this pool has been dropped, which finishes every queued job first.
+    pub(crate) unsafe fn submit(
+        &self,
+        offset: u64,
+        dst: *mut u8,
+        len: usize,
+        need: usize,
+        tag: usize,
+        done: &Done,
+    ) -> Result<()> {
+        let jobs = self.jobs.as_ref().ok_or_else(|| Error::Cuda {
+            what: "expert prefetch",
+            detail: "the read pool is shut down".to_string(),
+        })?;
+        let job = Job { offset, dst: dst as usize, len, need, tag, done: done.clone() };
+        jobs.send(job).map_err(|_| Error::Cuda {
+            what: "expert prefetch",
+            detail: "the read threads have exited".to_string(),
+        })
     }
 }
 

@@ -227,6 +227,9 @@ impl Ops for Cuda {
     fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
         self.note(self.qsa_pool_impl(raw, pooled, p));
     }
+    fn prefetch_hint(&self, next_router: &Weights<'_>, x: &[f32], k: usize) {
+        self.note(self.prefetch_hint_impl(next_router, x, k));
+    }
     fn qsa_select(&self, q: &[f32], pooled: &[f32], sel: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
         self.note(self.qsa_select_impl(q, pooled, sel, scores, cells));
     }
@@ -680,6 +683,9 @@ impl Ops for &Cuda {
 
     fn qsa_pool(&self, raw: &[u16], pooled: &mut [f32], p: &QsaPool<'_>) {
         (*self).qsa_pool(raw, pooled, p)
+    }
+    fn prefetch_hint(&self, next_router: &Weights<'_>, x: &[f32], k: usize) {
+        (*self).prefetch_hint(next_router, x, k)
     }
     fn qsa_select(&self, q: &[f32], pooled: &[f32], sel: &QsaSelect, scores: &mut [f32], cells: &mut [u32]) {
         (*self).qsa_select(q, pooled, sel, scores, cells)

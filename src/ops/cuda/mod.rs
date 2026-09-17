@@ -145,6 +145,18 @@ pub struct Cuda {
     /// were read at. A layer's `down` resolves against the same route as its
     /// gate and up, and reuses these rather than synchronizing and reading again.
     picks: RefCell<(u64, Vec<i32>)>,
+    /// Lookahead prefetch: the `route_gen` a `prefetch_hint` was launched for
+    /// and its k, so the resolve that reads that decision's picks reads the hint
+    /// too. SSD-TIER.md D20.
+    hint: Cell<Option<(u64, usize)>>,
+    /// The next layer's router logits for the hint, owned so its device mirror
+    /// keeps one address.
+    hint_logits: RefCell<Vec<f32>>,
+    /// The hint's ids as read back, waiting for the resolve to start their reads.
+    hint_ids: RefCell<Vec<i32>>,
+    /// A fixed slab size in slots, for tests that must oversubscribe a small
+    /// model. `None` sizes the slab from the budget.
+    expert_slots: Cell<Option<usize>>,
 
     /// Page-locked host memory the expert cache's overflow tier may claim.
     ///
@@ -861,6 +873,10 @@ impl Cuda {
                 expert_pool: Cell::new(None),
                 route_gen: Cell::new(0),
                 picks: RefCell::new((u64::MAX, Vec::new())),
+                hint: Cell::new(None),
+                hint_logits: RefCell::new(Vec::new()),
+                hint_ids: RefCell::new(Vec::new()),
+                expert_slots: Cell::new(None),
                 expert_host_budget: Cell::new(experts::DEFAULT_HOST_BUDGET),
                 f32_staged: Cell::new(false),
                 f32t_pair: RefCell::new(HashMap::new()),

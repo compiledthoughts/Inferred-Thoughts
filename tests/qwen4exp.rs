@@ -768,3 +768,65 @@ fn the_0_2b_serve_sequence_past_the_budget_restores_exactly_on_the_gpu() {
         assert_eq!(differing, 0, "step {step}: the restored turn is not the fresh one");
     }
 }
+
+/// **Lookahead prefetch changes when expert bytes arrive, never what is computed**
+/// (SSD-TIER.md D20). The 0.2B pushed into tier 3 — a 32-slot slab and no host
+/// tier (a 5-token prefill can lease all 24 of a layer's tensors), so most of its
+/// 96 expert tensors are cold and fetched from the file —
+/// decoding the same tokens with prefetch off and on: every logit identical, the
+/// "on" arm actually using prefetched reads, and both printing the uncapped run's
+/// tokens. With 8 experts a layer, the top-16 hint names every expert, so every
+/// decode layer prefetches.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_decodes_identically_with_lookahead_prefetch_when_oversubscribed() {
+    use inferred_thoughts::{Cuda, Engine};
+    let Some(f) = open(TINY) else { return };
+    let tk = inferred_thoughts::Tokenizer::from_metadata(&f.metadata).expect("tokenizer");
+    let tokens = tk.encode("According to all known laws", true, true);
+    let steps = 24;
+
+    // (label, slab slots, prefetch) -> every pass's logits and the fed tokens.
+    let arm = |slots: Option<usize>, prefetch: bool| {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(false);
+        gpu.set_model_path(&f.path);
+        gpu.set_map_base(f.map_base());
+        if slots.is_some() {
+            gpu.set_expert_slots(slots);
+            gpu.set_expert_host_budget(1);
+        }
+        let mut e = Engine::new(Model::load(&f).expect("load"), &gpu, 64, false);
+        let mut all = vec![e.prefill(&tokens).expect("prefill")];
+        gpu.set_prefetch(prefetch);
+        let mut fed = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(all.last().expect("logits"));
+            fed.push(t);
+            all.push(e.decode(t).expect("decode"));
+        }
+        if let Some(err) = gpu.take_error() {
+            panic!("a CUDA op reported an error: {err}");
+        }
+        let st = gpu.expert_stats().expect("the expert cache was built");
+        drop(e);
+        (all, fed, st)
+    };
+
+    let (_, plain, _) = arm(None, true);
+    let (off, off_fed, off_st) = arm(Some(32), false);
+    let (on, on_fed, on_st) = arm(Some(32), true);
+    println!(
+        "  capped: {} cold at load, fetched {} (off) / {} (on); prefetch off {} read, on {} read, {} used, {} dropped",
+        on_st.cold_at_load, off_st.fetched, on_st.fetched, off_st.prefetch_reads, on_st.prefetch_reads, on_st.prefetch_used, on_st.prefetch_wasted
+    );
+    assert!(on_st.oversubscribed && on_st.cold_at_load > 0, "the cap did not push the model into tier 3");
+    assert_eq!(off_st.prefetch_reads, 0, "prefetch off still read ahead");
+    assert!(on_st.prefetch_used > 0, "prefetch on never supplied a resolve");
+    assert_eq!(off_fed, plain, "capped without prefetch printed different tokens from the uncapped run");
+    assert_eq!(on_fed, plain, "capped with prefetch printed different tokens from the uncapped run");
+    for (pass, (a, b)) in off.iter().zip(&on).enumerate() {
+        assert_same_bits(a, b, &format!("pass {pass}, prefetch off against on"));
+    }
+}

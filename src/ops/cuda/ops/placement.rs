@@ -158,6 +158,22 @@ impl Cuda {
         }
     }
 
+    /// Fix the expert slab at `slots` slots, whatever the budget says; `None`
+    /// restores sizing by budget. For tests that must push a small model into
+    /// tier 3. Call before the first expert is placed.
+    pub fn set_expert_slots(&self, slots: Option<usize>) {
+        self.expert_slots.set(slots);
+    }
+
+    /// Turn lookahead prefetch on or off for this backend's expert cache, once it
+    /// exists (`INFERRED_PREFETCH=0` sets the default off). For tests comparing
+    /// both.
+    pub fn set_prefetch(&self, on: bool) {
+        if let Some(c) = self.experts.borrow_mut().as_mut() {
+            c.set_prefetch(on);
+        }
+    }
+
     /// Cap the expert slab, in bytes. Zero restores the automatic budget.
     pub fn set_expert_budget(&self, bytes: usize) {
         // Expressed as a reserve because that is what the sizing code has to
@@ -321,11 +337,8 @@ impl Cuda {
             let (free, _) = self.mem_info()?;
             let budget = self.slab_budget(free);
             let stride = w.stride();
-            let mut c = experts::ExpertCache::new(
-                stride,
-                budget / stride.max(1),
-                self.expert_host_budget.get(),
-            )?;
+            let slots = self.expert_slots.get().unwrap_or(budget / stride.max(1));
+            let mut c = experts::ExpertCache::new(stride, slots, self.expert_host_budget.get())?;
             if let (Some(p), Some(b)) = (self.model_path.borrow().as_ref(), self.map_base.get()) {
                 c.set_source(p.clone(), b);
             }

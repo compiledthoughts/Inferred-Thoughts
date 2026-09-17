@@ -790,6 +790,17 @@ pub trait Ops {
         }
     }
 
+    /// **A hint, not work**: the next MoE layer will route through `next_router`,
+    /// and `x` — this layer's router input, one token — predicts its choice well
+    /// enough to start reading its likely experts now (SSD-TIER.md D20: the next
+    /// router's top-16 on this input recalls 81% of its picks on the 125B). `k`
+    /// is how many to guess.
+    ///
+    /// Changes no value the model computes. A backend with nothing to prefetch
+    /// ignores it, which is the default; CUDA acts only while its expert pool is
+    /// oversubscribed.
+    fn prefetch_hint(&self, _next_router: &Weights<'_>, _x: &[f32], _k: usize) {}
+
     // ---- qwen4exp: Qwen Sparse Attention past its budget (qwen4exp.md, QSA) ----
     //
     // Scalar defaults, the oracle for the model's reference selection (decided

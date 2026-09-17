@@ -335,6 +335,11 @@ pub struct ExpertStats {
     /// sent them: one copy and one `apply_patches` launch each.
     pub patches: u64,
     pub patch_flushes: u64,
+    /// Lookahead prefetch (SSD-TIER.md D20): cold experts read ahead of the layer
+    /// that picked them, those a resolve then used, and those dropped unused.
+    pub prefetch_reads: u64,
+    pub prefetch_used: u64,
+    pub prefetch_wasted: u64,
     /// Whether the parallel reads run with `O_DIRECT`: asked for by default, and
     /// false if refused — `INFERRED_FETCH_DIRECT=0`, a staging buffer that is not
     /// page-aligned, or a file system that rejects the flag.
@@ -503,6 +508,18 @@ pub(super) struct ExpertCache {
     readers: Option<super::fetch::ReadPool>,
     /// Page-locked staging for those reads, [`FETCH_CHUNK`] experts at a time.
     pinned: Option<super::fetch::Pinned>,
+    /// Lookahead reads in flight or done, and their staging. Declared after
+    /// `readers` on purpose: fields drop in order, and the pool finishes every
+    /// queued read before its threads exit, so the staging outlives them.
+    prefetch: Prefetch,
+    /// Whether [`ExpertCache::start_prefetch`] reads anything.
+    /// `INFERRED_PREFETCH=0` turns it off; [`ExpertCache::set_prefetch`] too.
+    prefetch_on: bool,
+    /// The group opener that followed each opener last time: layer L's gate ->
+    /// layer L+1's. Learned as `groups` is. See [`ExpertCache::group_for`].
+    next_opener: HashMap<usize, usize>,
+    /// Experts per tensor at the last resolve, for a prefetch's bounds.
+    n_expert_seen: usize,
     /// Read threads for a fetch; 1 keeps the serial path. `INFERRED_FETCH_THREADS`.
     fetch_threads: usize,
     /// Whether the read pool asks for `O_DIRECT`; `INFERRED_FETCH_DIRECT=0` turns it
@@ -558,6 +575,119 @@ const DEFAULT_FETCH_THREADS: usize = 8;
 /// 0.88 MiB on the 125B. A decode layer boundary fetches a handful; a prefill
 /// resolve that needs more goes in batches.
 const FETCH_CHUNK: usize = 32;
+
+/// Lookahead reads at once: the most a layer's guesses start. The 125B's top-16
+/// over three tensors is 48 candidates, of which the cold ones are ~a third.
+const PREFETCH_SLOTS: usize = 32;
+
+/// A lookahead read's state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefetched {
+    InFlight,
+    Ready,
+    Failed,
+}
+
+/// Lookahead reads and the page-locked staging they land in (SSD-TIER.md D20).
+///
+/// **The invariant that makes the raw pointers sound**: a slot is in `free` only
+/// when no read targets it. A read's slot leaves `free` when it is submitted and
+/// returns only when the pool has reported it — through [`Prefetch::collect`] —
+/// whether its expert was used, dropped or never looked at.
+struct Prefetch {
+    staging: Option<super::fetch::Pinned>,
+    slot_len: usize,
+    free: Vec<usize>,
+    /// Expert key -> (slot, where the expert starts in it, state).
+    entries: HashMap<usize, (usize, usize, Prefetched)>,
+    /// Slots with a read in flight: true while their key is still wanted, false
+    /// once dropped (the slot is freed when the read reports).
+    busy: HashMap<usize, bool>,
+    done: super::fetch::Done,
+    reports: std::sync::mpsc::Receiver<(usize, std::io::Result<()>)>,
+}
+
+impl Prefetch {
+    fn new() -> Self {
+        let (done, reports) = std::sync::mpsc::channel();
+        Self {
+            staging: None,
+            slot_len: 0,
+            free: Vec::new(),
+            entries: HashMap::new(),
+            busy: HashMap::new(),
+            done,
+            reports,
+        }
+    }
+
+    /// Staging for [`PREFETCH_SLOTS`] slots of `slot_len`, allocated once.
+    fn ensure_staging(&mut self, slot_len: usize) -> Result<()> {
+        if self.staging.is_some() {
+            if slot_len != self.slot_len {
+                return Err(Error::Cuda {
+                    what: "expert prefetch",
+                    detail: format!("staging slots are {} bytes, a read needs {slot_len}", self.slot_len),
+                });
+            }
+            return Ok(());
+        }
+        self.staging = Some(super::fetch::Pinned::new(PREFETCH_SLOTS * slot_len)?);
+        self.slot_len = slot_len;
+        self.free = (0..PREFETCH_SLOTS).rev().collect();
+        Ok(())
+    }
+
+    fn slot_ptr(&mut self, slot: usize) -> *mut u8 {
+        match self.staging.as_mut() {
+            // In bounds: `slot < PREFETCH_SLOTS`, and the staging holds that many.
+            Some(p) => p.as_mut_slice()[slot * self.slot_len..].as_mut_ptr(),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Take the pool's reports: all that have arrived, and, with `until`, block
+    /// until that slot's read has reported.
+    fn collect(&mut self, until: Option<usize>) {
+        loop {
+            let waiting = until.is_some_and(|s| self.busy.contains_key(&s));
+            let report = if waiting {
+                match self.reports.recv() {
+                    Ok(r) => r,
+                    Err(_) => return,
+                }
+            } else {
+                match self.reports.try_recv() {
+                    Ok(r) => r,
+                    Err(_) => return,
+                }
+            };
+            let (slot, result) = report;
+            match self.busy.remove(&slot) {
+                Some(true) => {
+                    let state = if result.is_ok() { Prefetched::Ready } else { Prefetched::Failed };
+                    if let Some(e) = self.entries.values_mut().find(|e| e.0 == slot) {
+                        e.2 = state;
+                    }
+                }
+                // Dropped while in flight: the slot is free only now.
+                Some(false) => self.free.push(slot),
+                None => {}
+            }
+        }
+    }
+
+    /// Forget a guess. Its slot is freed now if its read is done, or when the
+    /// read reports.
+    fn discard(&mut self, key: usize) {
+        let Some((slot, _, state)) = self.entries.remove(&key) else { return };
+        if state == Prefetched::InFlight {
+            self.busy.insert(slot, false);
+        } else {
+            self.free.push(slot);
+        }
+    }
+}
 
 impl ExpertCache {
     /// Allocate a slab of `slots` slots of `stride` bytes, with `host_budget`
@@ -619,6 +749,10 @@ impl ExpertCache {
             file: None,
             readers: None,
             pinned: None,
+            prefetch: Prefetch::new(),
+            prefetch_on: std::env::var("INFERRED_PREFETCH").map_or(true, |v| v != "0"),
+            next_opener: HashMap::new(),
+            n_expert_seen: 0,
             fetch_threads: std::env::var("INFERRED_FETCH_THREADS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -975,12 +1109,193 @@ impl ExpertCache {
                 }
             }
         }
+        self.n_expert_seen = n_expert;
         let mut fetched = 0u64;
-        for batch in cold.chunks(FETCH_CHUNK) {
+        // Read ahead already: wait for any still in flight, then publish from the
+        // prefetch staging. The wait is a read the layer blocked on, so it is
+        // timed as one.
+        let mut rest = Vec::with_capacity(cold.len());
+        for key in cold {
+            match self.prefetch.entries.get(&key).map(|e| e.0) {
+                Some(slot) => {
+                    let t = std::time::Instant::now();
+                    self.prefetch.collect(Some(slot));
+                    self.stats.fetch_read_us += t.elapsed().as_micros() as u64;
+                    if self.publish_prefetched(key)? {
+                        fetched += stride as u64;
+                    } else {
+                        rest.push(key);
+                    }
+                }
+                None => rest.push(key),
+            }
+        }
+        for batch in rest.chunks(FETCH_CHUNK) {
             self.fetch_batch(batch)?;
             fetched += (batch.len() * stride) as u64;
         }
         Ok(fetched)
+    }
+
+    /// Turn lookahead prefetch on or off; on by default, `INFERRED_PREFETCH=0`
+    /// off. For tests that compare both in one process.
+    pub fn set_prefetch(&mut self, on: bool) {
+        self.prefetch_on = on;
+    }
+
+    /// Whether lookahead prefetch is on.
+    pub fn prefetch_on(&self) -> bool {
+        self.prefetch_on
+    }
+
+    /// **Lookahead prefetch** (SSD-TIER.md D20): start reading the cold experts
+    /// that the *next* routing decision is likely to pick — `ids`, the next
+    /// layer's router's top-k on this layer's input — for every tensor of the
+    /// group that follows the one just resolved. The reads run on the pool while
+    /// the GPU computes; [`ExpertCache::resolve_many`] takes what finished.
+    ///
+    /// Guesses left from the previous decision are dropped first. At most
+    /// [`PREFETCH_SLOTS`] reads are started; the rest wait for the real resolve.
+    /// Changes nothing a kernel reads: bytes stay in host staging until a resolve
+    /// publishes them.
+    pub fn start_prefetch(&mut self, ids: &[i32]) -> Result<()> {
+        if !self.prefetch_on || !self.parallel_fetch() {
+            return Ok(());
+        }
+        self.prefetch.collect(None);
+        let stale: Vec<usize> = self.prefetch.entries.keys().copied().collect();
+        for key in stale {
+            self.prefetch.discard(key);
+            self.stats.prefetch_wasted += 1;
+        }
+        let Some((_, opener)) = self.learning else { return Ok(()) };
+        let Some(&next) = self.next_opener.get(&opener) else { return Ok(()) };
+        let mut tensors = vec![next];
+        tensors.extend(self.groups.get(&next).into_iter().flatten().copied());
+
+        let n_expert = self.n_expert_seen;
+        let stride = self.stride;
+        let mut picks: Vec<usize> =
+            ids.iter().filter_map(|&e| usize::try_from(e).ok()).filter(|&e| e < n_expert).collect();
+        picks.sort_unstable();
+        picks.dedup();
+        let mut want = Vec::new();
+        for &tkey in &tensors {
+            for &e in &picks {
+                let key = tkey + e * stride;
+                if self.cold.contains(&key) && !self.prefetch.entries.contains_key(&key) {
+                    want.push(key);
+                }
+            }
+        }
+        if want.is_empty() {
+            return Ok(());
+        }
+        self.ensure_readers()?;
+        let (align, slot_len) = self.staging_geometry();
+        self.prefetch.ensure_staging(slot_len)?;
+        let Some((_, base)) = self.source.clone() else { return Ok(()) };
+        for key in want {
+            let Some(slot) = self.prefetch.free.pop() else { break };
+            let pre = key.saturating_sub(base) % align;
+            let start = (key.saturating_sub(base) - pre) as u64;
+            let len = (pre + stride).div_ceil(align) * align;
+            let dst = self.prefetch.slot_ptr(slot);
+            let submitted = match self.readers.as_ref() {
+                // SAFETY: `slot` was free, so nothing else reads, writes or
+                // publishes its memory until the pool reports on `done` for it:
+                // `Prefetch` returns a slot to `free` only on that report, and the
+                // staging is freed only after the pool, which finishes every
+                // queued read first (field order). `len <= slot_len`.
+                Some(pool) => unsafe { pool.submit(start, dst, len, pre + stride, slot, &self.prefetch.done) },
+                None => Err(Error::Cuda { what: "expert prefetch", detail: "no read pool".to_string() }),
+            };
+            match submitted {
+                Ok(()) => {
+                    self.prefetch.entries.insert(key, (slot, pre, Prefetched::InFlight));
+                    self.prefetch.busy.insert(slot, true);
+                    self.stats.prefetch_reads += 1;
+                }
+                Err(e) => {
+                    self.prefetch.free.push(slot);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish a finished prefetch of `key` through `make_resident`, freeing its
+    /// slot. False when there was none to publish (it failed), so the caller
+    /// reads it the ordinary way.
+    fn publish_prefetched(&mut self, key: usize) -> Result<bool> {
+        let Some((slot, pre, state)) = self.prefetch.entries.remove(&key) else { return Ok(false) };
+        if state != Prefetched::Ready {
+            self.prefetch.free.push(slot);
+            return Ok(false);
+        }
+        let Some(staging) = self.prefetch.staging.take() else {
+            return Err(Error::Cuda { what: "expert prefetch", detail: "the staging buffer vanished".to_string() });
+        };
+        let at = slot * self.prefetch.slot_len + pre;
+        let published = self.make_resident(key, &staging.as_slice()[at..at + self.stride]).map(|_| ());
+        self.prefetch.staging = Some(staging);
+        self.prefetch.free.push(slot);
+        published?;
+        self.stats.prefetch_used += 1;
+        Ok(true)
+    }
+
+    /// The read pool and its staging, opened on first use.
+    fn ensure_readers(&mut self) -> Result<()> {
+        use super::fetch::{DIRECT_ALIGN, Pinned, ReadPool};
+        if self.readers.is_some() {
+            return Ok(());
+        }
+        let Some((path, _)) = self.source.clone() else {
+            return Err(Error::Cuda {
+                what: "expert fetch",
+                detail: "a parallel fetch needs the model file".to_string(),
+            });
+        };
+        let mut direct = self.fetch_direct;
+        let pinned = Pinned::new(FETCH_CHUNK * self.slot_len_for(DIRECT_ALIGN))?;
+        // Stage 0 found `cuMemHostAlloc` page-aligned; checked, not assumed.
+        if pinned.as_slice().as_ptr() as usize % DIRECT_ALIGN != 0 {
+            direct = false;
+        }
+        let file = match super::fetch::open(&path, direct) {
+            Ok(f) => f,
+            Err(_) if direct => {
+                direct = false;
+                super::fetch::open(&path, false).map_err(|err| Error::Cuda {
+                    what: "expert fetch",
+                    detail: format!("opening {}: {err}", path.display()),
+                })?
+            }
+            Err(err) => {
+                return Err(Error::Cuda { what: "expert fetch", detail: format!("opening {}: {err}", path.display()) });
+            }
+        };
+        self.fetch_direct = direct;
+        self.stats.fetch_direct = direct;
+        self.pinned = Some(pinned);
+        self.readers = Some(ReadPool::new(file, self.fetch_threads)?);
+        Ok(())
+    }
+
+    /// One staging slot per expert. With `O_DIRECT` a read covers the expert's
+    /// enclosing page-aligned range — at most `align - 1` bytes before it and the
+    /// rest of its last page after — so a slot is that range's largest size, and
+    /// the expert sits `pre` bytes into it (SSD-TIER.md D4).
+    fn slot_len_for(&self, align: usize) -> usize {
+        (self.stride + align - 1).div_ceil(align) * align
+    }
+
+    /// The alignment reads use now, and the staging slot that fits one.
+    fn staging_geometry(&self) -> (usize, usize) {
+        let align = if self.fetch_direct { super::fetch::DIRECT_ALIGN } else { 1 };
+        (align, self.slot_len_for(align))
     }
 
     /// The tensors to resolve now for a call on `tkeys` under routing decision
@@ -1001,6 +1316,11 @@ impl ExpertCache {
                 }
             }
             _ => {
+                if let Some((_, prev)) = self.learning
+                    && prev != first
+                {
+                    self.next_opener.insert(prev, first);
+                }
                 self.learning = Some((route, first));
                 let group = self.groups.entry(first).or_default();
                 for &k in &tkeys[1..] {
@@ -1038,46 +1358,15 @@ impl ExpertCache {
     /// repoints its victim, uploads and repoints itself one at a time, in the same
     /// sequence as the serial path — which is why the two give the same evictions.
     fn fetch_batch(&mut self, keys: &[usize]) -> Result<()> {
-        use super::fetch::{DIRECT_ALIGN, Pinned, ReadPool};
         let stride = self.stride;
-        let Some((path, base)) = self.source.clone() else {
+        self.ensure_readers()?;
+        let Some((_, base)) = self.source.clone() else {
             return Err(Error::Cuda {
                 what: "expert fetch",
                 detail: "a parallel fetch needs the model file".to_string(),
             });
         };
-        // One staging slot per expert. With `O_DIRECT` a read covers the expert's
-        // enclosing page-aligned range — at most `DIRECT_ALIGN - 1` bytes before it
-        // and the rest of its last page after — so a slot is that range's largest
-        // size, and the expert sits `pre` bytes into it (SSD-TIER.md D4).
-        let slot_for = |align: usize| (stride + align - 1).div_ceil(align) * align;
-        if self.readers.is_none() {
-            let mut direct = self.fetch_direct;
-            let pinned = Pinned::new(FETCH_CHUNK * slot_for(DIRECT_ALIGN))?;
-            // Stage 0 found `cuMemHostAlloc` page-aligned; checked, not assumed.
-            if pinned.as_slice().as_ptr() as usize % DIRECT_ALIGN != 0 {
-                direct = false;
-            }
-            let file = match super::fetch::open(&path, direct) {
-                Ok(f) => f,
-                Err(_) if direct => {
-                    direct = false;
-                    super::fetch::open(&path, false).map_err(|err| Error::Cuda {
-                        what: "expert fetch",
-                        detail: format!("opening {}: {err}", path.display()),
-                    })?
-                }
-                Err(err) => {
-                    return Err(Error::Cuda { what: "expert fetch", detail: format!("opening {}: {err}", path.display()) });
-                }
-            };
-            self.fetch_direct = direct;
-            self.stats.fetch_direct = direct;
-            self.pinned = Some(pinned);
-            self.readers = Some(ReadPool::new(file, self.fetch_threads)?);
-        }
-        let align = if self.fetch_direct { DIRECT_ALIGN } else { 1 };
-        let slot = slot_for(align);
+        let (align, slot) = self.staging_geometry();
         let mut pinned = self.pinned.take().ok_or_else(|| Error::Cuda {
             what: "expert fetch",
             detail: "the staging buffer vanished".to_string(),

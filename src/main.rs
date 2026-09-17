@@ -1015,6 +1015,15 @@ small writes {:.1} | picks readback + sync {:.1} ({:.1} a token)",
                 per(e.readback_us),
                 e.readbacks as f64 / tokens.max(1) as f64,
             );
+            if e.prefetch_reads > 0 {
+                eprintln!(
+                    "         prefetch: {} read ahead ({:.1} a token), {} used, {} dropped unused",
+                    e.prefetch_reads,
+                    e.prefetch_reads as f64 / tokens.max(1) as f64,
+                    e.prefetch_used,
+                    e.prefetch_wasted,
+                );
+            }
         }
         // What a *static* placement that knew the routing distribution in
         // advance could have served from VRAM — the busiest slab-many experts,
