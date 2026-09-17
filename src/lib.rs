@@ -4,6 +4,7 @@
 //! under and `HANDOFF.md` for why the project exists.
 
 pub mod cache;
+pub mod dump;
 pub mod engine;
 pub mod error;
 pub mod gguf;

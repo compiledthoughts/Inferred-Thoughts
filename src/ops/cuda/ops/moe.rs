@@ -950,6 +950,23 @@ impl Cuda {
             let mut cache = self.experts.borrow_mut();
             let Some(c) = cache.as_mut() else { return Ok(()) };
             c.defer_writes();
+            // `INFERRED_EXPERT_LOG`: what each resolve picked and which picks
+            // were cold, before resolving makes them resident.
+            if let Some(d) = crate::dump::experts() {
+                for w in tensors {
+                    let tkey = w.data.as_ptr() as usize;
+                    let cold = c.cold_flags(tkey, w.n_expert, &picks.1);
+                    let head = [n_tok as u32, n_used as u32, w.n_expert as u32];
+                    d.record(&[
+                        b"ELOG",
+                        &self.passes_seen.get().to_le_bytes(),
+                        &(tkey as u64).to_le_bytes(),
+                        crate::dump::bytes_of(&head),
+                        crate::dump::bytes_of(&picks.1),
+                        &cold,
+                    ]);
+                }
+            }
             let resolved = tensors
                 .iter()
                 .try_for_each(|w| c.resolve(w.data.as_ptr() as usize, w.data, w.n_expert, &picks.1).map(|_| ()));

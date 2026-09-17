@@ -1339,6 +1339,20 @@ impl<'a> Qwen4Exp<'a> {
             )?;
             ctx.trace("hc_mixed", il, &s.mixed);
             ctx.trace("hc_inject", il, &s.inject);
+            // `INFERRED_ROUTER_DUMP`: the router's input, for the prefetch study.
+            // Reads it home, so graphs go off for the run; a measurement of what
+            // ran, not of speed.
+            if let Some(d) = crate::dump::router() {
+                ops.host_needs(&mut s.mixed);
+                let head = [il as u32, n as u32, c.n_embd as u32];
+                d.record(&[
+                    b"RDMP",
+                    crate::dump::bytes_of(&head[..1]),
+                    &(start_pos as u64).to_le_bytes(),
+                    crate::dump::bytes_of(&head[1..]),
+                    crate::dump::bytes_of(&s.mixed),
+                ]);
+            }
             self.moe(ops, layer, n, s);
             ctx.trace("ffn_moe_out", il, &s.block);
             self.hc_write(ops, s);

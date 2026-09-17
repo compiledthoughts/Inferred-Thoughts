@@ -869,6 +869,18 @@ impl ExpertCache {
     /// `tkey` is the tensor's key, its address in the mapping, and `data` the
     /// tensor's bytes there, read only when no model file is known. Returns the
     /// bytes fetched.
+    /// For each pick in `ids`, 1 if that expert of tensor `tkey` is cold now —
+    /// what [`ExpertCache::resolve`] would fetch — else 0. For
+    /// `INFERRED_EXPERT_LOG`; changes nothing.
+    pub fn cold_flags(&self, tkey: usize, n_expert: usize, ids: &[i32]) -> Vec<u8> {
+        ids.iter()
+            .map(|&e| match usize::try_from(e) {
+                Ok(e) if e < n_expert => u8::from(self.cold.contains(&(tkey + e * self.stride))),
+                _ => 0,
+            })
+            .collect()
+    }
+
     pub fn resolve(&mut self, tkey: usize, data: &[u8], n_expert: usize, ids: &[i32]) -> Result<u64> {
         let stride = self.stride;
         let mut picks: Vec<usize> =
