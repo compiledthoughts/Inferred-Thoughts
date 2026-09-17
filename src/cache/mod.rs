@@ -51,11 +51,16 @@ pub struct KvCache {
     idx_ratio: usize,
     pooled: Vec<f32>,
     /// Per layer, how many leading blocks of `pooled` are current: **the
-    /// watermark**. A pass at `start_pos` rewrites every cell from there on, so it
-    /// first lowers this to `start_pos / idx_ratio` — which covers a rewind, a
-    /// checkpoint restore and a reset alike, since every overwrite of a cell
-    /// happens in a pass that starts at or before it. See
-    /// [`KvCache::pooled_mut`].
+    /// watermark**. A pass at `start_pos` rewrites every cell from there on, so
+    /// **every pass that writes indexer keys** first lowers this to
+    /// `start_pos / idx_ratio` ([`KvCache::lower_pooled`]) — which covers a
+    /// rewind, a checkpoint restore and a reset alike, since every overwrite of a
+    /// cell happens in a pass that starts at or before it.
+    ///
+    /// **Dense passes too** (16-09): a prefill below the budget pools nothing but
+    /// still overwrites raw keys, and when only the pooling passes lowered this, a
+    /// reset followed by a short dense turn left its key in a block the next
+    /// conversation then kept.
     pooled_through: Vec<usize>,
 }
 
@@ -97,14 +102,21 @@ impl KvCache {
         self.n_ctx / self.idx_ratio.max(1)
     }
 
+    /// A pass starting at `start_pos` is about to write layer `il`'s indexer
+    /// keys: forget every pooled block that reaches that far. Call it in every
+    /// such pass, whether or not the pass pools.
+    pub fn lower_pooled(&mut self, il: usize, start_pos: usize) {
+        let through = &mut self.pooled_through[il];
+        *through = (*through).min(start_pos / self.idx_ratio.max(1));
+    }
+
     /// One layer's raw indexer keys and its pooled-key lane, for a pass starting
     /// at `start_pos`, **with the watermark already lowered for it**: returns the
     /// first block that is not current. The caller pools from there and then
     /// calls [`KvCache::set_pooled_through`].
     pub fn pooled_mut(&mut self, il: usize, start_pos: usize) -> (&[u16], &mut [f32], usize) {
-        let through = &mut self.pooled_through[il];
-        *through = (*through).min(start_pos / self.idx_ratio.max(1));
-        let from = *through;
+        self.lower_pooled(il, start_pos);
+        let from = self.pooled_through[il];
         let (lo, hi) = (il * self.n_ctx * self.idx_dim, (il + 1) * self.n_ctx * self.idx_dim);
         let nb = self.n_ctx / self.idx_ratio.max(1);
         let (plo, phi) = (il * nb * self.idx_dim, (il + 1) * nb * self.idx_dim);
@@ -297,6 +309,9 @@ mod tests {
         assert_eq!(c.pooled_mut(1, 30).2, 5, "a later start does not raise it again");
         assert_eq!(c.pooled_mut(0, 30).2, 0, "layers are independent");
         assert_eq!(c.pooled_mut(1, 0).2, 0, "a reset drops them all");
+        c.set_pooled_through(1, 9);
+        c.lower_pooled(1, 13);
+        assert_eq!(c.pooled_mut(1, 38).2, 3, "a pass that pools nothing still lowers it");
         let (raw, pooled, _) = c.pooled_mut(1, 0);
         assert_eq!((raw.len(), pooled.len()), (40 * 8, 10 * 8));
     }

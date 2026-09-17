@@ -1477,6 +1477,9 @@ impl<'a> Qwen4Exp<'a> {
         if qsa_reachable {
             ops.matmul(&indexer.k_proj, &s.mixed, &mut s.ik);
             ctx.trace("indexer_k_raw", il, &s.ik);
+            // These cells' pooled blocks are stale from here on, whether or not
+            // this pass pools (`KvCache::lower_pooled`).
+            kv.lower_pooled(slot, start_pos);
             ops.kv_write(kv.idx_layer_mut(slot), start_pos * c.indexer.head_dim, &s.ik);
         }
         // Past the budget, choose each query's cells before K and V are published:

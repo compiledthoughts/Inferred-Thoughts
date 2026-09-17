@@ -696,3 +696,75 @@ fn the_0_2b_reproduces_llama_cpps_greedy_text_through_the_sparse_path_on_the_gpu
     let text = tk.decode(&produced, false).expect("decode");
     assert_eq!(text, LLAMA_CPP_40);
 }
+
+/// **`serve`'s sequence, past the budget, is exact on the GPU**: in one engine, a
+/// 2,301-token first turn prefilled in 1,024-token slices with a checkpoint after
+/// each (as `serve` does at `--ctx 8192`), then 16 decode steps; a 25-token
+/// continuation and 16 more; a restore to the checkpoint at 2,048 and a different
+/// 428-token tail, 16 steps; a reset and a short unrelated turn; then the restored
+/// conversation again from zero, in the same slices. The restored turn's logits
+/// must equal the fresh one's in every step.
+///
+/// The 125B's server gave different replies for these two (16-09); this separates
+/// the engine's own restore path from anything only the oversubscribed model has.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_serve_sequence_past_the_budget_restores_exactly_on_the_gpu() {
+    use inferred_thoughts::{Cuda, Engine};
+    let Some(f) = open(TINY) else { return };
+    let gpu = Cuda::new(0).expect("cuda device");
+    let mut e = Engine::new(Model::load(&f).expect("load"), &gpu, 8192, false);
+    let slice = 1024;
+    let prefill_in_slices = |e: &mut Engine<'_, &Cuda>, toks: &[u32], cps: &mut Vec<_>| {
+        let mut last = Vec::new();
+        for chunk in toks.chunks(slice) {
+            last = e.prefill(chunk).expect("slice");
+            if chunk.len() == slice {
+                cps.push(e.checkpoint().expect("checkpoint"));
+            }
+        }
+        last
+    };
+    let decode_steps = |e: &mut Engine<'_, &Cuda>, first: Vec<f32>, n: usize| {
+        let mut all = vec![first];
+        for _ in 0..n {
+            let t = argmax(all.last().expect("logits"));
+            all.push(e.decode(t).expect("decode"));
+        }
+        all
+    };
+
+    let turn1 = synthetic(2301, 0);
+    let mut cps = Vec::new();
+    let l = prefill_in_slices(&mut e, &turn1, &mut cps);
+    decode_steps(&mut e, l, 16);
+    let l = e.prefill(&synthetic(25, 3)).expect("continuation");
+    decode_steps(&mut e, l, 16);
+
+    // The edited turn: turn 1's first 2,048 tokens, then a different tail.
+    let mut edited = turn1[..2048].to_vec();
+    edited.extend(synthetic(428, 5));
+    let cp = cps.iter().rev().find(|c| c.pos() <= 2048).expect("a checkpoint at or before 2,048").clone();
+    assert_eq!(cp.pos(), 2048);
+    e.restore(&cp).expect("restore");
+    let l = e.prefill(&edited[2048..]).expect("restored tail");
+    let restored = decode_steps(&mut e, l, 16);
+
+    e.reset();
+    let l = e.prefill(&synthetic(14, 9)).expect("elsewhere");
+    decode_steps(&mut e, l, 4);
+
+    e.reset();
+    let mut ignored = Vec::new();
+    let l = prefill_in_slices(&mut e, &edited, &mut ignored);
+    let fresh = decode_steps(&mut e, l, 16);
+    if let Some(err) = gpu.take_error() {
+        panic!("a CUDA op reported an error: {err}");
+    }
+    for (step, (a, b)) in restored.iter().zip(&fresh).enumerate() {
+        let differing = a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+        println!("  step {step:>2}: {differing} of {} logits differ", a.len());
+        assert_eq!(differing, 0, "step {step}: the restored turn is not the fresh one");
+    }
+}
