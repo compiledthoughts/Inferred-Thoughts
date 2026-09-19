@@ -318,18 +318,27 @@ pub struct ExpertStats {
     /// Microseconds of the tier-3 fetch path, split where the time goes: reading
     /// cold experts from the file, uploading them into their slots, the small
     /// table-entry and flag writes around each (the victim's two, the fetched
-    /// expert's two), and the picks readback that starts each resolve — its
-    /// synchronize and download. `readbacks` counts those. The synchronize also
-    /// waits out the kernels already queued ahead of it, so `readback_us` holds
-    /// GPU time too, not only the cost of the readback.
+    /// expert's two), and the picks readback that starts each resolve.
+    /// `readbacks` counts those.
     ///
     /// **Measured before parallelizing the reads**, because the 125B's decode rate
     /// tracked serial disk throughput and nothing said how much of a 300 ms token
     /// the disk actually was.
+    ///
+    /// **The readback is two costs, and was one counter until 18-09.** Its
+    /// `synchronize` waits out every kernel queued ahead of it, so that part is
+    /// GPU time, not overhead; the downloads after it are `n_tok * n_used * 4`
+    /// bytes of picks (40 at decode) plus the hint logits (~2 KB), which cannot
+    /// account for the ~32 ms a 125B token spent here. `readback_wait_us` is the
+    /// synchronize alone — the host waiting for the device — and
+    /// `readback_copy_us` the downloads and the host-side top-k. **Only the
+    /// second is overhead a faster path could remove**; the first shrinks only by
+    /// giving the GPU less to do, or by not waiting for it.
     pub fetch_read_us: u64,
     pub fetch_upload_us: u64,
     pub fetch_writes_us: u64,
-    pub readback_us: u64,
+    pub readback_wait_us: u64,
+    pub readback_copy_us: u64,
     pub readbacks: u64,
     /// Table-entry and flag writes queued during resolves, and the flushes that
     /// sent them: one copy and one `apply_patches` launch each.
@@ -429,8 +438,10 @@ pub(super) struct ExpertCache {
     /// Slot -> the key it holds. Only consulted once both tiers are full and
     /// CLOCK has taken over.
     owner: Vec<Option<usize>>,
-    /// CLOCK's reference bit. Dead until the host tier is exhausted.
-    referenced: Vec<bool>,
+    /// GCLOCK's heat counter, 0..=[`HEAT_MAX`]. Dead until the host tier is
+    /// exhausted. See [`clock_pick`] for the policy and why it is a count rather
+    /// than the reference bit it was until 19-09.
+    heat: Vec<u8>,
     hand: usize,
     blocks: Vec<HostBlock>,
     host_budget: usize,
@@ -723,7 +734,7 @@ impl ExpertCache {
             map: HashMap::with_capacity(slots * 2),
             next_slot: 0,
             owner: vec![None; slots],
-            referenced: vec![false; slots],
+            heat: vec![0; slots],
             hand: 0,
             blocks: Vec::new(),
             host_budget,
@@ -860,7 +871,7 @@ impl ExpertCache {
             e.uses += 1;
             let (addr, slot) = (e.addr, e.slot);
             match slot {
-                Some(s) => self.referenced[s as usize] = true,
+                Some(s) => self.heat[s as usize] = self.heat[s as usize].saturating_add(1).min(heat_max()),
                 None => self.stats.host_reads += 1,
             }
             self.stats.hits += 1;
@@ -909,7 +920,7 @@ impl ExpertCache {
             self.stats.place_h2d_us += t.elapsed().as_micros() as u64;
             self.stats.filled_bytes += src.len() as u64;
             self.owner[slot as usize] = Some(key);
-            self.referenced[slot as usize] = true;
+            self.heat[slot as usize] = HEAT_NEW;
             let addr = self.slot_ptr(slot);
             self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
             return Ok(addr);
@@ -985,9 +996,11 @@ impl ExpertCache {
         Ok(Some((ptr, n)))
     }
 
-    /// Count one picks readback — its synchronize and download — at `us`.
-    pub fn note_readback(&mut self, us: u64) {
-        self.stats.readback_us += us;
+    /// Count one picks readback: `wait` is its synchronize (GPU time), `copy` the
+    /// downloads and the host-side top-k that follow it.
+    pub fn note_readback(&mut self, wait: u64, copy: u64) {
+        self.stats.readback_wait_us += wait;
+        self.stats.readback_copy_us += copy;
         self.stats.readbacks += 1;
     }
 
@@ -1050,7 +1063,7 @@ impl ExpertCache {
             let key = tkey + e * stride;
             if !self.cold.contains(&key) {
                 if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
-                    self.referenced[slot as usize] = true;
+                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(heat_max());
                 }
                 continue;
             }
@@ -1105,7 +1118,7 @@ impl ExpertCache {
                 if self.cold.contains(&key) {
                     cold.push(key);
                 } else if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
-                    self.referenced[slot as usize] = true;
+                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(heat_max());
                 }
             }
         }
@@ -1416,7 +1429,13 @@ impl ExpertCache {
         self.upload(&self.slab, slot as usize * self.stride, bytes)?;
         self.stats.fetch_upload_us += t.elapsed().as_micros() as u64;
         self.owner[slot as usize] = Some(key);
-        self.referenced[slot as usize] = true;
+        // **A fetched expert enters cold, not hot** (19-09). 27.3% of a 125B
+        // token's expert accesses are cold and 40% of the hot set turns over
+        // inside one run, so most arrivals here are one-offs. Entering at
+        // `HEAT_MAX` — which the reference bit effectively did — let every
+        // transient flush a stable resident. `HEAT_NEW` makes an arrival
+        // survive one hand pass and no more unless it is picked again.
+        self.heat[slot as usize] = HEAT_NEW;
         let addr = self.slot_ptr(slot);
         self.map.insert(key, Entry { addr, slot: Some(slot), uses: 0 });
         self.cold.remove(&key);
@@ -1651,7 +1670,7 @@ impl ExpertCache {
                 self.home.insert(k, (key, (e + i) as u32));
                 self.stats.distinct += 1;
                 self.owner[slot as usize] = Some(k);
-                self.referenced[slot as usize] = true;
+                self.heat[slot as usize] = HEAT_NEW;
                 let addr = self.slot_ptr(slot);
                 self.map.insert(k, Entry { addr, slot: Some(slot), uses: 0 });
                 addrs.push(addr);
@@ -2028,7 +2047,7 @@ impl ExpertCache {
     /// expert the layer being resolved picked. See [`clock_pick`].
     fn evict_unleased(&mut self) -> Result<u32> {
         let (owner, lease) = (&self.owner, &self.lease);
-        match clock_pick(&mut self.referenced, &mut self.hand, |at| {
+        match clock_pick(&mut self.heat, &mut self.hand, |at| {
             owner[at].is_some_and(|k| lease.contains(&k))
         }) {
             Some(at) => Ok(at as u32),
@@ -2044,29 +2063,74 @@ impl ExpertCache {
     }
 }
 
-/// CLOCK with leases: advance the hand, clearing reference bits, and take the
-/// first slot that is not leased and whose bit was already clear. Leased slots
-/// are passed over without touching their bit.
+/// Heat a slot can reach. The hand may need `heat_max() + 1` laps to find a
+/// victim, so this trades scan length for how long a hot expert is protected.
 ///
-/// Terminates within two laps plus one step whenever any slot is unleased: the
-/// first lap clears every unleased bit, so the second finds one clear. `None`
-/// only when every slot is leased.
+/// **Deliberately small.** 40% of the 125B's hot set turns over inside one run
+/// (`skew.py`, 19-09), so a cache that holds on too hard cannot follow the drift
+/// — stickiness is the failure mode here, not the goal.
+const HEAT_MAX: u8 = 3;
+
+/// [`HEAT_MAX`], or `INFERRED_HEAT_MAX` when set; read once.
+///
+/// **`INFERRED_HEAT_MAX=1` is the control, and in the engine it is exact.** Heat
+/// only ever originates two ways — an arrival at [`HEAT_NEW`] (1) and a touch at
+/// `min(h + 1, heat_max())` — so at 1 every slot is 0 or 1, a touch sets it, a
+/// pass clears it, and the loop bound falls back to `2n + 1`. That is precisely
+/// the reference bit this replaced.
+///
+/// It is *not* exact for the unit tests below, which seed `heat` directly and so
+/// can hold values this cap never produced. Those were falsified instead by
+/// forcing the constant to 1, where the three behavioural tests fail with
+/// `Some(0)` against `Some(1)` — the hand taking whichever slot it met first.
+fn heat_max() -> u8 {
+    static H: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *H.get_or_init(|| {
+        std::env::var("INFERRED_HEAT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|v: u8| v.max(HEAT_NEW))
+            .unwrap_or(HEAT_MAX)
+    })
+}
+
+/// Heat an expert enters a slot with, below [`HEAT_MAX`] so it must be picked
+/// again to be protected. This is the admission rule; see the call in
+/// `make_resident`.
+const HEAT_NEW: u8 = 1;
+
+/// GCLOCK with leases: advance the hand, decaying heat, and take the first slot
+/// that is not leased and whose heat has reached zero. Leased slots are passed
+/// over without decaying.
+///
+/// **Counters, not a reference bit, since 19-09.** The bit made this pure
+/// recency, and recency alone is what a CLOCK cache gets wrong on this
+/// workload: measured on a 125B run, the resident quarter of the pool served
+/// 72.7% of accesses where an oracle of the same size served 87.9%. A count
+/// adds frequency — the classic LRU-K/GCLOCK direction — so an expert picked
+/// repeatedly outlives one picked once. Paired with `HEAT_NEW` admission, which
+/// is the half that stops one-off arrivals flushing the stable set.
+///
+/// Terminates within `HEAT_MAX + 1` laps plus one step whenever any slot is
+/// unleased: each lap drops every unleased slot's heat by at least one, so by
+/// the last one some unleased slot is at zero. `None` only when every slot is
+/// leased.
 ///
 /// A free function rather than a method so the policy is testable without a
 /// device, which is where it can be wrong in a way no output would reveal.
-fn clock_pick(referenced: &mut [bool], hand: &mut usize, leased: impl Fn(usize) -> bool) -> Option<usize> {
-    let n = referenced.len();
+fn clock_pick(heat: &mut [u8], hand: &mut usize, leased: impl Fn(usize) -> bool) -> Option<usize> {
+    let n = heat.len();
     if n == 0 {
         return None;
     }
-    for _ in 0..2 * n + 1 {
+    for _ in 0..(heat_max() as usize + 1) * n + 1 {
         let at = *hand;
         *hand = (*hand + 1) % n;
         if leased(at) {
             continue;
         }
-        if referenced[at] {
-            referenced[at] = false;
+        if heat[at] > 0 {
+            heat[at] -= 1;
         } else {
             return Some(at);
         }
@@ -2080,23 +2144,69 @@ mod tests {
     //! the ring is exercised through [`super::clock_pick`] directly — which is
     //! the part that can be wrong in a way no output would reveal.
 
-    use super::clock_pick;
+    use super::{HEAT_MAX, HEAT_NEW, clock_pick};
 
-    /// A CLOCK ring over the real [`super::clock_pick`], with nothing leased.
+    /// A GCLOCK ring over the real [`super::clock_pick`], with nothing leased.
     /// It used to be a hand-written copy "identical to" the cache's; it now
     /// calls the function the cache calls, so the two cannot drift.
     struct Clock {
-        referenced: Vec<bool>,
+        heat: Vec<u8>,
         hand: usize,
     }
 
     impl Clock {
         fn new(n: usize) -> Self {
-            Self { referenced: vec![false; n], hand: 0 }
+            Self { heat: vec![0; n], hand: 0 }
         }
         fn evict(&mut self) -> usize {
-            clock_pick(&mut self.referenced, &mut self.hand, |_| false).unwrap_or(usize::MAX)
+            clock_pick(&mut self.heat, &mut self.hand, |_| false).unwrap_or(usize::MAX)
         }
+    }
+
+    /// An arrival must be able to lose to an established resident, which is the
+    /// whole of the admission rule. If these ever became equal the policy would
+    /// silently go back to being recency-only.
+    #[test]
+    fn a_new_arrival_starts_below_the_ceiling() {
+        assert!(HEAT_NEW < HEAT_MAX, "HEAT_NEW {HEAT_NEW} must leave room to climb to {HEAT_MAX}");
+        assert!(HEAT_NEW > 0, "an arrival at zero heat would be evicted before it is used again");
+    }
+
+    /// **The property this policy exists for, and the one the reference bit
+    /// could not express**: the hand passes over a hot slot to take a colder one
+    /// it meets later. Under the old bit both slots read "referenced" and the
+    /// hand took whichever it reached first — here that would be slot 0, so this
+    /// test fails on the policy it replaced.
+    #[test]
+    fn the_hand_passes_a_hot_slot_to_take_a_cold_one() {
+        let mut heat = vec![HEAT_MAX, HEAT_NEW];
+        let mut hand = 0;
+        assert_eq!(clock_pick(&mut heat, &mut hand, |_| false), Some(1));
+    }
+
+    /// A one-off arrival does not flush an expert the layer keeps picking. With
+    /// 27.3% of a 125B token's expert accesses cold, arrivals are the common
+    /// case, so this is the ordinary path rather than an edge.
+    #[test]
+    fn an_arrival_is_evicted_before_an_expert_picked_again() {
+        let mut heat = vec![HEAT_NEW; 2];
+        // Slot 0 is picked again while resident; slot 1 is a fresh fetch.
+        for _ in 0..HEAT_MAX {
+            heat[0] = heat[0].saturating_add(1).min(HEAT_MAX);
+        }
+        let mut hand = 0;
+        assert_eq!(clock_pick(&mut heat, &mut hand, |_| false), Some(1));
+    }
+
+    /// A slot survives exactly as many passes of the hand as it has heat — the
+    /// graded version of "second chance". Leasing the other slots makes every
+    /// step of the hand a pass over the one being measured.
+    #[test]
+    fn a_slot_survives_exactly_its_heat_in_passes() {
+        let mut heat = vec![2u8, HEAT_MAX, HEAT_MAX];
+        let mut hand = 0;
+        assert_eq!(clock_pick(&mut heat, &mut hand, |at| at != 0), Some(0));
+        assert_eq!(heat[0], 0, "two passes must have spent both units of heat");
     }
 
     /// **A leased slot is never taken**, even when its reference bit is clear and
@@ -2104,40 +2214,40 @@ mod tests {
     /// resolving a layer's `up` able to evict the `gate` it had just resolved.
     #[test]
     fn a_leased_slot_is_never_taken() {
-        let mut referenced = vec![false; 4];
+        let mut heat = vec![0u8; 4];
         let mut hand = 0;
         let leased = |at: usize| at == 0 || at == 2;
         let got: Vec<usize> =
-            (0..6).map(|_| clock_pick(&mut referenced, &mut hand, leased).unwrap_or(usize::MAX)).collect();
+            (0..6).map(|_| clock_pick(&mut heat, &mut hand, leased).unwrap_or(usize::MAX)).collect();
         assert!(got.iter().all(|&s| s == 1 || s == 3), "took a leased slot: {got:?}");
     }
 
-    /// A leased slot's bit is left alone as the hand passes, so the lease does
-    /// not cost it its second chance once the lease ends.
+    /// A leased slot's heat is left alone as the hand passes, so the lease does
+    /// not cost it the protection it earned once the lease ends.
     #[test]
-    fn passing_a_leased_slot_leaves_its_bit_alone() {
-        let mut referenced = vec![true, false, false];
+    fn passing_a_leased_slot_leaves_its_heat_alone() {
+        let mut heat = vec![HEAT_MAX, 0, 0];
         let mut hand = 0;
-        assert_eq!(clock_pick(&mut referenced, &mut hand, |at| at == 0), Some(1));
-        assert!(referenced[0], "the hand cleared a leased slot's reference bit");
+        assert_eq!(clock_pick(&mut heat, &mut hand, |at| at == 0), Some(1));
+        assert_eq!(heat[0], HEAT_MAX, "the hand decayed a leased slot's heat");
     }
 
     /// With every slot leased there is nothing to take, and the answer is `None`
     /// rather than a spin or a leased slot.
     #[test]
     fn a_fully_leased_ring_yields_nothing() {
-        let mut referenced = vec![false, true, false];
+        let mut heat = vec![0, HEAT_MAX, 0];
         let mut hand = 1;
-        assert_eq!(clock_pick(&mut referenced, &mut hand, |_| true), None);
+        assert_eq!(clock_pick(&mut heat, &mut hand, |_| true), None);
     }
 
-    /// One unleased slot among many referenced, leased ones is still found:
-    /// termination must not depend on the leased slots' bits.
+    /// One unleased slot among many hot, leased ones is still found:
+    /// termination must not depend on the leased slots' heat.
     #[test]
     fn a_single_unleased_slot_is_found_through_a_full_ring() {
-        let mut referenced = vec![true; 8];
+        let mut heat = vec![HEAT_MAX; 8];
         let mut hand = 3;
-        let got = clock_pick(&mut referenced, &mut hand, |at| at != 6);
+        let got = clock_pick(&mut heat, &mut hand, |at| at != 6);
         assert_eq!(got, Some(6));
     }
 
@@ -2151,35 +2261,37 @@ mod tests {
         assert_eq!(got, (0..8).collect::<Vec<_>>());
     }
 
-    /// A referenced slot survives exactly one pass of the hand, which is what
-    /// "second chance" means and what makes this an LRU approximation rather
-    /// than FIFO.
+    /// A slot with one unit of heat survives exactly one pass of the hand, which
+    /// is the "second chance" the reference bit used to give and what makes this
+    /// an LRU approximation rather than FIFO. `HEAT_NEW` is that case, so this
+    /// also pins what a fresh arrival is worth.
     #[test]
-    fn a_referenced_slot_gets_one_second_chance_and_no_more() {
+    fn a_slot_at_one_heat_gets_one_second_chance_and_no_more() {
         let mut c = Clock::new(4);
         for _ in 0..4 {
             c.evict();
         }
-        c.referenced = vec![true, false, false, false];
+        c.heat = vec![HEAT_NEW, 0, 0, 0];
         // Slot 0 is protected this lap, so slot 1 goes first.
         assert_eq!(c.evict(), 1);
-        assert!(!c.referenced[0], "the hand must clear the bit as it passes");
-        // Its bit is now clear, so the next lap takes it.
+        assert_eq!(c.heat[0], 0, "the hand must spend the heat as it passes");
+        // Its heat is gone, so the next lap takes it.
         assert_eq!(c.evict(), 2);
         assert_eq!(c.evict(), 3);
         assert_eq!(c.evict(), 0);
     }
 
     /// With every bit set the hand still terminates, clearing a whole lap
-    /// first. An implementation that scanned for a clear bit without clearing
+    /// first. An implementation that scanned for a cold slot without decaying
     /// would spin forever here, and it would only ever happen on a full cache
-    /// under load.
+    /// under load. The loop bound grew with `HEAT_MAX`, so this is also the
+    /// guard on that arithmetic.
     #[test]
-    fn a_fully_referenced_ring_still_terminates() {
+    fn a_ring_at_full_heat_still_terminates() {
         let mut c = Clock::new(6);
-        c.referenced = vec![true; 6];
+        c.heat = vec![HEAT_MAX; 6];
         assert_eq!(c.evict(), 0);
-        assert!(c.referenced.iter().all(|r| !r));
+        assert!(c.heat.iter().all(|&h| h == 0), "every slot should have decayed to zero: {:?}", c.heat);
     }
 
     /// The busiest-`slots` coverage figure, on a distribution whose answer is

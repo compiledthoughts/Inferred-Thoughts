@@ -999,20 +999,24 @@ experts  {} slots x {:.2} MiB = {:.2} GiB of bounded cache",
                 e.fetch_bytes as f64 / 1048576.0,
                 e.fetch_bytes as f64 / 1048576.0 / tokens.max(1) as f64,
             );
-            // Where a fetch's time goes, per token over the whole run. The
-            // readback's synchronize also waits for the kernels queued ahead of it.
+            // Where a fetch's time goes, per token over the whole run. The picks
+            // readback is printed as two: `sync` is the host waiting out the
+            // kernels queued ahead of it (GPU time), `download` the ~2 KB that
+            // comes home plus the host top-k. Only the second is removable
+            // overhead. `ExpertStats::readback_wait_us`.
             let per = |us: u64| us as f64 / 1000.0 / tokens.max(1) as f64;
             let each = |us: u64, n: u64| if n == 0 { 0.0 } else { us as f64 / n as f64 };
             eprintln!(
                 "         fetch path ({}), ms/token: read {:.1} ({:.0} us each) | upload {:.1} ({:.0} us) | \
-small writes {:.1} | picks readback + sync {:.1} ({:.1} a token)",
+small writes {:.1} | picks sync {:.1} + download {:.1} ({:.1} a token)",
                 if e.fetch_direct { "O_DIRECT" } else { "buffered" },
                 per(e.fetch_read_us),
                 each(e.fetch_read_us, e.fetched),
                 per(e.fetch_upload_us),
                 each(e.fetch_upload_us, e.fetched),
                 per(e.fetch_writes_us),
-                per(e.readback_us),
+                per(e.readback_wait_us),
+                per(e.readback_copy_us),
                 e.readbacks as f64 / tokens.max(1) as f64,
             );
             if e.prefetch_reads > 0 {

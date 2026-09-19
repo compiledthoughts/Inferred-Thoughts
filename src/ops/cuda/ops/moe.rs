@@ -961,8 +961,14 @@ impl Cuda {
             picks.0 == route_now && picks.1.len() == n
         };
         if !fresh {
+            // Timed apart (18-09): the synchronize is the host waiting out the
+            // kernels queued ahead of it, the downloads below are ~2 KB. One
+            // counter could not tell which the ~32 ms a 125B token spends here
+            // belongs to. `ExpertStats::readback_wait_us`.
             let t = std::time::Instant::now();
             self.sync()?;
+            let waited = t.elapsed().as_micros() as u64;
+            let t = std::time::Instant::now();
             let mut ids = vec![0i32; n];
             self.d2h(&mut ids, idd)?;
             // The lookahead hint for this decision, in the same readback.
@@ -976,10 +982,10 @@ impl Cuda {
             } else {
                 self.hint_ids.borrow_mut().clear();
             }
-            let waited = t.elapsed().as_micros() as u64;
+            let copied = t.elapsed().as_micros() as u64;
             *self.picks.borrow_mut() = (route_now, ids);
             if let Some(c) = self.experts.borrow_mut().as_mut() {
-                c.note_readback(waited);
+                c.note_readback(waited, copied);
             }
         }
 
