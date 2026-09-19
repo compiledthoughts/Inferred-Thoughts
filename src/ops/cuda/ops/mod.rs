@@ -267,6 +267,10 @@ impl Ops for Cuda {
         self.note(self.gather_chunks_impl(src, chunk, stride, offset, out));
     }
 
+    fn mean_streams(&self, src: &[f32], n_stream: usize, nd: usize, inv: f32, out: &mut [f32]) {
+        self.note(self.mean_streams_impl(src, n_stream, nd, inv, out));
+    }
+
     fn scatter_chunks(
         &self,
         src: &[f32],
@@ -722,6 +726,10 @@ impl Ops for &Cuda {
         out: &mut [f32],
     ) {
         (*self).gather_chunks(src, chunk, stride, offset, out)
+    }
+
+    fn mean_streams(&self, src: &[f32], n_stream: usize, nd: usize, inv: f32, out: &mut [f32]) {
+        (*self).mean_streams(src, n_stream, nd, inv, out)
     }
 
     fn scatter_chunks(

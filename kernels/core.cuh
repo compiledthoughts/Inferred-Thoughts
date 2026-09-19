@@ -336,6 +336,35 @@ extern "C" __global__ void gather_chunks(int n_out, int chunk, int stride,
     out[i] = src[c * stride + offset + j];
 }
 
+// The mean of `n_stream` slices of `nd`, taken every `n_stream * nd` from
+// `src`: `src` is [n_tok][n_stream][nd], `out` is [n_tok][nd].
+//
+// **A fusion of eight launches into one.** qwen4exp's hyper-connection mixer
+// averaged its streams as four `gather_chunks`, three `add_assign` and one
+// `scale` -- twice a layer, 768 launches a token on the 125B, where those two
+// kernels are 9.2% and 5.8% of GPU time and the mixer is most of both. Traffic
+// falls from ~19x`nd` to 5x`nd`: the slices are read once and the mean written
+// once, with no round trip through `tmp`.
+//
+// **Bit-identical to that sequence, and it must stay so.** The accumulation
+// runs in the reference's order -- stream 0, + 1, + 2, ... -- and ends in a
+// multiply by `inv`, exactly as `scale` did. One thread owns one output, so no
+// output's sum is ever reassociated across threads. A tree over the streams
+// would be faster and wrong.
+extern "C" __global__ void mean_streams(int n_out, int n_stream, int nd,
+                                        float inv,
+                                        const float *__restrict__ src,
+                                        float *__restrict__ out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_out) return;
+    int t = i / nd;
+    int j = i - t * nd;
+    const float *base = src + (size_t)t * n_stream * nd + j;
+    float acc = base[0];
+    for (int s = 1; s < n_stream; ++s) acc += base[(size_t)s * nd];
+    out[i] = acc * inv;
+}
+
 // a += b * scale, elementwise.
 //
 // The MoE expert accumulation: a routed expert's output is weighted by its

@@ -114,6 +114,35 @@ impl Cuda {
         Ok(())
     }
 
+    /// See [`crate::ops::Ops::mean_streams`]. One thread per output, so each
+    /// output's sum keeps the reference's stream order and is bit-identical to
+    /// the four `gather_chunks` + three `add_assign` + one `scale` it replaces.
+    pub(super) fn mean_streams_impl(
+        &self,
+        src: &[f32],
+        n_stream: usize,
+        nd: usize,
+        inv: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let sd = self.mirror_in(src)?;
+        let od = self.mirror_out(out)?;
+        let args = [
+            KArg::I32(out.len() as i32),
+            KArg::I32(n_stream as i32),
+            KArg::I32(nd as i32),
+            KArg::F32(inv),
+            KArg::Ptr(sd),
+            KArg::Ptr(od),
+        ];
+        let blocks = out.len().div_ceil(256) as u32;
+        self.note_shape("mean_streams", out.len(), 0);
+        // SAFETY: parameters match `mean_streams` in kernels.cu; one thread per
+        // output element, guarded against the tail.
+        unsafe { self.launch_shared("mean_streams", blocks, 256, 0, &args)? };
+        Ok(())
+    }
+
     pub(super) fn scatter_chunks_impl(
         &self,
         src: &[f32],

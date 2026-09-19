@@ -182,6 +182,55 @@ fn attend_tolerance(n_pos: usize, reference: &[f32]) -> f32 {
     roundings * f32::EPSILON * magnitude.max(1.0)
 }
 
+/// **The fused hyper-connection mixer is bit-identical to the eight ops it
+/// replaces**, at the 125B's real stream count and width and across a batch.
+///
+/// Not "within a tolerance": `mean_streams` exists to cut launches, not to
+/// change arithmetic, so anything but equality is a bug. Each output keeps the
+/// reference's order — stream 0, + 1, + 2, … then one multiply by `inv` — and a
+/// kernel that reassociated the sum across threads, or divided by `n_stream`
+/// instead of multiplying, would be faster and would fail here.
+///
+/// **Shown able to fail**: `n_stream = 3` is included because `inv` is then not
+/// a power of two, where `x * (1.0/3.0) != x / 3.0`. A version deriving the
+/// scale rather than taking it fails on that case and passes on 4.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_fused_stream_mean_is_bit_identical_to_the_ops_it_replaces() {
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+
+    for &(n_stream, nd, n_tok) in &[(4usize, 2048usize, 1usize), (4, 2048, 7), (3, 512, 5), (2, 64, 1)] {
+        let src: Vec<f32> = (0..n_tok * n_stream * nd)
+            .map(|i| ((i * 2654435761usize) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let inv = 1.0 / n_stream as f32;
+
+        // The oracle: the trait default, which is the sequence in model code.
+        let mut want = vec![0.0f32; n_tok * nd];
+        Naive.mean_streams(&src, n_stream, nd, inv, &mut want);
+
+        // And what the eight ops actually did, so the default is not trusted
+        // on its own authority.
+        let mut seq = vec![0.0f32; n_tok * nd];
+        let mut tmp = vec![0.0f32; n_tok * nd];
+        Naive.gather_chunks(&src, nd, n_stream * nd, 0, &mut seq);
+        for s in 1..n_stream {
+            Naive.gather_chunks(&src, nd, n_stream * nd, s * nd, &mut tmp);
+            Naive.add_assign(&mut seq, &tmp);
+        }
+        Naive.scale(&mut seq, inv);
+        assert_eq!(seq, want, "the trait default diverged from the ops it stands for");
+
+        let mut got = vec![0.0f32; n_tok * nd];
+        gpu.begin_pass(n_tok);
+        gpu.mean_streams(&src, n_stream, nd, inv, &mut got);
+        gpu.host_needs(&mut got);
+        let bad = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(bad, 0, "n_stream {n_stream}, nd {nd}, n_tok {n_tok}: {bad} outputs differ");
+    }
+}
+
 #[test]
 #[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
 fn every_op_agrees_with_the_oracle() {

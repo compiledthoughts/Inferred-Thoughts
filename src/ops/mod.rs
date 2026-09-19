@@ -592,6 +592,43 @@ pub trait Ops {
         out: &mut [f32],
     );
 
+    /// The mean of `n_stream` slices of `nd` floats, taken every `n_stream * nd`
+    /// from `src`, into `out`.
+    ///
+    /// **A fusion, not a new operation.** `qwen4exp`'s hyper-connection mixer
+    /// averaged its streams as four [`Ops::gather_chunks`], three
+    /// [`Ops::add_assign`] and one [`Ops::scale`] — eight launches to average
+    /// four strided slices, twice a layer, 768 a token on the 125B. Those two
+    /// kernels were 9.2% and 5.8% of its GPU time and the mixer is ~62% and
+    /// ~74% of them. Traffic falls from ~19 x `nd` to 5 x `nd`.
+    ///
+    /// **Bit-identical to the sequence it replaces, by construction.** The
+    /// reference order is stream 0, + 1, + 2, ... then x `1/n_stream`, every
+    /// output element accumulates independently of every other, and this keeps
+    /// that order per element. So it needs no tolerance and no exact-path
+    /// switch; a backend that reassociated the sum would, and must not.
+    ///
+    /// `inv` is passed rather than derived: the sequence this replaces ends in
+    /// [`Ops::scale`], a *multiply*, and `x * (1.0 / 3.0)` is not `x / 3.0` in
+    /// f32. Deriving it here would break the bit-exactness above for any
+    /// `n_stream` that is not a power of two.
+    ///
+    /// `src` is `[n_tok][n_stream][nd]` and `out` is `[n_tok][nd]`.
+    ///
+    /// The default is the unfused sequence, so a backend gains nothing and
+    /// changes nothing until it overrides this.
+    fn mean_streams(&self, src: &[f32], n_stream: usize, nd: usize, inv: f32, out: &mut [f32]) {
+        for (i, o) in out.iter_mut().enumerate() {
+            let (t, j) = (i / nd, i % nd);
+            let base = t * n_stream * nd + j;
+            let mut acc = src[base];
+            for s in 1..n_stream {
+                acc += src[base + s * nd];
+            }
+            *o = acc * inv;
+        }
+    }
+
     /// The exact dual of [`Ops::gather_chunks`]: write contiguous `src` back
     /// into `dst` at `offset`, every `stride`.
     ///

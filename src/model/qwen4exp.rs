@@ -44,6 +44,17 @@ use crate::quant::dequantize_into;
 /// overrides it.
 const PREFETCH_K: usize = 10;
 
+/// Whether the hyper-connection mixer averages its streams in one op.
+/// `INFERRED_HC_FUSED=0` restores the eight-launch sequence.
+///
+/// **An A/B lever, not an exact-path switch.** `Ops::mean_streams` is
+/// bit-identical to the sequence it replaces — same order, same final multiply
+/// — so both arms must produce the same tokens, and a test asserts it.
+fn hc_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFERRED_HC_FUSED").map(|v| v != "0").unwrap_or(true))
+}
+
 /// [`PREFETCH_K`], or `INFERRED_PREFETCH_K` when set; read once.
 fn prefetch_k() -> usize {
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1237,12 +1248,23 @@ fn hc_read<O: Ops>(
     }
     ops.sigmoid_mul(xn, gate);
     // The mean in the reference's order: stream 0, + 1, + 2, ..., then x 1/n.
-    ops.gather_chunks(xn, nd, n_stream * nd, 0, mixed);
-    for s in 1..n_stream {
-        ops.gather_chunks(xn, nd, n_stream * nd, s * nd, tmp);
-        ops.add_assign(mixed, tmp);
+    //
+    // **One op, not eight** (20-09). The sequence below it ran four
+    // `gather_chunks`, three `add_assign` and one `scale` to average four
+    // strided slices — twice a layer, 768 launches a token on the 125B, where
+    // those two kernels are 9.2% and 5.8% of GPU time and this mixer is ~62%
+    // and ~74% of them. `Ops::mean_streams` is bit-identical to it, so the
+    // control below is an A/B lever rather than an exact-path escape.
+    if hc_fused() {
+        ops.mean_streams(xn, n_stream, nd, inv, mixed);
+    } else {
+        ops.gather_chunks(xn, nd, n_stream * nd, 0, mixed);
+        for s in 1..n_stream {
+            ops.gather_chunks(xn, nd, n_stream * nd, s * nd, tmp);
+            ops.add_assign(mixed, tmp);
+        }
+        ops.scale(mixed, inv);
     }
-    ops.scale(mixed, inv);
     Ok(())
 }
 
