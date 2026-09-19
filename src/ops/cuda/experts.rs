@@ -519,6 +519,12 @@ pub(super) struct ExpertCache {
     readers: Option<super::fetch::ReadPool>,
     /// Page-locked staging for those reads, [`FETCH_CHUNK`] experts at a time.
     pinned: Option<super::fetch::Pinned>,
+    /// Recorded after a batch of queued uploads, so their staging can be reused
+    /// once it has fired. Created on first use; `None` when uploads are
+    /// blocking. See [`ExpertCache::drain_uploads`].
+    upload_event: Option<ffi::CUevent>,
+    /// Whether [`Self::upload_event`] has been recorded since the last drain.
+    uploads_pending: bool,
     /// Lookahead reads in flight or done, and their staging. Declared after
     /// `readers` on purpose: fields drop in order, and the pool finishes every
     /// queued read before its threads exit, so the staging outlives them.
@@ -760,6 +766,8 @@ impl ExpertCache {
             file: None,
             readers: None,
             pinned: None,
+            upload_event: None,
+            uploads_pending: false,
             prefetch: Prefetch::new(),
             prefetch_on: std::env::var("INFERRED_PREFETCH").map_or(true, |v| v != "0"),
             next_opener: HashMap::new(),
@@ -808,6 +816,60 @@ impl ExpertCache {
         buf.write_at(offset_bytes, data)?;
         let (calls, bytes) = self.uploads.get();
         self.uploads.set((calls + 1, bytes + std::mem::size_of_val(data) as u64));
+        Ok(())
+    }
+
+    /// [`Self::upload`], queued instead of waited on.
+    ///
+    /// **`data` must be page-locked and must not be rewritten until
+    /// [`Self::drain_uploads`] has run.** Only the two fetch paths call this,
+    /// and both hold their staging across the call.
+    fn upload_async<T: Copy>(&self, buf: &DeviceBuffer, offset_bytes: usize, data: &[T]) -> Result<()> {
+        buf.write_at_async(offset_bytes, data)?;
+        let (calls, bytes) = self.uploads.get();
+        self.uploads.set((calls + 1, bytes + std::mem::size_of_val(data) as u64));
+        Ok(())
+    }
+
+    /// Record that queued uploads are outstanding, so a later
+    /// [`Self::drain_uploads`] knows what to wait for.
+    fn note_uploads_issued(&mut self) -> Result<()> {
+        if !async_upload_on() {
+            return Ok(());
+        }
+        if self.upload_event.is_none() {
+            let mut e: ffi::CUevent = std::ptr::null_mut();
+            // SAFETY: out-parameter; the event is destroyed in `Drop`.
+            unsafe { super::check(ffi::cuEventCreate(&mut e, 0), "cuEventCreate")? };
+            self.upload_event = Some(e);
+        }
+        if let Some(e) = self.upload_event {
+            // SAFETY: `e` was created above and the null stream is always valid.
+            unsafe { super::check(ffi::cuEventRecord(e, std::ptr::null_mut()), "cuEventRecord")? };
+            self.uploads_pending = true;
+        }
+        Ok(())
+    }
+
+    /// Wait for queued uploads before their staging is reused.
+    ///
+    /// **An event, not `cuCtxSynchronize`.** The drain at `start_prefetch` runs
+    /// with the layer's kernels already queued; a context sync would block on
+    /// those too, which is precisely the wait this change exists to remove. The
+    /// event was recorded when the GPU held nothing but these copies, so waiting
+    /// on it waits for them alone.
+    ///
+    /// Ordering against later kernels needs no drain at all: the copies and the
+    /// kernels share the null stream, which runs in order.
+    fn drain_uploads(&mut self) -> Result<()> {
+        if !self.uploads_pending {
+            return Ok(());
+        }
+        if let Some(e) = self.upload_event {
+            // SAFETY: `e` was created and recorded by `note_uploads_issued`.
+            unsafe { super::check(ffi::cuEventSynchronize(e), "cuEventSynchronize")? };
+        }
+        self.uploads_pending = false;
         Ok(())
     }
 
@@ -888,7 +950,7 @@ impl ExpertCache {
             // Both tiers were full, so `place` left it cold. This is a read, so
             // it must come back holding the bytes: fetch it into a VRAM slot now,
             // from the bytes the caller already holds. SSD-TIER.md D12.
-            return self.make_resident(key, src);
+            return self.make_resident(key, src, false);
         }
         match self.map.get(&key).and_then(|e| e.slot) {
             Some(_) => {}
@@ -1075,7 +1137,7 @@ impl ExpertCache {
             let read = self.read_expert(&mut stage[..stride], data, key, e);
             self.stats.fetch_read_us += t.elapsed().as_micros() as u64;
             let placed = match read {
-                Ok(()) => self.make_resident(key, &stage[..stride]),
+                Ok(()) => self.make_resident(key, &stage[..stride], false),
                 Err(err) => Err(err),
             };
             self.stage = stage;
@@ -1175,6 +1237,11 @@ impl ExpertCache {
         if !self.prefetch_on || !self.parallel_fetch() {
             return Ok(());
         }
+        // **Guard 2 of 3.** Slots freed by this layer's publishes go back on the
+        // free list, and the reads started below would overwrite staging whose
+        // queued upload has not landed. Waits on an event, not the context, so
+        // the layer's kernels — already queued by now — are not waited on.
+        self.drain_uploads()?;
         self.prefetch.collect(None);
         let stale: Vec<usize> = self.prefetch.entries.keys().copied().collect();
         for key in stale {
@@ -1251,10 +1318,14 @@ impl ExpertCache {
             return Err(Error::Cuda { what: "expert prefetch", detail: "the staging buffer vanished".to_string() });
         };
         let at = slot * self.prefetch.slot_len + pre;
-        let published = self.make_resident(key, &staging.as_slice()[at..at + self.stride]).map(|_| ());
+        let published = self.make_resident(key, &staging.as_slice()[at..at + self.stride], true).map(|_| ());
         self.prefetch.staging = Some(staging);
         self.prefetch.free.push(slot);
         published?;
+        // The slot just went back on the free list, so the next `start_prefetch`
+        // may read into it. Guard 2 of 3 is the drain there; this only records
+        // what that drain waits for.
+        self.note_uploads_issued()?;
         self.stats.prefetch_used += 1;
         Ok(true)
     }
@@ -1380,6 +1451,11 @@ impl ExpertCache {
             });
         };
         let (align, slot) = self.staging_geometry();
+        // **Guard 1 of 3.** The reads below overwrite the staging a previous
+        // batch's queued uploads may still be copying out of. Only bites when a
+        // resolve needs more than `FETCH_CHUNK` experts, which decode does not
+        // and prefill does.
+        self.drain_uploads()?;
         let mut pinned = self.pinned.take().ok_or_else(|| Error::Cuda {
             what: "expert fetch",
             detail: "the staging buffer vanished".to_string(),
@@ -1409,16 +1485,21 @@ impl ExpertCache {
         let published = read.and_then(|()| {
             keys.iter().zip(&pres).enumerate().try_for_each(|(i, (&key, &pre))| {
                 let at = i * slot + pre;
-                self.make_resident(key, &pinned.as_slice()[at..at + stride]).map(|_| ())
+                self.make_resident(key, &pinned.as_slice()[at..at + stride], true).map(|_| ())
             })
         });
         self.pinned = Some(pinned);
+        self.note_uploads_issued()?;
         published
     }
 
     /// Put `bytes` — expert `key`'s — into a VRAM slot, evicting an unleased
     /// expert to make room, and point `key`'s table entry at the slot.
-    fn make_resident(&mut self, key: usize, bytes: &[u8]) -> Result<ffi::CUdeviceptr> {
+    /// `src_pinned` says the caller's `bytes` are page-locked and will outlive a
+    /// queued copy — only then may the upload be asynchronous. The serial fetch
+    /// stages through an ordinary `Vec` and the first-sight path uses the
+    /// caller's own slice, so both pass `false`.
+    fn make_resident(&mut self, key: usize, bytes: &[u8], src_pinned: bool) -> Result<ffi::CUdeviceptr> {
         let slot = self.evict_unleased()?;
         if let Some(victim) = self.owner[slot as usize].take() {
             let t = std::time::Instant::now();
@@ -1426,7 +1507,11 @@ impl ExpertCache {
             self.stats.fetch_writes_us += t.elapsed().as_micros() as u64;
         }
         let t = std::time::Instant::now();
-        self.upload(&self.slab, slot as usize * self.stride, bytes)?;
+        if src_pinned && async_upload_on() {
+            self.upload_async(&self.slab, slot as usize * self.stride, bytes)?;
+        } else {
+            self.upload(&self.slab, slot as usize * self.stride, bytes)?;
+        }
         self.stats.fetch_upload_us += t.elapsed().as_micros() as u64;
         self.owner[slot as usize] = Some(key);
         // **A fetched expert enters cold, not hot** (19-09). 27.3% of a 125B
@@ -2099,6 +2184,19 @@ fn heat_max() -> u8 {
 /// `make_resident`.
 const HEAT_NEW: u8 = 1;
 
+/// Whether a fetched expert's upload is queued rather than waited on.
+/// `INFERRED_ASYNC_UPLOAD=0` restores the blocking copies.
+///
+/// **What it is worth**: a blocking 0.88 MiB upload measures 78 us against
+/// 32 us of bytes at this bus's 28.6 GB/s, so roughly 46 us of each is the host
+/// waiting while the copy engine idles between copies. Queued, a layer's ~7
+/// fetches issue in ~20 us and the engine runs them back to back
+/// (SSD-TIER.md D21).
+fn async_upload_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFERRED_ASYNC_UPLOAD").map(|v| v != "0").unwrap_or(true))
+}
+
 /// GCLOCK with leases: advance the hand, decaying heat, and take the first slot
 /// that is not leased and whose heat has reached zero. Leased slots are passed
 /// over without decaying.
@@ -2118,6 +2216,23 @@ const HEAT_NEW: u8 = 1;
 ///
 /// A free function rather than a method so the policy is testable without a
 /// device, which is where it can be wrong in a way no output would reveal.
+// **There is deliberately no `Drop` for `ExpertCache`, and one here segfaulted
+// every async run (20-09).** `Cuda::drop` calls `cuCtxDestroy_v2` in its body,
+// and a struct's fields drop *after* that body returns — so the cache's `Drop`
+// runs against a context that no longer exists, and `cuEventSynchronize` on a
+// dead context is a SIGSEGV, not an error code. Every arm with queued uploads
+// exited 139; the blocking arms never create the event and never crashed.
+//
+// Teardown does not need the drain anyway: `cuCtxDestroy` blocks until the
+// device has finished the context's work, and it runs before `Pinned` frees the
+// page-locked staging a queued copy reads. The event handle goes with the
+// context.
+//
+// What is left unguarded is a cache dropped *while* the context lives — a reset
+// or a model swap. No such path exists today. One that appears needs an
+// explicit drain at the call site, where the context is known good; it must not
+// be a `Drop`.
+
 fn clock_pick(heat: &mut [u8], hand: &mut usize, leased: impl Fn(usize) -> bool) -> Option<usize> {
     let n = heat.len();
     if n == 0 {

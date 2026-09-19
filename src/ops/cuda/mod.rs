@@ -1994,6 +1994,41 @@ impl DeviceBuffer {
         }
     }
 
+    /// [`Self::write_at`], queued on the null stream instead of waited on.
+    ///
+    /// **`data` must be page-locked, and must stay unwritten until the copy has
+    /// completed** — the caller proves both. Ordering against later kernels is
+    /// free because the null stream runs in order; what is *not* free is reuse
+    /// of the source buffer, which the caller guards with an event.
+    pub fn write_at_async<T: Copy>(&self, offset_bytes: usize, data: &[T]) -> Result<()> {
+        let bytes = std::mem::size_of_val(data);
+        if offset_bytes + bytes > self.bytes {
+            return Err(Error::Cuda {
+                what: "cuMemcpyHtoDAsync",
+                detail: format!(
+                    "{bytes} bytes at offset {offset_bytes} into a {} byte buffer",
+                    self.bytes
+                ),
+            });
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
+        // SAFETY: as `write_at`, plus the caller's guarantee that `data` is
+        // pinned and outlives the copy.
+        unsafe {
+            check(
+                ffi::cuMemcpyHtoDAsync_v2(
+                    self.ptr + offset_bytes as u64,
+                    data.as_ptr() as *const c_void,
+                    bytes,
+                    std::ptr::null_mut(),
+                ),
+                "cuMemcpyHtoDAsync",
+            )
+        }
+    }
+
     /// Copy out into a host slice, which must not ask for more than was
     /// allocated.
     pub fn read<T: Copy>(&self, out: &mut [T]) -> Result<()> {

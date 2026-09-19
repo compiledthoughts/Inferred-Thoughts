@@ -103,6 +103,20 @@ unsafe extern "C" {
     pub fn cuMemAlloc_v2(dptr: *mut CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
     pub fn cuMemcpyHtoD_v2(dst: CUdeviceptr, src: *const c_void, bytes: usize) -> CUresult;
+    /// The same copy, queued instead of waited on. **Only asynchronous when
+    /// `src` is page-locked** — from pageable memory the driver stages it and
+    /// blocks anyway, and the caller may reuse the buffer too early. Every
+    /// caller here therefore passes pinned staging and says so.
+    ///
+    /// Measured on the 125B: a blocking 0.88 MiB expert upload costs 78 us
+    /// where the bytes are 32 us at this bus's 28.6 GB/s, so ~46 us of each is
+    /// the host waiting rather than data moving (SSD-TIER.md D21).
+    pub fn cuMemcpyHtoDAsync_v2(
+        dst: CUdeviceptr,
+        src: *const c_void,
+        bytes: usize,
+        stream: CUstream,
+    ) -> CUresult;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: CUdeviceptr, bytes: usize) -> CUresult;
     pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> CUresult;
     pub fn cuMemsetD8_v2(dst: CUdeviceptr, value: u8, n: usize) -> CUresult;
