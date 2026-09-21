@@ -442,6 +442,15 @@ pub(super) struct ExpertCache {
     /// exhausted. See [`clock_pick`] for the policy and why it is a count rather
     /// than the reference bit it was until 19-09.
     heat: Vec<u8>,
+    /// [`heat_max`], read once at construction.
+    ///
+    /// **Not called per touch.** It is a `OnceLock`, so reading it is an atomic
+    /// load, and the touch below it runs on every resident pick — roughly 19M
+    /// times in the 35B's 19,706-token standard prefill (tokens x top-8 x 3
+    /// tensors x 40 layers). That atomic cost the standard run **0.9% of
+    /// prefill** against the reference bit it replaced, on a model where nothing
+    /// is ever cold and the eviction policy itself never runs. SSD-TIER D24.
+    heat_cap: u8,
     hand: usize,
     blocks: Vec<HostBlock>,
     host_budget: usize,
@@ -741,6 +750,7 @@ impl ExpertCache {
             next_slot: 0,
             owner: vec![None; slots],
             heat: vec![0; slots],
+            heat_cap: heat_max(),
             hand: 0,
             blocks: Vec::new(),
             host_budget,
@@ -933,7 +943,7 @@ impl ExpertCache {
             e.uses += 1;
             let (addr, slot) = (e.addr, e.slot);
             match slot {
-                Some(s) => self.heat[s as usize] = self.heat[s as usize].saturating_add(1).min(heat_max()),
+                Some(s) => self.heat[s as usize] = self.heat[s as usize].saturating_add(1).min(self.heat_cap),
                 None => self.stats.host_reads += 1,
             }
             self.stats.hits += 1;
@@ -1125,7 +1135,7 @@ impl ExpertCache {
             let key = tkey + e * stride;
             if !self.cold.contains(&key) {
                 if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
-                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(heat_max());
+                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(self.heat_cap);
                 }
                 continue;
             }
@@ -1180,7 +1190,7 @@ impl ExpertCache {
                 if self.cold.contains(&key) {
                     cold.push(key);
                 } else if let Some(slot) = self.map.get(&key).and_then(|x| x.slot) {
-                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(heat_max());
+                    self.heat[slot as usize] = self.heat[slot as usize].saturating_add(1).min(self.heat_cap);
                 }
             }
         }
