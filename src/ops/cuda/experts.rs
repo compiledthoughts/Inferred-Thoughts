@@ -101,11 +101,9 @@ unsafe extern "C" {
     fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
 }
 
-/// `POSIX_FADV_DONTNEED`, from `fcntl.h`.
-const POSIX_FADV_DONTNEED: c_int = 4;
+
 
 unsafe extern "C" {
-    fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) -> c_int;
 }
 
 /// Evict a file from the page cache.
@@ -140,13 +138,7 @@ pub fn drop_file_cache(path: &std::path::Path) {
 /// soon as they are placed holds the cache at roughly one tensor — 142 MiB —
 /// instead.
 pub fn drop_file_range(path: &std::path::Path, offset: i64, len: i64) {
-    use std::os::unix::io::AsRawFd;
-    let Ok(f) = std::fs::File::open(path) else { return };
-    // SAFETY: `f` owns a valid descriptor for the duration of the call. The
-    // range is advisory; the kernel clamps it to the file.
-    unsafe {
-        let _ = posix_fadvise(f.as_raw_fd(), offset, len, POSIX_FADV_DONTNEED);
-    }
+    crate::platform::release_range(path, offset, len);
 }
 
 /// Release the page cache backing `data`, keeping only whole pages inside it.
@@ -1573,7 +1565,6 @@ impl ExpertCache {
         let stride = self.stride;
         match self.source.clone() {
             Some((path, base)) => {
-                use std::os::unix::fs::FileExt;
                 if self.file.is_none() {
                     let f = std::fs::File::open(&path).map_err(|err| Error::Cuda {
                         what: "expert fetch",
@@ -1583,7 +1574,7 @@ impl ExpertCache {
                 }
                 let offset = key.saturating_sub(base) as u64;
                 match self.file.as_ref() {
-                    Some(f) => f.read_exact_at(dst, offset).map_err(|err| Error::Cuda {
+                    Some(f) => crate::platform::read_exact_at(f, dst, offset).map_err(|err| Error::Cuda {
                         what: "expert fetch",
                         detail: format!("{} bytes at offset {offset} of {}: {err}", dst.len(), path.display()),
                     }),
@@ -1698,13 +1689,12 @@ impl ExpertCache {
         let use_pread = std::env::var("INFERRED_PREAD").is_ok();
         let staged = match self.source.as_ref().filter(|_| use_pread) {
             Some((path, base)) => {
-                use std::os::unix::fs::FileExt;
                 let offset = (data.as_ptr() as usize).saturating_sub(*base) as u64;
                 if stage.len() < data.len() {
                     stage.resize(data.len(), 0);
                 }
                 std::fs::File::open(path)
-                    .and_then(|f| f.read_exact_at(&mut stage[..data.len()], offset))
+                    .and_then(|f| crate::platform::read_exact_at(&f, &mut stage[..data.len()], offset))
                     .is_ok()
             }
             None => false,

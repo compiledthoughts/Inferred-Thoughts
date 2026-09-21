@@ -15,38 +15,18 @@
 
 use std::ffi::c_void;
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use super::{check, ffi};
 use crate::error::{Error, Result};
 
-/// `O_DIRECT` on Linux x86_64: `#define __O_DIRECT 040000` in glibc's
-/// `bits/fcntl-linux.h:88`, and `00040000` in the kernel's `asm-generic/fcntl.h:48`.
-/// The crate has no `libc` dependency for one flag.
-const O_DIRECT: i32 = 0o40000;
+pub(crate) use crate::platform::DIRECT_ALIGN;
 
-/// What an `O_DIRECT` read must be aligned to: its buffer, its offset and its
-/// length, in whole 4 KiB pages. The disk under the WSL VHDX reports 512-byte
-/// logical and 4,096-byte physical blocks, so 4 KiB satisfies both — and is what
-/// stage 0 measured with (`scripts/ssd_fetch_rate.cu`, TIERS.md).
-pub(crate) const DIRECT_ALIGN: usize = 4096;
-
-/// Open the model file for tier-3 reads, with `O_DIRECT` when `direct`.
-///
-/// **Why `O_DIRECT`** (SSD-TIER.md D3): stage 0 on this drive read 4.7–4.9 GB/s
-/// with it at one thread against 1.18 GB/s buffered and cold, and 10.1 against 6.5
-/// at eight. It also keeps the fetches out of WSL's page cache, which filling
-/// with model pages is what hung the machine on 16-09.
+/// Open the model file for tier-3 reads, unbuffered when `direct`.
+/// See [`crate::platform::open_read`] for what that costs and buys.
 pub(crate) fn open(path: &std::path::Path, direct: bool) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut o = std::fs::OpenOptions::new();
-    o.read(true);
-    if direct {
-        o.custom_flags(O_DIRECT);
-    }
-    o.open(path)
+    crate::platform::open_read(path, direct)
 }
 
 /// Page-locked host memory owned for its lifetime. Not device-mapped: nothing
@@ -107,7 +87,7 @@ pub(crate) type Done = mpsc::Sender<(usize, std::io::Result<()>)>;
 fn read_at_least(file: &File, dst: &mut [u8], offset: u64, need: usize) -> std::io::Result<()> {
     let mut got = 0usize;
     while got < need {
-        match file.read_at(&mut dst[got..], offset + got as u64) {
+        match crate::platform::read_at(file, &mut dst[got..], offset + got as u64) {
             Ok(0) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,

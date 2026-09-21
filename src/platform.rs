@@ -1,0 +1,160 @@
+//! The three OS calls this engine makes that are not the same on Linux and
+//! Windows, behind one seam.
+//!
+//! **There are only three, and that is the point.** Every dependency is
+//! cross-platform — `memmap2`, `thiserror`, `clap`, `rayon`, `serde`, and no
+//! `libc` — so "WSL2 only" was habit rather than architecture. What is genuinely
+//! per-OS is positional reads, unbuffered opens, and a page-cache hint.
+//!
+//! Native Linux needs nothing from this module that it did not already have:
+//! the Unix arm is the code that was inline before.
+
+use std::fs::File;
+use std::path::Path;
+
+/// Read into `buf` from `offset` without moving the file cursor.
+///
+/// Positional because the read pool has eight threads on one `File`
+/// (`super::ops::cuda::fetch`); a seek-then-read pair would race.
+#[cfg(unix)]
+pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+/// Windows' positional read. `seek_read` does not move the cursor either, so
+/// the eight-thread contract holds the same way.
+#[cfg(windows)]
+pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buf, offset)
+}
+
+/// Fill `buf` from `offset`, or fail.
+///
+/// **Windows has no `read_exact_at`**, only the `seek_read` primitive, which may
+/// return short exactly as `read` does. So the loop is written once here rather
+/// than being an ambient guarantee at two call sites — a short read that silently
+/// left a tail of an expert uninitialised would compute with whatever was in the
+/// buffer, and produce plausible wrong tokens rather than an error.
+pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    let mut got = 0usize;
+    while got < buf.len() {
+        match read_at(file, &mut buf[got..], offset + got as u64) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the model file ended inside a tensor",
+                ));
+            }
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `O_DIRECT` on Linux x86_64: `#define __O_DIRECT 040000` in glibc's
+/// `bits/fcntl-linux.h:88`, `00040000` in the kernel's `asm-generic/fcntl.h:48`.
+#[cfg(unix)]
+const O_DIRECT: i32 = 0o40000;
+
+/// `FILE_FLAG_NO_BUFFERING`, `winnt.h`. The same bargain as `O_DIRECT`: the
+/// cache is bypassed, and buffer, offset and length must all be sector-aligned
+/// — which [`DIRECT_ALIGN`] already guarantees.
+#[cfg(windows)]
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+/// What an unbuffered read must be aligned to — buffer, offset and length — in
+/// whole 4 KiB pages.
+///
+/// The disk under the WSL VHDX reports 512-byte logical and 4,096-byte physical
+/// blocks, so 4 KiB satisfies both, and it is what stage 0 measured with.
+/// Windows wants the volume's physical sector size, which is 4 KiB on every
+/// NVMe this targets.
+pub const DIRECT_ALIGN: usize = 4096;
+
+/// Open a model file for tier-3 reads, unbuffered when `direct`.
+///
+/// **Why unbuffered**: stage 0 on this drive read 4.7–4.9 GB/s with `O_DIRECT`
+/// at one thread against 1.18 GB/s buffered and cold, and 10.1 against 6.5 at
+/// eight. It also keeps fetches out of the page cache, which filling with model
+/// pages is what hung the machine on 16-09.
+#[cfg(unix)]
+pub fn open_read(path: &Path, direct: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if direct {
+        o.custom_flags(O_DIRECT);
+    }
+    o.open(path)
+}
+
+#[cfg(windows)]
+pub fn open_read(path: &Path, direct: bool) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    if direct {
+        o.custom_flags(FILE_FLAG_NO_BUFFERING);
+    }
+    o.open(path)
+}
+
+#[cfg(unix)]
+mod fadv {
+    /// `POSIX_FADV_DONTNEED`, from `fcntl.h`.
+    pub(super) const DONTNEED: std::ffi::c_int = 4;
+    unsafe extern "C" {
+        pub(super) fn posix_fadvise(
+            fd: std::ffi::c_int,
+            offset: i64,
+            len: i64,
+            advice: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+}
+
+/// Hand a byte range of `path` back to the kernel's page cache.
+///
+/// `(0, 0)` names the whole file. Advisory: failure is ignored, and the caller
+/// must stay correct without it.
+///
+/// **Why it exists**: placement reads the whole expert pool through the mapping,
+/// so the cache climbs to 16 GiB while a 35B is being placed — which is what
+/// takes a 32 GB machine to 91%. Evicting each tensor as it is placed holds the
+/// cache at roughly one tensor, ~142 MiB.
+#[cfg(unix)]
+pub fn release_range(path: &Path, offset: i64, len: i64) {
+    use std::os::unix::io::AsRawFd;
+    let Ok(f) = File::open(path) else { return };
+    // SAFETY: `f` owns a valid descriptor for the call, and the advice is a
+    // hint the kernel clamps to the file.
+    unsafe {
+        let _ = fadv::posix_fadvise(f.as_raw_fd(), offset, len, fadv::DONTNEED);
+    }
+}
+
+/// **A no-op on Windows, deliberately.** There is no per-range equivalent of
+/// `POSIX_FADV_DONTNEED` — `SetSystemFileCacheSize` is process-wide and a blunt
+/// instrument.
+///
+/// Acceptable because of *why* the Unix arm exists. The cache pressure it
+/// answers is a WSL memory-cap problem, and the path that generates the most
+/// traffic — tier-3 fetches — is opened with `FILE_FLAG_NO_BUFFERING`, so those
+/// bytes never enter the cache to be evicted. What remains is the mapping used
+/// during placement, which Windows is free to reclaim under pressure as it sees
+/// fit.
+///
+/// If a Windows run is ever seen to thrash during placement, this is the first
+/// thing to revisit, and the honest fix is unbuffered placement reads rather
+/// than a cache hint.
+#[cfg(windows)]
+pub fn release_range(_path: &Path, _offset: i64, _len: i64) {}
+
+/// [`release_range`] over a whole file.
+pub fn release_file(path: &Path) {
+    release_range(path, 0, 0);
+}

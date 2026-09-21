@@ -10,6 +10,7 @@ pub mod error;
 pub mod gguf;
 pub mod model;
 pub mod ops;
+pub mod platform;
 pub mod profile;
 pub mod quant;
 pub mod serve;

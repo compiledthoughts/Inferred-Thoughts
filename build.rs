@@ -21,12 +21,16 @@ fn find_nvcc() -> PathBuf {
     for var in ["CUDA_PATH", "CUDA_HOME"] {
         println!("cargo:rerun-if-env-changed={var}");
         if let Ok(root) = std::env::var(var) {
-            let candidate = Path::new(&root).join("bin/nvcc");
+            // `CUDA_PATH` is what the Windows installer sets, and the only
+            // reliable way to find the toolkit there.
+            let exe = if cfg!(windows) { "bin/nvcc.exe" } else { "bin/nvcc" };
+            let candidate = Path::new(&root).join(exe);
             if candidate.exists() {
                 return candidate;
             }
         }
     }
+    #[cfg(unix)]
     for candidate in ["/usr/local/cuda/bin/nvcc", "/opt/cuda/bin/nvcc"] {
         if Path::new(candidate).exists() {
             return PathBuf::from(candidate);
@@ -99,14 +103,17 @@ fn main() {
              (CUDA 12.8+ is required)."
         ),
         Err(e) => panic!(
-            "could not run {} ({e}). The `cuda` feature needs the CUDA toolkit;              set CUDA_PATH if it lives somewhere other than /usr/local/cuda.",
+            "could not run {} ({e}). The `cuda` feature needs the CUDA toolkit;              set CUDA_PATH if it lives somewhere other than /usr/local/cuda (and on Windows CUDA_PATH is required).",
             nvcc.display()
         ),
     }
 
-    // libcuda.so ships with the driver, not the toolkit. On WSL2 it lives in a
-    // WSL-specific directory that is not on the default search path; the stubs
-    // directory is the fallback for link-time resolution.
+    // The driver library ships with the driver, not the toolkit.
+    //
+    // On Linux that is `libcuda.so`. Under WSL2 it lives in a WSL-specific
+    // directory that is not on the default search path; the stubs directory is
+    // the fallback for link-time resolution. Native Linux finds it in the third.
+    #[cfg(unix)]
     for dir in [
         "/usr/lib/wsl/lib",
         "/usr/local/cuda/lib64/stubs",
@@ -116,5 +123,21 @@ fn main() {
             println!("cargo:rustc-link-search=native={dir}");
         }
     }
+
+    // On Windows it is `nvcuda.dll`, linked through the `cuda.lib` import
+    // library that the toolkit installs beside the headers. There is no stubs
+    // directory and no system-wide search path to fall back on, so `CUDA_PATH`
+    // is load-bearing here rather than merely conventional.
+    #[cfg(windows)]
+    for var in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(root) = std::env::var(var) {
+            let dir = Path::new(&root).join("lib").join("x64");
+            if dir.exists() {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+                break;
+            }
+        }
+    }
+
     println!("cargo:rustc-link-lib=dylib=cuda");
 }

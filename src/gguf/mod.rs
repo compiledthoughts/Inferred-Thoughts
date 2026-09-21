@@ -117,30 +117,13 @@ impl Drop for GgufFile {
     }
 }
 
-/// `POSIX_FADV_DONTNEED`, from `fcntl.h`.
-const POSIX_FADV_DONTNEED: std::ffi::c_int = 4;
-
-unsafe extern "C" {
-    fn posix_fadvise(
-        fd: std::ffi::c_int,
-        offset: i64,
-        len: i64,
-        advice: std::ffi::c_int,
-    ) -> std::ffi::c_int;
-}
-
 /// Evict a whole file from the page cache.
 ///
 /// Addresses the file rather than a descriptor, so a fresh `open` reaches the
-/// same pages the mapping used.
+/// same pages the mapping used. A no-op on Windows; see
+/// [`crate::platform::release_range`] for why that is acceptable.
 fn drop_page_cache(path: &Path) {
-    use std::os::unix::io::AsRawFd;
-    let Ok(f) = std::fs::File::open(path) else { return };
-    // SAFETY: `f` owns a valid descriptor for the call; `(0, 0)` names the
-    // whole file, and the advice is purely a hint to the kernel.
-    unsafe {
-        let _ = posix_fadvise(f.as_raw_fd(), 0, 0, POSIX_FADV_DONTNEED);
-    }
+    crate::platform::release_file(path);
 }
 
 impl GgufFile {
