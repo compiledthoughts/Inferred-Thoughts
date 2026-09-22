@@ -158,3 +158,62 @@ pub fn release_range(_path: &Path, _offset: i64, _len: i64) {}
 pub fn release_file(path: &Path) {
     release_range(path, 0, 0);
 }
+
+#[cfg(unix)]
+mod madv {
+    /// `MADV_DONTNEED`, from `asm-generic/mman-common.h`.
+    ///
+    /// On a `MAP_PRIVATE` file mapping this discards the resident pages; a later
+    /// read faults them back from the file. So it is safe by construction here —
+    /// worst case it costs a re-read of data nothing reads again.
+    pub(super) const DONTNEED: std::ffi::c_int = 4;
+    unsafe extern "C" {
+        pub(super) fn madvise(
+            addr: *mut std::ffi::c_void,
+            len: usize,
+            advice: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+}
+
+/// Release the resident pages of a live mapping that backs `data`, keeping only
+/// whole pages inside it.
+///
+/// Rounds the start up and the end down, because `madvise` needs a page-aligned
+/// address and dropping a partial page at either end would discard bytes
+/// belonging to a neighbouring tensor.
+///
+/// Advisory and best-effort: a failure means the pages stay, which is the
+/// behaviour before this existed, so the return value is deliberately ignored.
+#[cfg(unix)]
+pub fn release_mapped(data: &[u8]) {
+    const PAGE: usize = 4096;
+    let start = data.as_ptr() as usize;
+    let end = start + data.len();
+    let lo = start.div_ceil(PAGE) * PAGE;
+    let hi = end / PAGE * PAGE;
+    if hi <= lo {
+        return;
+    }
+    // SAFETY: `[lo, hi)` is a whole number of pages inside `data`, which is a
+    // live borrow of the model's mmap. `MADV_DONTNEED` on a private file
+    // mapping only discards the cached pages; the mapping stays valid and a
+    // later read re-faults from the file.
+    unsafe {
+        let _ = madv::madvise(lo as *mut std::ffi::c_void, hi - lo, madv::DONTNEED);
+    }
+}
+
+/// **A no-op on Windows, deliberately**, for the reason [`release_range`] is.
+///
+/// The mapping is read-only, so its pages are clean, and Windows moves clean
+/// file pages to the standby list and reclaims them under pressure on its own.
+/// The Unix arm answers a WSL VM that holds on to memory it has been given;
+/// there is no VM here.
+///
+/// If a Windows run is ever seen to hold the mapping resident during placement,
+/// `VirtualUnlock` on the unlocked range trims it from the working set — a
+/// documented side effect rather than the call's purpose, which is why it is not
+/// used until a run shows it is needed.
+#[cfg(windows)]
+pub fn release_mapped(_data: &[u8]) {}

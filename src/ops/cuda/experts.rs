@@ -88,23 +88,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_int, c_void};
-
-/// `MADV_DONTNEED`, from `asm-generic/mman-common.h`.
-///
-/// On a `MAP_PRIVATE` file mapping this discards the resident pages; a later
-/// read faults them back from the file. So it is safe by construction here —
-/// worst case it costs a re-read of data nothing reads again.
-const MADV_DONTNEED: c_int = 4;
-
-unsafe extern "C" {
-    fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
-}
-
-
-
-unsafe extern "C" {
-}
+use std::ffi::c_void;
 
 /// Evict a file from the page cache.
 ///
@@ -150,28 +134,10 @@ pub fn drop_file_range(path: &std::path::Path, offset: i64, len: i64) {
 /// file *and* 4.5 GiB of unevictable pinned memory against a 21 GB WSL VM. The
 /// kernel thrashes, `free` reaches zero, and the Windows host stalls with it.
 ///
-/// Rounds the start up and the end down, because `madvise` needs a page-aligned
-/// address and dropping a partial page at either end would discard bytes
-/// belonging to a neighbouring tensor.
-///
-/// Advisory and best-effort: a failure means the pages stay, which is the
-/// behaviour before this existed, so the return value is deliberately ignored.
+/// See [`crate::platform::release_mapped`] for the page rounding and why
+/// Windows does nothing here.
 fn release_pages(data: &[u8]) {
-    const PAGE: usize = 4096;
-    let start = data.as_ptr() as usize;
-    let end = start + data.len();
-    let lo = start.div_ceil(PAGE) * PAGE;
-    let hi = end / PAGE * PAGE;
-    if hi <= lo {
-        return;
-    }
-    // SAFETY: `[lo, hi)` is a whole number of pages inside `data`, which is a
-    // live borrow of the model's mmap. `MADV_DONTNEED` on a private file
-    // mapping only discards the cached pages; the mapping stays valid and a
-    // later read re-faults from the file.
-    unsafe {
-        let _ = madvise(lo as *mut c_void, hi - lo, MADV_DONTNEED);
-    }
+    crate::platform::release_mapped(data);
 }
 
 /// VRAM held back from the expert slab, in bytes.
