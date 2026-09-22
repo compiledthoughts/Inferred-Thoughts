@@ -307,8 +307,9 @@ pub struct ExpertStats {
     pub prefetch_reads: u64,
     pub prefetch_used: u64,
     pub prefetch_wasted: u64,
-    /// Whether the parallel reads run with `O_DIRECT`: asked for by default, and
-    /// false if refused — `INFERRED_FETCH_DIRECT=0`, a staging buffer that is not
+    /// Whether the parallel reads run with `O_DIRECT`: asked for by default on
+    /// Linux and not on Windows (`platform::DIRECT_BY_DEFAULT`), and false if
+    /// refused — `INFERRED_FETCH_DIRECT=0`, a staging buffer that is not
     /// page-aligned, or a file system that rejects the flag.
     pub fetch_direct: bool,
 }
@@ -506,8 +507,9 @@ pub(super) struct ExpertCache {
     n_expert_seen: usize,
     /// Read threads for a fetch; 1 keeps the serial path. `INFERRED_FETCH_THREADS`.
     fetch_threads: usize,
-    /// Whether the read pool asks for `O_DIRECT`; `INFERRED_FETCH_DIRECT=0` turns it
-    /// off. What the pool actually got is `ExpertStats::fetch_direct`.
+    /// Whether the read pool asks for `O_DIRECT`: `platform::DIRECT_BY_DEFAULT`
+    /// (Linux yes, Windows no), and `INFERRED_FETCH_DIRECT=0` or `=1` overrides it.
+    /// What the pool actually got is `ExpertStats::fetch_direct`.
     fetch_direct: bool,
     /// Whether a layer's tensors are fetched as one batch (SSD-TIER.md D20):
     /// `INFERRED_FETCH_GROUP=0` goes back to one batch per tensor.
@@ -745,7 +747,8 @@ impl ExpertCache {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_FETCH_THREADS)
                 .max(1),
-            fetch_direct: std::env::var("INFERRED_FETCH_DIRECT").map_or(true, |v| v != "0"),
+            fetch_direct: std::env::var("INFERRED_FETCH_DIRECT")
+                .map_or(crate::platform::DIRECT_BY_DEFAULT, |v| v != "0"),
             group_fetch: std::env::var("INFERRED_FETCH_GROUP").map_or(true, |v| v != "0"),
             groups: HashMap::new(),
             learning: None,

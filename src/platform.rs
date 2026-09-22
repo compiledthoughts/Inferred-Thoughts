@@ -77,6 +77,26 @@ const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 /// NVMe this targets.
 pub const DIRECT_ALIGN: usize = 4096;
 
+/// Whether tier-3 reads are unbuffered unless `INFERRED_FETCH_DIRECT` says
+/// otherwise. **Yes on Linux, no on Windows**, and the difference is measured.
+///
+/// Linux: `O_DIRECT` is faster (below) and keeps 250 MiB a token of fetches out
+/// of a page cache that, under WSL's memory cap, hung the machine.
+///
+/// Windows: the engine holds a mapping of the model file for its whole life,
+/// and **while any mapping of a file exists, unbuffered reads of that file run
+/// at ~3.0 GB/s instead of ~5.3** — six threads of random 0.88 MiB reads on this
+/// Gen5 drive, reproduced outside the engine; untouched, touched, or with only
+/// the view unmapped, all the same; closing the mapping object restores it.
+/// Buffered reads do not care: 5.9 GB/s with the mapping held. On the 125B,
+/// natively: decode 6.15 -> 9.3 tok/s, 292 -> 107 us an expert, text identical.
+/// The page-cache concern does not carry over: Windows' standby list is
+/// reclaimed under pressure, with no VM cap to fill.
+#[cfg(unix)]
+pub const DIRECT_BY_DEFAULT: bool = true;
+#[cfg(windows)]
+pub const DIRECT_BY_DEFAULT: bool = false;
+
 /// Open a model file for tier-3 reads, unbuffered when `direct`.
 ///
 /// **Why unbuffered**: stage 0 on this drive read 4.7–4.9 GB/s with `O_DIRECT`
@@ -143,12 +163,11 @@ pub fn release_range(path: &Path, offset: i64, len: i64) {
 /// `POSIX_FADV_DONTNEED` — `SetSystemFileCacheSize` is process-wide and a blunt
 /// instrument.
 ///
-/// Acceptable because of *why* the Unix arm exists. The cache pressure it
-/// answers is a WSL memory-cap problem, and the path that generates the most
-/// traffic — tier-3 fetches — is opened with `FILE_FLAG_NO_BUFFERING`, so those
-/// bytes never enter the cache to be evicted. What remains is the mapping used
-/// during placement, which Windows is free to reclaim under pressure as it sees
-/// fit.
+/// Acceptable because of *why* the Unix arm exists: the cache pressure it
+/// answers is a WSL memory-cap problem. On Windows the file cache is the
+/// standby list, which the memory manager hands back under pressure on its own
+/// — both the pages the placement mapping touched and the tier-3 fetches, which
+/// are buffered here by default (`DIRECT_BY_DEFAULT`).
 ///
 /// If a Windows run is ever seen to thrash during placement, this is the first
 /// thing to revisit, and the honest fix is unbuffered placement reads rather
