@@ -14,16 +14,18 @@ use std::path::Path;
 
 /// Read into `buf` from `offset` without moving the file cursor.
 ///
-/// Positional because the read pool has eight threads on one `File`
-/// (`super::ops::cuda::fetch`); a seek-then-read pair would race.
+/// Positional so a caller never depends on a shared cursor; the read pool
+/// (`super::ops::cuda::fetch`) gives each of its threads its own handle.
 #[cfg(unix)]
 pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::unix::fs::FileExt;
     file.read_at(buf, offset)
 }
 
-/// Windows' positional read. `seek_read` does not move the cursor either, so
-/// the eight-thread contract holds the same way.
+/// Windows' positional read. Unlike `pread`, `seek_read` *does* move the
+/// cursor, and reads through one handle are serialized by the I/O manager, so
+/// concurrent readers each need their own handle — which is how
+/// `ops::cuda::fetch::ReadPool` is built.
 #[cfg(windows)]
 pub fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     use std::os::windows::fs::FileExt;

@@ -109,15 +109,21 @@ pub(crate) struct ReadPool {
 }
 
 impl ReadPool {
-    /// `threads` workers sharing one handle to `file`. `pread` names its offset,
-    /// so concurrent reads through one descriptor do not interfere.
-    pub(crate) fn new(file: File, threads: usize) -> Result<Self> {
-        let file = Arc::new(file);
+    /// One worker per handle in `files`, each reading only through its own.
+    ///
+    /// **One handle each, not one shared.** On Linux a shared descriptor would
+    /// do: `pread` names its offset. On Windows every read through one
+    /// synchronous handle is serialized on its file object, so the handles come
+    /// from separate opens of the path — `try_clone` would share the file object
+    /// and serialize just the same. Measured on the 125B natively, unbuffered:
+    /// decode 5.93 -> 6.07 tok/s. It was not the large Windows cost; that was the
+    /// model's mapping slowing unbuffered reads (`platform::DIRECT_BY_DEFAULT`).
+    pub(crate) fn new(files: Vec<File>) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
-        let mut workers = Vec::with_capacity(threads);
-        for i in 0..threads.max(1) {
-            let (rx, file) = (Arc::clone(&rx), Arc::clone(&file));
+        let mut workers = Vec::with_capacity(files.len());
+        for (i, file) in files.into_iter().enumerate() {
+            let rx = Arc::clone(&rx);
             let handle = std::thread::Builder::new()
                 .name(format!("expert-read-{i}"))
                 .spawn(move || {

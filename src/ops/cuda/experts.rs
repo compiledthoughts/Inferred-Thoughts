@@ -1329,10 +1329,20 @@ impl ExpertCache {
                 return Err(Error::Cuda { what: "expert fetch", detail: format!("opening {}: {err}", path.display()) });
             }
         };
+        // One handle per read thread, each its own open of the path, with the
+        // `direct` the first open settled on. See `ReadPool::new` for why.
+        let mut files = Vec::with_capacity(self.fetch_threads.max(1));
+        files.push(file);
+        for _ in 1..self.fetch_threads.max(1) {
+            files.push(super::fetch::open(&path, direct).map_err(|err| Error::Cuda {
+                what: "expert fetch",
+                detail: format!("opening {}: {err}", path.display()),
+            })?);
+        }
         self.fetch_direct = direct;
         self.stats.fetch_direct = direct;
         self.pinned = Some(pinned);
-        self.readers = Some(ReadPool::new(file, self.fetch_threads)?);
+        self.readers = Some(ReadPool::new(files)?);
         Ok(())
     }
 
