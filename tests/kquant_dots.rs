@@ -550,6 +550,13 @@ fn a_batched_k_quant_matmul_agrees_with_its_own_single_token_path() {
 
     let gpu = inferred_thoughts::Cuda::new(0).expect("cuda device");
     gpu.use_graphs(false);
+    // The property holds for the scalar k-quant kernels, which this guards.
+    // Batched Q5_K runs on the int8 tensor cores by default, a documented
+    // departure that folds eight int32 lanes into one and so differs from the
+    // single-token path by design; `q5k_scalar_restores_bit_equality` and the
+    // MMA precision test cover that path. Without this the test failed on
+    // `blk.3.attn_output` (203 of 256) ever since that default landed.
+    gpu.q5k_mma(false);
 
     for f in fixtures() {
         let w = Weights {
