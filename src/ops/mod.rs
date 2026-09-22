@@ -615,8 +615,15 @@ pub trait Ops {
     ///
     /// `src` is `[n_tok][n_stream][nd]` and `out` is `[n_tok][nd]`.
     ///
-    /// The default is the unfused sequence, so a backend gains nothing and
-    /// changes nothing until it overrides this.
+    /// **The default is a host loop, not the unfused sequence** — the arithmetic
+    /// of that sequence, run on host memory. Right for the CPU backends. Wrong
+    /// for anything that keeps activations on a device: it reads and writes the
+    /// host copies and tells the device nothing, so a later device op reads a
+    /// stale `out`. A backend or wrapper over a device must override this, as
+    /// `Cuda` does. (The sequence itself cannot be the default: it needs a
+    /// scratch buffer, and a per-call allocation is a new address for every
+    /// address-keyed mirror.) Found when a test wrapper forwarded every op but
+    /// this one.
     fn mean_streams(&self, src: &[f32], n_stream: usize, nd: usize, inv: f32, out: &mut [f32]) {
         for (i, o) in out.iter_mut().enumerate() {
             let (t, j) = (i / nd, i % nd);

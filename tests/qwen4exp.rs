@@ -327,6 +327,14 @@ mod exact_only {
             self.0.gather_chunks(src, chunk, stride, offset, out);
             self.0.host_needs(out);
         }
+        /// Must be forwarded like every other op here. Left to the trait's
+        /// default — a host loop — it wrote `mixed` on the host without telling
+        /// the device, and the next GPU op read a stale copy: worst 1.55 on the
+        /// 0.2B, while the backend itself was bit-identical all along.
+        fn mean_streams(&self, src: &[f32], n_stream: usize, nd: usize, inv: f32, out: &mut [f32]) {
+            self.0.mean_streams(src, n_stream, nd, inv, out);
+            self.0.host_needs(out);
+        }
         fn scatter_chunks(&self, src: &[f32], chunk: usize, stride: usize, offset: usize, dst: &mut [f32]) {
             self.0.scatter_chunks(src, chunk, stride, offset, dst);
             self.0.host_needs(dst);
