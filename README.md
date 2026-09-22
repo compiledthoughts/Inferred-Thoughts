@@ -229,15 +229,81 @@ GiB free, and ~580 launches per token is a fixed cost regardless of model size:
 at 0.6B each kernel does ~1.3 MB of work, on the 9B roughly 11x more, so the
 same overhead is a few percent there instead of a third.
 
+## Prerequisites
+
+Supported means built and tested on exactly this. Anything outside it may work,
+but it is not something this project tries to handle.
+
+**Hardware**
+
+- **An NVIDIA Blackwell GPU** (compute capability 12.0, `sm_120`), e.g. an RTX
+  50-series card. The kernels are built as `sm_120a`, which no other
+  architecture can load, and the NVFP4 path needs Blackwell's FP4 tensor cores.
+  On an older card, use llama.cpp.
+- **An x86-64 CPU.** The build uses `target-cpu=native`, so a binary runs on the
+  machine that built it. Developed on Zen 5 with AVX-512.
+- **Models on a local disk**: ext4 under Linux or WSL, NTFS under Windows.
+  Never a network share, and under WSL never `/mnt/c` or any other `/mnt/*`
+  path, which was measured 45x slower on CUDA. Models that spill past VRAM and RAM
+  stream experts from the disk, so an NVMe drive is what makes them usable.
+
+**Software, on every platform**
+
+- **An NVIDIA driver that supports CUDA 12.8** (R570 or newer). `nvidia-smi`
+  prints the highest CUDA version the driver supports in its header.
+- **The CUDA Toolkit 12.8 or newer.** It is needed to build; the binary itself
+  needs only the driver, because it embeds the kernels and calls the driver API
+  directly.
+- **Rust, a current stable**, from [rustup](https://rustup.rs). Tested on 1.98.0.
+
+**Linux, or WSL2 (Ubuntu 24.04)**
+
+- The toolkit in `/usr/local/cuda`, or `CUDA_PATH` pointing at it.
+- Under WSL, install the driver on Windows only and never inside the guest. The
+  guest reaches the GPU through `/usr/lib/wsl/lib`, which `build.rs` already
+  searches.
+
+**Windows 10/11, native**
+
+- **Visual Studio 2022 Build Tools** with the *Desktop development with C++*
+  workload, and Rust's MSVC toolchain (`x86_64-pc-windows-msvc`, rustup's
+  default on Windows).
+- **Build from an *x64 Native Tools Command Prompt for VS 2022*** (or after
+  running `vcvars64.bat`). `nvcc` runs `cl.exe` even to produce PTX, and a plain
+  shell cannot find it.
+- **`CUDA_PATH` must be set**, and the toolkit's installer sets it. It is how
+  the build finds both `nvcc` and `cuda.lib`.
+
+Minimal installs, from an administrator PowerShell:
+
+```powershell
+winget install --id Rustlang.Rustup
+winget install --id Microsoft.VisualStudio.2022.BuildTools --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+winget install --id Nvidia.CUDA --version 12.8
+```
+
+**Tests**
+
+- Tests that need a model look for it where the fixture recorded it. Point
+  `INFERRED_MODEL_DIR` at your model directory instead. `matches_llama_tokenize`
+  fails, by design, when it finds no model at all.
+- Device tests run one at a time, with `--test-threads=1`.
+
 ## Build
 
-Everything runs inside WSL (`Ubuntu-24.04`). Build artifacts go on ext4 rather
+On Linux or WSL (`Ubuntu-24.04`). Under WSL, build artifacts go on ext4 rather
 than DrvFs, which is much faster:
 
 ```bash
 export CARGO_TARGET_DIR=~/.cargo-target/inferredthoughts
 cargo build --release
 export B=~/.cargo-target/inferredthoughts/release/inferred
+```
+
+On Windows, from an *x64 Native Tools Command Prompt for VS 2022*:
+
+```bat
+cargo build --release --features cuda
 ```
 
 `.cargo/config.toml` sets `-C target-cpu=native`. Without it rustc emits
