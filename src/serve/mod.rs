@@ -678,6 +678,7 @@ pub fn serve<O: Ops>(
     })?;
     let base = format!("http://127.0.0.1:{}", opts.port);
     eprintln!("serving {} (ctx {})", opts.model_id, engine.n_ctx());
+    eprintln!("  chat here  {base}/         <- open it in a browser");
     eprintln!("  base url   {base}          <- most clients want this");
     eprintln!("  or         {base}/v1       <- if the client adds /chat/completions itself");
     eprintln!("  either works; the router matches on the path suffix");
@@ -832,6 +833,16 @@ fn handle<O: Ops>(
         }
         ("POST", p) if p.ends_with("/chat/completions") => {
             chat_completions(session, &mut stream, &body, opts)
+        }
+        // The chat page, served by the engine itself.
+        //
+        // **Embedded, not read from disk.** A binary that needs a file beside it
+        // is a binary someone can install wrong, and the whole point of this
+        // engine is one download plus a driver. `include_str!` costs ~12 KB.
+        // `normalize_path` strips the trailing slash, so the root arrives as "".
+        ("GET", "" | "/index.html" | "/ui" | "/chat") => {
+            send_head(&mut stream, 200, "text/html; charset=utf-8", UI.len())?;
+            write_all(&mut stream, UI.as_bytes())
         }
         ("OPTIONS", _) => send_head(&mut stream, 204, "text/plain", 0),
         _ => send_json(
@@ -1294,6 +1305,10 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>)> {
     }
     Ok((method, path, body))
 }
+
+/// The chat page. One file: markup, style and the client, no framework and no
+/// build step, talking to this same server's `/v1/chat/completions`.
+const UI: &str = include_str!("../../ui/index.html");
 
 fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream.write_all(bytes).map_err(|source| Error::Io {
