@@ -151,7 +151,15 @@ async function send(text) {
   meta.textContent = "…";
   el.appendChild(meta);
   const started = performance.now();
-  let firstToken = 0, pieces = 0;
+  let firstToken = 0, pieces = 0, timings = null;
+
+  // **The wait before the first token is the part that looks broken.** On the
+  // 125B a long prompt is tens of seconds of prefill with nothing on screen, so
+  // the count runs until the first piece arrives and then gets out of the way.
+  const waiting = setInterval(() => {
+    if (firstToken) return;
+    meta.textContent = `reading your prompt… ${((performance.now() - started) / 1000).toFixed(1)}s`;
+  }, 100);
 
   controller = new AbortController();
   $("send").disabled = true;
@@ -181,9 +189,18 @@ async function send(text) {
         if (!frame.startsWith("data:")) continue;
         const payload = frame.slice(5).trim();
         if (payload === "[DONE]") continue;
-        let d;
-        try { d = JSON.parse(payload).choices[0].delta; } catch { continue; }
-        if (!firstToken) firstToken = performance.now();
+        let frame;
+        try { frame = JSON.parse(payload); } catch { continue; }
+        // The last chunk carries the server's own timings: prefill and decode
+        // rates it measured, not wall time we guessed at.
+        if (frame.timings) timings = frame.timings;
+        const d = frame.choices?.[0]?.delta;
+        if (!d) continue;
+        if (!firstToken) {
+          firstToken = performance.now();
+          clearInterval(waiting);
+          meta.textContent = "";
+        }
         if (d.reasoning_content) {
           if (!think) { think = thinkBlock(el); thinkBody = think.querySelector(".body"); }
           thinkText += d.reasoning_content;
@@ -208,11 +225,31 @@ async function send(text) {
     if (!answer) bubble(el, "(no answer — the model produced only reasoning)");
     messages.push({ role: "assistant", content: answerText });
 
-    const secs = (performance.now() - (firstToken || started)) / 1000;
-    const rate = secs > 0 ? (pieces / secs).toFixed(1) : "—";
-    const wait = ((firstToken || performance.now()) - started) / 1000;
-    meta.textContent = `${rate} pieces/s · first token after ${wait.toFixed(1)}s`;
-    $("stat").textContent = `${rate} pieces/s`;
+    // One line, the server's numbers where it has them: time to first token as
+    // the user experienced it, then the two rates the engine measured, then how
+    // full the context is — the three things that answer "how long will this
+    // take" next time.
+    const ttft = ((firstToken || performance.now()) - started) / 1000;
+    const bits = [`TTFT ${ttft.toFixed(1)}s`];
+    if (timings) {
+      const n = (x) => (x ?? 0).toLocaleString();
+      if (timings.prompt_n) {
+        bits.push(`prefill ${timings.prompt_per_second.toFixed(1)} tok/s (${n(timings.prompt_n)})`);
+      }
+      if (timings.predicted_n) {
+        bits.push(`decode ${timings.predicted_per_second.toFixed(1)} tok/s (${n(timings.predicted_n)})`);
+      }
+      if (timings.setup_ms > 1) bits.push(`setup ${(timings.setup_ms / 1000).toFixed(1)}s`);
+      bits.push(`ctx ${n(timings.position)}/${n(timings.n_ctx)}`);
+      // Why a turn was slow is usually here: "continued at 4,096" reused the
+      // cache, "continued at 0" re-read the whole conversation.
+      if (timings.cache_label) bits.push(timings.cache_label);
+      $("stat").textContent = `${timings.predicted_per_second.toFixed(1)} tok/s`;
+    } else {
+      const secs = (performance.now() - (firstToken || started)) / 1000;
+      if (secs > 0) bits.push(`${(pieces / secs).toFixed(1)} pieces/s`);
+    }
+    meta.textContent = bits.join(" · ");
   } catch (e) {
     meta.className = "meta err";
     meta.textContent = e.name === "AbortError" ? "stopped" : `error: ${e.message}`;
@@ -222,6 +259,7 @@ async function send(text) {
       messages.pop();   // the turn never happened; do not resend it as history
     }
   } finally {
+    clearInterval(waiting);
     controller = null;
     $("send").disabled = false;
     $("stop").hidden = true;

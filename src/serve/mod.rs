@@ -486,6 +486,7 @@ impl<O: Ops> Session<'_, O> {
             self.tokens.extend_from_slice(&tokens[done..done + take]);
             done += take;
             self.consumed += take;
+            prefill_progress(done, tokens.len());
             // **Spacing measured from the last checkpoint, not from the start
             // of this turn.** The previous condition was `done < tokens.len()`,
             // which takes a checkpoint only between slices — so a turn shorter
@@ -1309,6 +1310,31 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>)> {
 /// The chat page. One file: markup, style and the client, no framework and no
 /// build step, talking to this same server's `/v1/chat/completions`.
 const UI: &str = include_str!("../../ui/index.html");
+
+/// One line, rewritten in place, while a long prompt prefills.
+///
+/// **Because the wait is otherwise silent.** A 3,879-token turn on
+/// Qwen3.8-Flash-Next is ~100 s of prefill during which the terminal shows
+/// nothing, and a user cannot tell a slow model from a hung one.
+///
+/// Only when stderr is a terminal, so a log file or a pipe keeps the shape
+/// `inferred generate` prints, and only past one slice, so short turns — every
+/// turn on the small models — stay quiet.
+fn prefill_progress(done: usize, total: usize) {
+    use std::io::IsTerminal;
+    if total <= 512 || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let pct = done as f64 * 100.0 / total as f64;
+    // `\r` and no newline: the line is replaced, not appended. The final slice
+    // clears it, since the turn's own report follows immediately.
+    if done >= total {
+        eprint!("\r{:60}\r", "");
+    } else {
+        eprint!("\r  prefill {done:>6} / {total} tokens  {pct:>5.1}%");
+    }
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
 
 fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     stream.write_all(bytes).map_err(|source| Error::Io {
