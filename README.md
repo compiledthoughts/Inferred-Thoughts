@@ -1,12 +1,56 @@
 # inferredThoughts
 
-A from-scratch Rust inference engine for GGUF mixture-of-experts models whose
-weights do not fit in VRAM. One binary, CUDA kernels of our own, no PyTorch and
-no `libllama`.
+**One card, the whole model.** A 176.9-billion-parameter mixture-of-experts
+model, answering at **9–10 tokens a second on a 16 GB consumer GPU** — not a
+distilled version of it, that model, 119 GiB of it, with three quarters of its
+experts still sitting on the SSD while it talks to you.
 
-The contribution is **tiering and placement policy** — which experts live in
-VRAM, which in pinned host memory, which stream from the SSD, and when bytes
-move — measured rather than claimed.
+It works by treating VRAM, pinned RAM and the NVMe drive as one memory
+hierarchy, and deciding token by token which experts belong where. On this
+machine 14% of the experts live in VRAM at any moment, and they serve **90.5%
+of every expert read** — because the ones the router keeps asking for are the
+ones that stay.
+
+```
+$ inferred serve -m Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080
+
+  ████ █  █ ████ ████ ███  ███  ████ ███
+   ██  ██ █ █    █    █  █ █  █ █    █  █
+   ██  █ ██ ███  ███  ███  ███  ███  █  █
+   ██  █  █ █    █    █ █  █ █  █    █  █
+  ████ █  █ █    ████ █  █ █  █ ████ ███
+
+  ████ █  █  ██  █  █  ███ █  █ ████  ███
+   ██  █  █ █  █ █  █ █    █  █  ██  █
+   ██  ████ █  █ █  █ █ ██ ████  ██   ██
+   ██  █  █ █  █ █  █ █  █ █  █  ██     █
+   ██  █  █  ██   ██   ███ █  █  ██  ███
+
+                        by compiledthoughts.dev
+
+model Qwen3.8-Flash-Next-NVFP4-Q8_0 | qwen4exp | 48 layers | ctx 32096
+device NVIDIA GeForce RTX 5060 Ti | 14.80 of 15.93 GiB free
+  chat here  http://127.0.0.1:8080/         <- open it in a browser
+
+  prefill      80 tok     3384.4 ms      23.64 tok/s
+  decode      110 tok    10572.1 ms      10.40 tok/s     96.1 ms/tok
+  placed at load: 10,247 in VRAM, 6,984 pinned in RAM, 56,497 on disk
+```
+
+**Why bother, when you could just buy more RAM?** Because holding that expert
+pool in DDR5 costs around $1,600, and holding it on a Gen5 SSD costs about $6 —
+and the SSD is only 1.4x more expensive per byte actually moved. A machine built
+to serve this class of model the usual way runs to roughly $9,000. This one is
+about $1,700, and most of that is not the GPU.
+
+**Where it is going:** 15–20 tok/s on a 120B-class model, then 250B and 500B on
+the same 16 GB card.
+
+**What it is not:** a general engine. Four model architectures, one GPU family
+(consumer Blackwell), and only the quantization formats those models actually
+use. llama.cpp runs everything, everywhere, and is faster on the 35B — it is the
+reference every kernel here was checked against, and the honest comparison is
+below, including where we lose.
 
 | | |
 |---|---|
@@ -25,6 +69,10 @@ On one RTX 5060 Ti (16 GB) with 32 GB of system RAM, native Windows:
 | Qwen3.5-9B Q8_0 | 9.1 GiB | — | 8.2 GiB | none | none | 281.6 | 40.7 |
 | Qwen3-0.6B Q8_0 | 0.6 GiB | — | 1.5 GiB | none | none | 2,659.8 | 292.8 |
 
+The 125B's **best observed turn is 10.40 tok/s** — 110 tokens at shallow depth,
+through the chat page. The 9.06 in the table is the measured run below, and the
+gap between them is real: decode on this model falls as a conversation grows.
+
 **One machine, one run each, 24-09-2026**, native Windows at default budgets:
 tok/s from the engine's own profile, tiers from its placement report. Prefill is
 a 5,548-token prompt (24 tokens for the 125B's row would measure per-pass
@@ -37,14 +85,15 @@ three large models).
 ### The 176.9B model, against llama.cpp on the same machine
 
 ```
- ours, native Windows      ██████████████████████████████████  9.06
- ours, WSL2                █████████████████████████           7.45–7.79
- llama.cpp CUDA, best fit  ██████████████████                   5.32–5.36
- llama.cpp, all experts    ██████████████                       4.36–4.42
+ ours, best observed turn  ██████████████████████████████████████ 10.40
+ ours, native Windows      █████████████████████████████████     9.06
+ ours, WSL2                ███████████████████████████           7.45–7.79
+ llama.cpp CUDA, best fit  ███████████████████                   5.32–5.36
+ llama.cpp, all experts    ████████████████                      4.36–4.42
    on the CPU
- llama.cpp, CPU only       █████████                            2.88
-                           └────────┴────────┴────────┴────────┴─ tok/s
-                           0        2.5      5.0      7.5     10.0
+ llama.cpp, CPU only       ██████████                            2.88
+                           └─────────┴─────────┴─────────┴─────────┴─ tok/s
+                           0         2.5       5.0       7.5      10.0
 ```
 
 llama.cpp's figures were taken under WSL2 on 16-09 on the same file, prompt and
