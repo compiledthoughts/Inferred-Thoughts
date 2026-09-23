@@ -1,0 +1,38 @@
+inferredThoughts
+Copyright 2026 compiledthoughts.dev
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+---
+
+Acknowledgements
+
+No third-party code is vendored here: every kernel, the GGUF reader, the
+tokenizer and the engine are written in this repository. What is owed is
+intellectual, and named where it was used.
+
+* llama.cpp (MIT, ggml-org/llama.cpp) is the behavioural oracle throughout.
+  Every numeric kernel here was checked against values dumped from it with
+  `llama-eval-callback`, the tokenizer against `llama-tokenize`, and its source
+  was read as the reference for technique — quantization block formats, the
+  chat template's shape, and how its CUDA backend quantizes activations. Its
+  measured throughput is the baseline this project reports against, including
+  where it is ahead.
+
+* pulsar (MIT) for the DeepSeek-V4 port notes and several mechanisms adopted
+  from them.
+
+* colibri for the lookahead-recall direction that became this engine's expert
+  prefetch.
+
+* The Qwen models (Alibaba) are what this engine was built to run; each model's
+  own licence governs its weights, which are not distributed here.
