@@ -242,53 +242,39 @@ impl Cuda {
             return slab;
         };
         let budget = avail.saturating_sub(Self::headroom_bytes()) as usize;
-        // **The whole card, not what is taken so far.** The slab is sized inside
-        // layer 0, before most dense weights are up, so "used now + slab" read
-        // ~10 GiB where the run committed 21.3 GB. The engine fills the card by
-        // design — slab, dense weights, KV, activations — so the honest estimate
-        // of what RAM will have to mirror is the card itself. Measured: card
-        // 15.93 GiB + 6 GiB tier = 21.9 against 21.3 GB of peak private bytes.
-        let _ = free_vram;
-        let vram = if crate::platform::RAM_COMMITS_VRAM { total_vram } else { 0 };
+        // **Only the pinned tier is charged, on every platform.**
+        //
+        // Windows does mirror device allocations in system memory, and that
+        // mirror is what made a 16 GB card beside a 6 GiB tier commit over
+        // 20 GB. But it is **pageable**: the memory manager writes it out under
+        // pressure, which is slow and survivable. Page-locked memory is not —
+        // it cannot be reclaimed at all, so it is the only term that can take a
+        // machine to zero.
+        //
+        // **Charging the card as well was measured wrong**, 24-09. With a
+        // browser open, available RAM sits near 15 GiB, below the 15.93 GiB
+        // card; the tier went to 0 and the slab to its floor on every model.
+        // The 35B, whose experts fit entirely, streamed 12,598 of them from
+        // disk and decoded 1.34 tok/s against 41, and the 125B read 1.36
+        // against 9. A ceiling that protects the machine by making the engine
+        // useless is not a ceiling worth having.
+        let _ = (free_vram, total_vram);
         let host = self.expert_host_budget.get();
-        if vram.saturating_add(host) <= budget {
+        if host <= budget {
             return slab;
         }
-        // The tier first, down to nothing: its experts become cold and are
-        // fetched from the file, which is a speed cost, not a failure.
-        let host_fits = budget.saturating_sub(vram).min(host);
+        // Its experts become cold and are fetched from the file: a speed cost,
+        // not a failure. **The slab is never touched** — see above.
+        let host_fits = budget.min(host);
         self.expert_host_budget.set(host_fits);
-        // **A floor, because below it the model cannot run at all.** A slab
-        // smaller than one layer's picks fails mid-resolve — "every one of the
-        // 423 VRAM slots holds an expert the layer being resolved picked" — and
-        // a configuration that cannot run is worse than one that leaves the
-        // machine tight. At 0.36 GiB the 125B failed; 2 GiB is ~5x the slots
-        // that failed and still a quarter of its usual slab. If even this
-        // overruns the budget, the line below says so and the run goes ahead.
-        const MIN_SLAB: usize = 2 << 30;
-        let slab_fits = if vram > budget {
-            // Even the VRAM footprint does not fit. Shrink the slab by the
-            // overrun; the experts it would have held go cold too.
-            slab.saturating_sub(vram - budget).max(slab.min(MIN_SLAB))
-        } else {
-            slab
-        };
-        if slab_fits.saturating_add(vram.saturating_sub(slab)) > budget {
-            eprintln!(
-                "budgets: the RAM ceiling cannot be met without a slab below {:.2} GiB, which cannot hold one layer's picks; proceeding over the ceiling",
-                MIN_SLAB as f64 / 1073741824.0,
-            );
-        }
         eprintln!(
-            "budgets capped by RAM: {:.2} GiB available, {:.2} GiB headroom -> host tier {:.2} -> {:.2} GiB, slab {:.2} -> {:.2} GiB",
+            "budgets capped by RAM: {:.2} GiB available, {:.2} GiB headroom -> pinned host tier {:.2} -> {:.2} GiB (the VRAM slab is unaffected)",
             avail as f64 / 1073741824.0,
             Self::headroom_bytes() as f64 / 1073741824.0,
             host as f64 / 1073741824.0,
             host_fits as f64 / 1073741824.0,
-            slab as f64 / 1073741824.0,
-            slab_fits as f64 / 1073741824.0,
         );
-        slab_fits
+        slab
     }
 
     /// Declare the model's whole expert pool — the sum of `n_expert` over every

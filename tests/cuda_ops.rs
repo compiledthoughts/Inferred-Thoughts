@@ -5640,8 +5640,7 @@ fn what_the_server_prefill_pattern_costs() {
 
     // Real content, as `prompt_real.txt` is: word salad routes to a handful of
     // experts and would flatter every arm equally but unrealistically.
-    let doc = std::fs::read_to_string("measurements/prompt_real.txt")
-        .expect("measurements/prompt_real.txt");
+    let Some(doc) = common::text_or_skip("prompt_real.txt") else { return };
     let tokens = tk.encode(&doc, true, true);
     let n = tokens.len();
     assert!(n > 8192, "{n} tokens; this needs several 2048-token slices");
@@ -6418,8 +6417,12 @@ fn the_35b_generates_identically_with_the_expert_pool_oversubscribed() {
     // chunks (`DEFAULT_MAX_BATCH`, `MOE_CHUNK`): the lease must clear between
     // them, and one layer resolves a union of up to all its experts at once.
     const PROMPT_TOKENS: usize = 700;
-    let text = include_str!("../measurements/prompt_6k.txt");
-    let mut tokens = tk.encode(text, true, true);
+    // **Read, not `include_str!`.** A compile-time dependency on a file outside
+    // the crate's sources makes the whole test target unbuildable wherever that
+    // file is absent — which is any tree published without `measurements/`,
+    // since these prompts are the project's own internal text.
+    let Some(text) = common::text_or_skip("prompt_6k.txt") else { return };
+    let mut tokens = tk.encode(&text, true, true);
     assert!(tokens.len() > PROMPT_TOKENS, "prompt_6k.txt tokenized shorter than {PROMPT_TOKENS}");
     tokens.truncate(PROMPT_TOKENS);
 

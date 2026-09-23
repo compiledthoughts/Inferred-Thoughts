@@ -43,6 +43,25 @@ macro_rules! model_or_skip {
 #[allow(unused_imports)]
 pub(crate) use model_or_skip;
 
+/// A prompt file from `measurements/`, or `None` with the skip announced.
+///
+/// **Read at run time on purpose.** These prompts are the project's own
+/// internal text — real prose, because word salad routes to a handful of
+/// experts and flatters every cache — so a published tree does not carry them.
+/// An `include_str!` would make the whole test target unbuildable there;
+/// `INFERRED_PROMPT_DIR` points at them when they live elsewhere.
+#[allow(dead_code)]
+pub fn text_or_skip(name: &str) -> Option<String> {
+    let dir = std::env::var("INFERRED_PROMPT_DIR").unwrap_or_else(|_| "measurements".to_string());
+    match std::fs::read_to_string(Path::new(&dir).join(name)) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            println!("SKIPPED: no {name} in {dir}; set INFERRED_PROMPT_DIR");
+            None
+        }
+    }
+}
+
 /// Compare raw bits, not a tolerance.
 ///
 /// `#[allow(dead_code)]`: every integration test binary compiles this module

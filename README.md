@@ -22,16 +22,25 @@ move — measured rather than claimed.
 
 On one RTX 5060 Ti (16 GB) with 32 GB of system RAM, native Windows:
 
-| model | size on disk | decode | note |
-|---|---|---|---|
-| Qwen3.8-Flash-Next | 119 GiB, 176.9B params | **9.0 tok/s** | 63 GiB of routed experts, streamed from NVMe |
-| Qwen3.6-35B-A3B | 19.1 GiB, NVFP4 | 41.8 tok/s | 509 tok/s prefill on a 19.7k prompt (measured under WSL) |
-| Qwen3.5-9B | 9.1 GiB, Q8_0 | 41 tok/s | dense |
-| Qwen3-0.6B | 0.6 GiB, Q8_0 | 286 tok/s | the oracle's test model |
+| model | file | of which PLE | VRAM | pinned RAM | from SSD | prefill | decode |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **Qwen3.8-Flash-Next** 176.9B | 119.0 GiB | 50.7 GiB | 13.6 GiB | 6.0 GiB | **76.6%** of experts, 271 MiB/token | 49.2 | **9.06** |
+| Qwen3.6-35B-A3B NVFP4 | 19.1 GiB | — | 13.5 GiB | 5.8 GiB | none | 591.2 | 34.3 |
+| Qwen3.6-35B-A3B IQ4_XS | 17.5 GiB | — | 13.2 GiB | 5.0 GiB | none | 668.8 | 34.1 |
+| Qwen3.5-9B Q8_0 | 9.1 GiB | — | 8.2 GiB | none | none | 281.6 | 40.7 |
+| Qwen3-0.6B Q8_0 | 0.6 GiB | — | 1.5 GiB | none | none | 2,659.8 | 292.8 |
 
-Every number is a measurement, cited in [`BENCHMARKS-v3.md`](BENCHMARKS-v3.md)
-and [`MODELS.md`](MODELS.md); the NVFP4 35B's is the one row still taken under
-WSL. Under WSL2 the same models run 3–20% slower, except the 125B at 7.5–8.0.
+**One machine, one run each, 24-09-2026**, native Windows at default budgets:
+tok/s from the engine's own profile, tiers from its placement report. Prefill is
+a 5,548-token prompt (24 tokens for the 125B's row would measure per-pass
+overhead, so it uses the same prompt); decode is a 128-token chat turn, which is
+why the 35B reads 34 here and ~41 on the 19,706-token standard run — depth and
+turn length both move it. "Pinned RAM" is the page-locked expert tier; Windows
+also mirrors VRAM in system memory, so the process peaks higher (19–22 GB on the
+three large models). Method and the rest in
+[`BENCHMARKS-v3.md`](BENCHMARKS-v3.md).
+
+Under WSL2 the same models run 3–20% slower, except the 125B at 7.5–8.0.
 On that WSL footing, llama.cpp CUDA at its best measured fit on this machine
 read 5.32–5.36 tok/s on the same model, prompt and day (16-09). The 35B is
 behind llama.cpp on both prefill and decode; the gap is in `HANDOFF-v3.md`.
