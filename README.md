@@ -10,13 +10,8 @@ move — measured rather than claimed.
 
 | | |
 |---|---|
-| [`HANDOFF-v3.md`](HANDOFF-v3.md) | why the project exists, where it stands, what is open |
-| [`BENCHMARKS-v3.md`](BENCHMARKS-v3.md) | current numbers, each with its method |
-| [`SCOREBOARD.md`](SCOREBOARD.md) | one row per landed change |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | module map, the `Ops` seam, where exactness stops |
-| [`TIERS.md`](TIERS.md), [`SSD-TIER.md`](SSD-TIER.md) | measured tier costs; the tier-3 decision log |
-| [`src/model/*.md`](src/model/) | one living reference per architecture |
-| [`docs/v1/`](docs/v1/), [`docs/v2/`](docs/v2/) | the history to v0.3.0 and to v0.8, frozen |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | how it works, and what is still unfinished |
+| [`src/model/*.md`](src/model/) | one living reference per architecture, beside its code |
 
 ## What runs
 
@@ -37,13 +32,30 @@ overhead, so it uses the same prompt); decode is a 128-token chat turn, which is
 why the 35B reads 34 here and ~41 on the 19,706-token standard run — depth and
 turn length both move it. "Pinned RAM" is the page-locked expert tier; Windows
 also mirrors VRAM in system memory, so the process peaks higher (19–22 GB on the
-three large models). Method and the rest in
-[`BENCHMARKS-v3.md`](BENCHMARKS-v3.md).
+three large models).
 
-Under WSL2 the same models run 3–20% slower, except the 125B at 7.5–8.0.
-On that WSL footing, llama.cpp CUDA at its best measured fit on this machine
-read 5.32–5.36 tok/s on the same model, prompt and day (16-09). The 35B is
-behind llama.cpp on both prefill and decode; the gap is in `HANDOFF-v3.md`.
+### The 176.9B model, against llama.cpp on the same machine
+
+```
+ ours, native Windows      ██████████████████████████████████  9.06
+ ours, WSL2                █████████████████████████           7.45–7.79
+ llama.cpp CUDA, best fit  ██████████████████                   5.32–5.36
+ llama.cpp, all experts    ██████████████                       4.36–4.42
+   on the CPU
+ llama.cpp, CPU only       █████████                            2.88
+                           └────────┴────────┴────────┴────────┴─ tok/s
+                           0        2.5      5.0      7.5     10.0
+```
+
+llama.cpp's figures were taken under WSL2 on 16-09 on the same file, prompt and
+machine, searching its options for the best fit it could reach (`--n-cpu-moe 42`
+won). Ours under WSL2 is the like-for-like row; native is higher. **Decode on
+this model falls with conversation length** — 8.02 tok/s at 160 tokens, 6.45 at
+1,635 — so a number without its length is not a number.
+
+Where we are behind: the **35B's prefill and decode**, at roughly 0.6x and 0.8x
+of llama.cpp on the same file. This engine is narrow by design — four
+architectures, one GPU family — and llama.cpp is not.
 
 ## Prerequisites
 
@@ -114,15 +126,20 @@ The flags that matter:
 redirect captures the payload alone. Failure exits non-zero with one
 `caused by:` line per level.
 
-Environment switches — quants, attention, fetch behaviour — are listed in
-`CLAUDE.md` under *Defaults and their switches*; each restores a slower or
-exact path and exists so a default can be A/B'd.
+**Every default has a switch that undoes it**, because that is how each one was
+measured: `INFERRED_Q5K_SCALAR`, `INFERRED_Q6K_SCALAR` and `--iq4-scalar` leave
+the tensor cores; `INFERRED_ATTN_F32` and `--rms-serial` restore the exact
+paths; `INFERRED_NVFP4_Q8` restores NVFP4's bit-exact arithmetic;
+`INFERRED_FETCH_THREADS`, `INFERRED_FETCH_DIRECT`, `INFERRED_PREFETCH` and
+`INFERRED_ASYNC_UPLOAD` control the tier-3 read path;
+`INFERRED_RAM_HEADROOM_GIB` sets how much memory is left for the rest of the
+machine. `inferred --help` lists the flags.
 
 ## Test
 
 ```bash
-cargo test --release --features cuda                 # 174, no model or device needed
-cargo test --release --features cuda -- --ignored --test-threads=1   # 96 more
+cargo test --release --features cuda                 # 178, no model or device needed
+cargo test --release --features cuda -- --ignored --test-threads=1   # 98 more
 ```
 
 The `--ignored` tests need a device and the models; point
