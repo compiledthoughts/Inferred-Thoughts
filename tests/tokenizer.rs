@@ -242,6 +242,63 @@ fn round_trips_through_decode() {
     }
 }
 
+/// `decode_keeping` renders the specials it is given and no others.
+///
+/// **What it guards.** `serve` streams a reasoning model's turn with the
+/// `<think>` markers kept and the chat scaffolding dropped, so a client can tell
+/// reasoning from answer. Dropping every special left Cline showing the model's
+/// thinking as its reply; keeping every special would leak `<|im_end|>` into it.
+#[test]
+fn decode_keeps_only_the_specials_it_is_given() {
+    for set in &load_fixtures() {
+        if !set.model.exists() {
+            continue;
+        }
+        let f = GgufFile::open(&set.model).expect("open model");
+        let tk = Tokenizer::from_metadata(&f.metadata).expect("build tokenizer");
+        let (Some(open), Some(close), Some(end)) = (
+            tk.special_id("<think>"),
+            tk.special_id("</think>"),
+            tk.special_id("<|im_end|>"),
+        ) else {
+            continue;
+        };
+
+        // A turn as the model emits one: reasoning between the markers, then the
+        // answer, then the end-of-turn the client must never see.
+        let mut ids = vec![open];
+        ids.extend(tk.encode("weighing it up", false, false));
+        ids.push(close);
+        ids.extend(tk.encode("the answer", false, false));
+        ids.push(end);
+
+        let keep = |id: u32| id == open || id == close;
+        let kept = tk.decode_keeping(&ids, &keep).expect("decode");
+        assert!(
+            kept.contains("<think>") && kept.contains("</think>"),
+            "the thinking markers must survive: {}",
+            show(&kept)
+        );
+        assert!(
+            !kept.contains("<|im_end|>"),
+            "no other special may be rendered: {}",
+            show(&kept)
+        );
+        assert!(kept.contains("weighing it up") && kept.contains("the answer"));
+
+        // And the two existing modes still mean what they meant.
+        let none = tk.decode(&ids, false).expect("decode");
+        assert!(!none.contains("<think>") && !none.contains("<|im_end|>"));
+        let all = tk.decode(&ids, true).expect("decode");
+        assert!(all.contains("<think>") && all.contains("<|im_end|>"));
+
+        println!(
+            "ok  decode_keeping  [{}]",
+            set.model.file_name().unwrap().to_string_lossy()
+        );
+    }
+}
+
 /// The corpus must actually cover the categories it claims to, so that thinning
 /// it later is a visible change rather than a silent loss of coverage.
 #[test]

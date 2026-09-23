@@ -931,17 +931,34 @@ fn chat_completions<O: Ops>(
 /// Detokenizing incrementally rather than per token, because a token is not a
 /// character: multi-byte UTF-8 and multi-token graphemes only render correctly
 /// once the following token arrives.
+///
+/// Returns the reply **as the client sees it**, with the thinking markers, and
+/// the same reply **without** them. The second is what [`Session::absorb`]
+/// records: `rendered` is compared against the conversation a client sends
+/// back, and clients strip the thinking from their history, so keeping the
+/// markers there would diverge the prefix and re-prefill every turn.
 fn generate<O: Ops>(
     session: &mut Session<'_, O>,
     mut logits: Vec<f32>,
     budget: usize,
     mut emit: impl FnMut(&str) -> Result<()>,
     mut cancelled: impl FnMut() -> bool,
-) -> Result<(String, &'static str, Vec<u32>)> {
+) -> Result<(String, String, &'static str, Vec<u32>)> {
     let eos = session.tk.eos_token_id;
     let mut shown = String::new();
     let mut produced: Vec<u32> = Vec::new();
     let mut reason = "length";
+    // **The thinking markers are kept; every other special is not.** A
+    // reasoning model emits `<think>…</think>` around its reasoning, and both
+    // are control tokens. Dropped, as they were, the client receives reasoning
+    // and answer as one string and shows the thinking as the reply — what Cline
+    // did. Rendered wholesale, `<|im_end|>` and the chat scaffolding leak in.
+    // A model without these markers yields `None` twice and nothing changes.
+    let think = [
+        session.tk.special_id("<think>"),
+        session.tk.special_id("</think>"),
+    ];
+    let keep = |id: u32| think.iter().any(|m| *m == Some(id));
 
     for _ in 0..budget {
         // **Every token, and it costs nothing.** A peek is about a microsecond
@@ -960,7 +977,7 @@ fn generate<O: Ops>(
         }
         produced.push(next);
 
-        if let Ok(text) = session.tk.decode(&produced, false) {
+        if let Ok(text) = session.tk.decode_keeping(&produced, &keep) {
             if let Some(delta) = text.strip_prefix(shown.as_str()) {
                 if !delta.is_empty() {
                     // **A failed write is a gone client, not a server error.**
@@ -992,7 +1009,8 @@ fn generate<O: Ops>(
     }
     // The ids, not just how many: the next turn's common-prefix scan needs to
     // see what the engine consumed, and the model's own output is part of that.
-    Ok((shown, reason, produced))
+    let plain = session.tk.decode(&produced, false).unwrap_or_else(|_| shown.clone());
+    Ok((shown, plain, reason, produced))
 }
 
 fn stream_completion<O: Ops>(
@@ -1020,10 +1038,10 @@ fn stream_completion<O: Ops>(
         let c = chunk(&id, created, &model, json!({"content": delta}), None);
         sse(stream, &c)
     };
-    let (text, reason, ids) = generate(session, logits, budget, &mut sink, || {
+    let (_text, plain, reason, ids) = generate(session, logits, budget, &mut sink, || {
         probe.as_ref().is_some_and(client_gone)
     })?;
-    session.absorb(&text, &ids);
+    session.absorb(&plain, &ids);
     if reason == "cancelled" {
         eprintln!("chat: client went away after {} tokens; stopped", ids.len());
         return Ok(());
@@ -1055,11 +1073,11 @@ fn whole_completion<O: Ops>(
     // without this it cannot tell a cancelled turn from a live one, and ran the
     // whole budget into a closed socket.
     let probe = stream.try_clone().ok();
-    let (text, reason, ids) = generate(session, logits, budget, |_| Ok(()), || {
+    let (text, plain, reason, ids) = generate(session, logits, budget, |_| Ok(()), || {
         probe.as_ref().is_some_and(client_gone)
     })?;
     let n = ids.len();
-    session.absorb(&text, &ids);
+    session.absorb(&plain, &ids);
     if reason == "cancelled" {
         eprintln!("chat: client went away after {n} tokens; stopped");
         return Ok(());
@@ -1405,8 +1423,10 @@ mod tests {
             panic!("the first turn reported a cancel");
         };
         assert!(n < checkpoint_spacing(8192), "the turn must be shorter than a spacing: {n}");
-        let (text, _, ids) = generate(&mut s, logits, 8, |_| Ok(()), || false).expect("generate");
-        s.absorb(&text, &ids);
+        // `plain` is what a session records: the reply without the thinking
+        // markers, which is what a client sends back.
+        let (text, plain, _, ids) = generate(&mut s, logits, 8, |_| Ok(()), || false).expect("generate");
+        s.absorb(&plain, &ids);
 
         let second = s.chat.wrap_turns(&[
             ("user", user),

@@ -298,11 +298,23 @@ impl Tokenizer {
     /// `render_special` controls whether control tokens appear literally; with
     /// it off they are skipped, which is what a chat UI wants.
     pub fn decode(&self, ids: &[u32], render_special: bool) -> Result<String> {
+        self.decode_keeping(ids, &|id| render_special || !self.is_special(id))
+    }
+
+    /// Decode, rendering a special token only when `keep` says so.
+    ///
+    /// **Why the middle ground exists.** A reasoning model's turn is
+    /// `<think>…</think>` then the answer, and both markers are control tokens.
+    /// Rendering every special leaks `<|im_end|>` and the chat scaffolding into
+    /// the reply; rendering none hands a client one undifferentiated string, so
+    /// it cannot tell reasoning from answer — which is what `serve` did, and
+    /// what left Cline showing the model's thinking as its reply.
+    pub fn decode_keeping(&self, ids: &[u32], keep: &dyn Fn(u32) -> bool) -> Result<String> {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             let text = self.token_text(id)?;
             if self.is_special(id) {
-                if render_special {
+                if keep(id) {
                     bytes.extend_from_slice(text.as_bytes());
                 }
                 continue;
