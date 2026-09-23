@@ -941,24 +941,31 @@ fn generate<O: Ops>(
     session: &mut Session<'_, O>,
     mut logits: Vec<f32>,
     budget: usize,
-    mut emit: impl FnMut(&str) -> Result<()>,
+    mut emit: impl FnMut(&str, Part) -> Result<()>,
     mut cancelled: impl FnMut() -> bool,
-) -> Result<(String, String, &'static str, Vec<u32>)> {
+) -> Result<Reply> {
     let eos = session.tk.eos_token_id;
-    let mut shown = String::new();
-    let mut produced: Vec<u32> = Vec::new();
     let mut reason = "length";
-    // **The thinking markers are kept; every other special is not.** A
-    // reasoning model emits `<think>…</think>` around its reasoning, and both
-    // are control tokens. Dropped, as they were, the client receives reasoning
-    // and answer as one string and shows the thinking as the reply — what Cline
-    // did. Rendered wholesale, `<|im_end|>` and the chat scaffolding leak in.
-    // A model without these markers yields `None` twice and nothing changes.
-    let think = [
-        session.tk.special_id("<think>"),
-        session.tk.special_id("</think>"),
-    ];
-    let keep = |id: u32| think.iter().any(|m| *m == Some(id));
+    // **Reasoning is a field of its own, not tagged text.** A reasoning model
+    // emits `<think>…</think>` around its reasoning and both are control tokens.
+    // Dropping them left the client one undifferentiated string and Cline showed
+    // the thinking as the reply; keeping them in `content` only moved the problem,
+    // since Cline renders the tags literally rather than folding them. So the two
+    // halves are streamed apart — `reasoning_content` and `content`, as DeepSeek's
+    // and vLLM's OpenAI-compatible servers do — and the markers themselves never
+    // go on the wire.
+    //
+    // A model without the markers yields `None` twice, `open` never matches, and
+    // every token is answer, exactly as before.
+    let open = session.tk.special_id("<think>");
+    let close = session.tk.special_id("</think>");
+    let mut part = Part::Content;
+    // Each half is decoded from its own ids: a token is not a character, so the
+    // text only renders once the following token arrives, and the two halves
+    // must not interleave while that settles.
+    let mut ids: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+    let mut shown: [String; 2] = [String::new(), String::new()];
+    let mut produced: Vec<u32> = Vec::new();
 
     for _ in 0..budget {
         // **Every token, and it costs nothing.** A peek is about a microsecond
@@ -977,8 +984,22 @@ fn generate<O: Ops>(
         }
         produced.push(next);
 
-        if let Ok(text) = session.tk.decode_keeping(&produced, &keep) {
-            if let Some(delta) = text.strip_prefix(shown.as_str()) {
+        // The markers switch halves and are never rendered themselves.
+        if Some(next) == open {
+            part = Part::Reasoning;
+            logits = session.engine.decode(next)?;
+            continue;
+        }
+        if Some(next) == close {
+            part = Part::Content;
+            logits = session.engine.decode(next)?;
+            continue;
+        }
+        let half = part as usize;
+        ids[half].push(next);
+
+        if let Ok(text) = session.tk.decode(&ids[half], false) {
+            if let Some(delta) = text.strip_prefix(shown[half].as_str()) {
                 if !delta.is_empty() {
                     // **A failed write is a gone client, not a server error.**
                     // `emit(delta)?` propagated it, so `generate` returned
@@ -990,14 +1011,14 @@ fn generate<O: Ops>(
                     //
                     // Both detections now land in the same place, so there is
                     // one exit and it always absorbs.
-                    if emit(delta).is_err() {
+                    if emit(delta, part).is_err() {
                         reason = "cancelled";
                         break;
                     }
-                    shown = text;
+                    shown[half] = text;
                 }
             } else {
-                shown = text;
+                shown[half] = text;
             }
         }
 
@@ -1009,8 +1030,35 @@ fn generate<O: Ops>(
     }
     // The ids, not just how many: the next turn's common-prefix scan needs to
     // see what the engine consumed, and the model's own output is part of that.
-    let plain = session.tk.decode(&produced, false).unwrap_or_else(|_| shown.clone());
-    Ok((shown, plain, reason, produced))
+    let [content, reasoning] = shown;
+    let plain = session
+        .tk
+        .decode(&produced, false)
+        .unwrap_or_else(|_| format!("{reasoning}{content}"));
+    Ok(Reply { content, reasoning, plain, reason, ids: produced })
+}
+
+/// Which half of a reasoning model's turn a piece of text belongs to. The
+/// discriminants index `generate`'s per-half buffers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Content = 0,
+    Reasoning = 1,
+}
+
+/// One finished turn, split the way a client needs it.
+struct Reply {
+    /// The answer: OpenAI's `content`.
+    content: String,
+    /// The reasoning between the markers: `reasoning_content`, empty for a model
+    /// that does not think.
+    reasoning: String,
+    /// Both halves with no markers, in the order the engine produced them. What
+    /// [`Session::absorb`] records, because `rendered` is matched against the
+    /// history a client sends back.
+    plain: String,
+    reason: &'static str,
+    ids: Vec<u32>,
 }
 
 fn stream_completion<O: Ops>(
@@ -1034,11 +1082,15 @@ fn stream_completion<O: Ops>(
 
     // Cloned before `sink` borrows the stream mutably.
     let probe = stream.try_clone().ok();
-    let mut sink = |delta: &str| -> Result<()> {
-        let c = chunk(&id, created, &model, json!({"content": delta}), None);
+    let mut sink = |delta: &str, part: Part| -> Result<()> {
+        let field = match part {
+            Part::Reasoning => "reasoning_content",
+            Part::Content => "content",
+        };
+        let c = chunk(&id, created, &model, json!({ field: delta }), None);
         sse(stream, &c)
     };
-    let (_text, plain, reason, ids) = generate(session, logits, budget, &mut sink, || {
+    let Reply { plain, reason, ids, .. } = generate(session, logits, budget, &mut sink, || {
         probe.as_ref().is_some_and(client_gone)
     })?;
     session.absorb(&plain, &ids);
@@ -1073,9 +1125,10 @@ fn whole_completion<O: Ops>(
     // without this it cannot tell a cancelled turn from a live one, and ran the
     // whole budget into a closed socket.
     let probe = stream.try_clone().ok();
-    let (text, plain, reason, ids) = generate(session, logits, budget, |_| Ok(()), || {
-        probe.as_ref().is_some_and(client_gone)
-    })?;
+    let Reply { content, reasoning, plain, reason, ids } =
+        generate(session, logits, budget, |_, _| Ok(()), || {
+            probe.as_ref().is_some_and(client_gone)
+        })?;
     let n = ids.len();
     session.absorb(&plain, &ids);
     if reason == "cancelled" {
@@ -1090,7 +1143,14 @@ fn whole_completion<O: Ops>(
         "model": opts.model_id,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": text},
+            // `reasoning_content` beside `content`, DeepSeek's field and the one
+            // OpenAI-compatible clients look for; omitted when the model does not
+            // think, rather than sent empty.
+            "message": if reasoning.is_empty() {
+                json!({"role": "assistant", "content": content})
+            } else {
+                json!({"role": "assistant", "content": content, "reasoning_content": reasoning})
+            },
             "finish_reason": reason,
         }],
         "usage": {
@@ -1423,10 +1483,10 @@ mod tests {
             panic!("the first turn reported a cancel");
         };
         assert!(n < checkpoint_spacing(8192), "the turn must be shorter than a spacing: {n}");
-        // `plain` is what a session records: the reply without the thinking
-        // markers, which is what a client sends back.
-        let (text, plain, _, ids) = generate(&mut s, logits, 8, |_| Ok(()), || false).expect("generate");
-        s.absorb(&plain, &ids);
+        // `plain` is what a session records: both halves, no markers.
+        let r = generate(&mut s, logits, 8, |_, _| Ok(()), || false).expect("generate");
+        let (text, ids) = (r.content.clone(), r.ids.clone());
+        s.absorb(&r.plain, &r.ids);
 
         let second = s.chat.wrap_turns(&[
             ("user", user),
@@ -1438,6 +1498,57 @@ mod tests {
         };
         println!("  first turn {n} tokens, generated {:?}; second turn {}, {fresh} new", text, how.label());
         assert!(matches!(how, Resume::Restored(p) if p == n), "resumed as {}, not at {n}", how.label());
+    }
+
+    /// The two halves of a turn leave `generate` separated, and no marker or
+    /// scaffolding token reaches either.
+    ///
+    /// **What it guards.** Cline shows `reasoning_content` as thinking and
+    /// `content` as the reply. Dropping the markers left it showing the model's
+    /// reasoning as the answer; putting them in `content` left it printing the
+    /// tags literally. `plain`, which the session records, has to stay the whole
+    /// reply either way, or the next turn re-prefills.
+    #[test]
+    #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
+    fn the_halves_of_a_turn_are_separated_and_carry_no_markers() {
+        let Some(f) = tiny_model() else { return };
+        let mut s = tiny_session(&f, 2048);
+        let prompt = s.chat.wrap_turns(&[("user", "What is 2+2?")]);
+        let Advanced::Ready(logits, _, _) = s.advance(&prompt, || false).expect("prefill") else {
+            panic!("the turn reported a cancel");
+        };
+        let mut streamed: Vec<(Part, String)> = Vec::new();
+        let r = generate(
+            &mut s,
+            logits,
+            24,
+            |delta, part| {
+                streamed.push((part, delta.to_string()));
+                Ok(())
+            },
+            || false,
+        )
+        .expect("generate");
+
+        for text in [&r.content, &r.reasoning, &r.plain] {
+            assert!(!text.contains("<think>"), "a marker reached the client: {text:?}");
+            assert!(!text.contains("</think>"), "a marker reached the client: {text:?}");
+            assert!(!text.contains("<|im_end|>"), "scaffolding reached the client: {text:?}");
+        }
+        // The session records both halves, so the next turn's prefix scan sees
+        // everything the engine consumed.
+        assert_eq!(r.plain, format!("{}{}", r.reasoning, r.content), "plain must be both halves");
+        // Every streamed piece belongs to the half it was tagged with.
+        let (mut c, mut t) = (String::new(), String::new());
+        for (part, delta) in &streamed {
+            match part {
+                Part::Content => c.push_str(delta),
+                Part::Reasoning => t.push_str(delta),
+            }
+        }
+        assert_eq!(c, r.content, "streamed content must equal the whole one");
+        assert_eq!(t, r.reasoning, "streamed reasoning must equal the whole one");
+        println!("  reasoning {} chars, content {} chars", r.reasoning.len(), r.content.len());
     }
 
     #[test]
