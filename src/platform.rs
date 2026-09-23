@@ -97,6 +97,80 @@ pub const DIRECT_BY_DEFAULT: bool = true;
 #[cfg(windows)]
 pub const DIRECT_BY_DEFAULT: bool = false;
 
+/// Whether a GPU allocation also commits system memory, one for one.
+///
+/// **True on Windows.** WDDM keeps a system-memory backing store for device
+/// allocations, so RAM must hold the VRAM footprint *as well as* the pinned
+/// tier. Measured on the 125B, natively, peak private bytes against the two
+/// budgets: 8.91 GiB slab + 6 GiB tier = 21.3 GB; the same slab + 2 GiB tier =
+/// 17.3 (−4.0, the tier exactly); 4 GiB slab + 2 GiB tier = 12.2 (−5.1, the
+/// slab). A 16 GB card filled beside a 6 GiB tier therefore commits over 20 GB
+/// before the model computes anything, which is what took a 32 GB machine to
+/// 0.4 GB free and hung it.
+///
+/// **False on Linux**, where a device allocation costs no host memory, and the
+/// WSL guest sees only its own cap.
+#[cfg(windows)]
+pub const RAM_COMMITS_VRAM: bool = true;
+#[cfg(unix)]
+pub const RAM_COMMITS_VRAM: bool = false;
+
+/// Left for the rest of the machine when the tiers are sized: 1 GiB (the
+/// user's call, 23-09). The budget is taken from memory that is *available*
+/// now — what Windows and a browser already hold is therefore already excluded,
+/// and this is the slack on top of that.
+pub const RAM_HEADROOM: u64 = 1 << 30;
+
+/// Physical memory that can be had without paging, in bytes.
+///
+/// Windows: `ullAvailPhys`, which counts free and standby pages — the standby
+/// list is file cache the memory manager hands back on demand. Linux:
+/// `MemAvailable`, the kernel's own estimate of the same thing.
+///
+/// `None` when it cannot be read, and every caller must then carry on with its
+/// own defaults rather than refuse to run.
+#[cfg(windows)]
+pub fn available_ram() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+    let mut s = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    // SAFETY: `s` is a correctly sized, initialised `MEMORYSTATUSEX` with its
+    // `length` set, which is the call's only contract.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut s) } != 0;
+    ok.then_some(s.avail_phys)
+}
+
+#[cfg(unix)]
+pub fn available_ram() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
 /// Open a model file for tier-3 reads, unbuffered when `direct`.
 ///
 /// **Why unbuffered**: stage 0 on this drive read 4.7–4.9 GB/s with `O_DIRECT`

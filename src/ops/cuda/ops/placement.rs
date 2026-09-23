@@ -208,6 +208,89 @@ impl Cuda {
         self.expert_reserve.set(self.expert_reserve.get().max(want));
     }
 
+    /// RAM left for the rest of the machine, [`crate::platform::RAM_HEADROOM`]
+    /// unless `INFERRED_RAM_HEADROOM_GIB` says otherwise — which is also how a
+    /// test makes memory scarce without filling it.
+    fn headroom_bytes() -> u64 {
+        std::env::var("INFERRED_RAM_HEADROOM_GIB")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|g| (g * 1073741824.0) as u64)
+            .unwrap_or(crate::platform::RAM_HEADROOM)
+    }
+
+    /// Hold the tiers inside the RAM that is actually available, returning the
+    /// slab budget that fits. Lowers the pinned host tier first, then the slab.
+    ///
+    /// **Why the slab counts against RAM at all, on Windows.** A device
+    /// allocation there carries a system-memory backing store, so RAM must hold
+    /// the VRAM footprint as well as the pinned tier
+    /// (`platform::RAM_COMMITS_VRAM` has the measurements). On Linux only the
+    /// pinned tier is charged, and the slab passes through untouched.
+    ///
+    /// **The rule is the user's (23-09): everything available now, less 1 GiB.**
+    /// `available_ram` already excludes what the rest of the machine holds, so
+    /// the headroom is slack on top of that. The host tier gives way first
+    /// because its size barely moves decode — SSD-TIER D21 measured 6 -> 14 GiB
+    /// as a wash, since a host-tier hit is still read across the bus — whereas
+    /// VRAM residency is the only thing that makes the model faster.
+    ///
+    /// Unreadable memory means no ceiling: the defaults stand, as they did
+    /// before this existed.
+    fn ram_ceiling(&self, slab: usize, free_vram: usize, total_vram: usize) -> usize {
+        let Some(avail) = crate::platform::available_ram() else {
+            return slab;
+        };
+        let budget = avail.saturating_sub(Self::headroom_bytes()) as usize;
+        // **The whole card, not what is taken so far.** The slab is sized inside
+        // layer 0, before most dense weights are up, so "used now + slab" read
+        // ~10 GiB where the run committed 21.3 GB. The engine fills the card by
+        // design — slab, dense weights, KV, activations — so the honest estimate
+        // of what RAM will have to mirror is the card itself. Measured: card
+        // 15.93 GiB + 6 GiB tier = 21.9 against 21.3 GB of peak private bytes.
+        let _ = free_vram;
+        let vram = if crate::platform::RAM_COMMITS_VRAM { total_vram } else { 0 };
+        let host = self.expert_host_budget.get();
+        if vram.saturating_add(host) <= budget {
+            return slab;
+        }
+        // The tier first, down to nothing: its experts become cold and are
+        // fetched from the file, which is a speed cost, not a failure.
+        let host_fits = budget.saturating_sub(vram).min(host);
+        self.expert_host_budget.set(host_fits);
+        // **A floor, because below it the model cannot run at all.** A slab
+        // smaller than one layer's picks fails mid-resolve — "every one of the
+        // 423 VRAM slots holds an expert the layer being resolved picked" — and
+        // a configuration that cannot run is worse than one that leaves the
+        // machine tight. At 0.36 GiB the 125B failed; 2 GiB is ~5x the slots
+        // that failed and still a quarter of its usual slab. If even this
+        // overruns the budget, the line below says so and the run goes ahead.
+        const MIN_SLAB: usize = 2 << 30;
+        let slab_fits = if vram > budget {
+            // Even the VRAM footprint does not fit. Shrink the slab by the
+            // overrun; the experts it would have held go cold too.
+            slab.saturating_sub(vram - budget).max(slab.min(MIN_SLAB))
+        } else {
+            slab
+        };
+        if slab_fits.saturating_add(vram.saturating_sub(slab)) > budget {
+            eprintln!(
+                "budgets: the RAM ceiling cannot be met without a slab below {:.2} GiB, which cannot hold one layer's picks; proceeding over the ceiling",
+                MIN_SLAB as f64 / 1073741824.0,
+            );
+        }
+        eprintln!(
+            "budgets capped by RAM: {:.2} GiB available, {:.2} GiB headroom -> host tier {:.2} -> {:.2} GiB, slab {:.2} -> {:.2} GiB",
+            avail as f64 / 1073741824.0,
+            Self::headroom_bytes() as f64 / 1073741824.0,
+            host as f64 / 1073741824.0,
+            host_fits as f64 / 1073741824.0,
+            slab as f64 / 1073741824.0,
+            slab_fits as f64 / 1073741824.0,
+        );
+        slab_fits
+    }
+
     /// Declare the model's whole expert pool — the sum of `n_expert` over every
     /// expert tensor — so the read counters are sized for all of it.
     ///
@@ -296,8 +379,8 @@ impl Cuda {
             // Sized here rather than at construction, because "free VRAM" only
             // means something once the permanent weights are on their way up.
             // Nothing before the first expert of layer 0 is large.
-            let (free, _) = self.mem_info()?;
-            let budget = self.slab_budget(free);
+            let (free, total) = self.mem_info()?;
+            let budget = self.ram_ceiling(self.slab_budget(free), free, total);
             let slots = budget / w.data.len().max(1);
             let mut c = experts::ExpertCache::new(w.data.len(), slots, self.expert_host_budget.get())?;
             if let Some(n) = self.expert_pool.get() {
@@ -334,8 +417,8 @@ impl Cuda {
         let key = w.data.as_ptr() as usize;
         let mut slot = self.experts.borrow_mut();
         if slot.is_none() {
-            let (free, _) = self.mem_info()?;
-            let budget = self.slab_budget(free);
+            let (free, total) = self.mem_info()?;
+            let budget = self.ram_ceiling(self.slab_budget(free), free, total);
             let stride = w.stride();
             let slots = self.expert_slots.get().unwrap_or(budget / stride.max(1));
             let mut c = experts::ExpertCache::new(stride, slots, self.expert_host_budget.get())?;
