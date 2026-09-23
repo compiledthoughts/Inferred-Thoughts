@@ -97,6 +97,30 @@ pub const DIRECT_BY_DEFAULT: bool = true;
 #[cfg(windows)]
 pub const DIRECT_BY_DEFAULT: bool = false;
 
+/// Let the console print UTF-8.
+///
+/// **Windows consoles default to a legacy code page** (437 here), so a UTF-8
+/// byte sequence arrives as mojibake — the start-up wordmark's block characters
+/// become three accented letters each. `SetConsoleOutputCP(CP_UTF8)` fixes it
+/// for the process's own console and touches nothing else. A redirected stream
+/// is unaffected either way, and a failure is ignored: the banner is decoration.
+#[cfg(windows)]
+pub fn init_console() {
+    unsafe extern "system" {
+        fn SetConsoleOutputCP(code_page: u32) -> i32;
+    }
+    const CP_UTF8: u32 = 65001;
+    // SAFETY: the call takes a code page by value and returns a flag; it cannot
+    // fail in a way that matters here.
+    unsafe {
+        let _ = SetConsoleOutputCP(CP_UTF8);
+    }
+}
+
+/// Nothing to do: a Linux terminal is already UTF-8.
+#[cfg(unix)]
+pub fn init_console() {}
+
 /// Whether a GPU allocation also commits system memory, one for one.
 ///
 /// **True on Windows.** WDDM keeps a system-memory backing store for device

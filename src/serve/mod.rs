@@ -1311,6 +1311,35 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>)> {
 /// build step, talking to this same server's `/v1/chat/completions`.
 const UI: &str = include_str!("../../ui/index.html");
 
+/// The wordmark, once, before a server loads its model.
+///
+/// Solid blocks rather than outlines, and only when stderr is a terminal: a log
+/// file or a pipe keeps the machine-readable shape every script here greps.
+pub fn banner() {
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    crate::platform::init_console();
+    eprintln!();
+    for line in [
+        "  ████ █  █ ████ ████ ███  ███  ████ ███ ",
+        "   ██  ██ █ █    █    █  █ █  █ █    █  █",
+        "   ██  █ ██ ███  ███  ███  ███  ███  █  █",
+        "   ██  █  █ █    █    █ █  █ █  █    █  █",
+        "  ████ █  █ █    ████ █  █ █  █ ████ ███ ",
+        "",
+        "  ████ █  █  ██  █  █  ███ █  █ ████  ███",
+        "   ██  █  █ █  █ █  █ █    █  █  ██  █   ",
+        "   ██  ████ █  █ █  █ █ ██ ████  ██   ██ ",
+        "   ██  █  █ █  █ █  █ █  █ █  █  ██     █",
+        "   ██  █  █  ██   ██   ███ █  █  ██  ███ ",
+    ] {
+        eprintln!("{line}");
+    }
+    eprintln!("                        by compiledthoughts.dev\n");
+}
+
 /// One line, rewritten in place, while a long prompt prefills.
 ///
 /// **Because the wait is otherwise silent.** A 3,879-token turn on

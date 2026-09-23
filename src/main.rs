@@ -1300,9 +1300,13 @@ fn with_batch<'a, O: inferred_thoughts::Ops>(
 }
 
 fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
-    use inferred_thoughts::serve::{ServeOpts, serve as run_server};
+    use inferred_thoughts::serve::{ServeOpts, banner, serve as run_server};
     use inferred_thoughts::tok::chat::ChatMl;
     use inferred_thoughts::{Engine, Model, Naive, Par, Spin, Tokenizer};
+
+    // First, before the model is opened: loading the 125B is a minute of
+    // silence, and a wordmark that arrives after it is decoration for nobody.
+    banner();
 
     let f = GgufFile::open(&a.model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
