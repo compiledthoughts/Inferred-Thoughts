@@ -184,10 +184,10 @@ async function send(text) {
       // SSE frames are separated by a blank line; a frame can arrive in pieces.
       let cut;
       while ((cut = buf.indexOf("\n\n")) !== -1) {
-        const frame = buf.slice(0, cut).trim();
+        const raw = buf.slice(0, cut).trim();
         buf = buf.slice(cut + 2);
-        if (!frame.startsWith("data:")) continue;
-        const payload = frame.slice(5).trim();
+        if (!raw.startsWith("data:")) continue;
+        const payload = raw.slice(5).trim();
         if (payload === "[DONE]") continue;
         let frame;
         try { frame = JSON.parse(payload); } catch { continue; }
