@@ -64,9 +64,8 @@ On one RTX 5060 Ti (16 GB) with 32 GB of system RAM, native Windows:
 | model | file | of which PLE | VRAM | pinned RAM | from SSD | prefill | decode |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | **Qwen3.8-Flash-Next** 176.9B | 119.0 GiB | 50.7 GiB | 13.6 GiB | 6.0 GiB | **76.6%** of experts, 271 MiB/token | 49.2 | **9.06** |
-| Qwen3.6-35B-A3B NVFP4 | 19.1 GiB | — | 13.5 GiB | 5.8 GiB | none | 591.2 | 34.3 |
-| Qwen3.6-35B-A3B IQ4_XS | 17.5 GiB | — | 13.2 GiB | 5.0 GiB | none | 668.8 | 34.1 |
-| Qwen3.5-9B Q8_0 | 9.1 GiB | — | 8.2 GiB | none | none | 281.6 | 40.7 |
+| Qwen3.6-35B-A3B NVFP4 | 19.1 GiB | — | 13.5 GiB | 5.8 GiB | none | 591.2 | 47.3 |
+| Qwen3.6-35B-A3B IQ4_XS | 17.5 GiB | — | 13.2 GiB | 5.0 GiB | none | 668.8 | 41.1 |
 | Qwen3-0.6B Q8_0 | 0.6 GiB | — | 1.5 GiB | none | none | 2,659.8 | 292.8 |
 
 The 125B's **best observed turn is 10.40 tok/s** — 110 tokens at shallow depth,
