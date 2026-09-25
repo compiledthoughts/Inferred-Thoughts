@@ -48,6 +48,7 @@ llama.cpp is ahead: ~965 prefill and ~52 decode on the IQ4_XS file.
 | | tested | required |
 |---|---|---|
 | GPU | RTX 5060 Ti 16 GB | NVIDIA Blackwell (RTX 50-series, `sm_120`) |
+| CPU | Ryzen 7 9700X (Zen 5) | any x86-64; the build targets the CPU it runs on. Intel untested |
 | Driver / CUDA | 591.86 / CUDA 12.8 | R570+ / CUDA Toolkit 12.8+ |
 | OS | Windows 11 native; WSL2 Ubuntu 24.04 | native Linux should work, but is untested |
 | Build tools | Rust 1.98, VS 2022 Build Tools (MSVC 14.44) | Rust stable; on Windows, VS 2022 Build Tools (C++) |
