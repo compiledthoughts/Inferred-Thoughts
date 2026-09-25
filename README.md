@@ -1,8 +1,7 @@
 # inferredThoughts
 
-A Rust + CUDA inference engine for mixture-of-experts models that fit in
-neither your GPU nor your RAM — models where more than half the weights stay on
-the SSD while they run.
+A Rust + CUDA inference engine for mixture-of-experts models, streaming their
+experts from the SSD.
 
 It runs **Qwen3.8-Flash-Next — 176.9B parameters, a 119 GiB file — at ~9 tokens
 a second on a 16 GB RTX 5060 Ti with 32 GB of RAM.** About 99 GiB of that file,
