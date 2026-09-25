@@ -1,138 +1,75 @@
-# How it works
+# How the SSD streaming works
 
-A Rust engine that runs GGUF mixture-of-experts models whose weights do not fit
-in VRAM. One binary, CUDA kernels written here, no PyTorch and no `libllama`.
-
-The interesting part is not the arithmetic — it is **where each expert lives and
-when its bytes move**. Everything below serves that.
-
----
-
-## The shape
+A mixture-of-experts model is mostly experts, and each token uses only a few of
+them. Qwen3.8-Flash-Next has 512 experts in each of its 48 layers and picks 10
+per layer per token. Its experts are 63.3 GiB; the card has 16 GB. So the
+experts live in three tiers, and the engine decides token by token which ones
+belong where.
 
 ```
-  GGUF file  ─►  model  ─►  Engine  ─►  Ops (the seam)  ─►  naive | spin | cuda
-   mmap          arch       KV cache,       one trait          scalar  threads  GPU
-   metadata      decode     batching,       per kernel
-   tensors       + weights  sampling
+  VRAM slab     ~400 GB/s   fixed slots, one expert each, a cache with GCLOCK eviction
+     ▲
+  pinned RAM     ~26 GB/s   page-locked host memory, read by the GPU across PCIe
+     ▲
+  NVMe (GGUF)     ~5 GB/s   everything else, read from the model file when picked
 ```
 
-- **`gguf`** reads the file: metadata, the tensor index, and a memory map. Every
-  architectural constant comes from the file, never from a table in the code.
-- **`model`** decodes one architecture per file (`src/model/<arch>.rs`). Comments
-  throughout the source cite internal design notes (`qwen4exp.md`,
-  `SSD-TIER.md` and others) that are not published; the code and its tests are
-  the record here.
-- **`engine`** owns the pass: prefill in batches, decode a token at a time, the
-  KV cache, the recurrent state, and the profile counters.
-- **`ops`** is the seam. One trait, one method per kernel. Everything above it
-  is backend-agnostic; everything below is a backend.
+## At load
 
-## The backends, and why there are four
+The dense weights and the KV cache go into VRAM first. The expert slab takes
+most of what is left, then the pinned tier fills up to its budget (6 GiB by
+default, never more than available RAM less 1 GiB). Every other expert stays in
+the file. For the 176.9B at default settings:
 
-| | what it is | why it exists |
-|---|---|---|
-| `naive` | scalar f32, single thread, no `unsafe` | **the oracle.** Never optimised. Everything else is checked against it |
-| `par` | rayon | superseded, kept as the control for a measured dispatch finding |
-| `spin` | `naive`'s kernels on a spin-waiting pool | the CPU engine |
-| `cuda` | driver API, PTX compiled by `build.rs` and embedded | the GPU engine |
+| VRAM | pinned RAM | on SSD |
+|---:|---:|---:|
+| 10,247 | 6,984 | 56,497 |
 
-**A backend that only redistributes work must reproduce the oracle bit for
-bit.** Parallel kernels are parallel over independent outputs, so each
-accumulation keeps its serial order. Where that is impossible — tensor cores
-fold differently from a scalar loop — the departure needs three things: a
-tolerance derived from the arithmetic, a switch that restores the exact path,
-and a test proving the switch works.
+expert tensors, of 73,728. The file is read in place: GGUF already aligns its
+tensors, so there is no repacked copy on disk. The model's 50.7 GiB n-gram table
+also stays in the file; each token reads 16 of its rows.
 
-## The expert tiers
+## Each token, each layer
 
-An MoE model's routed experts are most of its bytes and only a fraction are
-touched per token. They live in three places:
+1. **The router picks** 10 experts.
+2. **In VRAM:** used directly.
+3. **In pinned RAM:** the kernel reads the weights across PCIe itself. No copy,
+   no host involvement.
+4. **On the SSD:** the layer's cold experts are read as one batch by 8 threads,
+   each with its own file handle, into page-locked staging. Each upload into a
+   slab slot is queued rather than waited on. The slot's previous expert is
+   evicted by GCLOCK; its table entry is repointed first, and experts the
+   current layer is using cannot be evicted.
+5. **Lookahead:** the next layer's router is run early on this layer's output,
+   so the experts it will want are already being read while the GPU works.
 
-```
-  VRAM slab  ─ one allocation, cut into slots, one expert each, evicted by GCLOCK
-  host tier  ─ page-locked RAM, read across PCIe by the kernel itself
-  the file   ─ everything else, fetched on demand when a layer picks it
-```
+Reads are unbuffered (`O_DIRECT`) on Linux. On Windows they are buffered,
+because while a file is memory-mapped, Windows serves unbuffered reads of it at
+~3.0 GB/s against ~5.3 buffered.
 
-- **Every expert is addressable at all times.** A CUDA graph replays a fixed
-  sequence with no host involvement, so a miss cannot be serviced mid-token; an
-  expert that is not resident still has a valid device address, in the host tier
-  or after a fetch.
-- **The slab is a cache, not storage.** Slots are reused; the victim's table
-  entry is repointed before its slot is overwritten, and the experts a layer is
-  currently resolving are leased so they cannot be evicted underneath it.
-- **Tier 3 fetches in parallel** — several threads, each with its own file
-  handle, into page-locked staging, unbuffered on Linux and buffered on Windows
-  (where an open memory mapping of a file makes unbuffered reads of it slower).
-- **Lookahead prefetch** runs the next layer's router on this layer's output, so
-  the experts it will want are read while the GPU is still busy.
+## What it achieves
 
-The policy is measured rather than asserted: on a 176.9B model with 14% of its
-experts in VRAM, **90.5% of expert reads are served from VRAM** — ahead of the
-best fixed placement of the busiest experts, which serves 75.6%.
+On the 176.9B, with 14% of the experts in VRAM, **about 90% of expert reads are
+served from VRAM**, and the drive supplies ~270 MiB a token. The cache adapts
+as a conversation moves: the best *fixed* choice of the busiest experts would
+serve 81%.
 
-## What the engine refuses to do
+## Correctness
 
-- **Never materialise an f32 copy of a weight.** Matmuls walk quantized blocks.
-- **Never hand the seam a sub-slice of an activation buffer.** A device backend
-  keys its mirrors on the host address, so `&x[k..]` is an address it has never
-  seen; there are explicit gather and scatter ops for that.
-- **Never change a decode pass's kernel sequence with depth.** Decode replays a
-  recorded graph; anything depth-dependent is a kernel argument.
-- **Never invent a constant.** Read it from the file or from the reference
-  implementation's source, cite it, and fail loudly when a key is missing.
+Where an expert comes from never changes the answer. The acceptance test
+generates the same prompt at full budgets and at tier caps that force most
+experts to stream from disk, and requires identical tokens. Every kernel is
+checked against llama.cpp and against a scalar reference implementation kept
+in the engine.
 
-## How correctness is established
+## What is next
 
-1. **Fixtures from the reference.** Every numeric kernel has a unit test against
-   values dumped from llama.cpp before it is used anywhere.
-2. **Differential tests between backends.** Bit equality where the arithmetic
-   allows it, and a named, switchable tolerance where it does not.
-3. **Whole-model comparison.** `inferred trace` checksums every intermediate
-   tensor for a prompt, and a script diffs that against
-   `llama-eval-callback`'s. Agreement of ~1e-3 per tensor at Q8_0 is the
-   quantization floor, not slack.
-4. **Acceptance tests.** The same prompt generates identical tokens at full
-   budgets and at tier caps that force most experts to stream from disk.
+- **Fewer bytes per expert.** VRAM is the only tier that makes decode faster,
+  and it is full; a smaller expert format fits more of them.
+- **Less host time per token.** Bringing the router's picks back to the host
+  each layer is the largest single host cost, ~41 ms of a ~118 ms token.
+- **One slot per expert.** Gate, up and down of an expert placed together: one
+  lookup and one read instead of three.
 
-## The server
-
-`inferred serve` speaks the OpenAI chat API, and serves a chat page from the
-binary itself at `/`. Two things beyond the protocol:
-
-- **Conversation reuse.** The session records the exact text the engine has
-  consumed. A turn that extends it prefills only the difference; a turn that
-  diverges returns to the nearest checkpoint rather than to zero.
-- **Reasoning is separated.** A reasoning model's `<think>…</think>` is streamed
-  as `reasoning_content`, the answer as `content`, and the markers never reach
-  the client.
-
----
-
-## Work in progress
-
-Honest about what is not done, in the order it is likely to be tackled.
-
-- **Where the token goes, natively.** The decomposition that drives the work —
-  roughly half GPU kernels, half host path, barely overlapping — was measured
-  under WSL before two changes that moved both halves. The largest single host
-  item is the router's picks coming back to the host, ~41 ms of a ~118 ms token.
-- **Fewer bytes per expert.** Capacity on a 16 GB card is exhausted; two
-  independent lines of measurement end at "only VRAM residency helps", and the
-  way to more residency is a smaller expert quant.
-- **A fused expert slot.** Gate, up and down of one expert in one slot: one
-  table and one gather instead of three, the expert placed as a unit.
-- **Tool calling.** The server accepts `tools` and ignores it, so a client that
-  expects function calls gets prose. The models' own template is Hermes-style
-  (`<tools>` in the system block, `<tool_call>` in the reply), which is what
-  should be implemented.
-- **A UI beyond chat.** Live tier and memory figures — how much came from VRAM,
-  from RAM, from the SSD — and sliders for the context and tier caps. The engine
-  reports VRAM today; host memory is not exposed yet.
-- **Wider hardware.** Kernels are built `sm_120a`: consumer Blackwell only,
-  because the FP4 tensor cores are the point. Older cards would run scalar
-  fallbacks and be a slower llama.cpp, which already serves those users well.
-- **Native Linux** should work unchanged — every WSL mention in the source is a
-  comment rather than a branch — but that is untested.
-- **Prefill on the 125B** is ~50 tok/s and has had no attention at all.
+Source comments cite internal design notes (`SSD-TIER.md`, `qwen4exp.md` and
+others) that are not published; the code and its tests are the record here.
