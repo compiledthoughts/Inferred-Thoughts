@@ -1,12 +1,14 @@
 # inferredThoughts
 
-A Rust + CUDA inference engine for mixture-of-experts models that are larger
-than your GPU.
+A Rust + CUDA inference engine for mixture-of-experts models that fit in
+neither your GPU nor your RAM — models where more than half the weights stay on
+the SSD while they run.
 
 It runs **Qwen3.8-Flash-Next — 176.9B parameters, a 119 GiB file — at ~9 tokens
-a second on a single 16 GB RTX 5060 Ti**. VRAM, pinned system RAM and the NVMe
-drive are treated as one memory hierarchy: the experts the router keeps asking
-for stay in VRAM, and the rest are streamed from the SSD as they are picked.
+a second on a 16 GB RTX 5060 Ti with 32 GB of RAM.** About 99 GiB of that file,
+83%, stays on the NVMe drive. VRAM, pinned RAM and the SSD work as one memory
+hierarchy: the experts the router keeps asking for stay in VRAM, and the rest
+are read from the SSD as they are picked.
 
 - One binary: Rust host, CUDA kernels written here, compiled to PTX and embedded.
   No Python, no PyTorch, no `libllama`. A built binary needs only the NVIDIA driver.
