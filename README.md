@@ -52,10 +52,8 @@ use. llama.cpp runs everything, everywhere, and is faster on the 35B — it is t
 reference every kernel here was checked against, and the honest comparison is
 below, including where we lose.
 
-| | |
-|---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | how it works, and what is still unfinished |
-| [`src/model/*.md`](src/model/) | one living reference per architecture, beside its code |
+How it works, and what is still unfinished:
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## What runs
 

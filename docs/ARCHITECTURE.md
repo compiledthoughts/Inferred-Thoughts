@@ -19,9 +19,10 @@ when its bytes move**. Everything below serves that.
 
 - **`gguf`** reads the file: metadata, the tensor index, and a memory map. Every
   architectural constant comes from the file, never from a table in the code.
-- **`model`** decodes one architecture per file (`src/model/<arch>.rs`), with a
-  living reference beside it (`src/model/<arch>.md`) describing the forward pass
-  as the reference implementation performs it.
+- **`model`** decodes one architecture per file (`src/model/<arch>.rs`). Comments
+  throughout the source cite internal design notes (`qwen4exp.md`,
+  `SSD-TIER.md` and others) that are not published; the code and its tests are
+  the record here.
 - **`engine`** owns the pass: prefill in batches, decode a token at a time, the
   KV cache, the recurrent state, and the profile counters.
 - **`ops`** is the seam. One trait, one method per kernel. Everything above it
