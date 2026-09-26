@@ -137,5 +137,5 @@ The `--ignored` tests look for models in `INFERRED_MODEL_DIR`.
 
 ## License
 
-Apache 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE). llama.cpp is the
-behavioural reference every kernel was checked against.
+Apache 2.0 — see [`LICENSE`](LICENSE). llama.cpp is the behavioural reference
+every kernel was checked against.
