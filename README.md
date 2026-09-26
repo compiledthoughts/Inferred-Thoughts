@@ -83,8 +83,11 @@ Linux or WSL2: the same command. `build.rs` finds `nvcc` through `CUDA_PATH`,
 
 ## Run
 
+The build puts the binary at `target/release/inferred` (`target\release\inferred.exe`
+on Windows).
+
 ```bash
-inferred serve -m Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
+./target/release/inferred serve -m Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
 ```
 
 Open `http://127.0.0.1:8080/` for the chat page. Any OpenAI-compatible client
@@ -93,7 +96,7 @@ can use `http://127.0.0.1:8080/v1`.
 One-shot, from the command line:
 
 ```bash
-inferred generate -m <gguf> --backend cuda --chat -n 256 -p "Explain MoE routing."
+./target/release/inferred generate -m <gguf> --backend cuda --chat -n 256 -p "Explain MoE routing."
 ```
 
 | flag | |
