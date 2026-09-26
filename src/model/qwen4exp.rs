@@ -759,8 +759,8 @@ struct PleState {
 ///
 /// **Without it `serve` could answer one turn and no more**: a new request whose
 /// history differs from what was cached returns to a checkpoint, and PLE refused
-/// every pass that did not continue exactly where the last ended. pulsar reports
-/// the same gap (`qwen4exp.md`, "Other implementations").
+/// every pass that did not continue exactly where the last ended. Other
+/// implementations report the same gap (`qwen4exp.md`, "Other implementations").
 #[derive(Clone, Debug)]
 pub struct PleSnapshot {
     next_pos: usize,
