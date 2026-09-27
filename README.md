@@ -21,7 +21,8 @@ of the file left on the SSD. How it works:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 That is the proof this route is worth pursuing: next come bigger models on the
-same card, and tool calling so it can drive agents.
+same card, and tool calling so it can drive agents. **This is the first cut** —
+we expect it to get faster and better from here.
 
 ## Tested so far
 
