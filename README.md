@@ -157,6 +157,14 @@ Prompts are rendered with each model's own chat template, so an agent client
 `tool_calls`, in the format the model was trained on, and reasoning as
 `reasoning_content`.
 
+**Thinking** is on by default, and it costs tokens before every answer:
+
+| | server default | per request |
+|---|---|---|
+| turn thinking off (both models) | `--think off` | `"chat_template_kwargs": {"enable_thinking": false}` |
+| shorter thinking (176.9B: `xhigh`, `medium`, `low`) | `--reasoning-effort low` | `"reasoning_effort": "low"` |
+| reply length | `--max-tokens N`; default: until the context is full | `"max_tokens": N` |
+
 For `--ctx` and `--expert-host`, see
 [Context length and the KV cache](#context-length-and-the-kv-cache).
 
