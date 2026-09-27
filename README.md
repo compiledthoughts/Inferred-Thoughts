@@ -54,6 +54,83 @@ a chat turn, and on the 176.9B it falls as a conversation grows. On the same
 machine, natively on Windows, llama.cpp averaged 4.9 tok/s decoding the
 176.9B, against 9.06 for this engine.
 
+## Quick start
+
+### What you need
+
+- An RTX 50-series or RTX PRO Blackwell GPU; NVIDIA driver R570+; CUDA 12.8+
+- Rust (stable). On Windows: VS 2022 Build Tools, building from the *x64 Native Tools Command Prompt*
+- For the 176.9B: 32 GB of RAM and a fast local NVMe. Under WSL, keep models on ext4 (`~/models`), not `/mnt/c`.
+- To download models: Python 3.9+ (for the `hf` command), or `curl`; and free disk space: 128 GB for the 176.9B, 20.5 GB for the 35B.
+
+### Get a model
+
+Both GGUFs are on Hugging Face, no login needed. Model pages:
+[Qwen3.8-Flash-Next-NVFP4-Q8_0](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0)
+(176.9B) and
+[Qwen3.6-35B-A3B-NVFP4-Q8_0-it](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it)
+(35B); all models: [huggingface.co/CompiledThoughts](https://huggingface.co/CompiledThoughts).
+
+```bash
+pip install -U huggingface_hub
+
+# Qwen3.8-Flash-Next, 176.9B (119 GiB = 128 GB)
+hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --local-dir models
+
+# Qwen3.6-35B-A3B (19.1 GiB = 20.5 GB)
+hf download CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --local-dir models
+```
+
+If a download is interrupted, run the same command again and it resumes.
+Without Python, `curl -L -C - -O <url>` also resumes, with the URL
+`https://huggingface.co/<repo>/resolve/main/<file>`. Under WSL, use
+`--local-dir ~/models`.
+
+To check the 176.9B file (Linux or WSL), fetch the checksum beside it and
+verify:
+
+```bash
+hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 SHA256SUMS --local-dir models
+cd models && sha256sum -c SHA256SUMS
+```
+
+### Build and run
+
+```bash
+cargo build --release --features cuda
+./target/release/inferred serve -m models/Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
+```
+
+On Windows the binary is `target\release\inferred.exe`. Open
+`http://127.0.0.1:8080/` for the chat page; any OpenAI-compatible client can
+use `http://127.0.0.1:8080/v1`.
+
+Prompts are rendered with each model's own chat template, so an agent client
+(Cline, or anything that sends OpenAI `tools`) gets **tool calls** back as
+`tool_calls`, in the format the model was trained on, and reasoning as
+`reasoning_content`.
+
+**Thinking** is on by default, and it costs tokens before every answer:
+
+| | server default | per request |
+|---|---|---|
+| turn thinking off (both models) | `--think off` | `"chat_template_kwargs": {"enable_thinking": false}` |
+| shorter thinking (176.9B: `xhigh`, `medium`, `low`) | `--reasoning-effort low` | `"reasoning_effort": "low"` |
+| reply length | `--max-tokens N`; default: until the context is full | `"max_tokens": N` |
+
+For `--ctx` and `--expert-host`, see
+[Context length and the KV cache](#context-length-and-the-kv-cache).
+
+Tests: `cargo test --release --features cuda` (198, no GPU needed).
+
+## Limits and next
+
+- Tested on two models, one GPU family, Windows and WSL2 only.
+- Greedy decoding only. Tool calls stream as they are written; `tool_choice` other than `"none"` is left to the model.
+- Next: bigger models, older NVIDIA GPUs, native Linux.
+
+## Details
+
 ### The weight format: NVFP4
 
 Both models keep their routed experts in NVFP4: each weight is a 4-bit float
@@ -109,83 +186,6 @@ target\release\inferred.exe serve -m models\Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf -
 
 On the 35B, decode costs ~21.3 ms plus ~0.08 µs per position of context;
 prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
-
-## What you need
-
-- An RTX 50-series or RTX PRO Blackwell GPU; NVIDIA driver R570+; CUDA 12.8+
-- Rust (stable). On Windows: VS 2022 Build Tools, building from the
-  *x64 Native Tools Command Prompt*
-- For the 176.9B: 32 GB of RAM and a fast local NVMe. Under WSL, keep models
-  on ext4 (`~/models`), not `/mnt/c`.
-- To download models: Python 3.9+ (for the `hf` command), or `curl`; and free
-  disk space: 128 GB for the 176.9B, 20.5 GB for the 35B.
-
-## Get a model
-
-Both GGUFs are on Hugging Face, no login needed. Model pages:
-[Qwen3.8-Flash-Next-NVFP4-Q8_0](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0)
-(176.9B) and
-[Qwen3.6-35B-A3B-NVFP4-Q8_0-it](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it)
-(35B); all models: [huggingface.co/CompiledThoughts](https://huggingface.co/CompiledThoughts).
-
-```bash
-pip install -U huggingface_hub
-
-# Qwen3.8-Flash-Next, 176.9B (119 GiB = 128 GB)
-hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --local-dir models
-
-# Qwen3.6-35B-A3B (19.1 GiB = 20.5 GB)
-hf download CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --local-dir models
-```
-
-If a download is interrupted, run the same command again and it resumes.
-Without Python, `curl -L -C - -O <url>` also resumes, with the URL
-`https://huggingface.co/<repo>/resolve/main/<file>`. Under WSL, use
-`--local-dir ~/models`.
-
-To check the 176.9B file (Linux or WSL), fetch the checksum beside it and
-verify:
-
-```bash
-hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 SHA256SUMS --local-dir models
-cd models && sha256sum -c SHA256SUMS
-```
-
-## Build and run
-
-```bash
-cargo build --release --features cuda
-./target/release/inferred serve -m models/Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
-```
-
-On Windows the binary is `target\release\inferred.exe`. Open
-`http://127.0.0.1:8080/` for the chat page; any OpenAI-compatible client can
-use `http://127.0.0.1:8080/v1`.
-
-Prompts are rendered with each model's own chat template, so an agent client
-(Cline, or anything that sends OpenAI `tools`) gets **tool calls** back as
-`tool_calls`, in the format the model was trained on, and reasoning as
-`reasoning_content`.
-
-**Thinking** is on by default, and it costs tokens before every answer:
-
-| | server default | per request |
-|---|---|---|
-| turn thinking off (both models) | `--think off` | `"chat_template_kwargs": {"enable_thinking": false}` |
-| shorter thinking (176.9B: `xhigh`, `medium`, `low`) | `--reasoning-effort low` | `"reasoning_effort": "low"` |
-| reply length | `--max-tokens N`; default: until the context is full | `"max_tokens": N` |
-
-For `--ctx` and `--expert-host`, see
-[Context length and the KV cache](#context-length-and-the-kv-cache).
-
-Tests: `cargo test --release --features cuda` (198, no GPU needed).
-
-## Limits and next
-
-- Tested on two models, one GPU family, Windows and WSL2 only.
-- Greedy decoding only. Tool calls stream as they are written; `tool_choice`
-  other than `"none"` is left to the model.
-- Next: bigger models, older NVIDIA GPUs, native Linux.
 
 ## Acknowledgements
 
