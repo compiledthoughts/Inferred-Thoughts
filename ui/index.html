@@ -68,6 +68,11 @@
     cursor: pointer; min-height: 44px;
   }
   button.ghost { background: transparent; color: var(--dim); font-weight: 500; }
+  select {
+    min-height: 44px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--bg); color: var(--dim); font: inherit; font-size: 13px; cursor: pointer;
+  }
+  select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   button:disabled { opacity: .5; cursor: default; }
   .hint { max-width: 760px; margin: 6px auto 0; font-size: 12px; color: var(--dim); }
 </style>
@@ -86,6 +91,12 @@
 <footer>
   <form id="form">
     <textarea id="input" placeholder="Ask something…  (Enter to send, Shift+Enter for a new line)" autofocus></textarea>
+    <select id="thinking" title="How much the model thinks before it answers">
+      <option value="full">thinking: full</option>
+      <option value="medium">thinking: medium</option>
+      <option value="low">thinking: low</option>
+      <option value="off">thinking: off</option>
+    </select>
     <button id="send" type="submit">Send</button>
     <button class="ghost" id="stop" type="button" hidden>Stop</button>
   </form>
@@ -101,6 +112,25 @@ const $ = (id) => document.getElementById(id);
 const wrap = $("wrap"), log = $("log");
 const messages = [];          // what we send back: user and assistant turns only
 let controller = null;        // aborts the in-flight request
+
+// The thinking selector. "full" sends nothing, so the server's --think and
+// --reasoning-effort (or the model's own default) decide. "low" and "medium"
+// are Qwen3.8-Flash-Next's reasoning_effort levels; a template without that
+// switch keeps its default, and the server's -v log says so. "off" is the
+// templates' enable_thinking switch, which every Qwen3 template has.
+function thinkingFields() {
+  const v = $("thinking").value;
+  if (v === "off") return { chat_template_kwargs: { enable_thinking: false } };
+  if (v === "low" || v === "medium") return { reasoning_effort: v };
+  return {};
+}
+try {
+  const saved = localStorage.getItem("thinking");
+  if (saved && [...$("thinking").options].some((o) => o.value === saved)) $("thinking").value = saved;
+} catch {}
+$("thinking").addEventListener("change", () => {
+  try { localStorage.setItem("thinking", $("thinking").value); } catch {}
+});
 
 const atBottom = () => log.scrollHeight - log.scrollTop - log.clientHeight < 80;
 const scroll = (force) => { if (force || atBottom()) log.scrollTop = log.scrollHeight; };
@@ -171,7 +201,7 @@ async function send(text) {
       headers: { "Content-Type": "application/json" },
       // No max_tokens: the server's --max-tokens decides, by default the room
       // left in the context. A fixed 2048 cut a thinking model's answers off.
-      body: JSON.stringify({ messages, stream: true }),
+      body: JSON.stringify({ messages, stream: true, ...thinkingFields() }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`server said ${res.status}`);
