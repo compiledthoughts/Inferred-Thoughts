@@ -4,7 +4,8 @@ A Rust + CUDA inference engine for mixture-of-experts models, streaming their
 experts from the SSD.
 
 This engine treats the __memory hierarchy as a first-class scheduling problem__
-with lookahead, GCLOCK, and tier budgets.
+with lookahead prefetch, GCLOCK eviction (a clock-style cache that keeps the
+busiest experts in VRAM), and tier budgets.
 
 ## Why
 
@@ -24,10 +25,15 @@ of the file left on the SSD. How it works:
 Two models, on one machine: RTX 5060 Ti 16 GB, Ryzen 7 9700X, 32 GB DDR5,
 Gen5 NVMe.
 
+**Only tested on:**
+- **Windows 11 (native) and WSL2 (Ubuntu 24.04).** Native Linux is not tested.
+- **NVIDIA RTX 50-series / RTX PRO Blackwell (`sm_120`).** The kernels are
+  built for `sm_120a`; older GPUs are not supported yet.
+
 | model | GGUF | prefill tok/s | decode tok/s |
 |---|---|---:|---:|
-| Qwen3.8-Flash-Next, NVFP4, 176.9B | [119 GiB](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0) | 49.2 | **9.06** (best turn 10.40) |
-| Qwen3.6-35B-A3B, NVFP4 | [19.1 GiB](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it) | 591.2 | **47.3** |
+| Qwen3.8-Flash-Next, NVFP4, 176.9B | [download, 119 GiB](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0) | 49.2 | **9.06** (best turn 10.40) |
+| Qwen3.6-35B-A3B, NVFP4 | [download, 19.1 GiB](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it) | 591.2 | **47.3** |
 
 Native Windows 11, default settings. Prefill is a 5,548-token prompt; decode is
 a chat turn, and on the 176.9B it falls as a conversation grows. On the same
@@ -59,8 +65,10 @@ Decode as a conversation gets deeper, through `serve`:
 | 176.9B | ~0.2k | 10.40 | Windows, 24-09-2026 |
 | | ~29k | 6.45 | WSL2, 22-09-2026 |
 
-The ~36k row, on Windows (at this `--ctx`, the default 6 GiB pinned tier left
-experts on the SSD and decode fell to ~26 tok/s; 10 GiB fixed it):
+Keep `--ctx` as small as the session needs. If decode slows sharply at a
+large `--ctx`, raise `--expert-host` (the pinned-RAM expert tier, 6 GiB by
+default). The ~36k row, on Windows: at this `--ctx` the default tier left
+experts on the SSD and decode fell to ~26 tok/s; 10 GiB fixed it:
 
 ```bat
 target\release\inferred.exe serve -m Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --backend cuda --port 8080 --ctx 64096 --expert-host 10 -v
@@ -68,11 +76,6 @@ target\release\inferred.exe serve -m Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --backen
 
 On the 35B, decode costs ~21.3 ms plus ~0.08 µs per position of context;
 prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
-
-**Only tested on:**
-- **Windows 11 (native) and WSL2 (Ubuntu 24.04).** Native Linux is not tested.
-- **NVIDIA RTX 50-series / RTX PRO Blackwell (`sm_120`).** The kernels are
-  built for `sm_120a`; older GPUs are not supported yet.
 
 ## What you need
 
@@ -93,9 +96,8 @@ On Windows the binary is `target\release\inferred.exe`. Open
 `http://127.0.0.1:8080/` for the chat page; any OpenAI-compatible client can
 use `http://127.0.0.1:8080/v1`.
 
-`--ctx` reserves the KV cache up front, out of the VRAM the experts would use:
-keep it as small as the session needs. If decode slows sharply at a large
-`--ctx`, raise `--expert-host` (pinned-RAM expert tier, 6 GiB by default).
+For `--ctx` and `--expert-host`, see
+[Context length and the KV cache](#context-length-and-the-kv-cache).
 
 Tests: `cargo test --release --features cuda` (179, no GPU needed).
 
@@ -104,6 +106,16 @@ Tests: `cargo test --release --features cuda` (179, no GPU needed).
 - Tested on two models, one GPU family, Windows and WSL2 only.
 - Greedy decoding only; no tool calling yet.
 - Next: older NVIDIA GPUs, native Linux, more models.
+
+## Acknowledgements
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp): the behavioural
+  reference every kernel was checked against.
+- [colibri](https://github.com/JustVugg/colibri): the lookahead direction
+  behind the expert prefetch.
+- [SGLang](https://github.com/sgl-project/sglang): its day-0 notes on
+  Qwen3.8-Flash-Next.
+- And many more.
 
 ## License
 
