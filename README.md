@@ -19,7 +19,7 @@ The goal: good large models, at acceptable speed, on reasonably priced hardware.
 
 ## Result
 
-**A 177B model on 38 GB of RAM + VRAM and an SSD: 20 GiB of its 119 GiB file sits in memory, the other 99 GiB stays on the SSD and is read as tokens need it, and it still decodes ~9-10 tokens a second (prefill 49.2).**
+### A 177B model on 38 GB of RAM + VRAM: 99 GiB of its 119 GiB file streams from the SSD, only 20 GiB sits in memory, and it still decodes ~9-10 tokens a second.
 
 
 
