@@ -43,6 +43,24 @@ a chat turn, and on the 176.9B it falls as a conversation grows. On the same
 machine under WSL2, llama.cpp's best configuration decodes the 176.9B at 5.3
 tok/s, against 7.5–7.8 for this engine there.
 
+### The weight format: NVFP4
+
+Both models keep their routed experts in NVFP4: each weight is a 4-bit float
+(E2M1), and every 16 weights share an 8-bit FP8 (E4M3) scale, so **4.5 bits
+per weight** (4 + 8/16). The 176.9B's experts bear it out: 120.8B parameters in
+63.28 GiB is 4.50 bits each.
+
+| format | bits per weight | scale |
+|---|---:|---|
+| IQ4_XS | 4.25 | per 32 weights |
+| MXFP4 | 4.25 | one power-of-two scale per 32 |
+| **NVFP4** | **4.5** | one FP8 scale per 16 — finer, so more accurate |
+| Q8_0 | 8.5 | one fp16 scale per 32 |
+
+The extra quarter-bit buys a format Blackwell's tensor cores multiply
+directly: the matmuls run FP4 × FP4 on the tensor cores (the `sm_120a`
+instruction), with no unpacking to 8 or 16 bits first.
+
 ### Context length and the KV cache
 
 `--ctx` reserves the whole KV cache at start-up, in VRAM the experts would
