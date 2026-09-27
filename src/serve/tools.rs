@@ -105,6 +105,92 @@ fn parse_xml(body: &str, tools: Option<&Value>) -> Option<ToolCall> {
     Some(ToolCall { name, arguments })
 }
 
+/// What can already be sent of an XML call the model is still writing: the
+/// function name once complete, and the longest prefix of the final
+/// `arguments` JSON that the text so far makes certain.
+///
+/// **For streaming, so a client shows a long call — a file being written — as
+/// it arrives** instead of after minutes of silence (a 177B writing an HTML
+/// page at ~7 tok/s). The output is compact JSON built exactly as
+/// `Value::Object(arguments).to_string()` builds it, so every prefix returned
+/// here is a prefix of the whole call's `arguments`, and each call's result
+/// extends the previous one's. Two things are held back to keep that true:
+/// a string value's trailing characters that could still be the start of
+/// `\n</parameter>` (the final newline is dropped), and any non-string value
+/// until it is closed, since it is parsed as JSON only whole.
+///
+/// `(None, "")` until the function name is complete, and for the JSON format,
+/// which is small and sent whole.
+pub fn partial_args(text: &str, tools: Option<&Value>) -> (Option<String>, String) {
+    const OPEN: &str = "<function=";
+    const PARAM: &str = "<parameter=";
+    const CLOSE: &str = "</parameter>";
+    let Some(f) = text.find(OPEN) else { return (None, String::new()) };
+    let rest = &text[f + OPEN.len()..];
+    let Some(end_name) = rest.find('>') else { return (None, String::new()) };
+    let name = rest[..end_name].trim().to_string();
+    if name.is_empty() {
+        return (None, String::new());
+    }
+    let mut rest = &rest[end_name + 1..];
+    let done = rest.find("</function>");
+    if let Some(end) = done {
+        rest = &rest[..end];
+    }
+
+    let mut out = String::from("{");
+    let mut first = true;
+    while let Some(open) = rest.find(PARAM) {
+        let after = &rest[open + PARAM.len()..];
+        let Some(end_key) = after.find('>') else { return (Some(name), out) };
+        let key = after[..end_key].trim().trim_matches(|c| c == '"' || c == '\'');
+        let region = &after[end_key + 1..];
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&Value::String(key.to_string()).to_string());
+        out.push(':');
+        let ty = param_type(tools, &name, key);
+        match region.find(CLOSE) {
+            Some(end) => {
+                let raw = &region[..end];
+                let raw = raw.strip_prefix('\n').unwrap_or(raw);
+                let raw = raw.strip_suffix('\n').unwrap_or(raw);
+                out.push_str(&value(raw, ty).to_string());
+                rest = &region[end + CLOSE.len()..];
+            }
+            None => {
+                // Still being written. A string streams now; anything else
+                // waits to be parsed whole.
+                if ty == Some("string") && !region.is_empty() {
+                    let body = region.strip_prefix('\n').unwrap_or(region);
+                    let safe = &body[..certain_len(body, &format!("\n{CLOSE}"))];
+                    let quoted = Value::String(safe.to_string()).to_string();
+                    out.push_str(&quoted[..quoted.len() - 1]);
+                }
+                return (Some(name), out);
+            }
+        }
+    }
+    if done.is_some() {
+        out.push('}');
+    }
+    (Some(name), out)
+}
+
+/// How much of `body` is certain: all of it, less the longest suffix that is
+/// a prefix of `closer` and may yet turn out to be the closer itself.
+fn certain_len(body: &str, closer: &str) -> usize {
+    let n = body.len();
+    for k in (1..=closer.len().min(n)).rev() {
+        if body.is_char_boundary(n - k) && closer.starts_with(&body[n - k..]) {
+            return n - k;
+        }
+    }
+    n
+}
+
 /// The JSON-schema `type` of one parameter of one tool, if the request says.
 fn param_type<'a>(tools: Option<&'a Value>, tool: &str, param: &str) -> Option<&'a str> {
     tools?
@@ -191,6 +277,58 @@ mod tests {
         assert_eq!(parse("I will now call a tool.", None), None);
         assert_eq!(parse("<function=>\n</function>", None), None);
         assert_eq!(parse("{not json", None), None);
+    }
+
+    /// Every cut point of a call: what is streamed only ever grows, and the
+    /// whole call ends exactly as the whole-call parse serializes it.
+    fn streams_monotonically_to_the_whole(call: &str, tools: Option<&Value>) {
+        let whole = parse(call, tools).expect("the whole call parses");
+        let target = Value::Object(whole.arguments.clone()).to_string();
+        let mut sent = String::new();
+        let mut named = false;
+        for (cut, _) in call.char_indices().chain(std::iter::once((call.len(), ' '))) {
+            let (name, prefix) = partial_args(&call[..cut], tools);
+            if let Some(n) = name {
+                assert_eq!(n, whole.name, "name at cut {cut}");
+                named = true;
+            }
+            assert!(prefix.starts_with(&sent), "cut {cut}: {prefix:?} does not extend {sent:?}");
+            assert!(target.starts_with(&prefix), "cut {cut}: {prefix:?} is not a prefix of {target:?}");
+            sent = prefix;
+        }
+        assert!(named, "the name was never streamed");
+        assert_eq!(sent, target, "the stream ends as the whole call");
+    }
+
+    #[test]
+    fn a_long_file_write_streams_as_it_is_written() {
+        let tools = json!([{"type": "function", "function": {"name": "write_to_file", "parameters": {
+            "type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}
+        }}}]);
+        // A value holding `</`, `\n</div>` and a lone `<parameter` lookalike,
+        // quotes, a backslash, a tab and a multi-byte character.
+        let call = "\n<function=write_to_file>\n<parameter=path>\ndemo/index.html\n</parameter>\n<parameter=content>\n<div class=\"x\">\n\t<p>a\\b é</p>\n</div>\n<!-- <parameter note -->\n</parameter>\n</function>\n";
+        streams_monotonically_to_the_whole(call, Some(&tools));
+    }
+
+    #[test]
+    fn typed_and_untyped_values_stream_to_the_whole() {
+        let call = "<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=max_lines>\n20\n</parameter>\n</function>";
+        streams_monotonically_to_the_whole(call, Some(&tools()));
+        // No schema: values wait until closed, then parse as JSON if they can.
+        let call = "<function=f>\n<parameter=o>\n{\"a\": [1, 2]}\n</parameter>\n<parameter=s>\nwords\n</parameter>\n</function>";
+        streams_monotonically_to_the_whole(call, None);
+        streams_monotonically_to_the_whole("<function=list_models>\n</function>", None);
+    }
+
+    #[test]
+    fn nothing_streams_before_the_name_or_for_json_calls() {
+        assert_eq!(partial_args("\n<function=writ", None), (None, String::new()));
+        assert_eq!(partial_args("{\"name\": \"f\"", None), (None, String::new()));
+        // A string value is streamed while open, holding back a possible closer.
+        let t = tools();
+        let (_, p) = partial_args("<function=read_file>\n<parameter=path>\nREAD\n</param", Some(&t));
+        assert_eq!(p, "{\"path\":\"READ");
     }
 
     #[test]

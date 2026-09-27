@@ -1137,6 +1137,12 @@ fn generate<O: Ops>(
     let call_close = session.tk.special_id("</tool_call>");
     let mut in_call = false;
     let mut call_ids: Vec<u32> = Vec::new();
+    // **A call streams as it is written** (`tools::partial_args`): its name once
+    // complete, then its arguments JSON as each part becomes certain. A 177B
+    // writing a file through a tool call is minutes of generation, and a call
+    // sent only whole left the client showing nothing for all of it (27-09).
+    let mut call_named = false;
+    let mut call_sent = String::new();
     let mut calls: Vec<ToolCall> = Vec::new();
     // A call that does not parse is shown as text rather than lost.
     let mut unparsed = String::new();
@@ -1181,32 +1187,68 @@ fn generate<O: Ops>(
         if call_open.is_some() && Some(next) == call_open {
             in_call = true;
             call_ids.clear();
+            call_named = false;
+            call_sent.clear();
             logits = session.engine.decode(next)?;
             continue;
         }
         if in_call {
+            let index = calls.len();
+            let mut gone = false;
             if Some(next) == call_close {
                 in_call = false;
                 let text = session.tk.decode(&call_ids, false).unwrap_or_default();
                 match tools::parse(&text, tools) {
                     Some(call) => {
-                        if emit(Out::Call(calls.len(), &call)).is_err() {
-                            reason = "cancelled";
-                            break;
+                        // Whatever the stream has not sent yet: all of it for a
+                        // JSON-format call, the held-back tail for an XML one.
+                        let whole = Value::Object(call.arguments.clone()).to_string();
+                        if !call_named {
+                            gone |= emit(Out::CallStart(index, &call.name)).is_err();
+                        }
+                        match whole.strip_prefix(call_sent.as_str()) {
+                            Some(rest) if !rest.is_empty() => {
+                                gone |= emit(Out::CallArgs(index, rest)).is_err();
+                            }
+                            Some(_) => {}
+                            None => eprintln!(
+                                "  warning   tool call {index} streamed arguments that its whole parse does not extend"
+                            ),
                         }
                         calls.push(call);
                     }
                     None => {
-                        let raw = format!("<tool_call>{text}</tool_call>");
-                        if emit(Out::Text(&raw, Part::Content)).is_err() {
-                            reason = "cancelled";
-                            break;
+                        if call_named {
+                            eprintln!("  warning   tool call {index} was streamed but does not parse whole");
                         }
+                        let raw = format!("<tool_call>{text}</tool_call>");
+                        gone |= emit(Out::Text(&raw, Part::Content)).is_err();
                         unparsed.push_str(&raw);
                     }
                 }
             } else {
                 call_ids.push(next);
+                // Send what the call's text so far makes certain.
+                if let Ok(text) = session.tk.decode(&call_ids, false) {
+                    if !text.ends_with('\u{FFFD}') {
+                        if let (Some(name), prefix) = tools::partial_args(&text, tools) {
+                            if !call_named {
+                                gone |= emit(Out::CallStart(index, &name)).is_err();
+                                call_named = true;
+                            }
+                            if let Some(d) = prefix.strip_prefix(call_sent.as_str()) {
+                                if !d.is_empty() {
+                                    gone |= emit(Out::CallArgs(index, d)).is_err();
+                                    call_sent = prefix;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if gone {
+                reason = "cancelled";
+                break;
             }
             if session.engine.pos() + 1 >= session.engine.n_ctx() {
                 reason = "length";
@@ -1303,8 +1345,10 @@ struct Gen<'a> {
 enum Out<'a> {
     /// Text for one half.
     Text(&'a str, Part),
-    /// A finished tool call, and its index in the turn.
-    Call(usize, &'a ToolCall),
+    /// Tool call `index` has begun, and this is its function's name.
+    CallStart(usize, &'a str),
+    /// More of tool call `index`'s `arguments` JSON, to append to what was sent.
+    CallArgs(usize, &'a str),
 }
 
 /// OpenAI's id for the `index`-th call of a turn created at `created`.
@@ -1362,13 +1406,18 @@ fn stream_completion<O: Ops>(
         let delta = match out {
             Out::Text(text, Part::Reasoning) => json!({ "reasoning_content": text }),
             Out::Text(text, Part::Content) => json!({ "content": text }),
-            // One delta per call, whole: the call is parsed only once its
-            // closing token arrives, so there is nothing partial to stream.
-            Out::Call(index, call) => {
-                let mut entry = call.to_openai(&call_id(created, index));
-                entry["index"] = json!(index);
-                json!({ "tool_calls": [entry] })
-            }
+            // OpenAI's streamed call: the first delta names it, the rest append
+            // to its `arguments` string.
+            Out::CallStart(index, name) => json!({ "tool_calls": [{
+                "index": index,
+                "id": call_id(created, index),
+                "type": "function",
+                "function": {"name": name, "arguments": ""},
+            }] }),
+            Out::CallArgs(index, more) => json!({ "tool_calls": [{
+                "index": index,
+                "function": {"arguments": more},
+            }] }),
         };
         let c = chunk(&id, created, &model, delta, None);
         sse(stream, &c)
