@@ -3,17 +3,26 @@
 A Rust + CUDA inference engine for mixture-of-experts models, streaming their
 experts from the SSD.
 
-This engine treats the __memory hierarchy as a first-class scheduling problem__
-with lookahead prefetch, GCLOCK eviction (a clock-style cache that keeps the busiest experts in VRAM), and tier budgets.
+This engine treats the __memory hierarchy as a first-class scheduling problem__ with lookahead prefetch, GCLOCK eviction (a clock-style cache that keeps the busiest experts in VRAM), and tier budgets.
+
+---
 
 ## Why
 
-RAM prices shot up. Running a large model the usual way means holding all of it in VRAM and RAM, and that memory is the expensive part. In a
-mixture-of-experts model each token uses only a few experts, we are extending that idea to ssd,  so most of the model can stay on an NVMe SSD and be read when it is needed. The goal: good large models, at acceptable speed, on reasonably priced hardware.
+RAM prices shot up. Running a large model the usual way means holding all of it in VRAM and RAM, and that memory is the expensive part.
+
+In a mixture-of-experts model each token uses only a few experts. We extend that idea to the SSD: most of the model stays on an NVMe SSD and is read when it is needed.
+
+The goal: good large models, at acceptable speed, on reasonably priced hardware.
+
+---
 
 ## Result
 
 **A 177B model on 38 GB of RAM + VRAM and an SSD: 20 GiB of its 119 GiB file sits in memory, the other 99 GiB stays on the SSD and is read as tokens need it, and it still decodes ~9-10 tokens a second (prefill 49.2).**
+
+
+
 
 ![Cline talking to Qwen3.8-Flash-Next through inferred serve on Windows, 5x speed](docs/demo.gif)
 
@@ -34,6 +43,8 @@ How it works: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 That is the proof this route is worth pursuing: next come bigger models on the same card. **This is the first cut.** We expect it to get faster and better from here.
 
+---
+
 ## Tested so far
 
 Two models, on one machine: RTX 5060 Ti 16 GB, Ryzen 7 9700X, 32 GB DDR5,
@@ -49,10 +60,11 @@ Gen5 NVMe.
 | Qwen3.8-Flash-Next, NVFP4, 176.9B | [download, 119 GiB](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0) | 49.2 | **9.06** (best turn 10.40) |
 | Qwen3.6-35B-A3B, NVFP4 | [download, 19.1 GiB](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it) | 591.2 | **47.3** |
 
-Native Windows 11, default settings. Prefill is a 5,548-token prompt; decode is
-a chat turn, and on the 176.9B it falls as a conversation grows. On the same
-machine, natively on Windows, llama.cpp averaged 4.9 tok/s decoding the
-176.9B, against 9.06 for this engine.
+Native Windows 11, default settings. Prefill is a 5,548-token prompt; decode is a chat turn, and on the 176.9B it falls as a conversation grows.
+
+On the same machine, natively on Windows, llama.cpp averaged 4.9 tok/s decoding the 176.9B, against 9.06 for this engine.
+
+---
 
 ## Quick start
 
@@ -123,11 +135,15 @@ For `--ctx` and `--expert-host`, see
 
 Tests: `cargo test --release --features cuda` (198, no GPU needed).
 
+---
+
 ## Limits and next
 
 - Tested on two models, one GPU family, Windows and WSL2 only.
 - Greedy decoding only. Tool calls stream as they are written; `tool_choice` other than `"none"` is left to the model.
 - Next: bigger models, older NVIDIA GPUs, native Linux.
+
+---
 
 ## Details
 
@@ -187,6 +203,8 @@ target\release\inferred.exe serve -m models\Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf -
 On the 35B, decode costs ~21.3 ms plus ~0.08 µs per position of context;
 prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
 
+---
+
 ## Acknowledgements
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp): the behavioural reference every kernel was checked against.
@@ -194,6 +212,8 @@ prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
 - [SGLang](https://github.com/sgl-project/sglang): its day-0 notes on Qwen3.8-Flash-Next.
 - [Claude](https://claude.ai) (Anthropic): used to speed up development.
 - And many more.
+
+---
 
 ## License
 
