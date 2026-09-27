@@ -86,7 +86,7 @@ Decode as a conversation gets deeper, through `serve`:
 | | ~100k | 33.8 | WSL2, 12-09-2026 |
 | 176.9B | ~0.2k | 10.40 | Windows, 24-09-2026 |
 | | ~6k | 8.35 | Windows, 27-09-2026 (a 1,111-token reply) |
-| | ~29k | 6.45 | WSL2, 22-09-2026 |
+| | ~29k | 6.88 | Windows, 27-09-2026 (Cline, 33 turns, 6 tools) |
 
 Keep `--ctx` as small as the session needs. If decode slows sharply at a
 large `--ctx`, raise `--expert-host` (the pinned-RAM expert tier, 6 GiB by
