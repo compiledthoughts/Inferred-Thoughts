@@ -40,8 +40,8 @@ Gen5 NVMe.
 
 Native Windows 11, default settings. Prefill is a 5,548-token prompt; decode is
 a chat turn, and on the 176.9B it falls as a conversation grows. On the same
-machine under WSL2, llama.cpp's best configuration decodes the 176.9B at 5.3
-tok/s, against 7.5–7.8 for this engine there.
+machine, natively on Windows, llama.cpp averaged 4.9 tok/s decoding the
+176.9B, against 9.06 for this engine.
 
 ### The weight format: NVFP4
 
