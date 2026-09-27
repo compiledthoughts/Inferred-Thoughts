@@ -4,25 +4,35 @@ A Rust + CUDA inference engine for mixture-of-experts models, streaming their
 experts from the SSD.
 
 This engine treats the __memory hierarchy as a first-class scheduling problem__
-with lookahead prefetch, GCLOCK eviction (a clock-style cache that keeps the
-busiest experts in VRAM), and tier budgets.
+with lookahead prefetch, GCLOCK eviction (a clock-style cache that keeps the busiest experts in VRAM), and tier budgets.
 
 ## Why
 
-RAM prices shot up. Running a large model the usual way means holding all of
-it in VRAM and RAM, and that memory is the expensive part. In a
-mixture-of-experts model each token uses only a few experts, so most of the
-model can stay on an NVMe SSD and be read when it is needed. The goal: good
-large models, at acceptable speed, on reasonably priced hardware.
+RAM prices shot up. Running a large model the usual way means holding all of it in VRAM and RAM, and that memory is the expensive part. In a
+mixture-of-experts model each token uses only a few experts, we are extending that idea to ssd,  so most of the model can stay on an NVMe SSD and be read when it is needed. The goal: good large models, at acceptable speed, on reasonably priced hardware.
 
-Today that means **Qwen3.8-Flash-Next — 176.9B parameters, a 119 GiB file — at
-~9 tokens a second on a 16 GB RTX 5060 Ti with 32 GB of RAM**, with about 83%
-of the file left on the SSD. How it works:
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+## Result
 
-That is the proof this route is worth pursuing: next come bigger models on the
-same card. **This is the first cut** — we expect it to get faster and better
-from here.
+**A 177B model on 38 GB of RAM + VRAM and an SSD: 20 GiB of its 119 GiB file sits in memory, the other 99 GiB stays on the SSD and is read as tokens need it, and it still decodes ~9-10 tokens a second (prefill 49.2).**
+
+![Cline talking to Qwen3.8-Flash-Next through inferred serve on Windows, 5x speed](docs/demo.gif)
+
+*Cline in VS Code talking to the 177B through `inferred serve`, native Windows, played at 5x.*
+
+- **Model:** Qwen3.8-Flash-Next, 176.9B parameters, NVFP4
+- **Hardware:** a 16 GB RTX 5060 Ti with 32 GB of RAM, about 22 GB of it usable once Windows takes its ~10 GB
+
+| part of the file | size | where it lives |
+|---|---:|---|
+| dense weights (attention, shared experts, embeddings) | 5.1 GiB | memory |
+| hottest routed experts | 8.8 GiB | VRAM |
+| next-hottest routed experts | 6.0 GiB | pinned RAM |
+| remaining routed experts | 48.5 GiB | SSD, streamed on demand |
+| n-gram table | 50.7 GiB | SSD, 16 rows read per token |
+
+How it works: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+That is the proof this route is worth pursuing: next come bigger models on the same card. **This is the first cut.** We expect it to get faster and better from here.
 
 ## Tested so far
 
@@ -55,7 +65,7 @@ per weight** (4 + 8/16). The 176.9B's experts bear it out: 120.8B parameters in
 |---|---:|---|
 | IQ4_XS | 4.25 | per 32 weights |
 | MXFP4 | 4.25 | one power-of-two scale per 32 |
-| **NVFP4** | **4.5** | one FP8 scale per 16 — finer, so more accurate |
+| **NVFP4** | **4.5** | one FP8 scale per 16, finer, so more accurate |
 | Q8_0 | 8.5 | one fp16 scale per 32 |
 
 The extra quarter-bit buys a format Blackwell's tensor cores multiply
@@ -65,8 +75,8 @@ instruction), with no unpacking to 8 or 16 bits first.
 ### Context length and the KV cache
 
 `--ctx` reserves the whole KV cache at start-up, in VRAM the experts would
-otherwise use. Measured per position — 20 KiB on the 35B, 28.5 KiB on the
-176.9B — plus a fixed recurrent state (84 and 150 MiB):
+otherwise use. Measured per position: 20 KiB on the 35B, 28.5 KiB on the
+176.9B, plus a fixed recurrent state (84 and 150 MiB):
 
 | `--ctx` | 35B KV | 176.9B KV |
 |---:|---:|---:|
@@ -179,14 +189,12 @@ Tests: `cargo test --release --features cuda` (198, no GPU needed).
 
 ## Acknowledgements
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp): the behavioural
-  reference every kernel was checked against.
-- [colibri](https://github.com/JustVugg/colibri): the lookahead direction
-  behind the expert prefetch.
-- [SGLang](https://github.com/sgl-project/sglang): its day-0 notes on
-  Qwen3.8-Flash-Next.
+- [llama.cpp](https://github.com/ggml-org/llama.cpp): the behavioural reference every kernel was checked against.
+- [colibri](https://github.com/JustVugg/colibri): the lookahead direction behind the expert prefetch.
+- [SGLang](https://github.com/sgl-project/sglang): its day-0 notes on Qwen3.8-Flash-Next.
+- [Claude](https://claude.ai) (Anthropic): used to speed up development.
 - And many more.
 
 ## License
 
-Apache 2.0 — see [`LICENSE`](LICENSE).
+Apache 2.0, see [`LICENSE`](LICENSE).
