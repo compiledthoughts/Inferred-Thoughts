@@ -110,7 +110,11 @@ prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
 
 ## Get a model
 
-Both GGUFs are on Hugging Face, no login needed:
+Both GGUFs are on Hugging Face, no login needed. Model pages:
+[Qwen3.8-Flash-Next-NVFP4-Q8_0](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0)
+(176.9B) and
+[Qwen3.6-35B-A3B-NVFP4-Q8_0-it](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it)
+(35B); all models: [huggingface.co/CompiledThoughts](https://huggingface.co/CompiledThoughts).
 
 ```bash
 pip install -U huggingface_hub
