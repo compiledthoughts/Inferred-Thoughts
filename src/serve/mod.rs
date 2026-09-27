@@ -1358,11 +1358,32 @@ fn prefill_progress(done: usize, total: usize) {
     // `\r` and no newline: the line is replaced, not appended. The final slice
     // clears it, since the turn's own report follows immediately.
     if done >= total {
-        eprint!("\r{:60}\r", "");
+        eprint!("\r{:80}\r", "");
     } else {
-        eprint!("\r  prefill {done:>6} / {total} tokens  {pct:>5.1}%");
+        let bar = progress_bar(done, total, 30);
+        eprint!("\r  prefill {bar} {done:>6} / {total} tokens  {pct:>5.1}%");
     }
     let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+/// `[=========>          ]`: `width` cells between the brackets, filled in
+/// proportion to `done / total`, with `>` marking the leading edge until the
+/// bar is full. ASCII only, so every console draws it the same.
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    let filled = if total == 0 { width } else { (done.min(total) * width) / total };
+    let mut bar = String::with_capacity(width + 2);
+    bar.push('[');
+    for i in 0..width {
+        bar.push(if i + 1 < filled || (i + 1 == filled && filled == width) {
+            '='
+        } else if i + 1 == filled {
+            '>'
+        } else {
+            ' '
+        });
+    }
+    bar.push(']');
+    bar
 }
 
 fn write_all(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
@@ -1446,6 +1467,16 @@ fn send_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prefill_bar_fills_in_proportion() {
+        assert_eq!(progress_bar(0, 5312, 10), "[          ]");
+        assert_eq!(progress_bar(1024, 5312, 10), "[>         ]");
+        assert_eq!(progress_bar(2656, 5312, 10), "[====>     ]");
+        assert_eq!(progress_bar(5312, 5312, 10), "[==========]");
+        assert_eq!(progress_bar(9999, 5312, 10), "[==========]");
+        assert_eq!(progress_bar(0, 0, 4), "[====]");
+    }
 
     /// **A cancel during prefill is heard between slices, and the resent request
     /// continues where it stopped** (17-09). The 0.2B test model on `Naive`, a
