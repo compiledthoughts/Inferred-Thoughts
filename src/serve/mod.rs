@@ -51,6 +51,9 @@ use crate::ops::Ops;
 use crate::tok::Tokenizer;
 use crate::tok::chat::ChatMl;
 
+mod tools;
+use tools::ToolCall;
+
 /// Tokens between checkpoints, and the prefill slice size.
 ///
 /// Sets the worst-case re-prefill after a divergence: land anywhere inside a
@@ -95,28 +98,61 @@ pub struct ServeOpts {
 
 #[derive(Deserialize)]
 struct ChatRequest {
+    /// Kept as JSON, not a struct: the model's own template reads each message,
+    /// and fields a struct would drop — `tool_calls`, `tool_call_id`,
+    /// `reasoning_content` — are exactly the ones it renders. See
+    /// [`template_message`].
     #[serde(default)]
-    messages: Vec<Message>,
+    messages: Vec<Value>,
     #[serde(default)]
     stream: bool,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     max_completion_tokens: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct Message {
-    #[serde(default = "user_role")]
-    role: String,
-    /// Either a string or the array-of-parts form some clients send. Both are
-    /// flattened to text by [`content_text`].
+    /// OpenAI's function definitions, rendered into the prompt by the template.
     #[serde(default)]
-    content: Value,
+    tools: Option<Value>,
+    /// `"none"` leaves the tools out; any other choice is left to the model.
+    #[serde(default)]
+    tool_choice: Option<Value>,
 }
 
-fn user_role() -> String {
-    "user".to_string()
+/// One OpenAI message as the chat template expects it.
+///
+/// Content is flattened to text by [`content_text`], as before. A tool call's
+/// `arguments` arrive as a JSON *string*, and the template iterates them with
+/// `|items`, so they are parsed into an object here; an unparseable one is
+/// passed through and the template's own error names it.
+fn template_message(m: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+    out.insert("role".to_string(), json!(role));
+    out.insert(
+        "content".to_string(),
+        json!(content_text(m.get("content").unwrap_or(&Value::Null))),
+    );
+    if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+        let calls: Vec<Value> = calls
+            .iter()
+            .map(|c| {
+                let mut c = c.clone();
+                if let Some(Value::String(s)) = c.pointer("/function/arguments") {
+                    if let Ok(parsed @ Value::Object(_)) = serde_json::from_str::<Value>(s) {
+                        c["function"]["arguments"] = parsed;
+                    }
+                }
+                c
+            })
+            .collect();
+        out.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    for key in ["tool_call_id", "name", "reasoning_content"] {
+        if let Some(v) = m.get(key) {
+            out.insert(key.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 /// Flatten a message's content to plain text.
@@ -476,12 +512,34 @@ impl<O: Ops> Session<'_, O> {
         let mut done = 0usize;
         let spacing = checkpoint_spacing(self.engine.n_ctx());
         let slice = spacing.min(self.engine.max_batch());
+        // **The prompt's end checkpoint goes after its last special token**, not
+        // after its last token, when ordinary tokens follow. A special token is
+        // atomic, so the next request re-tokenizes to the same ids through it;
+        // an ordinary one can merge with what the next request appends. The
+        // Qwen3.6 and Qwen3.8 templates end the prompt with `<think>\n`, and the
+        // next request renders that turn as `<think>\n\n</think>`: the two
+        // newlines become one token, the ids agree only to `<think>`, and a
+        // checkpoint one token later is unusable — measured, a tool round-trip
+        // restarted from zero (27-09).
+        let stable = tokens
+            .iter()
+            .rposition(|&t| self.tk.is_special(t))
+            .map(|i| i + 1)
+            .filter(|&s| s > 0 && s < tokens.len());
         while done < tokens.len() {
             if cancelled() {
                 self.rendered = self.consumed_text(want, &base, &tokens[..done]);
                 return Ok(Advanced::Cancelled { done, of: tokens.len() });
             }
-            let take = slice.min(tokens.len() - done);
+            let mut take = slice.min(tokens.len() - done);
+            // Stop the slice at the stable point so the checkpoint lands on it.
+            // A split prefill is bit-identical to a whole one
+            // (`split_prefill_equals_single_prefill`).
+            if let Some(s) = stable {
+                if done < s && s < done + take {
+                    take = s - done;
+                }
+            }
             logits = self.engine.prefill(&tokens[done..done + take])?;
             self.tokens.extend_from_slice(&tokens[done..done + take]);
             done += take;
@@ -495,7 +553,7 @@ impl<O: Ops> Session<'_, O> {
             // is not "a copy of where we already are": the next turn continues
             // past it, which is precisely what makes it a return point for the
             // divergence after that.
-            if self.consumed - self.last_ckpt >= spacing {
+            if self.consumed - self.last_ckpt >= spacing || Some(done) == stable {
                 self.take_checkpoint();
             }
         }
@@ -504,8 +562,9 @@ impl<O: Ops> Session<'_, O> {
         // that reply, just past this point; with checkpoints only every spacing,
         // a conversation shorter than one spacing had nowhere to return to but
         // zero, and Cline restarted every turn of a ~1,100-token session (17-09).
-        // The ladder is still capped at `MAX_CHECKPOINTS`.
-        if self.consumed > self.last_ckpt {
+        // The ladder is still capped at `MAX_CHECKPOINTS`. When the prompt ends
+        // in ordinary tokens, the stable point above already took it.
+        if stable.is_none() && self.consumed > self.last_ckpt {
             self.take_checkpoint();
         }
         self.rendered = want.to_string();
@@ -871,21 +930,29 @@ fn chat_completions<O: Ops>(
         }
     };
 
-    let texts: Vec<(String, String)> = req
-        .messages
-        .iter()
-        .map(|m| (m.role.clone(), content_text(&m.content)))
-        .collect();
-    let turns: Vec<(&str, &str)> = texts
-        .iter()
-        .map(|(r, c)| (r.as_str(), c.as_str()))
-        .collect();
-    let want = session.chat.wrap_turns(&turns);
+    // Tools reach the model only through its own template, and only when the
+    // client offers some and has not said `tool_choice: "none"`.
+    let tools = match (&req.tools, req.tool_choice.as_ref().and_then(Value::as_str)) {
+        (_, Some("none")) => None,
+        (Some(Value::Array(a)), _) if !a.is_empty() => req.tools.as_ref(),
+        _ => None,
+    };
+    let messages = Value::Array(req.messages.iter().map(template_message).collect());
+    let want = match session.chat.render(&messages, tools) {
+        Ok(w) => w,
+        Err(e) => return send_json(stream, 400, &json!({"error": {"message": e.to_string()}})),
+    };
+    // Both Qwen3.6 and Qwen3.8 templates open the reply inside the thinking
+    // block, so the model's first tokens are reasoning and it emits only the
+    // closing marker.
+    let thinking = want.ends_with("<think>\n");
+    let n_turns = req.messages.len();
 
     if opts.verbose {
         clipped("body    ", &String::from_utf8_lossy(body), 1200);
-        for (role, content) in &turns {
-            clipped(&format!("  {role:<9}"), content, 300);
+        for m in messages.as_array().into_iter().flatten() {
+            let role = m["role"].as_str().unwrap_or("?");
+            clipped(&format!("  {role:<9}"), m["content"].as_str().unwrap_or(""), 300);
         }
         // What actually reaches the tokenizer. Everything before this is
         // already in the engine, so this is the only text that costs anything.
@@ -921,15 +988,16 @@ fn chat_completions<O: Ops>(
         }
     };
     eprintln!(
-        "chat: {} turns, {fresh} new tokens ({}), budget {budget}",
-        turns.len(),
+        "chat: {n_turns} turns, {fresh} new tokens ({}), budget {budget}{}",
         how.label(),
+        tools.and_then(Value::as_array).map_or(String::new(), |t| format!(", {} tools", t.len())),
     );
 
+    let turn = Gen { budget, tools, thinking };
     let r = if req.stream {
-        stream_completion(session, stream, logits, budget, opts, mark, how)
+        stream_completion(session, stream, logits, turn, opts, mark, how)
     } else {
-        whole_completion(session, stream, logits, budget, opts, mark, how)
+        whole_completion(session, stream, logits, turn, opts, mark, how)
     };
     // Reported even when the client hung up mid-stream: the work still
     // happened, and a disconnect is exactly when it is useful to see what it
@@ -952,12 +1020,25 @@ fn chat_completions<O: Ops>(
 fn generate<O: Ops>(
     session: &mut Session<'_, O>,
     mut logits: Vec<f32>,
-    budget: usize,
-    mut emit: impl FnMut(&str, Part) -> Result<()>,
+    turn: Gen<'_>,
+    mut emit: impl FnMut(Out<'_>) -> Result<()>,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<Reply> {
+    let Gen { budget, tools, thinking } = turn;
     let eos = session.tk.eos_token_id;
     let mut reason = "length";
+    // **A tool call is its own part, collected and parsed whole.** The model
+    // writes it between its `<tool_call>` and `</tool_call>` tokens in the
+    // format its template taught it (`tools::parse`); the client gets it as
+    // OpenAI's `tool_calls`, never as text. Only when the request offered
+    // tools: without them the markers are dropped as control tokens, as before.
+    let call_open = tools.and(session.tk.special_id("<tool_call>"));
+    let call_close = session.tk.special_id("</tool_call>");
+    let mut in_call = false;
+    let mut call_ids: Vec<u32> = Vec::new();
+    let mut calls: Vec<ToolCall> = Vec::new();
+    // A call that does not parse is shown as text rather than lost.
+    let mut unparsed = String::new();
     // **Reasoning is a field of its own, not tagged text.** A reasoning model
     // emits `<think>…</think>` around its reasoning and both are control tokens.
     // Dropping them left the client one undifferentiated string and Cline showed
@@ -971,7 +1052,7 @@ fn generate<O: Ops>(
     // every token is answer, exactly as before.
     let open = session.tk.special_id("<think>");
     let close = session.tk.special_id("</think>");
-    let mut part = Part::Content;
+    let mut part = if thinking { Part::Reasoning } else { Part::Content };
     // Each half is decoded from its own ids: a token is not a character, so the
     // text only renders once the following token arrives, and the two halves
     // must not interleave while that settles.
@@ -995,6 +1076,44 @@ fn generate<O: Ops>(
             break;
         }
         produced.push(next);
+
+        if call_open.is_some() && Some(next) == call_open {
+            in_call = true;
+            call_ids.clear();
+            logits = session.engine.decode(next)?;
+            continue;
+        }
+        if in_call {
+            if Some(next) == call_close {
+                in_call = false;
+                let text = session.tk.decode(&call_ids, false).unwrap_or_default();
+                match tools::parse(&text, tools) {
+                    Some(call) => {
+                        if emit(Out::Call(calls.len(), &call)).is_err() {
+                            reason = "cancelled";
+                            break;
+                        }
+                        calls.push(call);
+                    }
+                    None => {
+                        let raw = format!("<tool_call>{text}</tool_call>");
+                        if emit(Out::Text(&raw, Part::Content)).is_err() {
+                            reason = "cancelled";
+                            break;
+                        }
+                        unparsed.push_str(&raw);
+                    }
+                }
+            } else {
+                call_ids.push(next);
+            }
+            if session.engine.pos() + 1 >= session.engine.n_ctx() {
+                reason = "length";
+                break;
+            }
+            logits = session.engine.decode(next)?;
+            continue;
+        }
 
         // The markers switch halves and are never rendered themselves.
         if Some(next) == open {
@@ -1023,7 +1142,7 @@ fn generate<O: Ops>(
                     //
                     // Both detections now land in the same place, so there is
                     // one exit and it always absorbs.
-                    if emit(delta, part).is_err() {
+                    if emit(Out::Text(delta, part)).is_err() {
                         reason = "cancelled";
                         break;
                     }
@@ -1042,12 +1161,45 @@ fn generate<O: Ops>(
     }
     // The ids, not just how many: the next turn's common-prefix scan needs to
     // see what the engine consumed, and the model's own output is part of that.
-    let [content, reasoning] = shown;
+    // A call cut off by the budget or the context is shown as the text it got to.
+    if in_call {
+        let text = session.tk.decode(&call_ids, false).unwrap_or_default();
+        unparsed.push_str(&format!("<tool_call>{text}"));
+    }
+    let [mut content, reasoning] = shown;
+    content.push_str(&unparsed);
+    if !calls.is_empty() && reason == "stop" {
+        reason = "tool_calls";
+    }
     let plain = session
         .tk
         .decode(&produced, false)
         .unwrap_or_else(|_| format!("{reasoning}{content}"));
-    Ok(Reply { content, reasoning, plain, reason, ids: produced })
+    Ok(Reply { content, reasoning, plain, reason, ids: produced, calls })
+}
+
+/// What one turn generates with.
+#[derive(Clone, Copy)]
+struct Gen<'a> {
+    budget: usize,
+    /// The request's `tools`, when offered: turns on tool-call parsing and
+    /// types the parsed arguments.
+    tools: Option<&'a Value>,
+    /// The prompt ends inside the thinking block, so generation starts there.
+    thinking: bool,
+}
+
+/// One piece of a turn, as `generate` hands it to the transport.
+enum Out<'a> {
+    /// Text for one half.
+    Text(&'a str, Part),
+    /// A finished tool call, and its index in the turn.
+    Call(usize, &'a ToolCall),
+}
+
+/// OpenAI's id for the `index`-th call of a turn created at `created`.
+fn call_id(created: u64, index: usize) -> String {
+    format!("call_{created}_{index}")
 }
 
 /// Which half of a reasoning model's turn a piece of text belongs to. The
@@ -1071,13 +1223,15 @@ struct Reply {
     plain: String,
     reason: &'static str,
     ids: Vec<u32>,
+    /// Tool calls, in the order the model made them.
+    calls: Vec<ToolCall>,
 }
 
 fn stream_completion<O: Ops>(
     session: &mut Session<'_, O>,
     stream: &mut TcpStream,
     logits: Vec<f32>,
-    budget: usize,
+    turn: Gen<'_>,
     opts: &ServeOpts,
     mark: Mark,
     how: Resume,
@@ -1094,15 +1248,22 @@ fn stream_completion<O: Ops>(
 
     // Cloned before `sink` borrows the stream mutably.
     let probe = stream.try_clone().ok();
-    let mut sink = |delta: &str, part: Part| -> Result<()> {
-        let field = match part {
-            Part::Reasoning => "reasoning_content",
-            Part::Content => "content",
+    let mut sink = |out: Out<'_>| -> Result<()> {
+        let delta = match out {
+            Out::Text(text, Part::Reasoning) => json!({ "reasoning_content": text }),
+            Out::Text(text, Part::Content) => json!({ "content": text }),
+            // One delta per call, whole: the call is parsed only once its
+            // closing token arrives, so there is nothing partial to stream.
+            Out::Call(index, call) => {
+                let mut entry = call.to_openai(&call_id(created, index));
+                entry["index"] = json!(index);
+                json!({ "tool_calls": [entry] })
+            }
         };
-        let c = chunk(&id, created, &model, json!({ field: delta }), None);
+        let c = chunk(&id, created, &model, delta, None);
         sse(stream, &c)
     };
-    let Reply { plain, reason, ids, .. } = generate(session, logits, budget, &mut sink, || {
+    let Reply { plain, reason, ids, .. } = generate(session, logits, turn, &mut sink, || {
         probe.as_ref().is_some_and(client_gone)
     })?;
     session.absorb(&plain, &ids);
@@ -1127,7 +1288,7 @@ fn whole_completion<O: Ops>(
     session: &mut Session<'_, O>,
     stream: &mut TcpStream,
     logits: Vec<f32>,
-    budget: usize,
+    turn: Gen<'_>,
     opts: &ServeOpts,
     mark: Mark,
     how: Resume,
@@ -1137,8 +1298,8 @@ fn whole_completion<O: Ops>(
     // without this it cannot tell a cancelled turn from a live one, and ran the
     // whole budget into a closed socket.
     let probe = stream.try_clone().ok();
-    let Reply { content, reasoning, plain, reason, ids } =
-        generate(session, logits, budget, |_, _| Ok(()), || {
+    let Reply { content, reasoning, plain, reason, ids, calls } =
+        generate(session, logits, turn, |_| Ok(()), || {
             probe.as_ref().is_some_and(client_gone)
         })?;
     let n = ids.len();
@@ -1148,21 +1309,33 @@ fn whole_completion<O: Ops>(
         return Ok(());
     }
 
+    let created = now();
+    // `reasoning_content` beside `content`, DeepSeek's field and the one
+    // OpenAI-compatible clients look for; omitted when the model does not think,
+    // rather than sent empty. With tool calls, an empty `content` is `null`, as
+    // OpenAI sends it.
+    let mut message = json!({"role": "assistant", "content": content});
+    if !reasoning.is_empty() {
+        message["reasoning_content"] = json!(reasoning);
+    }
+    if !calls.is_empty() {
+        // The template puts a blank line between the thinking and the call; a
+        // reply that is only a call has no content, as OpenAI reports it.
+        if content.trim().is_empty() {
+            message["content"] = Value::Null;
+        }
+        message["tool_calls"] = Value::Array(
+            calls.iter().enumerate().map(|(i, c)| c.to_openai(&call_id(created, i))).collect(),
+        );
+    }
     let body = json!({
         "id": completion_id(),
         "object": "chat.completion",
-        "created": now(),
+        "created": created,
         "model": opts.model_id,
         "choices": [{
             "index": 0,
-            // `reasoning_content` beside `content`, DeepSeek's field and the one
-            // OpenAI-compatible clients look for; omitted when the model does not
-            // think, rather than sent empty.
-            "message": if reasoning.is_empty() {
-                json!({"role": "assistant", "content": content})
-            } else {
-                json!({"role": "assistant", "content": content, "reasoning_content": reasoning})
-            },
+            "message": message,
             "finish_reason": reason,
         }],
         "usage": {
@@ -1573,6 +1746,13 @@ mod tests {
     /// conversation with a different assistant message and a new question: the
     /// only return point is the checkpoint every prompt now ends with. Before it,
     /// Cline restarted every turn of a ~1,100-token session.
+    ///
+    /// **Where exactly: after the prompt's last special token** (27-09), here
+    /// `<|im_start|>` two tokens before the end of `…assistant\n`. The ordinary
+    /// tokens after it can merge with what the next request appends — on the
+    /// Qwen3.6/3.8 templates a trailing `<think>\n` did, and a tool round-trip
+    /// restarted from zero — so the checkpoint stops short of them, at the cost
+    /// of re-running those few tokens.
     #[test]
     #[ignore = "needs the 0.2B test model's NVFP4-expert GGUF in ~/models or INFERRED_MODEL_DIR"]
     fn a_changed_reply_returns_to_the_end_of_the_prompt() {
@@ -1585,7 +1765,8 @@ mod tests {
         };
         assert!(n < checkpoint_spacing(8192), "the turn must be shorter than a spacing: {n}");
         // `plain` is what a session records: both halves, no markers.
-        let r = generate(&mut s, logits, 8, |_, _| Ok(()), || false).expect("generate");
+        let turn = Gen { budget: 8, tools: None, thinking: false };
+        let r = generate(&mut s, logits, turn, |_| Ok(()), || false).expect("generate");
         let (text, ids) = (r.content.clone(), r.ids.clone());
         s.absorb(&r.plain, &r.ids);
 
@@ -1598,7 +1779,19 @@ mod tests {
             panic!("the second turn reported a cancel");
         };
         println!("  first turn {n} tokens, generated {:?}; second turn {}, {fresh} new", text, how.label());
-        assert!(matches!(how, Resume::Restored(p) if p == n), "resumed as {}, not at {n}", how.label());
+        let prompt = s.tk.encode(&first, true, true);
+        let stable = prompt
+            .iter()
+            .rposition(|&t| s.tk.is_special(t))
+            .map(|i| i + 1)
+            .filter(|&p| p < prompt.len())
+            .unwrap_or(n);
+        assert!(stable < n, "the prompt ends in ordinary tokens after its last special one");
+        assert!(
+            matches!(how, Resume::Restored(p) if p == stable),
+            "resumed as {}, not at the last special token ({stable} of {n})",
+            how.label()
+        );
     }
 
     /// The two halves of a turn leave `generate` separated, and no marker or
@@ -1622,9 +1815,11 @@ mod tests {
         let r = generate(
             &mut s,
             logits,
-            24,
-            |delta, part| {
-                streamed.push((part, delta.to_string()));
+            Gen { budget: 24, tools: None, thinking: false },
+            |out| {
+                if let Out::Text(delta, part) = out {
+                    streamed.push((part, delta.to_string()));
+                }
                 Ok(())
             },
             || false,
