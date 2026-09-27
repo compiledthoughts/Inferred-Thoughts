@@ -1,0 +1,353 @@
+{
+ "model": "Qwen3-0.6B-Q8_0.gguf",
+ "jinja2": "3.1.6",
+ "cases": [
+  {
+   "name": "user",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "system_user",
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "multi_turn",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "reasoning_in_history",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "The user greets me."
+    },
+    {
+     "role": "user",
+     "content": "Again?"
+    }
+   ],
+   "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "tools_user",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "List the files in k:\\compiledthoughts."
+    }
+   ],
+   "expected": "<|im_start|>system\nYou are a coding agent.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "tool_call_and_result",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "List the files in k:\\compiledthoughts."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll list them.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "list_files",
+        "arguments": {
+         "path": "k:\\compiledthoughts"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "README.md\nsrc/"
+    }
+   ],
+   "expected": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\nI'll list them.\n<tool_call>\n{\"name\": \"list_files\", \"arguments\": {\"path\": \"k:\\\\compiledthoughts\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "two_calls_two_results",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is in the README?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "list_files",
+        "arguments": {
+         "path": "k:\\compiledthoughts"
+        }
+       }
+      },
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "README.md",
+         "max_lines": 20
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "README.md\nsrc/"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "# inferredThoughts\n\"quoted\" text"
+    }
+   ],
+   "expected": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is in the README?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"list_files\", \"arguments\": {\"path\": \"k:\\\\compiledthoughts\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\": \"README.md\", \"max_lines\": 20}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response>\n<tool_response>\n# inferredThoughts\n\"quoted\" text\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  },
+  {
+   "name": "no_user_query",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Only a system message."
+    }
+   ],
+   "expected": "<|im_start|>system\nOnly a system message.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>assistant\n",
+   "error": null
+  }
+ ]
+}

@@ -6,12 +6,25 @@
 //! prompt is therefore not a convenience — it is the difference between a
 //! usable answer and a repetition loop.
 //!
-//! **This is not a Jinja interpreter.** `tokenizer.chat_template` is 4100
-//! characters of Jinja on Qwen3, and interpreting it properly means a template
-//! engine and a lot of surface area for something that is not this project's
-//! thesis. Instead we recognize *one* shape — ChatML, the
-//! `<|im_start|>role\n…<|im_end|>` structure — and refuse anything else with a
-//! named error rather than guessing.
+//! Two renderers, for two jobs.
+//!
+//! - **[`ChatMl::wrap`] and [`ChatMl::wrap_turns`]** recognize *one* shape —
+//!   ChatML, the `<|im_start|>role\n…<|im_end|>` structure — for `generate
+//!   --chat`, the `serve` warm-up and the tests that pin prompts to the token.
+//!   Unchanged, so every number measured through them stays comparable.
+//! - **[`ChatMl::render`]** runs the model's own `tokenizer.chat_template`, as
+//!   written, for `serve`. Tools, tool calls, tool results and the thinking
+//!   block are all spelled by the template, and a model's template *is* its
+//!   specification: re-typing it in Rust would drift from what the model was
+//!   trained on (the hand-written ChatML path never opened the reply with
+//!   `<think>\n`, which both Qwen3.6 and Qwen3.8 templates do).
+//!
+//! The engine is [minijinja], Jinja by Jinja's author, configured as Hugging
+//! Face `transformers` configures Jinja for chat templates: `trim_blocks`,
+//! `lstrip_blocks`, Python's string methods, `raise_exception`, and a `tojson`
+//! with Python's separators. An earlier version of this file refused a template
+//! engine as too much surface area to write; borrowing a mature one is a
+//! different trade.
 //!
 //! Nothing here is hardcoded per model. The marker spellings must be present as
 //! real tokens in the file's own vocabulary, and the file's own chat template
@@ -19,19 +32,87 @@
 //! That is what `CLAUDE.md`'s "never invent format constants" asks for: the
 //! constants are read from the model, and a model that disagrees fails loudly.
 
+use std::sync::Arc;
+
 use super::Tokenizer;
 use crate::error::{Error, Result};
 use crate::gguf::Metadata;
 
-/// The ChatML markers, confirmed to exist in a specific model.
+/// The ChatML markers, confirmed to exist in a specific model, and the model's
+/// own chat template, compiled.
 #[derive(Debug, Clone)]
 pub struct ChatMl {
     start: String,
     end: String,
+    /// `None` when the template failed to compile; [`ChatMl::render`] then
+    /// returns the reason instead of guessing a format.
+    template: Option<Arc<minijinja::Environment<'static>>>,
+    template_error: Option<String>,
 }
 
 /// GGUF key holding the Jinja chat template.
 const TEMPLATE_KEY: &str = "tokenizer.chat_template";
+
+/// The name the compiled template is registered under; any name would do.
+const TEMPLATE_NAME: &str = "chat";
+
+/// Compile a chat template the way `transformers` sets up Jinja for one
+/// (`utils/chat_template_utils.py`): blocks trimmed, Python's string methods
+/// available, `raise_exception` defined, and `tojson` as Python's `json.dumps`.
+fn compile(source: &str) -> std::result::Result<minijinja::Environment<'static>, String> {
+    let mut env = minijinja::Environment::new();
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", tojson);
+    env.add_function("raise_exception", raise_exception);
+    env.add_template_owned(TEMPLATE_NAME, source.to_string())
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(env)
+}
+
+fn template_error(e: minijinja::Error) -> Error {
+    Error::UnsupportedChatTemplate { detail: format!("{e:#}") }
+}
+
+/// `raise_exception(message)`: the templates' own validation, surfaced as an
+/// error rather than rendered.
+fn raise_exception(message: String) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message))
+}
+
+/// `tojson` as `transformers` defines it: `json.dumps(x, ensure_ascii=False)`,
+/// so `", "` and `": "` between items and keys in insertion order.
+///
+/// **Not minijinja's built-in**, which is compact (`","`, `":"`) and escapes
+/// HTML characters. The tools block is rendered with this filter, and the model
+/// was trained on Python's spacing; a compact line is a different prompt.
+fn tojson(value: minijinja::Value) -> std::result::Result<minijinja::Value, minijinja::Error> {
+    let mut out = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, PythonFormatter);
+    serde::Serialize::serialize(&value, &mut ser)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string()))?;
+    let text = String::from_utf8(out)
+        .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::BadSerialization, e.to_string()))?;
+    Ok(minijinja::Value::from_safe_string(text))
+}
+
+/// `json.dumps`'s default separators: `", "` and `": "`.
+struct PythonFormatter;
+
+impl serde_json::ser::Formatter for PythonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(&mut self, w: &mut W, first: bool) -> std::io::Result<()> {
+        if first { Ok(()) } else { w.write_all(b", ") }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+}
 
 impl ChatMl {
     /// Confirm this model speaks ChatML, or say why not.
@@ -64,10 +145,44 @@ impl ChatMl {
             });
         }
 
+        let (template, template_error) = match compile(template) {
+            Ok(env) => (Some(Arc::new(env)), None),
+            Err(e) => (None, Some(e)),
+        };
         Ok(Self {
             start: start.to_string(),
             end: end.to_string(),
+            template,
+            template_error,
         })
+    }
+
+    /// Render a conversation with the model's own chat template, and open the
+    /// assistant turn.
+    ///
+    /// `messages` and `tools` are OpenAI-shaped JSON, passed to the template as
+    /// the variables of the same names, with `add_generation_prompt` set. Tool
+    /// calls in assistant messages must carry `arguments` as an object: the
+    /// template iterates them with `|items`. [`crate::serve`] converts the JSON
+    /// string OpenAI clients send.
+    pub fn render(&self, messages: &serde_json::Value, tools: Option<&serde_json::Value>) -> Result<String> {
+        let env = self.template.as_ref().ok_or_else(|| Error::UnsupportedChatTemplate {
+            detail: format!(
+                "the model's chat template does not compile: {}",
+                self.template_error.as_deref().unwrap_or("unknown")
+            ),
+        })?;
+        let tmpl = env.get_template(TEMPLATE_NAME).map_err(template_error)?;
+        let tools = match tools {
+            Some(t) => minijinja::Value::from_serialize(t),
+            None => minijinja::Value::UNDEFINED,
+        };
+        tmpl.render(minijinja::context! {
+            messages => minijinja::Value::from_serialize(messages),
+            tools => tools,
+            add_generation_prompt => true,
+        })
+        .map_err(template_error)
     }
 
     /// One user turn, followed by the opening of the assistant turn so the
@@ -108,7 +223,53 @@ mod tests {
         ChatMl {
             start: "<|im_start|>".to_string(),
             end: "<|im_end|>".to_string(),
+            template: None,
+            template_error: None,
         }
+    }
+
+    /// A `ChatMl` whose template is `source`, for testing the engine setup
+    /// without a model file.
+    fn with_template(source: &str) -> ChatMl {
+        ChatMl {
+            template: Some(Arc::new(compile(source).expect("compiles"))),
+            ..chatml()
+        }
+    }
+
+    #[test]
+    fn tojson_uses_pythons_separators_and_keeps_key_order() {
+        // `json.dumps({"b": 1, "a": [1, "x"], "u": "é\n"}, ensure_ascii=False)`
+        let c = with_template("{{ tools[0] | tojson }}");
+        let tools = serde_json::json!([{"b": 1, "a": [1, "x"], "u": "é\n"}]);
+        assert_eq!(
+            c.render(&serde_json::json!([]), Some(&tools)).unwrap(),
+            r#"{"b": 1, "a": [1, "x"], "u": "é\n"}"#
+        );
+    }
+
+    #[test]
+    fn blocks_are_trimmed_and_python_string_methods_work() {
+        // trim_blocks + lstrip_blocks: a block tag's own line leaves nothing.
+        let c = with_template(
+            "{%- for m in messages %}\n  {% if m.content.startswith('x') %}\n[{{ m.content.split(':')[1].rstrip('!') }}]\n  {% endif %}\n{%- endfor %}",
+        );
+        let msgs = serde_json::json!([{"role": "user", "content": "x:hi!"}, {"role": "user", "content": "y"}]);
+        assert_eq!(c.render(&msgs, None).unwrap(), "[hi]\n");
+    }
+
+    #[test]
+    fn raise_exception_is_an_error_not_text() {
+        let c = with_template("{{ raise_exception('No messages provided.') }}");
+        let e = c.render(&serde_json::json!([]), None).unwrap_err().to_string();
+        assert!(e.contains("No messages provided."), "{e}");
+    }
+
+    #[test]
+    fn an_uncompilable_template_is_refused_by_name() {
+        let c = ChatMl { template_error: Some("unexpected end".to_string()), ..chatml() };
+        let e = c.render(&serde_json::json!([]), None).unwrap_err().to_string();
+        assert!(e.contains("does not compile") && e.contains("unexpected end"), "{e}");
     }
 
     #[test]

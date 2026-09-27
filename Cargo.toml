@@ -21,7 +21,15 @@ rayon = "1"
 # content arrays and unknown fields, which is where a hand-rolled parser breaks
 # against a real UI rather than against a test.
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order`: a tool's JSON reaches the prompt through the template's
+# `tojson`, and the model was trained on its keys in the order the client wrote
+# them. Sorted keys would be a different prompt.
+serde_json = { version = "1", features = ["preserve_order"] }
+# The model's own chat template, rendered as written rather than re-implemented.
+# minijinja is Jinja by Jinja's author; `pycompat` supplies the Python string
+# methods the Qwen templates call (`startswith`, `split`, `rstrip`, ...).
+minijinja = { version = "2", features = ["preserve_order", "loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 [features]
 # Off by default so the crate builds and tests without a CUDA toolkit.

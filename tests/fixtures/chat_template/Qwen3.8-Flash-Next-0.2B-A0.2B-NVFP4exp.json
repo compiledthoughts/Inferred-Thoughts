@@ -1,0 +1,353 @@
+{
+ "model": "Qwen3.8-Flash-Next-0.2B-A0.2B-NVFP4exp.gguf",
+ "jinja2": "3.1.6",
+ "cases": [
+  {
+   "name": "user",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello"
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "system_user",
+   "tools": null,
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "multi_turn",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello! How can I help?"
+    },
+    {
+     "role": "user",
+     "content": "Tell me a joke."
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "reasoning_in_history",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Hello!",
+     "reasoning_content": "The user greets me."
+    },
+    {
+     "role": "user",
+     "content": "Again?"
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\nThe user greets me.\n</think>\n\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "tools_user",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a coding agent."
+    },
+    {
+     "role": "user",
+     "content": "List the files in k:\\compiledthoughts."
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "tool_call_and_result",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "List the files in k:\\compiledthoughts."
+    },
+    {
+     "role": "assistant",
+     "content": "I'll list them.",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "list_files",
+        "arguments": {
+         "path": "k:\\compiledthoughts"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "README.md\nsrc/"
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'll list them.\n\n<tool_call>\n<function=list_files>\n<parameter=path>\nk:\\compiledthoughts\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "two_calls_two_results",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is in the README?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_0",
+       "type": "function",
+       "function": {
+        "name": "list_files",
+        "arguments": {
+         "path": "k:\\compiledthoughts"
+        }
+       }
+      },
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "read_file",
+        "arguments": {
+         "path": "README.md",
+         "max_lines": 20
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_0",
+     "content": "README.md\nsrc/"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "# inferredThoughts\n\"quoted\" text"
+    }
+   ],
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is in the README?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=list_files>\n<parameter=path>\nk:\\compiledthoughts\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=max_lines>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response>\n<tool_response>\n# inferredThoughts\n\"quoted\" text\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "no_user_query",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "list_files",
+      "description": "List the files in a directory.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "description": "Directory to list."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "read_file",
+      "description": "Read a text file — UTF-8, e.g. résumé.txt.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        },
+        "max_lines": {
+         "type": "integer",
+         "description": "Stop after this many lines."
+        }
+       },
+       "required": [
+        "path"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Only a system message."
+    }
+   ],
+   "expected": null,
+   "error": "No user query found in messages."
+  }
+ ]
+}
