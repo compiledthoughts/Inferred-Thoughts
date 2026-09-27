@@ -56,6 +56,13 @@ Decode as a conversation gets deeper, through `serve`:
 | 176.9B | ~0.2k | 10.40 | Windows, 24-09-2026 |
 | | ~29k | 6.45 | WSL2, 22-09-2026 |
 
+The ~36k row, on Windows (at this `--ctx`, the default 6 GiB pinned tier left
+experts on the SSD and decode fell to ~26 tok/s; 10 GiB fixed it):
+
+```bat
+target\release\inferred.exe serve -m Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --backend cuda --port 8080 --ctx 64096 --expert-host 10 -v
+```
+
 On the 35B, decode costs ~21.3 ms plus ~0.08 µs per position of context;
 prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
 
