@@ -169,15 +169,18 @@ impl ChatMl {
         self.render_with(messages, tools, None)
     }
 
-    /// [`ChatMl::render`], plus the template's `reasoning_effort` variable when
-    /// the client sent one. Qwen3.8's template reads it (`xhigh`, the default,
-    /// `medium` or `low`) and refuses any other value by name; templates that do
-    /// not read it ignore it.
+    /// [`ChatMl::render`], plus the template's own switches — what OpenAI-style
+    /// servers call `chat_template_kwargs`: `enable_thinking` (Qwen3.6 and
+    /// Qwen3.8 pre-fill an empty thinking block when it is false),
+    /// `reasoning_effort` (Qwen3.8: `xhigh`, the default, `medium` or `low`;
+    /// any other value is refused by name), `preserve_thinking`. A template
+    /// ignores the ones it does not read. `messages`, `tools` and
+    /// `add_generation_prompt` are set here and cannot be overridden.
     pub fn render_with(
         &self,
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
-        reasoning_effort: Option<&str>,
+        kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String> {
         let env = self.template.as_ref().ok_or_else(|| Error::UnsupportedChatTemplate {
             detail: format!(
@@ -186,21 +189,19 @@ impl ChatMl {
             ),
         })?;
         let tmpl = env.get_template(TEMPLATE_NAME).map_err(template_error)?;
-        let tools = match tools {
-            Some(t) => minijinja::Value::from_serialize(t),
-            None => minijinja::Value::UNDEFINED,
-        };
-        let effort = match reasoning_effort {
-            Some(e) => minijinja::Value::from(e),
-            None => minijinja::Value::UNDEFINED,
-        };
-        tmpl.render(minijinja::context! {
-            messages => minijinja::Value::from_serialize(messages),
-            tools => tools,
-            reasoning_effort => effort,
-            add_generation_prompt => true,
-        })
-        .map_err(template_error)
+        let mut ctx = kwargs.cloned().unwrap_or_default();
+        ctx.insert("messages".to_string(), messages.clone());
+        match tools {
+            Some(t) => {
+                ctx.insert("tools".to_string(), t.clone());
+            }
+            None => {
+                ctx.remove("tools");
+            }
+        }
+        ctx.insert("add_generation_prompt".to_string(), serde_json::Value::Bool(true));
+        tmpl.render(minijinja::Value::from_serialize(&ctx))
+            .map_err(template_error)
     }
 
     /// One user turn, followed by the opening of the assistant turn so the
@@ -277,12 +278,18 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_reaches_the_template_only_when_given() {
-        let c = with_template("[{{ reasoning_effort|default('xhigh') }}]");
-        let m = serde_json::json!([]);
-        assert_eq!(c.render_with(&m, None, Some("medium")).unwrap(), "[medium]");
-        assert_eq!(c.render_with(&m, None, None).unwrap(), "[xhigh]");
-        assert_eq!(c.render(&m, None).unwrap(), "[xhigh]");
+    fn template_switches_reach_the_template_only_when_given() {
+        let c = with_template(
+            "[{{ reasoning_effort|default('xhigh') }}|{{ 'off' if enable_thinking is defined and enable_thinking is false else 'on' }}|{{ messages|length }}]",
+        );
+        let m = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let kw = serde_json::json!({"reasoning_effort": "medium", "enable_thinking": false});
+        assert_eq!(c.render_with(&m, None, kw.as_object()).unwrap(), "[medium|off|1]");
+        assert_eq!(c.render_with(&m, None, None).unwrap(), "[xhigh|on|1]");
+        assert_eq!(c.render(&m, None).unwrap(), "[xhigh|on|1]");
+        // A switch cannot replace the conversation itself.
+        let sneaky = serde_json::json!({"messages": []});
+        assert_eq!(c.render_with(&m, None, sneaky.as_object()).unwrap(), "[xhigh|on|1]");
     }
 
     #[test]

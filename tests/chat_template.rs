@@ -35,7 +35,8 @@ fn check(fixture: &str) {
     for case in cases {
         let name = case["name"].as_str().unwrap_or("?");
         let tools = case.get("tools").filter(|t| !t.is_null());
-        let got = chat.render(&case["messages"], tools);
+        let kwargs = case.get("kwargs").and_then(serde_json::Value::as_object);
+        let got = chat.render_with(&case["messages"], tools, kwargs);
         match (case["expected"].as_str(), case["error"].as_str()) {
             (Some(want), _) => {
                 let got = got.unwrap_or_else(|e| panic!("{model} / {name}: render failed: {e}"));

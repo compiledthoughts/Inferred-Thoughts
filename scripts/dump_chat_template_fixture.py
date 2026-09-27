@@ -96,10 +96,16 @@ CASES = [
     ("no_user_query", TOOLS, [
         {"role": "system", "content": "Only a system message."},
     ]),
+    ("thinking_off", None, [
+        {"role": "user", "content": "What is 2+2?"},
+    ], {"enable_thinking": False}),
+    ("reasoning_low", None, [
+        {"role": "user", "content": "What is 2+2?"},
+    ], {"reasoning_effort": "low"}),
 ]
 
 
-def render(template: str, messages, tools):
+def render(template: str, messages, tools, kwargs=None):
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=[loopcontrols])
 
     def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
@@ -110,10 +116,11 @@ def render(template: str, messages, tools):
 
     env.filters["tojson"] = tojson
     env.globals["raise_exception"] = raise_exception
-    kwargs = {"messages": messages, "add_generation_prompt": True}
+    context = dict(kwargs or {})
+    context.update({"messages": messages, "add_generation_prompt": True})
     if tools is not None:
-        kwargs["tools"] = tools
-    return env.from_string(template).render(**kwargs)
+        context["tools"] = tools
+    return env.from_string(template).render(**context)
 
 
 def main():
@@ -128,10 +135,11 @@ def main():
     template = meta["kv"]["tokenizer.chat_template"]["value"]
 
     cases = []
-    for name, tools, messages in CASES:
-        case = {"name": name, "tools": tools, "messages": messages, "expected": None, "error": None}
+    for name, tools, messages, *rest in CASES:
+        kwargs = rest[0] if rest else None
+        case = {"name": name, "tools": tools, "messages": messages, "kwargs": kwargs, "expected": None, "error": None}
         try:
-            case["expected"] = render(template, messages, tools)
+            case["expected"] = render(template, messages, tools, kwargs)
         except jinja2.exceptions.TemplateError as e:
             case["error"] = str(e)
         cases.append(case)

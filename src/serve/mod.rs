@@ -91,7 +91,13 @@ pub struct ServeOpts {
     /// Advertised through `/v1/models` and echoed in responses. A client that
     /// asks for a different one still gets this: there is one model loaded.
     pub model_id: String,
+    /// Default reply budget when a request sets none; 0 is "until the context
+    /// is full".
     pub max_tokens: usize,
+    /// `--think`: the default for the template's `enable_thinking`, when set.
+    pub think: Option<bool>,
+    /// `--reasoning-effort`: the default for the template's `reasoning_effort`.
+    pub reasoning_effort: Option<String>,
     /// Print each request's body and the prompt it renders to.
     pub verbose: bool,
 }
@@ -121,6 +127,33 @@ struct ChatRequest {
     /// rather than failing the turn.
     #[serde(default)]
     reasoning_effort: Option<String>,
+    /// The template's own switches, as vLLM, SGLang and llama.cpp's server
+    /// accept them: `{"enable_thinking": false}` turns thinking off for this
+    /// request. Overrides `--think` and `--reasoning-effort`.
+    #[serde(default)]
+    chat_template_kwargs: Option<serde_json::Map<String, Value>>,
+}
+
+/// The template switches for one request: the server's defaults, then the
+/// request's `reasoning_effort`, then its `chat_template_kwargs`, each
+/// overriding the last.
+fn template_kwargs(req: &ChatRequest, opts: &ServeOpts) -> serde_json::Map<String, Value> {
+    let mut kw = serde_json::Map::new();
+    if let Some(on) = opts.think {
+        kw.insert("enable_thinking".to_string(), json!(on));
+    }
+    if let Some(e) = &opts.reasoning_effort {
+        kw.insert("reasoning_effort".to_string(), json!(e));
+    }
+    if let Some(e) = &req.reasoning_effort {
+        kw.insert("reasoning_effort".to_string(), json!(e));
+    }
+    if let Some(extra) = &req.chat_template_kwargs {
+        for (k, v) in extra {
+            kw.insert(k.clone(), v.clone());
+        }
+    }
+    kw
 }
 
 /// Requests handled since start-up, for the turn header.
@@ -1011,33 +1044,45 @@ fn chat_completions<O: Ops>(
         _ => None,
     };
     let messages = Value::Array(req.messages.iter().map(template_message).collect());
-    let effort = req.reasoning_effort.as_deref();
-    let (want, effort_note) = match session.chat.render_with(&messages, tools, effort) {
-        Ok(w) => (w, effort.map(str::to_string)),
-        // A value this template refuses: its own default, said in the log.
-        Err(_) if effort.is_some() => match session.chat.render_with(&messages, tools, None) {
-            Ok(w) => (w, effort.map(|e| format!("{e} (not this template's; its default used)"))),
-            Err(e) => return refuse(stream, &e.to_string()),
-        },
+    let mut kwargs = template_kwargs(&req, opts);
+    let effort = kwargs.get("reasoning_effort").and_then(Value::as_str).map(str::to_string);
+    let (want, effort_note) = match session.chat.render_with(&messages, tools, Some(&kwargs)) {
+        Ok(w) => (w, effort.clone()),
+        // An effort this template refuses: its own default, said in the log.
+        Err(_) if effort.is_some() => {
+            kwargs.remove("reasoning_effort");
+            match session.chat.render_with(&messages, tools, Some(&kwargs)) {
+                Ok(w) => (w, effort.map(|e| format!("{e} (not this template's; its default used)"))),
+                Err(e) => return refuse(stream, &e.to_string()),
+            }
+        }
         Err(e) => return refuse(stream, &e.to_string()),
     };
+    // 0 — the default — asks for nothing: the context's room is the limit.
     let budget = req
         .max_tokens
         .or(req.max_completion_tokens)
         .unwrap_or(opts.max_tokens);
+    // Both Qwen3.6 and Qwen3.8 templates open the reply inside the thinking
+    // block, so the model's first tokens are reasoning and it emits only the
+    // closing marker. With `enable_thinking` false they close an empty block
+    // instead, and the reply is answer from its first token.
+    let thinking = want.ends_with("<think>\n");
     let mut parts = vec![format!("{} messages", req.messages.len())];
     if let Some(t) = tools.and_then(Value::as_array) {
         parts.push(format!("{} tools", t.len()));
     }
-    parts.push(format!("max_tokens {}", thousands(budget)));
-    if let Some(e) = &effort_note {
+    parts.push(if budget == 0 {
+        "max_tokens: until the context is full".to_string()
+    } else {
+        format!("max_tokens {}", thousands(budget))
+    });
+    if kwargs.get("enable_thinking") == Some(&json!(false)) {
+        parts.push("thinking off".to_string());
+    } else if let Some(e) = &effort_note {
         parts.push(format!("reasoning {e}"));
     }
     eprintln!("  request   {}", parts.join(" · "));
-    // Both Qwen3.6 and Qwen3.8 templates open the reply inside the thinking
-    // block, so the model's first tokens are reasoning and it emits only the
-    // closing marker.
-    let thinking = want.ends_with("<think>\n");
 
     if opts.verbose {
         clipped("body    ", &String::from_utf8_lossy(body), 1200);
@@ -1078,7 +1123,7 @@ fn chat_completions<O: Ops>(
     // about to cut a reply off (Cline asks for 32,000 at 28,761 of 32,096).
     let (pos, n_ctx) = (session.engine.pos(), session.engine.n_ctx());
     let room = n_ctx.saturating_sub(pos + 1);
-    let budget = budget.min(room);
+    let budget = if budget == 0 { room } else { budget.min(room) };
     let used = pos * 100 / n_ctx.max(1);
     eprintln!(
         "  context   {} · {} new · {} of {} positions ({used}%) · reply room {}{}",

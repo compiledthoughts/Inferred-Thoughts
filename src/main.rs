@@ -252,9 +252,21 @@ enum Command {
         /// afterwards; this only replaces the layer-order starting point.
         #[arg(long)]
         warmup: bool,
-        /// Default generation budget when the request does not set one.
-        #[arg(short = 'n', long, default_value_t = 512)]
+        /// Default generation budget when the request does not set one. 0, the
+        /// default, is "until the context is full": a thinking model spends much
+        /// of any small budget reasoning before it answers.
+        #[arg(short = 'n', long, default_value_t = 0)]
         max_tokens: usize,
+        /// Thinking, for models whose chat template can turn it off (Qwen3.6,
+        /// Qwen3.8): `on`, the template's default, or `off`. A request's
+        /// `chat_template_kwargs.enable_thinking` overrides it.
+        #[arg(long, value_parser = ["on", "off"])]
+        think: Option<String>,
+        /// Default reasoning effort, for templates that read one (Qwen3.8:
+        /// `xhigh`, its default, `medium` or `low`). A request's own
+        /// `reasoning_effort` overrides it.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
         /// Count kernel launches, bus crossings and expert residency, and
         /// report them after every turn.
         ///
@@ -359,6 +371,8 @@ fn main() -> ExitCode {
             expert_host,
             warmup,
             max_tokens,
+            think,
+            reasoning_effort,
             profile_device,
             threads,
             backend,
@@ -373,6 +387,8 @@ fn main() -> ExitCode {
             expert_host,
             warmup,
             max_tokens,
+            think: think.map(|t| t == "on"),
+            reasoning_effort,
             profile_device,
             threads,
             backend,
@@ -1277,6 +1293,9 @@ struct ServeArgs {
     /// Prefill a built-in text at start-up and re-place experts by it. CUDA only.
     warmup: bool,
     max_tokens: usize,
+    /// `--think`: `Some(false)` turns thinking off by default.
+    think: Option<bool>,
+    reasoning_effort: Option<String>,
     /// Report launch counts and expert residency after each turn.
     profile_device: bool,
     threads: usize,
@@ -1323,6 +1342,8 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
         port: a.port,
         model_id: format!("{name}-{}", a.backend),
         max_tokens: a.max_tokens,
+        think: a.think,
+        reasoning_effort: a.reasoning_effort.clone(),
         verbose: a.verbose,
     };
 

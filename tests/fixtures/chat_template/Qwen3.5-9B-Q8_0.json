@@ -11,6 +11,7 @@
      "content": "Hello"
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -27,6 +28,7 @@
      "content": "What is 2+2?"
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -47,6 +49,7 @@
      "content": "Tell me a joke."
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -68,6 +71,7 @@
      "content": "Again?"
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAgain?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -126,6 +130,7 @@
      "content": "List the files in k:\\compiledthoughts."
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a coding agent.<|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -201,6 +206,7 @@
      "content": "README.md\nsrc/"
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nList the files in k:\\compiledthoughts.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI'll list them.\n\n<tool_call>\n<function=list_files>\n<parameter=path>\nk:\\compiledthoughts\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -292,6 +298,7 @@
      "content": "# inferredThoughts\n\"quoted\" text"
     }
    ],
+   "kwargs": null,
    "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files in a directory.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"Directory to list.\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a text file — UTF-8, e.g. résumé.txt.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"max_lines\": {\"type\": \"integer\", \"description\": \"Stop after this many lines.\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is in the README?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=list_files>\n<parameter=path>\nk:\\compiledthoughts\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=read_file>\n<parameter=path>\nREADME.md\n</parameter>\n<parameter=max_lines>\n20\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nREADME.md\nsrc/\n</tool_response>\n<tool_response>\n# inferredThoughts\n\"quoted\" text\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
    "error": null
   },
@@ -346,8 +353,39 @@
      "content": "Only a system message."
     }
    ],
+   "kwargs": null,
    "expected": null,
    "error": "No user query found in messages."
+  },
+  {
+   "name": "thinking_off",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "kwargs": {
+    "enable_thinking": false
+   },
+   "expected": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "error": null
+  },
+  {
+   "name": "reasoning_low",
+   "tools": null,
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 2+2?"
+    }
+   ],
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "expected": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "error": null
   }
  ]
 }

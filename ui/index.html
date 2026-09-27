@@ -169,7 +169,9 @@ async function send(text) {
     const res = await fetch("v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages, stream: true, max_tokens: 2048 }),
+      // No max_tokens: the server's --max-tokens decides, by default the room
+      // left in the context. A fixed 2048 cut a thinking model's answers off.
+      body: JSON.stringify({ messages, stream: true }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`server said ${res.status}`);
