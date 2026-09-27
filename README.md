@@ -3,6 +3,9 @@
 A Rust + CUDA inference engine for mixture-of-experts models, streaming their
 experts from the SSD.
 
+This engine treats the __memory hierarchy as a first-class scheduling problem__
+with lookahead, GCLOCK, and tier budgets.
+
 ## Why
 
 RAM prices shot up. Running a large model the usual way means holding all of
@@ -94,7 +97,7 @@ use `http://127.0.0.1:8080/v1`.
 keep it as small as the session needs. If decode slows sharply at a large
 `--ctx`, raise `--expert-host` (pinned-RAM expert tier, 6 GiB by default).
 
-Tests: `cargo test --release --features cuda` (178, no GPU needed).
+Tests: `cargo test --release --features cuda` (179, no GPU needed).
 
 ## Limits and next
 
