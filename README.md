@@ -21,8 +21,8 @@ of the file left on the SSD. How it works:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 That is the proof this route is worth pursuing: next come bigger models on the
-same card, and tool calling so it can drive agents. **This is the first cut** —
-we expect it to get faster and better from here.
+same card. **This is the first cut** — we expect it to get faster and better
+from here.
 
 ## Tested so far
 
@@ -152,16 +152,22 @@ On Windows the binary is `target\release\inferred.exe`. Open
 `http://127.0.0.1:8080/` for the chat page; any OpenAI-compatible client can
 use `http://127.0.0.1:8080/v1`.
 
+Prompts are rendered with each model's own chat template, so an agent client
+(Cline, or anything that sends OpenAI `tools`) gets **tool calls** back as
+`tool_calls`, in the format the model was trained on, and reasoning as
+`reasoning_content`.
+
 For `--ctx` and `--expert-host`, see
 [Context length and the KV cache](#context-length-and-the-kv-cache).
 
-Tests: `cargo test --release --features cuda` (179, no GPU needed).
+Tests: `cargo test --release --features cuda` (191, no GPU needed).
 
 ## Limits and next
 
 - Tested on two models, one GPU family, Windows and WSL2 only.
-- Greedy decoding only; no tool calling yet.
-- Next: bigger models, tool calling, older NVIDIA GPUs, native Linux.
+- Greedy decoding only. Tool calling is basic: each call arrives whole, not
+  streamed argument by argument.
+- Next: bigger models, older NVIDIA GPUs, native Linux.
 
 ## Acknowledgements
 
