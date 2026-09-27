@@ -33,7 +33,8 @@ The goal: good large models, at acceptable speed, on reasonably priced hardware.
 
 | part of the file | size | where it lives |
 |---|---:|---|
-| dense weights (attention, shared experts, embeddings) | 5.1 GiB | memory |
+| dense weights (attention, shared experts, LM head) | 4.4 GiB | VRAM |
+| token embedding table | 0.6 GiB | RAM, one row read per token |
 | hottest routed experts | 8.8 GiB | VRAM |
 | next-hottest routed experts | 6.0 GiB | pinned RAM |
 | remaining routed experts | 48.5 GiB | SSD, streamed on demand |
