@@ -74,7 +74,7 @@ default). The ~36k row, on Windows: at this `--ctx` the default tier left
 experts on the SSD and decode fell to ~26 tok/s; 10 GiB fixed it:
 
 ```bat
-target\release\inferred.exe serve -m Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --backend cuda --port 8080 --ctx 64096 --expert-host 10 -v
+target\release\inferred.exe serve -m models\Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --backend cuda --port 8080 --ctx 64096 --expert-host 10 -v
 ```
 
 On the 35B, decode costs ~21.3 ms plus ~0.08 µs per position of context;
@@ -87,12 +87,41 @@ prefill falls from ~724 tok/s at the start of a conversation to ~237 by 86k.
   *x64 Native Tools Command Prompt*
 - For the 176.9B: 32 GB of RAM and a fast local NVMe. Under WSL, keep models
   on ext4 (`~/models`), not `/mnt/c`.
+- To download models: Python 3.9+ (for the `hf` command), or `curl`; and free
+  disk space: 128 GB for the 176.9B, 20.5 GB for the 35B.
+
+## Get a model
+
+Both GGUFs are on Hugging Face, no login needed:
+
+```bash
+pip install -U huggingface_hub
+
+# Qwen3.8-Flash-Next, 176.9B (119 GiB = 128 GB)
+hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --local-dir models
+
+# Qwen3.6-35B-A3B (19.1 GiB = 20.5 GB)
+hf download CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it Qwen3.6-35B-A3B-NVFP4-Q8_0-it.gguf --local-dir models
+```
+
+If a download is interrupted, run the same command again and it resumes.
+Without Python, `curl -L -C - -O <url>` also resumes, with the URL
+`https://huggingface.co/<repo>/resolve/main/<file>`. Under WSL, use
+`--local-dir ~/models`.
+
+To check the 176.9B file (Linux or WSL), fetch the checksum beside it and
+verify:
+
+```bash
+hf download CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0 SHA256SUMS --local-dir models
+cd models && sha256sum -c SHA256SUMS
+```
 
 ## Build and run
 
 ```bash
 cargo build --release --features cuda
-./target/release/inferred serve -m Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
+./target/release/inferred serve -m models/Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf --backend cuda --port 8080 --ctx 8192
 ```
 
 On Windows the binary is `target\release\inferred.exe`. Open
