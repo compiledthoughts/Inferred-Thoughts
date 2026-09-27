@@ -160,13 +160,13 @@ Prompts are rendered with each model's own chat template, so an agent client
 For `--ctx` and `--expert-host`, see
 [Context length and the KV cache](#context-length-and-the-kv-cache).
 
-Tests: `cargo test --release --features cuda` (191, no GPU needed).
+Tests: `cargo test --release --features cuda` (198, no GPU needed).
 
 ## Limits and next
 
 - Tested on two models, one GPU family, Windows and WSL2 only.
-- Greedy decoding only. Tool calling is basic: each call arrives whole, not
-  streamed argument by argument.
+- Greedy decoding only. Tool calls stream as they are written; `tool_choice`
+  other than `"none"` is left to the model.
 - Next: bigger models, older NVIDIA GPUs, native Linux.
 
 ## Acknowledgements
