@@ -20,6 +20,9 @@ Today that means **Qwen3.8-Flash-Next — 176.9B parameters, a 119 GiB file — 
 of the file left on the SSD. How it works:
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+That is the proof this route is worth pursuing: next come bigger models on the
+same card, and tool calling so it can drive agents.
+
 ## Tested so far
 
 Two models, on one machine: RTX 5060 Ti 16 GB, Ryzen 7 9700X, 32 GB DDR5,
@@ -105,7 +108,7 @@ Tests: `cargo test --release --features cuda` (179, no GPU needed).
 
 - Tested on two models, one GPU family, Windows and WSL2 only.
 - Greedy decoding only; no tool calling yet.
-- Next: older NVIDIA GPUs, native Linux, more models.
+- Next: bigger models, tool calling, older NVIDIA GPUs, native Linux.
 
 ## Acknowledgements
 
