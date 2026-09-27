@@ -166,6 +166,19 @@ impl ChatMl {
     /// template iterates them with `|items`. [`crate::serve`] converts the JSON
     /// string OpenAI clients send.
     pub fn render(&self, messages: &serde_json::Value, tools: Option<&serde_json::Value>) -> Result<String> {
+        self.render_with(messages, tools, None)
+    }
+
+    /// [`ChatMl::render`], plus the template's `reasoning_effort` variable when
+    /// the client sent one. Qwen3.8's template reads it (`xhigh`, the default,
+    /// `medium` or `low`) and refuses any other value by name; templates that do
+    /// not read it ignore it.
+    pub fn render_with(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String> {
         let env = self.template.as_ref().ok_or_else(|| Error::UnsupportedChatTemplate {
             detail: format!(
                 "the model's chat template does not compile: {}",
@@ -177,9 +190,14 @@ impl ChatMl {
             Some(t) => minijinja::Value::from_serialize(t),
             None => minijinja::Value::UNDEFINED,
         };
+        let effort = match reasoning_effort {
+            Some(e) => minijinja::Value::from(e),
+            None => minijinja::Value::UNDEFINED,
+        };
         tmpl.render(minijinja::context! {
             messages => minijinja::Value::from_serialize(messages),
             tools => tools,
+            reasoning_effort => effort,
             add_generation_prompt => true,
         })
         .map_err(template_error)
@@ -256,6 +274,15 @@ mod tests {
         );
         let msgs = serde_json::json!([{"role": "user", "content": "x:hi!"}, {"role": "user", "content": "y"}]);
         assert_eq!(c.render(&msgs, None).unwrap(), "[hi]\n");
+    }
+
+    #[test]
+    fn reasoning_effort_reaches_the_template_only_when_given() {
+        let c = with_template("[{{ reasoning_effort|default('xhigh') }}]");
+        let m = serde_json::json!([]);
+        assert_eq!(c.render_with(&m, None, Some("medium")).unwrap(), "[medium]");
+        assert_eq!(c.render_with(&m, None, None).unwrap(), "[xhigh]");
+        assert_eq!(c.render(&m, None).unwrap(), "[xhigh]");
     }
 
     #[test]

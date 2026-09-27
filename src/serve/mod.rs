@@ -116,6 +116,79 @@ struct ChatRequest {
     /// `"none"` leaves the tools out; any other choice is left to the model.
     #[serde(default)]
     tool_choice: Option<Value>,
+    /// Passed to the template, which decides what it means (Qwen3.8: `xhigh`,
+    /// `medium`, `low`). A value the template refuses falls back to its default
+    /// rather than failing the turn.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+}
+
+/// Requests handled since start-up, for the turn header.
+static TURNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The line that opens each turn in the terminal: a rule, so one turn's
+/// output never runs into the next.
+fn turn_header(n: usize, route: &str, bytes: usize) -> String {
+    let head = format!("━━ turn {n} · POST {route} · {} ", size(bytes));
+    let pad = 80usize.saturating_sub(head.chars().count());
+    format!("{head}{}", "━".repeat(pad))
+}
+
+/// `28761` → `28,761`.
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A byte count for a human: `512 B`, `12.3 KB`, `1.2 MB`.
+fn size(bytes: usize) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} B"),
+        b if b < 1024 * 1024 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / 1048576.0),
+    }
+}
+
+/// Refuse a request: to the client as a 400, **and in the terminal**, where it
+/// used to go unsaid — a turn that overflowed the context left the log
+/// silent after "continued at …" while the client got the reason.
+fn refuse(stream: &mut TcpStream, message: &str) -> Result<()> {
+    eprintln!("  error     400 → client: {message}");
+    send_json(stream, 400, &json!({"error": {"message": message}}))
+}
+
+/// What to stream after a token, given the text already sent and the half's
+/// text decoded so far.
+#[derive(Debug, PartialEq)]
+enum Delta<'a> {
+    /// New text to send.
+    Emit(&'a str),
+    /// The text ends inside a multi-byte character; wait for the next token.
+    Wait,
+    /// The decoded text no longer extends what was sent; adopt it silently.
+    Resync,
+}
+
+/// **A character split across tokens is held back, not sent as `�`.** The
+/// tokenizer decodes lossily, so an emoji's first token alone ends in U+FFFD.
+/// Sending that and resyncing when the next token completed it left clients
+/// with a `�` in place of every such character — Cline sent them back in its
+/// history (27-09).
+fn next_delta<'a>(sent: &str, text: &'a str) -> Delta<'a> {
+    if text.ends_with('\u{FFFD}') {
+        return Delta::Wait;
+    }
+    match text.strip_prefix(sent) {
+        Some(d) => Delta::Emit(d),
+        None => Delta::Resync,
+    }
 }
 
 /// One OpenAI message as the chat template expects it.
@@ -293,9 +366,10 @@ fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
     let kv = engine.kv_capacity_bytes() as f64 / 1048576.0;
     let rs = engine.recurrent_capacity_bytes() as f64 / 1048576.0;
     eprintln!(
-        "  kv       {:>6} / {} positions  {kv:.0} MiB{}",
+        "  kv       {:>6} / {} positions ({}%)  {kv:.0} MiB{}",
         engine.pos(),
         engine.n_ctx(),
+        engine.pos() * 100 / engine.n_ctx().max(1),
         if rs > 0.0 {
             format!(", recurrent {rs:.0} MiB")
         } else {
@@ -466,7 +540,7 @@ impl<O: Ops> Session<'_, O> {
             let how = self.return_to(target)?;
             if !self.rendered.is_empty() {
                 eprintln!(
-                    "chat: the request left the held text at {}; tokens agree for {common} of {}, {}",
+                    "  diverged  the request left the held text at {}; tokens agree for {common} of {}, {}",
                     divergence(&self.rendered, want),
                     want_tokens.len(),
                     how.label(),
@@ -871,7 +945,8 @@ fn handle<O: Ops>(
     // 404 whose message the user has to reverse-engineer, which is exactly how
     // this was found.
     let route = normalize_path(&path);
-    if opts.verbose {
+    // A chat turn opens with its own header; the rest get a line under -v.
+    if opts.verbose && !route.ends_with("/chat/completions") {
         eprintln!("--> {method} {route}  ({} bytes)", body.len());
     }
 
@@ -892,7 +967,7 @@ fn handle<O: Ops>(
             send_json(&mut stream, 200, &body)
         }
         ("POST", p) if p.ends_with("/chat/completions") => {
-            chat_completions(session, &mut stream, &body, opts)
+            chat_completions(session, &mut stream, p, &body, opts)
         }
         // The chat page, served by the engine itself.
         //
@@ -916,18 +991,16 @@ fn handle<O: Ops>(
 fn chat_completions<O: Ops>(
     session: &mut Session<'_, O>,
     stream: &mut TcpStream,
+    route: &str,
     body: &[u8],
     opts: &ServeOpts,
 ) -> Result<()> {
+    let n = TURNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    eprintln!("\n{}", turn_header(n, route, body.len()));
+
     let req: ChatRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
-        Err(e) => {
-            return send_json(
-                stream,
-                400,
-                &json!({"error": {"message": format!("could not parse request: {e}")}}),
-            );
-        }
+        Err(e) => return refuse(stream, &format!("could not parse request: {e}")),
     };
 
     // Tools reach the model only through its own template, and only when the
@@ -938,15 +1011,33 @@ fn chat_completions<O: Ops>(
         _ => None,
     };
     let messages = Value::Array(req.messages.iter().map(template_message).collect());
-    let want = match session.chat.render(&messages, tools) {
-        Ok(w) => w,
-        Err(e) => return send_json(stream, 400, &json!({"error": {"message": e.to_string()}})),
+    let effort = req.reasoning_effort.as_deref();
+    let (want, effort_note) = match session.chat.render_with(&messages, tools, effort) {
+        Ok(w) => (w, effort.map(str::to_string)),
+        // A value this template refuses: its own default, said in the log.
+        Err(_) if effort.is_some() => match session.chat.render_with(&messages, tools, None) {
+            Ok(w) => (w, effort.map(|e| format!("{e} (not this template's; its default used)"))),
+            Err(e) => return refuse(stream, &e.to_string()),
+        },
+        Err(e) => return refuse(stream, &e.to_string()),
     };
+    let budget = req
+        .max_tokens
+        .or(req.max_completion_tokens)
+        .unwrap_or(opts.max_tokens);
+    let mut parts = vec![format!("{} messages", req.messages.len())];
+    if let Some(t) = tools.and_then(Value::as_array) {
+        parts.push(format!("{} tools", t.len()));
+    }
+    parts.push(format!("max_tokens {}", thousands(budget)));
+    if let Some(e) = &effort_note {
+        parts.push(format!("reasoning {e}"));
+    }
+    eprintln!("  request   {}", parts.join(" · "));
     // Both Qwen3.6 and Qwen3.8 templates open the reply inside the thinking
     // block, so the model's first tokens are reasoning and it emits only the
     // closing marker.
     let thinking = want.ends_with("<think>\n");
-    let n_turns = req.messages.len();
 
     if opts.verbose {
         clipped("body    ", &String::from_utf8_lossy(body), 1200);
@@ -961,17 +1052,12 @@ fn chat_completions<O: Ops>(
         clipped("new     ", new, 400);
     }
 
-    let budget = req
-        .max_tokens
-        .or(req.max_completion_tokens)
-        .unwrap_or(opts.max_tokens);
-
     let mark = Mark::take(&session.engine);
     // Announced before `advance`, because a long prefill is minutes of silence
     // otherwise and the count is the only clue to why.
     let approx = want.len().saturating_sub(session.rendered.len()) / 4;
     if approx > 2048 {
-        eprintln!("chat: ~{approx} new tokens to prefill; this will take a while");
+        eprintln!("  prefill   ~{} new tokens; this will take a while", thousands(approx));
     }
     // Probed between prefill slices, as `generate` probes between tokens.
     let probe = stream.try_clone().ok();
@@ -979,18 +1065,33 @@ fn chat_completions<O: Ops>(
     let (logits, how, fresh) = match advanced {
         Ok(Advanced::Ready(logits, how, fresh)) => (logits, how, fresh),
         Ok(Advanced::Cancelled { done, of }) => {
-            eprintln!("chat: client went away during prefill after {done} of {of} tokens; stopped");
+            eprintln!("  cancelled client went away during prefill after {done} of {of} tokens");
             report(&session.engine, mark);
             return Ok(());
         }
-        Err(e) => {
-            return send_json(stream, 400, &json!({"error": {"message": e.to_string()}}));
-        }
+        Err(e) => return refuse(stream, &e.to_string()),
     };
+
+    // **The reply can use only the context that is left**, whatever the client
+    // asked for: generation stops at the edge either way, and printing the
+    // request's `max_tokens` as the budget hid that a nearly full context was
+    // about to cut a reply off (Cline asks for 32,000 at 28,761 of 32,096).
+    let (pos, n_ctx) = (session.engine.pos(), session.engine.n_ctx());
+    let room = n_ctx.saturating_sub(pos + 1);
+    let budget = budget.min(room);
+    let used = pos * 100 / n_ctx.max(1);
     eprintln!(
-        "chat: {n_turns} turns, {fresh} new tokens ({}), budget {budget}{}",
+        "  context   {} · {} new · {} of {} positions ({used}%) · reply room {}{}",
         how.label(),
-        tools.and_then(Value::as_array).map_or(String::new(), |t| format!(", {} tools", t.len())),
+        thousands(fresh),
+        thousands(pos),
+        thousands(n_ctx),
+        thousands(room),
+        if room < 1024 {
+            "\n            ⚠ nearly full: raise --ctx, or let the client compact the conversation"
+        } else {
+            ""
+        },
     );
 
     let turn = Gen { budget, tools, thinking };
@@ -1130,8 +1231,11 @@ fn generate<O: Ops>(
         ids[half].push(next);
 
         if let Ok(text) = session.tk.decode(&ids[half], false) {
-            if let Some(delta) = text.strip_prefix(shown[half].as_str()) {
-                if !delta.is_empty() {
+            match next_delta(&shown[half], &text) {
+                // Half a character: send nothing until it is whole.
+                Delta::Wait => {}
+                Delta::Resync => shown[half] = text.clone(),
+                Delta::Emit(delta) if !delta.is_empty() => {
                     // **A failed write is a gone client, not a server error.**
                     // `emit(delta)?` propagated it, so `generate` returned
                     // `Err` and the caller never reached `absorb` — leaving the
@@ -1146,10 +1250,9 @@ fn generate<O: Ops>(
                         reason = "cancelled";
                         break;
                     }
-                    shown[half] = text;
+                    shown[half] = text.clone();
                 }
-            } else {
-                shown[half] = text;
+                Delta::Emit(_) => {}
             }
         }
 
@@ -1158,6 +1261,13 @@ fn generate<O: Ops>(
             break;
         }
         logits = session.engine.decode(next)?;
+    }
+    // The whole halves as decoded, for a non-streaming reply: what was streamed,
+    // plus a character still held back when generation stopped.
+    for h in 0..2 {
+        if let Ok(t) = session.tk.decode(&ids[h], false) {
+            shown[h] = t;
+        }
     }
     // The ids, not just how many: the next turn's common-prefix scan needs to
     // see what the engine consumed, and the model's own output is part of that.
@@ -1268,7 +1378,7 @@ fn stream_completion<O: Ops>(
     })?;
     session.absorb(&plain, &ids);
     if reason == "cancelled" {
-        eprintln!("chat: client went away after {} tokens; stopped", ids.len());
+        eprintln!("  cancelled client went away after {} tokens", ids.len());
         return Ok(());
     }
 
@@ -1305,7 +1415,7 @@ fn whole_completion<O: Ops>(
     let n = ids.len();
     session.absorb(&plain, &ids);
     if reason == "cancelled" {
-        eprintln!("chat: client went away after {n} tokens; stopped");
+        eprintln!("  cancelled client went away after {n} tokens");
         return Ok(());
     }
 
@@ -1640,6 +1750,36 @@ fn send_json(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbers_and_sizes_read_as_a_person_writes_them() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1,000");
+        assert_eq!(thousands(28761), "28,761");
+        assert_eq!(thousands(1234567), "1,234,567");
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(105341), "102.9 KB");
+        assert_eq!(size(3 * 1048576), "3.0 MB");
+    }
+
+    #[test]
+    fn the_turn_header_is_one_80_column_rule() {
+        let h = turn_header(34, "/v1/chat/completions", 105341);
+        assert!(h.starts_with("━━ turn 34 · POST /v1/chat/completions · 102.9 KB ━"), "{h}");
+        assert_eq!(h.chars().count(), 80);
+    }
+
+    #[test]
+    fn a_split_character_is_held_back_then_sent_whole() {
+        // An emoji's first token decodes to a replacement character.
+        assert_eq!(next_delta("Hi ", "Hi \u{FFFD}"), Delta::Wait);
+        // The next token completes it: sent whole, never as `�`.
+        assert_eq!(next_delta("Hi ", "Hi 😀"), Delta::Emit("😀"));
+        assert_eq!(next_delta("Hi 😀", "Hi 😀 there"), Delta::Emit(" there"));
+        // Text that no longer extends what was sent is adopted, not streamed.
+        assert_eq!(next_delta("abc", "abd"), Delta::Resync);
+    }
 
     #[test]
     fn the_prefill_bar_fills_in_proportion() {
