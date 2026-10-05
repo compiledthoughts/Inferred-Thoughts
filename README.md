@@ -59,13 +59,15 @@ Gen5 NVMe.
 | model | GGUF | prefill tok/s | decode tok/s |
 |---|---|---:|---:|
 | Qwen3.8-Flash-Next, NVFP4, 176.9B | [download, 119 GiB](https://huggingface.co/CompiledThoughts/Qwen3.8-Flash-Next-NVFP4-Q8_0) | 49.2 | **9.06** (best turn 10.40) |
-| Qwen3.8-Flash-Next, NVFP4, 176.9B, **v1.1** | same file | **169.5** | **9.01** |
+| Qwen3.8-Flash-Next, NVFP4, 176.9B, **v1.1** | same file | **72.6** | **9.01** |
 | Qwen3.6-35B-A3B, NVFP4 | [download, 19.1 GiB](https://huggingface.co/CompiledThoughts/Qwen3.6-35B-A3B-NVFP4-Q8_0-it) | 591.2 | **47.3** |
 
 Native Windows 11, default settings. Prefill is a 5,548-token prompt; decode is a chat turn, and on the 176.9B it falls as a conversation grows.
 
 **v1.1 prefills 3.5x faster.** A long prompt now runs one layer at a time, so each layer's experts are read from the SSD once per 8,192 prompt tokens instead of once per 512.
 - Prefill: a 5,688-token prompt, median of four runs, 47.8 tok/s with the new path switched off on the same day.
+- Through `inferred serve` (`--ctx 8000`), turns of 3,454 and 4,615 new tokens prefilled 68.5 and 72.6 tok/s, against 42.9 and 44.3 before.
+- `serve` gains less than the 5,688-token run because it prefills in 2,048-token steps, so it can be cancelled and checkpointed between them.
 
 
 On the same machine, natively on Windows, llama.cpp averaged 4.9 tok/s decoding the 176.9B, against 9.06 for this engine.
