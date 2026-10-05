@@ -54,7 +54,20 @@ use crate::tok::chat::ChatMl;
 mod tools;
 use tools::ToolCall;
 
-/// Tokens between checkpoints, and the prefill slice size.
+/// Prompt tokens one `Engine::prefill` call takes in `serve`: a cancel is heard,
+/// and a checkpoint can be taken, only between calls.
+///
+/// **2,048, not `--batch`, so `serve` prefills layer-major.** The engine runs a
+/// call longer than `--batch` layer by layer (`Qwen4Exp::forward_layer_major`),
+/// fetching each streamed expert once per call. Capped at `--batch`, every call
+/// was one chunk and fetched the cold pool again: the 125B prefilled 42.9 and
+/// 44.3 tok/s through `serve` (06-10) against `generate`'s 169.5. A 2,048-token
+/// call is about one sweep of the cold experts plus compute, ~20 s on the 125B,
+/// so a cancel waits at most that long. Other models chunk it at `--batch`, and
+/// a split prefill is bit-identical to a whole one either way.
+const PREFILL_SLICE: usize = 2048;
+
+/// Tokens between checkpoints.
 ///
 /// Sets the worst-case re-prefill after a divergence: land anywhere inside a
 /// window and the tokens back to its start are re-run. At the 35B's measured
@@ -507,6 +520,9 @@ struct Session<'a, O: Ops> {
     /// seven turns grew the conversation to 16,050 positions with zero
     /// checkpoints, and turn 8 diverged and re-ran all 15,275 tokens, 170.9 s.
     last_ckpt: usize,
+    /// Tokens per prefill call, [`PREFILL_SLICE`] in `serve`; a field so a test
+    /// can cut a turn into slices it can count.
+    prefill_slice: usize,
 }
 
 impl<O: Ops> Session<'_, O> {
@@ -610,15 +626,16 @@ impl<O: Ops> Session<'_, O> {
         // cannot change a bit, which `split_prefill_equals_single_prefill` pins
         // down.
         //
-        // **No wider than a batch, and the client checked before each.** A
-        // prefill used to be one uninterruptible call per checkpoint spacing,
-        // and on Qwen3.8-Flash-Next a 3,879-token Cline turn is 100 s of it: a
-        // cancel there was heard only when decode began (17-09). A batch is
-        // ~15 s on that model and a fraction of a second on the 35B.
+        // **Bounded, and the client checked before each.** A prefill used to be
+        // one uninterruptible call per turn, and on Qwen3.8-Flash-Next a
+        // 3,879-token Cline turn was 100 s of it: a cancel there was heard only
+        // when decode began (17-09). Capped at a batch from then until 06-10,
+        // which kept every call chunk-major; `PREFILL_SLICE` has why it is
+        // 2,048 now.
         let mut logits = Vec::new();
         let mut done = 0usize;
         let spacing = checkpoint_spacing(self.engine.n_ctx());
-        let slice = spacing.min(self.engine.max_batch());
+        let slice = self.prefill_slice.max(1);
         // **The prompt's end checkpoint goes after its last special token**, not
         // after its last token, when ordinary tokens follow. A special token is
         // atomic, so the next request re-tokenizes to the same ids through it;
@@ -864,6 +881,7 @@ pub fn serve<O: Ops>(
         checkpoints: Vec::new(),
         last_ckpt: 0,
         consumed: 0,
+        prefill_slice: PREFILL_SLICE,
     };
 
     // One connection at a time. The engine holds a single session, so
@@ -1887,8 +1905,9 @@ mod tests {
 
     /// **A cancel during prefill is heard between slices, and the resent request
     /// continues where it stopped** (17-09). The 0.2B test model on `Naive`, a
-    /// ~1,400-token turn at `--ctx 4096` (spacing 512, batch 512): cancelled
-    /// after two slices, the session holds exactly 1,024 of its tokens and the
+    /// ~1,400-token turn at `--ctx 4096` (spacing 512, and slices of 512 set here
+    /// so the turn has several): cancelled after two slices, the session holds
+    /// exactly 1,024 of its tokens and the
     /// matching prefix of its text; the same request again continues at 1,024
     /// and finishes where an uncancelled session does. Where the rest tokenizes
     /// as it did in one piece, the logits are the uncancelled ones to the bit.
@@ -1927,6 +1946,7 @@ mod tests {
             checkpoints: Vec::new(),
             last_ckpt: 0,
             consumed: 0,
+            prefill_slice: PREFILL_SLICE,
         }
     }
 
@@ -1936,7 +1956,11 @@ mod tests {
         let Some(f) = tiny_model() else { return };
         let readme = include_str!("../../README.md");
         let cut = readme.char_indices().map(|(i, _)| i).take_while(|&i| i <= 5000).last().unwrap_or(0);
-        let session = || tiny_session(&f, 4096);
+        let session = || {
+            let mut s = tiny_session(&f, 4096);
+            s.prefill_slice = 512;
+            s
+        };
         let mut plain = session();
         let want = plain.chat.wrap(&readme[..cut]);
 
