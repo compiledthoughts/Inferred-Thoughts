@@ -86,6 +86,24 @@ pub struct Engine<'a, O: Ops> {
 /// because a chunk is just a prefill at a later `start_pos`.
 pub const DEFAULT_MAX_BATCH: usize = 512;
 
+/// Prompt tokens one layer-major prefill pass takes, in sub-chunks of at most
+/// [`Engine::max_batch`]; a longer prompt runs as several such passes.
+///
+/// **A memory bound.** Each sub-chunk keeps its own wide residual for the whole
+/// pass — 40 KiB a token on the 125B (4 streams x 2,560 x f32), mirrored on the
+/// device — so 8,192 tokens hold 320 MiB on the host and as much in VRAM, against
+/// a card that has ~1.9 GiB free at `--batch 512`. The expert re-reads it removes
+/// scale with the number of passes, so 8,192 already takes a 5,688-token prompt
+/// from twelve sweeps of the cold pool to one.
+pub const LAYER_MAJOR_MAX_TOKENS: usize = 8192;
+
+/// Layer-major prefill where the model provides it; `INFERRED_LAYER_MAJOR=0`
+/// restores chunk-by-chunk prefill, the control arm. Read once.
+fn layer_major_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("INFERRED_LAYER_MAJOR").map_or(true, |v| v != "0"))
+}
+
 /// A point a sequence can be returned to.
 ///
 /// **What has to be saved is the recurrent state, and only that.** A KV cache
@@ -287,6 +305,25 @@ impl<'a, O: Ops> Engine<'a, O> {
         Ok((logits, t0.elapsed()))
     }
 
+    /// [`Engine::run`] for a layer-major `qwen4exp` prefill pass, in sub-chunks of
+    /// at most [`Engine::max_batch`].
+    fn run_layer_major(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Duration)> {
+        let Model::Qwen4Exp(m) = &self.model else {
+            return self.run(tokens);
+        };
+        let rs = self.recurrent.as_mut().ok_or_else(|| Error::InconsistentArchitecture {
+            what: "recurrent state",
+            detail: "qwen4exp needs recurrent state and none was supplied".to_string(),
+        })?;
+        let start = self.cache.len();
+        let mut noop = |_: &str, _: usize, _: &[f32]| {};
+        let mut ctx = Ctx::new(&mut noop, &mut self.prof);
+        let t0 = Instant::now();
+        let logits =
+            m.forward_layer_major(&self.ops, tokens, start, self.max_batch, &mut self.cache, rs, &mut ctx)?;
+        Ok((logits, t0.elapsed()))
+    }
+
     /// Process a whole prompt, in chunks of at most [`Engine::max_batch`].
     /// Returns logits for its last token.
     ///
@@ -302,9 +339,24 @@ impl<'a, O: Ops> Engine<'a, O> {
 
     /// The chunk loop, shared by [`Engine::prefill`] and [`Engine::generate`]
     /// so neither can acquire its own batching policy.
+    ///
+    /// **`qwen4exp` prefills layer-major** past one batch: each group of up to
+    /// [`LAYER_MAJOR_MAX_TOKENS`] runs every sub-chunk through a layer before the
+    /// next, so a streamed expert is fetched once per group rather than once per
+    /// chunk. The same arithmetic over an even split; see
+    /// `Qwen4Exp::forward_layer_major`.
     fn prefill_chunked(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Duration)> {
         let mut logits = Vec::new();
         let mut total = Duration::ZERO;
+        if matches!(self.model, Model::Qwen4Exp(_)) && layer_major_on() && tokens.len() > self.max_batch {
+            for group in tokens.chunks(LAYER_MAJOR_MAX_TOKENS) {
+                let (l, dt) =
+                    if group.len() > self.max_batch { self.run_layer_major(group)? } else { self.run(group)? };
+                logits = l;
+                total += dt;
+            }
+            return Ok((logits, total));
+        }
         for chunk in tokens.chunks(self.max_batch) {
             let (l, dt) = self.run(chunk)?;
             logits = l;

@@ -1141,6 +1141,11 @@ struct Scratch {
     cells: Vec<u32>,
     hmixed: Vec<f32>,
     logits: Vec<f32>,
+    /// Layer-major prefill's residuals, one per sub-chunk, each swapped into
+    /// `res` while its sub-chunk runs. Separate buffers rather than one wide
+    /// one, so every buffer the seam sees is whole and keeps its own device
+    /// mirror across the layers of the pass (CLAUDE.md: never a sub-slice).
+    parts: Vec<Vec<f32>>,
 }
 
 impl Scratch {
@@ -1284,8 +1289,114 @@ impl<'a> Qwen4Exp<'a> {
         rs: &mut RecurrentState,
         ctx: &mut Ctx<'_>,
     ) -> Result<Vec<f32>> {
-        let c = &self.cfg;
         let n = tokens.len();
+        self.check_pass(n, start_pos, kv, rs)?;
+        let mut st = self.ple_state.borrow_mut();
+        self.ple_begin(ops, start_pos, &mut st)?;
+
+        ops.begin_pass(n);
+        let s = &mut *self.scratch.borrow_mut();
+        s.fit(&self.cfg, n);
+        self.embed(ops, tokens, s, ctx)?;
+        for il in 0..self.cfg.n_layer {
+            self.layer(ops, il, tokens, start_pos, kv, rs, &mut st, s, ctx)?;
+        }
+        kv.commit(start_pos + n);
+        st.next_pos = start_pos + n;
+        self.head(ops, n, s, ctx)
+    }
+
+    /// [`Qwen4Exp::forward`] over a prompt longer than one pass should hold,
+    /// **layer-major**: every sub-chunk of at most `max_sub` tokens runs through
+    /// layer L before any runs through L+1, all inside one pass.
+    ///
+    /// **Why** (`TODO.md`, layer-major prefill): run chunk by chunk, a 512-token
+    /// chunk of the 125B touches nearly every expert of every layer (512 tokens x
+    /// top-10 over 512 experts), so each chunk fetched most of the ~48 GiB cold
+    /// pool again — 470,938 experts, 404 GiB, for a 5,688-token prompt. Layer by
+    /// layer, a layer's experts are fetched once and every sub-chunk then hits
+    /// them, since one layer's 1,536 expert tensors fit the slab many times over.
+    ///
+    /// **The same arithmetic as chunk-major prefill over the same split**, in a
+    /// different order. Each sub-chunk runs [`Qwen4Exp::layer`] exactly as a pass
+    /// of its own would, at its own `start_pos`: attention reads positions from
+    /// the arguments, not from the committed length, the recurrent state and
+    /// QSA's pooled-key watermark are per layer and visited in token order, and
+    /// PLE's window advances inside [`Qwen4Exp::ple`] as each sub-chunk passes
+    /// through it. `the_0_2b_prefills_layer_major_bit_identically` holds it to the
+    /// bit.
+    ///
+    /// **One pass, because `begin_pass` marks every device mirror stale**: a
+    /// sub-chunk's residual must stay on the device from one layer to the next,
+    /// so each has its own buffer in `Scratch::parts`, swapped into `res` while
+    /// it runs.
+    ///
+    /// **The split is even** — sizes differ by at most one token — because
+    /// `Scratch::fit` regrows a buffer by writing it, and a short last sub-chunk
+    /// would regrow every scratch buffer at every layer: ~380 MiB of host writes
+    /// per layer for a 5,688-token prompt at 512, against one token's worth here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_layer_major<O: Ops>(
+        &self,
+        ops: &O,
+        tokens: &[u32],
+        start_pos: usize,
+        max_sub: usize,
+        kv: &mut KvCache,
+        rs: &mut RecurrentState,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<Vec<f32>> {
+        let n = tokens.len();
+        self.check_pass(n, start_pos, kv, rs)?;
+        let mut st = self.ple_state.borrow_mut();
+        self.ple_begin(ops, start_pos, &mut st)?;
+
+        let subs = even_split(n, max_sub);
+        let w = self.cfg.hc.n_stream * self.cfg.n_embd;
+        let s = &mut *self.scratch.borrow_mut();
+        // Every allocation before `begin_pass`, so no buffer is freed inside the
+        // pass and no address a mirror was written through this pass is reused.
+        // The first sub-chunk is the largest, so no later `fit` grows past it.
+        if s.parts.len() < subs.len() {
+            s.parts.resize_with(subs.len(), Vec::new);
+        }
+        for (part, &(_, len)) in s.parts.iter_mut().zip(&subs) {
+            part.resize(len * w, 0.0);
+        }
+        s.fit(&self.cfg, subs[0].1);
+
+        ops.begin_pass(n);
+        for (k, &(off, len)) in subs.iter().enumerate() {
+            s.fit(&self.cfg, len);
+            std::mem::swap(&mut s.res, &mut s.parts[k]);
+            let r = self.embed(ops, &tokens[off..off + len], s, ctx);
+            std::mem::swap(&mut s.res, &mut s.parts[k]);
+            r?;
+        }
+        for il in 0..self.cfg.n_layer {
+            for (k, &(off, len)) in subs.iter().enumerate() {
+                s.fit(&self.cfg, len);
+                std::mem::swap(&mut s.res, &mut s.parts[k]);
+                let r = self.layer(ops, il, &tokens[off..off + len], start_pos + off, kv, rs, &mut st, s, ctx);
+                std::mem::swap(&mut s.res, &mut s.parts[k]);
+                r?;
+            }
+        }
+        kv.commit(start_pos + n);
+        st.next_pos = start_pos + n;
+
+        let last = subs.len() - 1;
+        let len = subs[last].1;
+        s.fit(&self.cfg, len);
+        std::mem::swap(&mut s.res, &mut s.parts[last]);
+        let out = self.head(ops, len, s, ctx);
+        std::mem::swap(&mut s.res, &mut s.parts[last]);
+        out
+    }
+
+    /// What every pass checks before it touches anything.
+    fn check_pass(&self, n: usize, start_pos: usize, kv: &KvCache, rs: &RecurrentState) -> Result<()> {
+        let c = &self.cfg;
         if n == 0 {
             return Err(Error::InconsistentArchitecture {
                 what: "forward",
@@ -1314,8 +1425,13 @@ impl<'a> Qwen4Exp<'a> {
                 ),
             });
         }
+        Ok(())
+    }
 
-        let mut st = self.ple_state.borrow_mut();
+    /// PLE's per-sequence state at the start of a pass: cleared at position 0,
+    /// and otherwise required to continue exactly where the last pass ended.
+    fn ple_begin<O: Ops>(&self, ops: &O, start_pos: usize, st: &mut PleState) -> Result<()> {
+        let c = &self.cfg;
         if let Some(p) = &c.ple {
             if start_pos == 0 {
                 st.prev.clear();
@@ -1335,11 +1451,14 @@ impl<'a> Qwen4Exp<'a> {
                 });
             }
         }
+        Ok(())
+    }
 
-        ops.begin_pass(n);
+    /// The embeddings of `tokens` into `s.x`, broadcast into the wide residual
+    /// `s.res`. `s` must already fit `tokens.len()`.
+    fn embed<O: Ops>(&self, ops: &O, tokens: &[u32], s: &mut Scratch, ctx: &mut Ctx<'_>) -> Result<()> {
+        let c = &self.cfg;
         let (nd, n_stream) = (c.n_embd, c.hc.n_stream);
-        let s = &mut *self.scratch.borrow_mut();
-        s.fit(c, n);
         for (t, &token) in tokens.iter().enumerate() {
             if token as usize >= c.n_vocab {
                 return Err(Error::TokenOutOfRange { id: token, vocab_size: c.n_vocab });
@@ -1353,65 +1472,79 @@ impl<'a> Qwen4Exp<'a> {
 
         ops.mul_streams(&mut s.res, &s.x, &s.ones_streams, n_stream);
         ctx.trace("hc_init", 0, &s.res);
+        Ok(())
+    }
 
-        for il in 0..c.n_layer {
-            let layer = &self.layers[il];
-            if layer.ple.is_some() {
-                self.ple(ops, il, tokens, &mut *st, s, ctx)?;
-            }
-
-            hc_read(
-                ops, c, &layer.hc_attn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
-                &mut s.tmp, &mut s.mixed, Some(&mut s.inject), None,
-            )?;
-            ctx.trace("hc_attn_mixed", il, &s.mixed);
-            match &layer.mixer {
-                Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, s, ctx)?,
-                Mixer::Attn { .. } => self.attention(ops, layer, il, start_pos, n, kv, s, ctx)?,
-            }
-            self.hc_write(ops, s);
-            // The reference's second combine is renamed `l_last` (cb overwrites the
-            // name), so its printed `hc_combine` is this one, after the mixer.
-            ctx.trace("hc_combine", il, &s.res);
-
-            hc_read(
-                ops, c, &layer.hc_ffn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
-                &mut s.tmp, &mut s.mixed, Some(&mut s.inject), Some((&mut *ctx, il)),
-            )?;
-            ctx.trace("hc_mixed", il, &s.mixed);
-            ctx.trace("hc_inject", il, &s.inject);
-            // `INFERRED_ROUTER_DUMP`: the router's input, for the prefetch study.
-            // Reads it home, so graphs go off for the run; a measurement of what
-            // ran, not of speed.
-            if let Some(d) = crate::dump::router() {
-                ops.host_needs(&mut s.mixed);
-                let head = [il as u32, n as u32, c.n_embd as u32];
-                d.record(&[
-                    b"RDMP",
-                    crate::dump::bytes_of(&head[..1]),
-                    &(start_pos as u64).to_le_bytes(),
-                    crate::dump::bytes_of(&head[1..]),
-                    crate::dump::bytes_of(&s.mixed),
-                ]);
-            }
-            let next_router = self.layers.get(il + 1).map(|l| &l.ffn.gate_inp);
-            self.moe(ops, layer, next_router, n, s);
-            ctx.trace("ffn_moe_out", il, &s.block);
-            self.hc_write(ops, s);
-            ctx.trace("l_last", il, &s.res);
+    /// Layer `il` over `tokens`, which start at `start_pos`, on the residual in
+    /// `s.res`. The whole of a layer, so a pass and a layer-major pass run the
+    /// same code for it.
+    #[allow(clippy::too_many_arguments)]
+    fn layer<O: Ops>(
+        &self,
+        ops: &O,
+        il: usize,
+        tokens: &[u32],
+        start_pos: usize,
+        kv: &mut KvCache,
+        rs: &mut RecurrentState,
+        st: &mut PleState,
+        s: &mut Scratch,
+        ctx: &mut Ctx<'_>,
+    ) -> Result<()> {
+        let c = &self.cfg;
+        let n = tokens.len();
+        let layer = &self.layers[il];
+        if layer.ple.is_some() {
+            self.ple(ops, il, tokens, st, s, ctx)?;
         }
-        kv.commit(start_pos + n);
 
-        if let Some(p) = &c.ple {
-            let keep = p.ngram_size - 1;
-            let mut seq: Vec<u32> = st.prev.iter().copied().chain(tokens.iter().copied()).collect();
-            if seq.len() > keep {
-                seq.drain(..seq.len() - keep);
-            }
-            st.prev = seq;
+        hc_read(
+            ops, c, &layer.hc_attn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
+            &mut s.tmp, &mut s.mixed, Some(&mut s.inject), None,
+        )?;
+        ctx.trace("hc_attn_mixed", il, &s.mixed);
+        match &layer.mixer {
+            Mixer::Delta { .. } => self.gated_delta(ops, layer, il, rs, s, ctx)?,
+            Mixer::Attn { .. } => self.attention(ops, layer, il, start_pos, n, kv, s, ctx)?,
         }
-        st.next_pos = start_pos + n;
+        self.hc_write(ops, s);
+        // The reference's second combine is renamed `l_last` (cb overwrites the
+        // name), so its printed `hc_combine` is this one, after the mixer.
+        ctx.trace("hc_combine", il, &s.res);
 
+        hc_read(
+            ops, c, &layer.hc_ffn, &s.res, &s.ones, &mut s.xn, &mut s.lo, &mut s.hgate,
+            &mut s.tmp, &mut s.mixed, Some(&mut s.inject), Some((&mut *ctx, il)),
+        )?;
+        ctx.trace("hc_mixed", il, &s.mixed);
+        ctx.trace("hc_inject", il, &s.inject);
+        // `INFERRED_ROUTER_DUMP`: the router's input, for the prefetch study.
+        // Reads it home, so graphs go off for the run; a measurement of what
+        // ran, not of speed.
+        if let Some(d) = crate::dump::router() {
+            ops.host_needs(&mut s.mixed);
+            let head = [il as u32, n as u32, c.n_embd as u32];
+            d.record(&[
+                b"RDMP",
+                crate::dump::bytes_of(&head[..1]),
+                &(start_pos as u64).to_le_bytes(),
+                crate::dump::bytes_of(&head[1..]),
+                crate::dump::bytes_of(&s.mixed),
+            ]);
+        }
+        let next_router = self.layers.get(il + 1).map(|l| &l.ffn.gate_inp);
+        self.moe(ops, layer, next_router, n, s);
+        ctx.trace("ffn_moe_out", il, &s.block);
+        self.hc_write(ops, s);
+        ctx.trace("l_last", il, &s.res);
+        Ok(())
+    }
+
+    /// The output head on the last of the `n` rows in `s.res`, and the end of the
+    /// pass.
+    fn head<O: Ops>(&self, ops: &O, n: usize, s: &mut Scratch, ctx: &mut Ctx<'_>) -> Result<Vec<f32>> {
+        let c = &self.cfg;
+        let (nd, n_stream) = (c.n_embd, c.hc.n_stream);
         // The final mixer carries the output norm; only the last row is needed.
         let w = n_stream * nd;
         ops.gather_chunks(&s.res, w, w, (n - 1) * w, &mut s.hres);
@@ -1768,13 +1901,56 @@ impl<'a> Qwen4Exp<'a> {
 
         ops.add_assign(&mut s.pgated, &s.pconv_out);
         ops.add_assign(&mut s.res, &s.pgated);
+
+        // The window the next tokens to pass through here will read. Advanced
+        // here rather than at the end of the pass, so a layer-major pass, whose
+        // sub-chunks all reach this layer before any reaches the head, sees each
+        // sub-chunk's predecessors exactly as a pass of its own would.
+        let keep = p.ngram_size - 1;
+        let mut seq: Vec<u32> = st.prev.iter().copied().chain(tokens.iter().copied()).collect();
+        if seq.len() > keep {
+            seq.drain(..seq.len() - keep);
+        }
+        st.prev = seq;
         Ok(())
     }
+}
+
+/// `n` tokens cut into the fewest sub-chunks of at most `max` tokens, as evenly as
+/// they go: `(offset, len)`, the longer ones first, lengths differing by at most
+/// one. See [`Qwen4Exp::forward_layer_major`] for why even.
+fn even_split(n: usize, max: usize) -> Vec<(usize, usize)> {
+    let k = n.div_ceil(max.max(1)).max(1);
+    let (q, r) = (n / k, n % k);
+    let mut out = Vec::with_capacity(k);
+    let mut off = 0;
+    for i in 0..k {
+        let len = q + usize::from(i < r);
+        out.push((off, len));
+        off += len;
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn even_split_covers_the_prompt_in_the_fewest_near_equal_sub_chunks() {
+        assert_eq!(even_split(5688, 512), (0..12).map(|i| (i * 474, 474)).collect::<Vec<_>>());
+        assert_eq!(even_split(1025, 512), vec![(0, 342), (342, 342), (684, 341)]);
+        assert_eq!(even_split(512, 512), vec![(0, 512)]);
+        assert_eq!(even_split(7, 1), (0..7).map(|i| (i, 1)).collect::<Vec<_>>());
+        for (n, max) in [(5688, 512), (5689, 512), (2061, 1024), (513, 512), (3, 8)] {
+            let s = even_split(n, max);
+            assert_eq!(s.len(), n.div_ceil(max), "{n}/{max}: not the fewest");
+            assert_eq!(s.iter().map(|p| p.1).sum::<usize>(), n, "{n}/{max}: does not cover");
+            assert!(s.windows(2).all(|w| w[0].0 + w[0].1 == w[1].0), "{n}/{max}: not contiguous");
+            assert!(s.iter().all(|p| p.1 <= max), "{n}/{max}: a sub-chunk over the cap");
+            assert!(s.windows(2).all(|w| w[0].1 >= w[1].1 && w[0].1 - w[1].1 <= 1), "{n}/{max}: not even");
+        }
+    }
 
     /// The 125B's settings, from `inferred inspect` on
     /// `Qwen3.8-Flash-Next-NVFP4-Q8_0.gguf`, so the derived dimensions can be

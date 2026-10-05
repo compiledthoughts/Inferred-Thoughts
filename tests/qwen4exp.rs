@@ -838,3 +838,114 @@ fn the_0_2b_decodes_identically_with_lookahead_prefetch_when_oversubscribed() {
         assert_same_bits(a, b, &format!("pass {pass}, prefetch off against on"));
     }
 }
+
+/// **Layer-major prefill is chunk-by-chunk prefill in another order, to the bit**
+/// (`Qwen4Exp::forward_layer_major`). On the `naive` oracle: a 40-token prompt at
+/// `max_batch` 16 runs layer-major as sub-chunks of 14, 13 and 13, and the same
+/// three prefilled one pass each must give identical logits — and so must six
+/// decode steps after it, which read the KV, the recurrent state and the PLE window
+/// the prefill left behind. 48 tokens is the even case, three of 16.
+///
+/// Needs `INFERRED_LAYER_MAJOR` unset: with it at `0` the first arm is chunked too.
+#[test]
+#[ignore = "needs the 0.2B test model's NVFP4-expert GGUF; run with -- --ignored"]
+fn the_0_2b_prefills_layer_major_bit_identically_on_naive() {
+    use inferred_thoughts::{Engine, Naive};
+    let Some(f) = open(TINY) else { return };
+    let follow = synthetic(6, 3);
+    for (n, split) in [(40, vec![14, 13, 13]), (48, vec![16, 16, 16])] {
+        let prompt = synthetic(n, 0);
+        let run = |layer_major: bool| {
+            let mut e = Engine::new(Model::load(&f).expect("load"), Naive, n + follow.len() + 1, false);
+            let mut all = Vec::new();
+            if layer_major {
+                e.set_max_batch(16);
+                all.push(e.prefill(&prompt).expect("layer-major prefill"));
+            } else {
+                let mut at = 0;
+                let mut last = Vec::new();
+                for &len in &split {
+                    last = e.prefill(&prompt[at..at + len]).expect("one pass per sub-chunk");
+                    at += len;
+                }
+                all.push(last);
+            }
+            for &t in &follow {
+                all.push(e.decode(t).expect("decode"));
+            }
+            all
+        };
+        let (chunked, layered) = (run(false), run(true));
+        for (pass, (a, b)) in chunked.iter().zip(&layered).enumerate() {
+            assert_same_bits(a, b, &format!("{n} tokens, pass {pass}: chunk by chunk against layer-major"));
+        }
+    }
+}
+
+/// **On the GPU and oversubscribed, layer-major prefill computes the same and
+/// fetches less.** The 0.2B pushed into tier 3 — a 32-slot slab and no host tier,
+/// so one layer's 24 expert tensors fit and two layers' do not — prefilling 2,100
+/// tokens at `max_batch` 512, which is five sub-chunks of 420 and past QSA's
+/// budget, so the later ones select sparsely against the pooled keys. The same five
+/// prefilled one pass each are the reference; then 8 decode steps fed the argmax.
+/// Every logit identical, and fewer experts fetched from the file: chunk by chunk,
+/// every pass fetches every layer again.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "needs an sm_120 device and the 0.2B test model's NVFP4-expert GGUF"]
+fn the_0_2b_prefills_layer_major_bit_identically_and_fetches_less_on_the_gpu() {
+    use inferred_thoughts::{Cuda, Engine};
+    let Some(f) = open(TINY) else { return };
+    let prompt = synthetic(2100, 0);
+    let steps = 8;
+
+    let arm = |layer_major: bool| {
+        let gpu = Cuda::new(0).expect("cuda device");
+        gpu.use_graphs(false);
+        gpu.set_model_path(&f.path);
+        gpu.set_map_base(f.map_base());
+        gpu.set_expert_slots(Some(32));
+        gpu.set_expert_host_budget(1);
+        let mut e = Engine::new(Model::load(&f).expect("load"), &gpu, prompt.len() + steps + 4, false);
+        let mut all = Vec::new();
+        if layer_major {
+            all.push(e.prefill(&prompt).expect("layer-major prefill"));
+        } else {
+            let mut last = Vec::new();
+            for chunk in prompt.chunks(420) {
+                last = e.prefill(chunk).expect("one pass per sub-chunk");
+            }
+            all.push(last);
+        }
+        let mut fed = Vec::new();
+        for _ in 0..steps {
+            let t = argmax(all.last().expect("logits"));
+            fed.push(t);
+            all.push(e.decode(t).expect("decode"));
+        }
+        if let Some(err) = gpu.take_error() {
+            panic!("a CUDA op reported an error: {err}");
+        }
+        let st = gpu.expert_stats().expect("the expert cache was built");
+        drop(e);
+        (all, fed, st)
+    };
+
+    let (chunked, chunked_fed, chunked_st) = arm(false);
+    let (layered, layered_fed, layered_st) = arm(true);
+    println!(
+        "  {} cold at load; fetched {} chunk by chunk, {} layer-major",
+        layered_st.cold_at_load, chunked_st.fetched, layered_st.fetched
+    );
+    assert!(layered_st.oversubscribed && layered_st.cold_at_load > 0, "the cap did not push the model into tier 3");
+    assert_eq!(layered_fed, chunked_fed, "layer-major printed different tokens");
+    for (pass, (a, b)) in chunked.iter().zip(&layered).enumerate() {
+        assert_same_bits(a, b, &format!("pass {pass}, chunk by chunk against layer-major"));
+    }
+    assert!(
+        layered_st.fetched < chunked_st.fetched,
+        "layer-major fetched {} experts, chunk by chunk {}: no re-reads were removed",
+        layered_st.fetched,
+        chunked_st.fetched
+    );
+}
