@@ -61,6 +61,13 @@ impl Cuda {
         self.q5k_scalar.set(on);
     }
 
+    /// Force the `__dp4a` batched Q8_0 matmul, so the tensor-core one can be
+    /// priced and checked against it in the same process. `INFERRED_Q8_SCALAR`
+    /// sets it from the environment.
+    pub fn q8_scalar(&self, on: bool) {
+        self.q8_scalar.set(on);
+    }
+
     /// Route batched IQ4_XS matmuls through `mma.m16n8k32.s8`.
     ///
     /// **A probe, not a product.** It answers one question: whether the int8
@@ -760,6 +767,41 @@ impl Cuda {
             // exactly `n_out` rows and `shared` is `warps * n_blocks` floats,
             // which is what the kernel indexes.
             unsafe { self.launch_shared("matmul_q8_0_warp", grid_rows, block, shared, &args)? };
+            return Ok(());
+        }
+
+        // **Prefill on the int8 tensor cores**, bit-identical to the batched
+        // kernel below, which `INFERRED_Q8_SCALAR` restores. A warp holds 16
+        // weight rows for 32 tokens where the batched kernel holds one row for
+        // `MM_TOK` 8, so weights are read a quarter as often, and the products
+        // run on the tensor cores. Rows come in sixteens, as for IQ4_XS.
+        if !self.q8_scalar.get() && w.n_out % 16 == 0 {
+            let margs = [
+                KArg::I32(w.n_in as i32),
+                KArg::I32(w.n_out as i32),
+                KArg::I32(n_tok as i32),
+                KArg::Ptr(ws),
+                KArg::Ptr(wq),
+                KArg::Ptr(sd),
+                KArg::Ptr(qd),
+                KArg::Ptr(od),
+            ];
+            self.note_shape("matmul_q8_0_mma", w.n_in, w.n_out);
+            // SAFETY: parameters match `matmul_q8_0_mma`; `block` is 256 threads,
+            // so eight warps cover 128 rows per block, `n_out % 16 == 0` keeps
+            // every warp's 16 rows inside the tensor, the kernel clamps its own
+            // token tail, and it uses no dynamic shared memory.
+            unsafe {
+                self.launch_grid2(
+                    "matmul_q8_0_mma",
+                    w.n_out.div_ceil(128) as u32,
+                    // 8 tokens per MMA times MMA_NTILE tiles per weight load.
+                    n_tok.div_ceil(32) as u32,
+                    256,
+                    0,
+                    &margs,
+                )?
+            };
             return Ok(());
         }
 

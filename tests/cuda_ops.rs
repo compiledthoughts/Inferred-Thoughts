@@ -3675,6 +3675,77 @@ fn the_batched_iq4_matmul_is_bit_identical() {
     }
 }
 
+/// **The tensor-core Q8_0 matmul is bit-identical to the `__dp4a` one, and to
+/// the oracle.**
+///
+/// `matmul_q8_0_mma` takes every batched Q8_0 matmul by default (06-10). Its
+/// claim is the IQ4_XS one: an `m16n8k32` tile is exactly one Q8_0 block, so the
+/// MMA returns the block's integer dot, and the fold `acc += (float)s * (dw *
+/// dx)` runs over blocks in ascending order as `matmul_q8_0_batch` runs it.
+/// Equal bits, three ways: the MMA kernel, the batched kernel
+/// (`INFERRED_Q8_SCALAR`'s path) and `Naive`.
+///
+/// Shapes are the 125B's and the 35B's dense Q8_0 widths, and one whose `n_out`
+/// is not a multiple of 16, which must fall back to the batched kernel. Token
+/// counts cover a lone token (decode's `matmul_q8_0_warp`), partial token tiles
+/// (7, 13, 33 against the kernel's 32) and a layer-major sub-chunk (474). The
+/// oracle runs up to 33 tokens; past that the two GPU kernels are compared, the
+/// batched one being already held to the oracle above.
+#[test]
+#[ignore = "needs an sm_120 device; run with --release --features cuda -- --ignored"]
+fn the_q8_0_mma_matmul_is_bit_identical() {
+    use inferred_thoughts::gguf::GgmlType;
+
+    let gpu = Cuda::new(0).expect("cuda device");
+    gpu.use_graphs(false);
+    let cpu = Naive;
+
+    // Held for the whole test: device copies are keyed on the host address.
+    let cases: Vec<(usize, usize)> =
+        vec![(2560, 512), (2560, 640), (640, 2560), (2560, 2560), (6144, 2560), (2048, 4096), (2560, 24)];
+    let held: Vec<Vec<u8>> = cases
+        .iter()
+        .map(|&(n_in, n_out)| q8_0(&noise(n_in * n_out, 0x51d0 + n_out as u64 + n_in as u64), n_in))
+        .collect();
+    let inputs: Vec<Vec<f32>> =
+        [1usize, 2, 7, 13, 33, 474].iter().map(|&t| noise(6144 * t, 0x7a11 + t as u64)).collect();
+
+    let run = |w: &Weights<'_>, x: &[f32], n_tok: usize, scalar: bool| {
+        gpu.q8_scalar(scalar);
+        let mut got = vec![0.0f32; w.n_out * n_tok];
+        gpu.begin_pass(n_tok);
+        gpu.host_wrote(x);
+        gpu.matmul(w, x, &mut got);
+        gpu.host_needs(&mut got);
+        gpu.end_pass();
+        assert!(gpu.take_error().is_none(), "a CUDA op reported a driver error");
+        got
+    };
+    let differing = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+
+    for (&(n_in, n_out), bytes) in cases.iter().zip(&held) {
+        let w = Weights { data: bytes, ty: GgmlType::Q8_0, n_in, n_out, pooled: false };
+        for (&n_tok, full) in [1usize, 2, 7, 13, 33, 474].iter().zip(&inputs) {
+            // An owned copy, so the seam sees a whole buffer and never a slice
+            // of one (CLAUDE.md). `run` marks it host-written, so an address
+            // the allocator recycles is uploaded again rather than trusted.
+            let x = full[..n_in * n_tok].to_vec();
+            let mma = run(&w, &x, n_tok, false);
+            let batched = run(&w, &x, n_tok, true);
+            let d = differing(&mma, &batched);
+            println!("  {n_in:>5} x {n_out:<5} n_tok {n_tok:>3}: {d} of {} differ, mma against batched", mma.len());
+            assert_eq!(d, 0, "{n_in} x {n_out}, {n_tok} tokens: the MMA kernel is not the batched one");
+            if n_tok <= 33 {
+                let mut want = vec![0.0f32; n_out * n_tok];
+                cpu.matmul(&w, &x, &mut want);
+                let d = differing(&mma, &want);
+                assert_eq!(d, 0, "{n_in} x {n_out}, {n_tok} tokens: {d} outputs differ from the oracle");
+            }
+        }
+    }
+    gpu.q8_scalar(false);
+}
+
 /// **The batched `ssm_conv` reproduces the token-by-token one, bit for bit.**
 ///
 /// `the_gdn_ops_agree_with_the_oracle` covers `ssm_conv` at one token, which is

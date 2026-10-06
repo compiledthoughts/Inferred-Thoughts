@@ -235,6 +235,126 @@ __global__ void matmul_iq4_xs_q8_k_mma(int n_in, int n_out, int n_tok,
 }
 
 // ---------------------------------------------------------------------------
+// Q8_0 x Q8_0 on the int8 tensor cores — the dense matmuls in prefill
+// ---------------------------------------------------------------------------
+//
+// **Why** (06-10). Layer-major prefill made the 125B's prefill compute-bound,
+// and `--profile-kernels` on a 5,688-token prompt put `matmul_q8_0_batch` first
+// at 31.9% of kernel time: every attention, GDN and shared-expert projection.
+// That kernel is `__dp4a` on the CUDA cores and holds one weight row for
+// `MM_TOK` 8 tokens, so a row is read once per 8 tokens. Here a warp holds 16
+// rows for `8 * MMA_NTILE` = 32 tokens, and the products run on the tensor
+// cores.
+//
+// **Bit-identical to `matmul_q8_0_batch`, by the IQ4_XS argument.** Per output
+// the reference folds, over blocks of 32 in ascending order from zero,
+//
+//     acc += (float)sumi * (dw * dx)
+//
+// with `sumi` the integer dot of one block. A Q8_0 block is 32 int8 weights
+// against 32 int8 activations, which is exactly one `m16n8k32` tile, so the MMA
+// returns that same integer, and the fold below is the same expression in the
+// same order in a register. `--fmad=false` is global, so nothing contracts.
+// `the_q8_0_mma_matmul_is_bit_identical` holds it to the bit.
+//
+// Same geometry as `matmul_iq4_xs_q8_k_mma`: one warp per 16 rows by 32
+// tokens, A in registers across the token tiles, no shared memory. The weight
+// layout is the repacked one `matmul_q8_0_batch` reads: f16 scales `[row][block]`
+// and int8 quants `[row][n_in]`.
+__global__ void matmul_q8_0_mma(int n_in, int n_out, int n_tok,
+                                const unsigned short *__restrict__ w_scales,
+                                const signed char *__restrict__ w_quants,
+                                const float *__restrict__ x_scales,
+                                const signed char *__restrict__ x_quants,
+                                float *__restrict__ out) {
+    const int n_blocks = n_in / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    const int j0 = (blockIdx.x * (blockDim.x >> 5) + warp) * 16;   // first row
+    const int t0 = blockIdx.y * (8 * MMA_NTILE);                   // first token
+    if (j0 >= n_out) return;
+
+    const int g = lane >> 2;
+    const int q = lane & 3;
+
+    // This lane owns rows j0+g and j0+g+8 (`n_out % 16 == 0`, so both exist).
+    // Within each token tile it loads B for column `g` and accumulates columns
+    // `2q` and `2q+1`.
+    const int row_a = j0 + g;
+    const int row_b = j0 + g + 8;
+    const signed char *qa = w_quants + (size_t)row_a * n_in;
+    const signed char *qb = w_quants + (size_t)row_b * n_in;
+    const unsigned short *sa = w_scales + (size_t)row_a * n_blocks;
+    const unsigned short *sb = w_scales + (size_t)row_b * n_blocks;
+
+    // One f32 accumulator per output, folded ascending as the reference folds.
+    float acc[MMA_NTILE][4];
+#pragma unroll
+    for (int n = 0; n < MMA_NTILE; ++n) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) acc[n][k] = 0.0f;
+    }
+
+    for (int bb = 0; bb < n_blocks; ++bb) {
+        const float dwa = __half2float(__ushort_as_half(sa[bb]));
+        const float dwb = __half2float(__ushort_as_half(sb[bb]));
+
+        // **Loaded once for every token tile below.** Block `bb` is quants
+        // [32 bb, 32 bb + 32) of the row; lane q takes k = 4q..4q+3 and
+        // 4q+16..4q+19, as the m16n8k32 A fragment lays them out.
+        const int off = bb * 32 + q * 4;
+        int a[4];
+        a[0] = *(const int *)(qa + off);
+        a[2] = *(const int *)(qa + off + 16);
+        a[1] = *(const int *)(qb + off);
+        a[3] = *(const int *)(qb + off + 16);
+
+#pragma unroll
+        for (int n = 0; n < MMA_NTILE; ++n) {
+            const int tb = t0 + n * 8 + g;
+            int b[2] = {0, 0};
+            if (tb < n_tok) {
+                const signed char *xq = x_quants + (size_t)tb * n_in + (size_t)bb * 32;
+                b[0] = *(const int *)(xq + q * 4);
+                b[1] = *(const int *)(xq + 16 + q * 4);
+            }
+
+            // Zeroed per block: a scale per 32 weights means an int32
+            // accumulator cannot span two of them.
+            const int zero[4] = {0, 0, 0, 0};
+            int s[4];
+            mma_m16n8k32_s8(s, a, b, zero);
+
+            const int c0 = t0 + n * 8 + 2 * q;
+            const int c1 = c0 + 1;
+            const float dx0 = (c0 < n_tok) ? x_scales[(size_t)c0 * n_blocks + bb] : 0.0f;
+            const float dx1 = (c1 < n_tok) ? x_scales[(size_t)c1 * n_blocks + bb] : 0.0f;
+
+            // `(float)sumi * (dw * dx)`, the reference's grouping, then added.
+            acc[n][0] += (float)s[0] * (dwa * dx0);
+            acc[n][1] += (float)s[1] * (dwa * dx1);
+            acc[n][2] += (float)s[2] * (dwb * dx0);
+            acc[n][3] += (float)s[3] * (dwb * dx1);
+        }
+    }
+
+#pragma unroll
+    for (int n = 0; n < MMA_NTILE; ++n) {
+        const int c0 = t0 + n * 8 + 2 * q;
+        const int c1 = c0 + 1;
+        if (c0 < n_tok) {
+            out[(size_t)c0 * n_out + row_a] = acc[n][0];
+            out[(size_t)c0 * n_out + row_b] = acc[n][2];
+        }
+        if (c1 < n_tok) {
+            out[(size_t)c1 * n_out + row_a] = acc[n][1];
+            out[(size_t)c1 * n_out + row_b] = acc[n][3];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Q5_K x Q8_K on the int8 tensor cores
 // ---------------------------------------------------------------------------
 //

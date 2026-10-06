@@ -191,6 +191,10 @@ pub struct Cuda {
     q6k_scalar: Cell<bool>,
     /// Force the one-token Q5_K matmul, for the prefill A/B.
     q5k_scalar: Cell<bool>,
+    /// Force the `__dp4a` batched Q8_0 matmul instead of the tensor-core one,
+    /// for the prefill A/B. Both are bit-identical; this prices one against
+    /// the other in a single binary.
+    q8_scalar: Cell<bool>,
     /// Force one delta-rule launch per token, for the prefill A/B.
     delta_seq: Cell<bool>,
     /// Force the per-pair routed FFN even for a batch, for the A/B.
@@ -886,6 +890,7 @@ impl Cuda {
                 iq4_untiled: Cell::new(false),
                 q6k_scalar: Cell::new(env_flag("INFERRED_Q6K_SCALAR")),
                 q5k_scalar: Cell::new(env_flag("INFERRED_Q5K_SCALAR")),
+                q8_scalar: Cell::new(env_flag("INFERRED_Q8_SCALAR")),
                 delta_seq: Cell::new(env_flag("INFERRED_DELTA_SEQ")),
                 moe_ungrouped: Cell::new(false),
                 iq4_mma: Cell::new(true),

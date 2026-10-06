@@ -445,6 +445,7 @@ impl Ops for Cuda {
         let env: Vec<&str> = [
             ("INFERRED_Q6K_SCALAR", self.q6k_scalar.get()),
             ("INFERRED_Q5K_SCALAR", self.q5k_scalar.get()),
+            ("INFERRED_Q8_SCALAR", self.q8_scalar.get()),
             ("INFERRED_IQ4_STAGED", self.iq4_staged.get()),
             ("INFERRED_DELTA_SEQ", self.delta_seq.get()),
             ("INFERRED_ATTN_MMA", self.attn_mma.get()),
