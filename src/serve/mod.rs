@@ -325,6 +325,11 @@ struct Mark {
     /// watches it happen.
     setup_ns: u64,
     setup_label: &'static str,
+    /// The backend's tier-3 counters, `None` on a CPU backend. Differenced to
+    /// say where a turn's prefill went, not only how long it took (06-10).
+    tier: Option<crate::ops::TierCounters>,
+    /// When the snapshot was taken, for the turn's wall time.
+    at: std::time::Instant,
 }
 
 impl Mark {
@@ -337,6 +342,8 @@ impl Mark {
             decode_ns: e.prof.decode_ns,
             setup_ns,
             setup_label,
+            tier: e.ops.tier_counters(),
+            at: std::time::Instant::now(),
         }
     }
 }
@@ -379,7 +386,10 @@ fn timings_json<O: Ops>(engine: &Engine<'_, O>, before: Mark, how: Resume) -> Va
 }
 
 /// Print what this turn cost, in the shape `inferred generate` prints.
-fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
+///
+/// `ckpt_ns` is the time this turn spent copying checkpoints, which happens
+/// between prefill calls and so is in neither the prefill nor the decode line.
+fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark, ckpt_ns: u64) {
     let now = Mark::take(engine);
     let line = |name: &str, tok: u64, ns: u64| {
         if tok == 0 {
@@ -415,6 +425,67 @@ fn report<O: Ops>(engine: &Engine<'_, O>, before: Mark) {
         "decode",
         now.decode_tokens - before.decode_tokens,
         now.decode_ns - before.decode_ns,
+    );
+    // **Where the prefill went, not only how long it took** (06-10): a turn that
+    // took twice `generate`'s time for the same prompt could not be explained
+    // from the line above. The fetch path is host time inside the prefill; the
+    // picks wait is the host waiting on the device, so GPU time; the rest of
+    // the prefill line is GPU work the host was not waiting on.
+    if let (Some(a), Some(b)) = (before.tier, now.tier) {
+        let ms = |x: u64, y: u64| y.saturating_sub(x) as f64 / 1e3;
+        let fetched = b.fetched - a.fetched;
+        let gib = (b.fetch_bytes - a.fetch_bytes) as f64 / 1073741824.0;
+        eprintln!(
+            "  fetch    {:>6} experts {gib:>6.2} GiB  read {:.0} ms · upload {:.0} ms · writes {:.0} ms · picks wait {:.0} ms + copy {:.0} ms",
+            fetched,
+            ms(a.read_us, b.read_us),
+            ms(a.upload_us, b.upload_us),
+            ms(a.writes_us, b.writes_us),
+            ms(a.picks_wait_us, b.picks_wait_us),
+            ms(a.picks_copy_us, b.picks_copy_us),
+        );
+        let lookups = b.lookups - a.lookups;
+        let host = b.host_reads - a.host_reads;
+        eprintln!(
+            "  memory   {} activation copies on the device, {} MiB ({:+} MiB this turn) · expert slab {} slots, {:.2} GiB",
+            b.mirrors,
+            thousands((b.mirror_bytes / 1048576) as usize),
+            (b.mirror_bytes as i64 - a.mirror_bytes as i64) / 1048576,
+            thousands(b.slots as usize),
+            (b.slots * b.slot_bytes) as f64 / 1073741824.0,
+        );
+        let mib = |x: u64| thousands((x / 1048576) as usize);
+        eprintln!(
+            "  resident {} MiB accounted: weights {} · kv {} · activations {} + quantized {} · pool {} · slab {} | driver says {} in use",
+            mib(b.resident_bytes),
+            mib(b.weight_bytes),
+            mib(b.kv_bytes),
+            mib(b.mirror_bytes),
+            mib(b.quant_bytes),
+            mib(b.pool_bytes),
+            mib(b.slots * b.slot_bytes),
+            mib(b.vram_total - b.vram_free),
+        );
+        eprintln!(
+            "  tiers    {:.1}% of {} expert reads crossed PCIe ({:.2} GiB) · prefetch {} read, {} used · VRAM {} of {} MiB in use",
+            100.0 * host as f64 / lookups.max(1) as f64,
+            thousands(lookups as usize),
+            (host * b.slot_bytes) as f64 / 1073741824.0,
+            b.prefetch_reads - a.prefetch_reads,
+            b.prefetch_used - a.prefetch_used,
+            thousands(((b.vram_total - b.vram_free) / 1048576) as usize),
+            thousands((b.vram_total / 1048576) as usize),
+        );
+    }
+    // Everything the turn spent outside the engine's own passes: rendering and
+    // tokenizing, checkpoint copies, sampling and the socket.
+    let wall_ns = now.at.duration_since(before.at).as_nanos() as u64;
+    let engine_ns = prefill_ns + (now.decode_ns - before.decode_ns);
+    eprintln!(
+        "  outside  {:.0} ms of a {:.0} ms turn, checkpoints {:.0} ms of it",
+        wall_ns.saturating_sub(engine_ns) as f64 / 1e6,
+        wall_ns as f64 / 1e6,
+        ckpt_ns as f64 / 1e6,
     );
     // Whatever the backend can say about itself. A no-op on every CPU
     // backend; on CUDA, and only under `--profile-device`, the launch and
@@ -534,6 +605,8 @@ struct Session<'a, O: Ops> {
     /// The most tokens a prefill call takes, [`PREFILL_MAX`] in `serve`; a field
     /// so a test can cut a turn into calls it can count.
     prefill_max: usize,
+    /// Time spent taking checkpoints, cumulative, for the per-turn report.
+    ckpt_ns: u64,
 }
 
 impl<O: Ops> Session<'_, O> {
@@ -788,7 +861,10 @@ impl<O: Ops> Session<'_, O> {
     /// tokens back to the earlier one, and re-running old tokens is no cheaper
     /// than re-running recent ones.
     fn take_checkpoint(&mut self) {
-        let Some(c) = self.engine.checkpoint() else {
+        let t = std::time::Instant::now();
+        let taken = self.engine.checkpoint();
+        self.ckpt_ns += t.elapsed().as_nanos() as u64;
+        let Some(c) = taken else {
             // No recurrent state: `rewind` reaches any position for free and a
             // checkpoint would copy nothing.
             return;
@@ -892,6 +968,7 @@ pub fn serve<O: Ops>(
         last_ckpt: 0,
         consumed: 0,
         prefill_max: PREFILL_MAX,
+        ckpt_ns: 0,
     };
 
     // One connection at a time. The engine holds a single session, so
@@ -1126,6 +1203,7 @@ fn chat_completions<O: Ops>(
     }
 
     let mark = Mark::take(&session.engine);
+    let ckpt_before = session.ckpt_ns;
     // Announced before `advance`, because a long prefill is minutes of silence
     // otherwise and the count is the only clue to why.
     let approx = want.len().saturating_sub(session.rendered.len()) / 4;
@@ -1139,7 +1217,7 @@ fn chat_completions<O: Ops>(
         Ok(Advanced::Ready(logits, how, fresh)) => (logits, how, fresh),
         Ok(Advanced::Cancelled { done, of }) => {
             eprintln!("  cancelled client went away during prefill after {done} of {of} tokens");
-            report(&session.engine, mark);
+            report(&session.engine, mark, session.ckpt_ns - ckpt_before);
             return Ok(());
         }
         Err(e) => return refuse(stream, &e.to_string()),
@@ -1176,7 +1254,7 @@ fn chat_completions<O: Ops>(
     // Reported even when the client hung up mid-stream: the work still
     // happened, and a disconnect is exactly when it is useful to see what it
     // cost.
-    report(&session.engine, mark);
+    report(&session.engine, mark, session.ckpt_ns - ckpt_before);
     r
 }
 
@@ -1983,6 +2061,7 @@ mod tests {
             last_ckpt: 0,
             consumed: 0,
             prefill_max: PREFILL_MAX,
+            ckpt_ns: 0,
         }
     }
 

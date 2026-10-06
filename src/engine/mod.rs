@@ -157,14 +157,16 @@ impl<'a, O: Ops> Engine<'a, O> {
             .map(|(n, conv, ssm)| RecurrentState::new(n, conv, ssm));
         let mut prof = Profile::new(detail);
         prof.weight_bytes = model.weight_bytes_per_pass();
-        Self {
+        let engine = Self {
             model,
             ops,
             cache,
             recurrent,
             max_batch: DEFAULT_MAX_BATCH,
             prof,
-        }
+        };
+        engine.reserve_scratch();
+        engine
     }
 
     /// Cap the prompt tokens handed to one forward pass. See
@@ -173,6 +175,22 @@ impl<'a, O: Ops> Engine<'a, O> {
     /// engine with it.
     pub fn set_max_batch(&mut self, n: usize) {
         self.max_batch = n.max(1);
+        self.reserve_scratch();
+    }
+
+    /// Tell the model how many tokens a pass can hold, so its activation
+    /// buffers are allocated once at that size and never move (06-10:
+    /// `qwen4exp`'s moved buffers orphaned ~600 MiB of device copies in
+    /// `serve`). Only `qwen4exp` holds scratch this way today.
+    fn reserve_scratch(&self) {
+        if let Model::Qwen4Exp(m) = &self.model {
+            m.reserve_batch(self.max_batch);
+            // And tell the backend how large those buffers get, so the expert
+            // slab leaves room for them however small the first pass is (06-10:
+            // without it `serve`'s slab took ~400 MiB more than `generate`'s and
+            // the card overflowed into WDDM paging).
+            self.ops.reserve_activations(m.activation_peak_bytes(self.cache.n_ctx()));
+        }
     }
 
     pub fn max_batch(&self) -> usize {

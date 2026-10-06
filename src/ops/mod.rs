@@ -322,6 +322,49 @@ pub struct Delta<'a> {
     pub n_v_heads: usize,
 }
 
+/// A device backend's cumulative tier-3 counters and its VRAM, as
+/// [`Ops::tier_counters`] reports them. Microsecond fields are host wall time
+/// spent in that part of the fetch path; `picks_wait_us` is the host waiting on
+/// the device before it can read a layer's picks, so it is GPU time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TierCounters {
+    /// Experts read from the model file into a VRAM slot, and their bytes.
+    pub fetched: u64,
+    pub fetch_bytes: u64,
+    pub read_us: u64,
+    pub upload_us: u64,
+    pub writes_us: u64,
+    pub picks_wait_us: u64,
+    pub picks_copy_us: u64,
+    pub prefetch_reads: u64,
+    pub prefetch_used: u64,
+    /// Expert reads by kernels, and how many of them crossed PCIe to the host tier.
+    pub lookups: u64,
+    pub host_reads: u64,
+    pub slot_bytes: u64,
+    /// Device memory free and total, from the driver, at the snapshot.
+    pub vram_free: u64,
+    pub vram_total: u64,
+    /// Device copies of activation buffers held, and their bytes. They are
+    /// keyed on host addresses and kept for the life of the process.
+    pub mirrors: u64,
+    pub mirror_bytes: u64,
+    /// The expert pool does not fit in VRAM plus the host tier, so experts are
+    /// fetched from the file and migration between tiers is paused.
+    pub oversubscribed: bool,
+    /// VRAM slots in the expert slab, each `slot_bytes`.
+    pub slots: u64,
+    /// Everything the backend itself accounts for on the device, by category:
+    /// weights, KV (with QSA's lanes), activation copies and their Q8_0 forms,
+    /// the scratch pool and the expert slab. The driver's `vram_total -
+    /// vram_free` less this is what the backend does not see.
+    pub resident_bytes: u64,
+    pub weight_bytes: u64,
+    pub kv_bytes: u64,
+    pub quant_bytes: u64,
+    pub pool_bytes: u64,
+}
+
 impl Delta<'_> {
     /// The key/query head that value head `h` reads.
     ///
@@ -1220,6 +1263,21 @@ pub trait Ops {
     /// Called once per turn. Implementations should print nothing unless asked
     /// to, since this runs in a server's hot path.
     fn device_report(&self) {}
+
+    /// The most bytes of activations a pass can hold, declared by the engine so a
+    /// device backend can budget memory for them before the first pass. A no-op
+    /// where activations live in host memory anyway.
+    fn reserve_activations(&self, _bytes: usize) {}
+
+    /// Cumulative tier-3 and residency counters, for a per-turn breakdown.
+    ///
+    /// `None` on every CPU backend, which has no tiers. `serve` differences two
+    /// snapshots to say where one turn's time went, which its total prefill
+    /// time alone could not: on 06-10 a `serve` turn took ~50 s for a prompt
+    /// `generate` prefilled in ~28 s on the same binary and card.
+    fn tier_counters(&self) -> Option<TierCounters> {
+        None
+    }
 
     /// Which code paths this backend will actually run, for a startup banner.
     ///

@@ -129,6 +129,14 @@ pub struct Cuda {
     /// caller knows the context length.
     expert_reserve: Cell<usize>,
 
+    /// The most activation-copy bytes a pass of the engine's batch can hold,
+    /// declared by the engine (`Ops::reserve_activations`). The slab holds back
+    /// this less whatever copies already exist when it is sized, so its size no
+    /// longer depends on how large the first pass happened to be (06-10: a
+    /// short first request in `serve` let the slab take ~400 MiB that the first
+    /// long turn's activations then pushed past the card).
+    activation_peak: Cell<usize>,
+
     /// The automatic slab's ceiling, [`experts::DEFAULT_SLAB_CAP`]; `None` once an
     /// explicit budget is set, which is then the reserve's job alone.
     expert_cap: Cell<Option<usize>>,
@@ -873,6 +881,7 @@ impl Cuda {
                 launches: RefCell::new(HashMap::new()),
                 record_launches: Cell::new(false),
                 expert_reserve: Cell::new(experts::DEFAULT_RESERVE),
+                activation_peak: Cell::new(0),
                 expert_cap: Cell::new(Some(experts::DEFAULT_SLAB_CAP)),
                 expert_pool: Cell::new(None),
                 route_gen: Cell::new(0),

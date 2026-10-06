@@ -470,6 +470,44 @@ impl Ops for Cuda {
     /// that has to answer the next turn. For per-kernel timing use
     /// `generate --profile-device` with a long prompt, which runs the same
     /// prefill.
+    fn reserve_activations(&self, bytes: usize) {
+        self.set_activation_peak(bytes);
+    }
+
+    /// The expert cache's counters and the driver's VRAM figures. Reading the
+    /// counters absorbs the device-side tallies, which synchronizes, so this is
+    /// for a turn boundary and never for inside a pass.
+    fn tier_counters(&self) -> Option<crate::ops::TierCounters> {
+        let e = self.expert_stats()?;
+        let (free, total) = self.mem_info().unwrap_or((0, 0));
+        let r = self.resident_bytes();
+        Some(crate::ops::TierCounters {
+            mirrors: r.mirrors,
+            mirror_bytes: r.mirror_bytes,
+            oversubscribed: e.oversubscribed,
+            slots: e.slots,
+            resident_bytes: r.total(),
+            weight_bytes: r.weight_bytes,
+            kv_bytes: r.kv_bytes,
+            quant_bytes: r.quant_bytes,
+            pool_bytes: r.pool_bytes,
+            fetched: e.fetched,
+            fetch_bytes: e.fetch_bytes,
+            read_us: e.fetch_read_us,
+            upload_us: e.fetch_upload_us,
+            writes_us: e.fetch_writes_us,
+            picks_wait_us: e.readback_wait_us,
+            picks_copy_us: e.readback_copy_us,
+            prefetch_reads: e.prefetch_reads,
+            prefetch_used: e.prefetch_used,
+            lookups: e.lookups(),
+            host_reads: e.host_reads,
+            slot_bytes: e.slot_bytes,
+            vram_free: free as u64,
+            vram_total: total as u64,
+        })
+    }
+
     fn device_report(&self) {
         if !self.report_per_turn.get() {
             return;
@@ -642,6 +680,14 @@ impl Ops for &Cuda {
 
     fn device_report(&self) {
         (*self).device_report()
+    }
+
+    fn tier_counters(&self) -> Option<crate::ops::TierCounters> {
+        (*self).tier_counters()
+    }
+
+    fn reserve_activations(&self, bytes: usize) {
+        (*self).reserve_activations(bytes)
     }
 
     fn setup_cost(&self) -> Option<(u64, &'static str)> {

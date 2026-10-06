@@ -292,8 +292,29 @@ impl Cuda {
     /// Slab bytes from free VRAM at sizing time: free minus the reserve, under
     /// the automatic cap when there is one.
     fn slab_budget(&self, free: usize) -> usize {
-        let budget = free.saturating_sub(self.expert_reserve.get());
+        // The activations still to come: their declared peak less the copies
+        // that already exist, which `free` has already paid for.
+        // Read from the mirrors map directly, not `resident_bytes`: this runs
+        // while the caller holds `experts` mutably, which that would borrow too.
+        let have: usize = self
+            .mirrors
+            .borrow()
+            .values()
+            .map(|m| {
+                m.buf.len_bytes()
+                    + m.quant.as_ref().map_or(0, |(s, q)| s.len_bytes() + q.len_bytes())
+                    + m.quant_k.as_ref().map_or(0, |(s, q, b)| s.len_bytes() + q.len_bytes() + b.len_bytes())
+            })
+            .sum();
+        let to_come = self.activation_peak.get().saturating_sub(have);
+        let budget = free.saturating_sub(self.expert_reserve.get()).saturating_sub(to_come);
         self.expert_cap.get().map_or(budget, |cap| budget.min(cap))
+    }
+
+    /// Declare the activation peak the slab must leave room for. See the
+    /// `activation_peak` field.
+    pub(crate) fn set_activation_peak(&self, bytes: usize) {
+        self.activation_peak.set(bytes);
     }
 
     /// Cap the page-locked host tier behind the expert slab, in bytes.

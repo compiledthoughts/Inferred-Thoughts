@@ -957,6 +957,37 @@ impl<'a> Qwen4Exp<'a> {
         self.cfg.n_kv_layer()
     }
 
+    /// Size the per-token scratch for passes of up to `n` tokens, the engine's
+    /// batch, so no later pass moves a buffer (`Scratch::fit`). Only ever grows.
+    pub fn reserve_batch(&self, n: usize) {
+        let mut s = self.scratch.borrow_mut();
+        s.reserve = s.reserve.max(n);
+    }
+
+    /// The most bytes of activations a pass can hold with the scratch reserved
+    /// for `reserve_batch` tokens and a context of `n_ctx`, for a device backend
+    /// that keeps a copy of each: the per-token scratch at a full batch, the
+    /// layer-major residuals for a whole group (`engine::LAYER_MAJOR_MAX_TOKENS`)
+    /// and QSA's per-query buffers at full depth. An upper bound: a buffer the
+    /// backend never mirrors is counted anyway.
+    pub fn activation_peak_bytes(&self, n_ctx: usize) -> usize {
+        let c = &self.cfg;
+        let mut s = self.scratch.borrow_mut();
+        let cap = s.reserve.max(1);
+        s.fit(c, cap);
+        let fitted = s.fitted_bytes();
+        let f = std::mem::size_of::<f32>();
+        let group = crate::engine::LAYER_MAJOR_MAX_TOKENS.min(n_ctx);
+        let residuals = group * c.hc.n_stream * c.n_embd * f;
+        let ratio = c.compress_ratios.iter().copied().max().unwrap_or(0) as usize;
+        let qsa = if ratio > 0 {
+            cap * (n_ctx / ratio + 1) * f + cap * (c.indexer.top_k as usize + ratio) * std::mem::size_of::<u32>()
+        } else {
+            0
+        };
+        fitted + residuals + qsa
+    }
+
     /// PLE's state as it stands, for a checkpoint; `None` for a model without PLE.
     ///
     /// **The conv history is read back from the device first.** A device backend
@@ -1146,66 +1177,106 @@ struct Scratch {
     /// one, so every buffer the seam sees is whole and keeps its own device
     /// mirror across the layers of the pass (CLAUDE.md: never a sub-slice).
     parts: Vec<Vec<f32>>,
+    /// Tokens a pass may hold, so per-token buffers are allocated once at that
+    /// size (`Scratch::fit`). The engine sets it to its batch; zero until then.
+    reserve: usize,
 }
 
 impl Scratch {
+    /// Bytes of the buffers `fit` sizes, at their current lengths. QSA's buffers
+    /// and the layer-major residuals are sized elsewhere and not counted here.
+    fn fitted_bytes(&self) -> usize {
+        let v = [
+            &self.x, &self.res, &self.ones_streams, &self.ones, &self.xn, &self.lo, &self.hgate,
+            &self.tmp, &self.mixed, &self.inject, &self.wide, &self.block, &self.qg, &self.q,
+            &self.g, &self.k, &self.v, &self.attn, &self.qkv, &self.z, &self.alpha, &self.beta,
+            &self.conv, &self.q_part, &self.k_part, &self.v_part, &self.core, &self.router,
+            &self.logit, &self.g_all, &self.u_all, &self.o_all, &self.e_gate, &self.e_up,
+            &self.e_out, &self.emb, &self.pkey, &self.pvalue, &self.pquery, &self.psdot,
+            &self.pgated, &self.pconv_in, &self.pconv_out, &self.hres, &self.hxn, &self.hlo,
+            &self.hgate1, &self.htmp, &self.ik, &self.iq, &self.hmixed, &self.logits,
+        ];
+        v.iter().map(|b| b.len()).sum::<usize>() * std::mem::size_of::<f32>()
+    }
+
+    /// Every buffer sized for a pass of `n` tokens.
+    ///
+    /// **Per-token buffers are allocated once, for `reserve` tokens** (06-10). A
+    /// device backend keeps a copy of each buffer keyed on its host address and
+    /// never frees it, so a buffer that grows past its capacity moves and
+    /// orphans its old device copy. `serve` runs passes of many sizes in one
+    /// process (its warm-up, then each turn's sub-chunks) and orphaned ~600 MiB
+    /// that way on 06-10, which filled the card and slowed every kernel 2-4x.
+    /// Reserved up front, a buffer only resizes inside its allocation, so its
+    /// address never changes and a device copy that has to grow is replaced
+    /// under the same key, freeing the old one.
     fn fit(&mut self, c: &Config, n: usize) {
+        let cap = n.max(self.reserve);
         let (nd, hc, lr, m) = (c.n_embd, c.hc.n_stream, c.hc.low_rank, c.moe);
-        let z = |b: &mut Vec<f32>, k: usize| b.resize(k, 0.0);
-        z(&mut self.x, n * nd);
-        z(&mut self.res, n * hc * nd);
+        // `per` values per token, room for `cap` tokens.
+        let z = |b: &mut Vec<f32>, per: usize| {
+            if b.capacity() < cap * per {
+                b.reserve_exact(cap * per - b.len());
+            }
+            b.resize(n * per, 0.0);
+        };
+        // Sizes that do not scale with the pass.
+        let f = |b: &mut Vec<f32>, k: usize| b.resize(k, 0.0);
+        z(&mut self.x, nd);
+        z(&mut self.res, hc * nd);
         self.ones_streams.clear();
+        self.ones_streams.reserve_exact(cap * hc);
         self.ones_streams.resize(n * hc, 1.0);
         self.ones.clear();
         self.ones.resize(nd, 1.0);
-        z(&mut self.xn, n * hc * nd);
-        z(&mut self.lo, n * lr);
-        z(&mut self.hgate, n * hc * nd);
-        z(&mut self.tmp, n * nd);
-        z(&mut self.mixed, n * nd);
-        z(&mut self.inject, n * hc);
-        z(&mut self.wide, n * hc * nd);
-        z(&mut self.block, n * nd);
-        z(&mut self.qg, n * c.q_gate_dim());
-        z(&mut self.q, n * c.head_dim * c.n_head);
-        z(&mut self.g, n * c.head_dim * c.n_head);
-        z(&mut self.k, n * c.kv_dim());
-        z(&mut self.v, n * c.kv_dim());
-        z(&mut self.attn, n * c.head_dim * c.n_head);
-        z(&mut self.qkv, n * c.conv_dim());
-        z(&mut self.z, n * c.value_dim());
-        z(&mut self.alpha, n * c.n_v_heads());
-        z(&mut self.beta, n * c.n_v_heads());
-        z(&mut self.conv, n * c.conv_dim());
-        z(&mut self.q_part, n * c.key_dim());
-        z(&mut self.k_part, n * c.key_dim());
-        z(&mut self.v_part, n * c.value_dim());
-        z(&mut self.core, n * c.value_dim());
-        z(&mut self.router, n * m.n_expert);
-        z(&mut self.logit, n);
-        z(&mut self.g_all, n * m.n_expert_used * m.expert_ff);
-        z(&mut self.u_all, n * m.n_expert_used * m.expert_ff);
-        z(&mut self.o_all, n * m.n_expert_used * nd);
-        z(&mut self.e_gate, n * m.shared_ff);
-        z(&mut self.e_up, n * m.shared_ff);
-        z(&mut self.e_out, n * nd);
-        z(&mut self.emb, n * nd);
-        z(&mut self.pkey, n * hc * nd);
-        z(&mut self.pvalue, n * nd);
-        z(&mut self.pquery, n * hc * nd);
-        z(&mut self.psdot, n * hc);
-        z(&mut self.pgated, n * hc * nd);
-        z(&mut self.pconv_in, n * hc * nd);
-        z(&mut self.pconv_out, n * hc * nd);
-        z(&mut self.hres, hc * nd);
-        z(&mut self.hxn, hc * nd);
-        z(&mut self.hlo, lr);
-        z(&mut self.hgate1, hc * nd);
-        z(&mut self.htmp, nd);
-        z(&mut self.ik, n * c.indexer.head_dim);
-        z(&mut self.iq, n * c.indexer.n_head * c.indexer.head_dim);
-        z(&mut self.hmixed, nd);
-        z(&mut self.logits, c.n_vocab);
+        z(&mut self.xn, hc * nd);
+        z(&mut self.lo, lr);
+        z(&mut self.hgate, hc * nd);
+        z(&mut self.tmp, nd);
+        z(&mut self.mixed, nd);
+        z(&mut self.inject, hc);
+        z(&mut self.wide, hc * nd);
+        z(&mut self.block, nd);
+        z(&mut self.qg, c.q_gate_dim());
+        z(&mut self.q, c.head_dim * c.n_head);
+        z(&mut self.g, c.head_dim * c.n_head);
+        z(&mut self.k, c.kv_dim());
+        z(&mut self.v, c.kv_dim());
+        z(&mut self.attn, c.head_dim * c.n_head);
+        z(&mut self.qkv, c.conv_dim());
+        z(&mut self.z, c.value_dim());
+        z(&mut self.alpha, c.n_v_heads());
+        z(&mut self.beta, c.n_v_heads());
+        z(&mut self.conv, c.conv_dim());
+        z(&mut self.q_part, c.key_dim());
+        z(&mut self.k_part, c.key_dim());
+        z(&mut self.v_part, c.value_dim());
+        z(&mut self.core, c.value_dim());
+        z(&mut self.router, m.n_expert);
+        z(&mut self.logit, 1);
+        z(&mut self.g_all, m.n_expert_used * m.expert_ff);
+        z(&mut self.u_all, m.n_expert_used * m.expert_ff);
+        z(&mut self.o_all, m.n_expert_used * nd);
+        z(&mut self.e_gate, m.shared_ff);
+        z(&mut self.e_up, m.shared_ff);
+        z(&mut self.e_out, nd);
+        z(&mut self.emb, nd);
+        z(&mut self.pkey, hc * nd);
+        z(&mut self.pvalue, nd);
+        z(&mut self.pquery, hc * nd);
+        z(&mut self.psdot, hc);
+        z(&mut self.pgated, hc * nd);
+        z(&mut self.pconv_in, hc * nd);
+        z(&mut self.pconv_out, hc * nd);
+        f(&mut self.hres, hc * nd);
+        f(&mut self.hxn, hc * nd);
+        f(&mut self.hlo, lr);
+        f(&mut self.hgate1, hc * nd);
+        f(&mut self.htmp, nd);
+        z(&mut self.ik, c.indexer.head_dim);
+        z(&mut self.iq, c.indexer.n_head * c.indexer.head_dim);
+        f(&mut self.hmixed, nd);
+        f(&mut self.logits, c.n_vocab);
     }
 }
 
@@ -1360,7 +1431,13 @@ impl<'a> Qwen4Exp<'a> {
         if s.parts.len() < subs.len() {
             s.parts.resize_with(subs.len(), Vec::new);
         }
+        // Each residual is allocated for a whole sub-chunk once, for the reason
+        // `Scratch::fit` gives: a part that moved would orphan its device copy.
+        let room = max_sub.max(1).max(s.reserve) * w;
         for (part, &(_, len)) in s.parts.iter_mut().zip(&subs) {
+            if part.capacity() < room {
+                part.reserve_exact(room - part.len());
+            }
             part.resize(len * w, 0.0);
         }
         s.fit(&self.cfg, subs[0].1);
@@ -1781,6 +1858,17 @@ impl<'a> Qwen4Exp<'a> {
         kv.set_pooled_through(slot, sel.n_blocks);
 
         // Resized, never sliced: a device backend keys buffers on their address.
+        // And reserved for a full batch at the deepest the context allows, once:
+        // `bscores` grows with depth, and a buffer that moved would orphan its
+        // device copy (`Scratch::fit`).
+        let cap = n.max(s.reserve);
+        let blocks_max = (kv.n_ctx() / sel.ratio.max(1)).max(sel.n_blocks).max(1);
+        if s.bscores.capacity() < cap * blocks_max {
+            s.bscores.reserve_exact(cap * blocks_max - s.bscores.len());
+        }
+        if s.cells.capacity() < cap * sel.stride() {
+            s.cells.reserve_exact(cap * sel.stride() - s.cells.len());
+        }
         s.bscores.resize(n * sel.n_blocks.max(1), 0.0);
         s.cells.resize(n * sel.stride(), 0);
         ops.qsa_select(&s.iq, kv.pooled_layer(slot), sel, &mut s.bscores, &mut s.cells);

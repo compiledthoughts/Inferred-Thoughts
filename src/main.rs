@@ -1391,6 +1391,25 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
                 "warmup {} tokens in {:.1} s, expert placement included | {} experts re-placed in {:.2} s",
                 w.tokens, w.prefill_s, w.swaps, w.replace_s,
             );
+            if let Some(t) = inferred_thoughts::ops::Ops::tier_counters(&engine.ops) {
+                eprintln!(
+                    "memory after warmup: {} activation copies, {} MiB | VRAM {} of {} MiB in use",
+                    t.mirrors,
+                    t.mirror_bytes / 1048576,
+                    (t.vram_total - t.vram_free) / 1048576,
+                    t.vram_total / 1048576,
+                );
+                // SSD-TIER D12/D13 and D22: oversubscribed, migration is paused,
+                // so the re-placement moves nothing, and fetching during the run
+                // beats any fixed placement. What is left is moving the one-time
+                // setup out of the first request.
+                if t.oversubscribed {
+                    eprintln!(
+                        "warmup   this model streams experts from the SSD, so placement follows the session \
+                         and the warm-up only moved the one-time setup out of the first request"
+                    );
+                }
+            }
         }
         let r = run_server(engine, tk, chat, opts);
         if let Some(e) = cuda.take_error() {
