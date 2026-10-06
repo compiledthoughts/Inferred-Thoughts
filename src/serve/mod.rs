@@ -54,18 +54,29 @@ use crate::tok::chat::ChatMl;
 mod tools;
 use tools::ToolCall;
 
-/// Prompt tokens one `Engine::prefill` call takes in `serve`: a cancel is heard,
-/// and a checkpoint can be taken, only between calls.
+/// The most prompt tokens one `Engine::prefill` call takes in `serve`: a cancel
+/// is heard, and a checkpoint can be taken, only between calls.
 ///
-/// **2,048, not `--batch`, so `serve` prefills layer-major.** The engine runs a
-/// call longer than `--batch` layer by layer (`Qwen4Exp::forward_layer_major`),
-/// fetching each streamed expert once per call. Capped at `--batch`, every call
-/// was one chunk and fetched the cold pool again: the 125B prefilled 42.9 and
-/// 44.3 tok/s through `serve` (06-10) against `generate`'s 169.5. A 2,048-token
-/// call is about one sweep of the cold experts plus compute, ~20 s on the 125B,
-/// so a cancel waits at most that long. Other models chunk it at `--batch`, and
-/// a split prefill is bit-identical to a whole one either way.
-const PREFILL_SLICE: usize = 2048;
+/// **A turn is planned, not cut at a fixed size.** The engine runs a call longer
+/// than `--batch` layer by layer (`Qwen4Exp::forward_layer_major`), and each call
+/// is one sweep of the streamed experts, ~7.4 s on the 125B whatever its length.
+/// So a turn runs as the fewest calls of at most this many tokens, split evenly
+/// (`next_call`). Calls capped at `--batch` prefilled the 125B at 42.9 and 44.3
+/// tok/s through `serve` (06-10); fixed 2,048-token calls, 68.5 and 72.6, with a
+/// 4,615-token turn still three calls and three sweeps.
+///
+/// **The engine's own layer-major limit**, so a turn up to it is one pass. The
+/// price is cancel latency: a cancel waits for the call in flight, up to ~50 s
+/// at 8,192 tokens on the 125B. Other models chunk a call at `--batch`, and a
+/// split prefill is bit-identical to a whole one either way.
+const PREFILL_MAX: usize = crate::engine::LAYER_MAJOR_MAX_TOKENS;
+
+/// The next prefill call's length, with `rest` tokens of the turn left and calls
+/// of at most `max`: the fewest calls that cover `rest`, as even as they go.
+fn next_call(rest: usize, max: usize) -> usize {
+    let max = max.max(1);
+    rest.div_ceil(rest.div_ceil(max).max(1))
+}
 
 /// Tokens between checkpoints.
 ///
@@ -520,9 +531,9 @@ struct Session<'a, O: Ops> {
     /// seven turns grew the conversation to 16,050 positions with zero
     /// checkpoints, and turn 8 diverged and re-ran all 15,275 tokens, 170.9 s.
     last_ckpt: usize,
-    /// Tokens per prefill call, [`PREFILL_SLICE`] in `serve`; a field so a test
-    /// can cut a turn into slices it can count.
-    prefill_slice: usize,
+    /// The most tokens a prefill call takes, [`PREFILL_MAX`] in `serve`; a field
+    /// so a test can cut a turn into calls it can count.
+    prefill_max: usize,
 }
 
 impl<O: Ops> Session<'_, O> {
@@ -630,12 +641,11 @@ impl<O: Ops> Session<'_, O> {
         // one uninterruptible call per turn, and on Qwen3.8-Flash-Next a
         // 3,879-token Cline turn was 100 s of it: a cancel there was heard only
         // when decode began (17-09). Capped at a batch from then until 06-10,
-        // which kept every call chunk-major; `PREFILL_SLICE` has why it is
-        // 2,048 now.
+        // which kept every call chunk-major; `PREFILL_MAX` has how a turn is
+        // planned now.
         let mut logits = Vec::new();
         let mut done = 0usize;
         let spacing = checkpoint_spacing(self.engine.n_ctx());
-        let slice = self.prefill_slice.max(1);
         // **The prompt's end checkpoint goes after its last special token**, not
         // after its last token, when ordinary tokens follow. A special token is
         // atomic, so the next request re-tokenizes to the same ids through it;
@@ -655,7 +665,7 @@ impl<O: Ops> Session<'_, O> {
                 self.rendered = self.consumed_text(want, &base, &tokens[..done]);
                 return Ok(Advanced::Cancelled { done, of: tokens.len() });
             }
-            let mut take = slice.min(tokens.len() - done);
+            let mut take = next_call(tokens.len() - done, self.prefill_max);
             // Stop the slice at the stable point so the checkpoint lands on it.
             // A split prefill is bit-identical to a whole one
             // (`split_prefill_equals_single_prefill`).
@@ -881,7 +891,7 @@ pub fn serve<O: Ops>(
         checkpoints: Vec::new(),
         last_ckpt: 0,
         consumed: 0,
-        prefill_slice: PREFILL_SLICE,
+        prefill_max: PREFILL_MAX,
     };
 
     // One connection at a time. The engine holds a single session, so
@@ -1894,6 +1904,32 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_is_prefilled_in_the_fewest_even_calls() {
+        let plan = |n: usize, max: usize| {
+            let (mut done, mut calls) = (0, Vec::new());
+            while done < n {
+                let take = next_call(n - done, max);
+                calls.push(take);
+                done += take;
+            }
+            calls
+        };
+        // The two turns measured through serve on 06-10: one call each now.
+        assert_eq!(plan(4615, 8192), vec![4615]);
+        assert_eq!(plan(3454, 8192), vec![3454]);
+        assert_eq!(plan(12_000, 8192), vec![6000, 6000]);
+        assert_eq!(plan(8193, 8192), vec![4097, 4096]);
+        assert_eq!(plan(1799, 512), vec![450, 450, 450, 449]);
+        for (n, max) in [(1, 8192), (8192, 8192), (20_001, 8192), (1799, 512), (5, 1)] {
+            let calls = plan(n, max);
+            assert_eq!(calls.len(), n.div_ceil(max), "{n}/{max}: not the fewest");
+            assert_eq!(calls.iter().sum::<usize>(), n, "{n}/{max}: does not cover");
+            assert!(calls.iter().all(|&c| c <= max), "{n}/{max}: a call over the cap");
+            assert!(calls.windows(2).all(|w| w[0] >= w[1] && w[0] - w[1] <= 1), "{n}/{max}: not even");
+        }
+    }
+
+    #[test]
     fn the_prefill_bar_fills_in_proportion() {
         assert_eq!(progress_bar(0, 5312, 10), "[          ]");
         assert_eq!(progress_bar(1024, 5312, 10), "[>         ]");
@@ -1903,14 +1939,14 @@ mod tests {
         assert_eq!(progress_bar(0, 0, 4), "[====]");
     }
 
-    /// **A cancel during prefill is heard between slices, and the resent request
+    /// **A cancel during prefill is heard between calls, and the resent request
     /// continues where it stopped** (17-09). The 0.2B test model on `Naive`, a
-    /// ~1,400-token turn at `--ctx 4096` (spacing 512, and slices of 512 set here
-    /// so the turn has several): cancelled after two slices, the session holds
-    /// exactly 1,024 of its tokens and the
-    /// matching prefix of its text; the same request again continues at 1,024
-    /// and finishes where an uncancelled session does. Where the rest tokenizes
-    /// as it did in one piece, the logits are the uncancelled ones to the bit.
+    /// ~1,800-token turn at `--ctx 4096` (spacing 512, and calls of at most 512 set
+    /// here so the turn has several): cancelled after two calls, the session holds
+    /// exactly the tokens those two covered and the matching prefix of its text;
+    /// the same request again continues there and finishes where an uncancelled
+    /// session does. Where the rest tokenizes as it did in one piece, the logits
+    /// are the uncancelled ones to the bit.
     use crate::gguf::GgufFile;
     use crate::ops::naive::Naive;
 
@@ -1946,7 +1982,7 @@ mod tests {
             checkpoints: Vec::new(),
             last_ckpt: 0,
             consumed: 0,
-            prefill_slice: PREFILL_SLICE,
+            prefill_max: PREFILL_MAX,
         }
     }
 
@@ -1958,7 +1994,7 @@ mod tests {
         let cut = readme.char_indices().map(|(i, _)| i).take_while(|&i| i <= 5000).last().unwrap_or(0);
         let session = || {
             let mut s = tiny_session(&f, 4096);
-            s.prefill_slice = 512;
+            s.prefill_max = 512;
             s
         };
         let mut plain = session();
@@ -1967,7 +2003,11 @@ mod tests {
         let Advanced::Ready(whole, _, n) = plain.advance(&want, || false).expect("uncancelled") else {
             panic!("an uncancelled prefill reported a cancel");
         };
-        assert!(n > 1024 + 256, "the turn is too short to cut after two slices: {n} tokens");
+        assert!(n > 3 * 512, "the turn is too short to cut after two of several calls: {n} tokens");
+        // Where two calls end: the turn is planned as the fewest calls of at most
+        // 512, evenly, so not at 1,024.
+        let first = next_call(n, 512);
+        let cut_at = first + next_call(n - first, 512);
 
         let mut s = session();
         let mut checks = 0;
@@ -1978,15 +2018,15 @@ mod tests {
         let Ok(Advanced::Cancelled { done, of }) = r else {
             panic!("the third check should have cancelled");
         };
-        assert_eq!((done, of), (1024, n));
-        assert_eq!((s.consumed, s.engine.pos(), s.tokens.len()), (1024, 1024, 1024));
+        assert_eq!((done, of), (cut_at, n));
+        assert_eq!((s.consumed, s.engine.pos(), s.tokens.len()), (cut_at, cut_at, cut_at));
         assert!(!s.rendered.is_empty() && want.starts_with(s.rendered.as_str()), "the text prefix was lost");
 
         let Advanced::Ready(resumed, how, fresh) = s.advance(&want, || false).expect("resent") else {
             panic!("the resent request reported a cancel");
         };
         println!("  resumed: {} , {fresh} new tokens, ends at {}", how.label(), s.engine.pos());
-        assert!(matches!(how, Resume::Continued(1024)), "resumed as {}", how.label());
+        assert!(matches!(how, Resume::Continued(p) if p == cut_at), "resumed as {}", how.label());
         assert_eq!(s.consumed, s.engine.pos());
         let same_split = s.tokens == plain.tokens;
         println!("  the rest tokenized as in one piece: {same_split}");
