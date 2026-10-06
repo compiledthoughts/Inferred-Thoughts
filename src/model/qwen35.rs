@@ -901,6 +901,18 @@ impl<'a> Qwen35<'a> {
             .sum()
     }
 
+    /// Each MoE layer's routed expert types, gate, up and down; empty on the
+    /// dense variant.
+    pub fn expert_types(&self) -> Vec<(crate::gguf::GgmlType, crate::gguf::GgmlType, crate::gguf::GgmlType)> {
+        self.layers
+            .iter()
+            .filter_map(|l| match &l.ffn {
+                Ffn::Moe { gate, up, down, .. } => Some((gate.ty, up.ty, down.ty)),
+                Ffn::Dense { .. } => None,
+            })
+            .collect()
+    }
+
     /// The matmul weights, with `n_used` experts' worth of each routed tensor.
     fn weight_bytes(&self, n_used: usize) -> u64 {
         let w = |m: &Weights<'_>| m.ty.n_bytes(m.n_in as u64) * m.n_out as u64;

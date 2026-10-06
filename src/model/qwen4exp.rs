@@ -1067,6 +1067,11 @@ impl<'a> Qwen4Exp<'a> {
         self.layers.iter().map(|l| l.ffn.gate.n_expert + l.ffn.up.n_expert + l.ffn.down.n_expert).sum()
     }
 
+    /// Each layer's routed expert types, gate, up and down.
+    pub fn expert_types(&self) -> Vec<(crate::gguf::GgmlType, crate::gguf::GgmlType, crate::gguf::GgmlType)> {
+        self.layers.iter().map(|l| (l.ffn.gate.ty, l.ffn.up.ty, l.ffn.down.ty)).collect()
+    }
+
     /// The matmul weights; with `routed`, also the used share of each expert
     /// tensor and one PLE row per hash head.
     fn weight_bytes(&self, routed: bool) -> u64 {

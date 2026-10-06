@@ -19,6 +19,41 @@ pub mod spin;
 
 use crate::gguf::GgmlType;
 
+/// Whether a backend can run routed experts stored as `gate`, `up` and `down`.
+///
+/// **Checked once at load**, because a missing kernel was only recorded per call:
+/// a GitHub user's Q4_K / Q5_1 quant streamed garbage while `generate` kept going.
+/// The CPU backends run every format their kernels implement (`quant` and
+/// `naive`'s matmul). The CUDA backend has grouped routed-expert kernels for two:
+/// gate and up together as IQ4_XS or as NVFP4 (`moe_glu`), and down as either.
+pub fn check_expert_types(
+    gate: GgmlType,
+    up: GgmlType,
+    down: GgmlType,
+    on_cuda: bool,
+) -> crate::error::Result<()> {
+    use GgmlType::*;
+    let ok = if on_cuda {
+        matches!((gate, up), (Iq4Xs, Iq4Xs) | (Nvfp4, Nvfp4)) && matches!(down, Iq4Xs | Nvfp4)
+    } else {
+        [gate, up, down]
+            .iter()
+            .all(|t| matches!(t, F32 | F16 | Bf16 | Q8_0 | Q5K | Q6K | Iq4Xs | Nvfp4))
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(crate::error::Error::UnsupportedExperts {
+        found: format!("{} (gate) / {} (up) / {} (down)", gate.name(), up.name(), down.name()),
+        backend: if on_cuda { "--backend cuda" } else { "the CPU backends" },
+        supported: if on_cuda {
+            "IQ4_XS or NVFP4 experts, gate and up of the same type"
+        } else {
+            "F32, F16, BF16, Q8_0, Q5_K, Q6_K, IQ4_XS and NVFP4"
+        },
+    })
+}
+
 /// A weight matrix, left in whatever quantized form the file stores it.
 ///
 /// Deliberately a borrow of the mmap rather than owned f32: materializing the
@@ -1387,5 +1422,44 @@ pub trait Ops {
         for (d, &s) in slab[offset..offset + src.len()].iter_mut().zip(src) {
             *d = crate::quant::half::f32_to_f16(s);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_expert_types;
+    use crate::gguf::GgmlType::*;
+
+    #[test]
+    fn the_cuda_backend_refuses_routed_experts_it_has_no_kernel_for() {
+        // The two formats the grouped kernels run, as the models ship them.
+        assert!(check_expert_types(Nvfp4, Nvfp4, Nvfp4, true).is_ok());
+        assert!(check_expert_types(Iq4Xs, Iq4Xs, Iq4Xs, true).is_ok());
+        // The GitHub report: a Q4_K / Q5_1 quant.
+        assert!(check_expert_types(Q4K, Q4K, Q5_1, true).is_err());
+        assert!(check_expert_types(Q5_1, Q5_1, Q5_1, true).is_err());
+        // `moe_glu` needs gate and up of one type.
+        assert!(check_expert_types(Iq4Xs, Nvfp4, Iq4Xs, true).is_err());
+        // Formats the CPU runs but the CUDA expert path does not.
+        assert!(check_expert_types(Q8_0, Q8_0, Q8_0, true).is_err());
+    }
+
+    #[test]
+    fn the_cpu_backends_run_every_format_their_kernels_implement() {
+        for t in [F32, F16, Bf16, Q8_0, Q5K, Q6K, Iq4Xs, Nvfp4] {
+            assert!(check_expert_types(t, t, t, false).is_ok(), "{}", t.name());
+        }
+        assert!(check_expert_types(Q4K, Q4K, Q4K, false).is_err());
+        assert!(check_expert_types(Q8_0, Q8_0, Q5_1, false).is_err());
+    }
+
+    #[test]
+    fn a_refusal_names_what_it_found_and_what_runs() {
+        let msg = match check_expert_types(Q4K, Q4K, Q5_1, true) {
+            Err(e) => e.to_string(),
+            Ok(()) => String::new(),
+        };
+        assert!(msg.contains("q4_K") || msg.contains("Q4_K"), "{msg}");
+        assert!(msg.contains("IQ4_XS or NVFP4"), "{msg}");
     }
 }

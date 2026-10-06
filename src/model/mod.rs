@@ -170,6 +170,20 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// Refuse a model whose routed experts the backend cannot run, at load rather
+    /// than mid-run (see [`crate::ops::check_expert_types`]). A dense model passes.
+    pub fn check_experts(&self, on_cuda: bool) -> Result<()> {
+        let types = match self {
+            Model::Qwen3(_) => Vec::new(),
+            Model::Qwen35(m) => m.expert_types(),
+            Model::Qwen4Exp(m) => m.expert_types(),
+        };
+        for (gate, up, down) in types {
+            crate::ops::check_expert_types(gate, up, down, on_cuda)?;
+        }
+        Ok(())
+    }
+
     /// Experts across every routed expert tensor, which a device backend's expert
     /// cache has to be able to count.
     pub fn expert_pool(&self) -> usize {

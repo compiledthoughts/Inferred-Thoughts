@@ -101,6 +101,19 @@ pub enum Error {
     #[error("dequantization of {ty} is not implemented yet")]
     UnsupportedQuantType { ty: &'static str },
 
+    /// A model whose routed experts the chosen backend has no kernel for,
+    /// refused at load rather than computed wrong (a Q4_K / Q5_1 quant once
+    /// streamed garbage because the per-call error was only recorded).
+    #[error(
+        "this model's routed experts are {found}, which {backend} cannot run; it runs {supported}. \
+         Use a GGUF whose experts are one of those"
+    )]
+    UnsupportedExperts {
+        found: String,
+        backend: &'static str,
+        supported: &'static str,
+    },
+
     #[error(
         "dequantizing {n} elements of {ty} needs {expected} bytes of input, got {got}"
     )]

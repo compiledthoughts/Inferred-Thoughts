@@ -491,6 +491,9 @@ fn generate(model: &str, prompt: &str, o: GenOpts) -> inferred_thoughts::Result<
     let f = GgufFile::open(model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
     let m = Model::load(&f)?;
+    // Refused here, before any weight moves, rather than as a per-call error
+    // recorded while generation keeps going.
+    m.check_experts(o.backend == "cuda")?;
 
     // Wrapping happens before tokenization so the markers go through
     // `parse_special` and encode as single tokens, not as literal text.
@@ -1330,6 +1333,9 @@ fn serve(a: ServeArgs) -> inferred_thoughts::Result<()> {
     let f = GgufFile::open(&a.model)?;
     let tk = Tokenizer::from_metadata(&f.metadata)?;
     let m = Model::load(&f)?;
+    // Refused up front, as for a chat template below: experts the backend has
+    // no kernel for would otherwise compute wrong on every request.
+    m.check_experts(a.backend == "cuda")?;
     // Refused up front rather than per request: a server that cannot render a
     // chat turn has nothing useful to do.
     let chat = ChatMl::detect(&tk, &f.metadata)?;
